@@ -74,12 +74,44 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     eprintln!("Failed to send response: {e}");
                 }
             } else {
-                println!(
-                    "[{}] Message from {}: {}",
-                    chrono::Utc::now().format("%H:%M:%S"),
-                    msg.sender,
-                    msg.body
-                );
+                // Not a command and not a button press: treat as a human's
+                // reply to a task they were handed. Route it onto the awaiting-
+                // human task assigned to the agent this bot fronts and record it
+                // as a message — that satisfies the task's HumanInput wait so the
+                // coordinator resumes/completes it. (The "awaiting-human task
+                // router" formerly deferred at src/notify/telegram.rs:42.)
+                match crate::commands::service::human_dispatch::route_inbound_reply(
+                    &workgraph_dir,
+                    &msg.channel,
+                    &msg.sender,
+                    &msg.body,
+                ) {
+                    Some(task_id) => {
+                        println!(
+                            "[{}] Reply from {} recorded on awaiting-human task '{}'",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            msg.sender,
+                            task_id
+                        );
+                        if let Err(e) = channel
+                            .send_text(
+                                &effective_chat_id,
+                                &format!("✓ Recorded your reply on task '{}'.", task_id),
+                            )
+                            .await
+                        {
+                            eprintln!("Failed to send ack: {e}");
+                        }
+                    }
+                    None => {
+                        println!(
+                            "[{}] Message from {} (no awaiting-human task matched): {}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            msg.sender,
+                            msg.body
+                        );
+                    }
+                }
             }
         }
 
