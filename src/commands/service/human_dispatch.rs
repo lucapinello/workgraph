@@ -106,7 +106,10 @@ pub fn park_ready_human_tasks(graph: &mut WorkGraph, dir: &Path) -> Vec<ParkedHu
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("coordinator".to_string()),
                 user: Some(worksgood::current_user()),
-                message: format!("{} (assigned to human agent '{}')", PARK_LOG_MARKER, agent_id),
+                message: format!(
+                    "{} (assigned to human agent '{}')",
+                    PARK_LOG_MARKER, agent_id
+                ),
             });
             parked.push(ParkedHumanTask {
                 task_id: t.id.clone(),
@@ -290,8 +293,7 @@ pub fn try_complete_human_task_on_reply(
 /// `has_non_agent_message_since` uses for `WaitCondition::HumanInput`.
 fn latest_human_reply(dir: &Path, task_id: &str, wait_started: Option<&str>) -> Option<String> {
     let msgs = messages::list_messages(dir, task_id).ok()?;
-    let wait_time =
-        wait_started.and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
+    let wait_time = wait_started.and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
     msgs.into_iter()
         .filter(|m| !m.sender.starts_with("agent-"))
         .filter(|m| match wait_time {
@@ -366,9 +368,9 @@ pub fn route_inbound_reply(
 /// True if a task's wait spec includes `WaitCondition::HumanInput`.
 fn waits_on_human_input(task: &Task) -> bool {
     match &task.wait_condition {
-        Some(WaitSpec::All(c) | WaitSpec::Any(c)) => {
-            c.iter().any(|cond| matches!(cond, WaitCondition::HumanInput))
-        }
+        Some(WaitSpec::All(c) | WaitSpec::Any(c)) => c
+            .iter()
+            .any(|cond| matches!(cond, WaitCondition::HumanInput)),
         None => false,
     }
 }
@@ -393,9 +395,7 @@ fn bound_agent_for_channel(dir: &Path, channel_type: &str, agents: &[Agent]) -> 
     let notify_config = load_notify_config(dir).ok().flatten()?;
     let tg = TelegramConfig::from_notify_config(&notify_config).ok()?;
 
-    let want_bot_id = channel_type
-        .strip_prefix("telegram:")
-        .unwrap_or("default");
+    let want_bot_id = channel_type.strip_prefix("telegram:").unwrap_or("default");
     let binding = tg
         .all_bots()
         .into_iter()
@@ -536,14 +536,13 @@ mod tests {
         // Human replies via a non-agent message.
         messages::send_message(dir, "groceries", "eggs, milk, bread", "nadin", "normal").unwrap();
 
-        let handled = try_complete_human_task_on_reply(
-            &mut graph,
-            dir,
-            "groceries",
-            wait_started.as_deref(),
-        );
+        let handled =
+            try_complete_human_task_on_reply(&mut graph, dir, "groceries", wait_started.as_deref());
 
-        assert!(handled, "human task reply should be handled here, not by generic resume");
+        assert!(
+            handled,
+            "human task reply should be handled here, not by generic resume"
+        );
         let t = graph.get_task("groceries").unwrap();
         assert_eq!(t.status, Status::Done);
         assert!(t.wait_condition.is_none());
@@ -556,7 +555,9 @@ mod tests {
             .expect("artifact file written");
         assert_eq!(written, "eggs, milk, bread");
         assert!(
-            t.log.iter().any(|l| l.message.contains("Human reply received")),
+            t.log
+                .iter()
+                .any(|l| l.message.contains("Human reply received")),
             "completion log records the reply"
         );
     }
@@ -601,7 +602,10 @@ mod tests {
 
         let handled = try_complete_human_task_on_reply(&mut graph, dir, "build", None);
 
-        assert!(!handled, "AI-assigned task must fall through to generic resume");
+        assert!(
+            !handled,
+            "AI-assigned task must fall through to generic resume"
+        );
         assert_eq!(graph.get_task("build").unwrap().status, Status::Waiting);
     }
 }
