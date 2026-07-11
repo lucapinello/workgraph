@@ -11,14 +11,20 @@ use std::path::Path;
 use worksgood::notify::NotificationChannel;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
-use worksgood::notify::telegram_group::{NaturalRoute, route_natural};
+use worksgood::notify::telegram_group::{CONCIERGE_BOT, NaturalRoute, route_natural};
 
 /// Run the Telegram listener.
 ///
 /// Starts a long-running process that polls for incoming messages via the
 /// Telegram Bot API and dispatches WG commands.
 pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
-    let config = load_telegram_config()?;
+    // Load the raw notify config once: `TelegramConfig` drives the banner and
+    // the group @mention router, while `all_from_notify_config` builds one
+    // channel per configured bot for the poll loop below.
+    let notify_config = NotifyConfig::load(Some(Path::new(".")))
+        .context("Failed to load notification config")?
+        .context("No notify.toml found. Create one at ~/.config/workgraph/notify.toml")?;
+    let config = TelegramConfig::from_notify_config(&notify_config)?;
     let effective_chat_id = chat_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| config.chat_id.clone());
@@ -26,20 +32,48 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     println!("Starting Telegram listener...");
     println!("{}", bot_banner(&config));
     println!("Chat ID: {}", effective_chat_id);
+
+    // Build one channel per configured bot. Live evidence for this whole task:
+    // Luca tags a bot in the group and the @mention lands ONLY in that bot's
+    // getUpdates queue — so a listener that polls a single bot never sees
+    // mentions of the others. We long-poll EVERY bot concurrently (one tokio
+    // task per bot, each persisting its own offset) and funnel them all into
+    // one shared receiver, which the single routing pipeline below drains.
+    let channels = TelegramChannel::all_from_notify_config(&notify_config)
+        .context("Failed to build Telegram channels")?;
+    if channels.is_empty() {
+        anyhow::bail!("No Telegram bots configured — nothing to poll");
+    }
+
+    // Replies go out via one bot: the concierge (otto) when present, else the
+    // first configured bot. This matches the pre-existing single-channel reply
+    // behaviour — the poll fan-out below is the only change in scope here.
+    let reply_idx = channels
+        .iter()
+        .position(|c| c.bot_id() == CONCIERGE_BOT)
+        .unwrap_or(0);
+
     println!("Press Ctrl+C to stop\n");
 
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
 
-    // Keep a copy of the full multi-bot config for group @mention resolution;
-    // `config` itself is moved into the channel below.
+    // Config for group @mention resolution in the routing pipeline.
     let route_config = config.clone();
 
     rt.block_on(async {
-        let channel = TelegramChannel::new(config);
-        let mut rx = channel
-            .listen()
-            .await
-            .context("Failed to start Telegram listener")?;
+        // One shared receiver fed by every bot's poll task. Each task tags its
+        // messages with the bot's channel_type, so the router still knows which
+        // bot received a given update.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        for ch in &channels {
+            println!("polling {}", ch.bot_id());
+            ch.spawn_poll(tx.clone(), Some(bot_offset_state_path(ch.bot_id())?));
+        }
+        // Drop our own sender handle so the receiver closes if every poll task
+        // exits (all senders dropped) rather than hanging forever.
+        drop(tx);
+
+        let channel = &channels[reply_idx];
 
         let workgraph_dir = dir.to_path_buf();
         while let Some(msg) = rx.recv().await {
@@ -971,6 +1005,26 @@ fn get_state_file_path() -> Result<std::path::PathBuf> {
         .join(".config")
         .join("workgraph")
         .join("telegram_update_id"))
+}
+
+/// Per-bot `getUpdates` offset checkpoint file.
+///
+/// The multi-bot listener polls every bot concurrently, so each needs its own
+/// cursor file — a single shared `telegram_update_id` (as the legacy
+/// single-bot wait-reply path uses) would let one bot's offset clobber
+/// another's and replay/skip updates. Keyed by `bot_id` alongside the legacy
+/// file, e.g. `~/.config/workgraph/telegram_update_id_bruno`. The `bot_id`
+/// comes from the config key; any path separators are neutralised defensively.
+fn bot_offset_state_path(bot_id: &str) -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().context("could not determine home directory")?;
+    let safe: String = bot_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Ok(home
+        .join(".config")
+        .join("workgraph")
+        .join(format!("telegram_update_id_{safe}")))
 }
 
 /// Render the startup banner line describing which bot(s) are configured.

@@ -371,6 +371,42 @@ impl NotificationChannel for TelegramChannel {
 
     async fn listen(&self) -> Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        // Legacy single-bot path: poll this one bot into its own receiver,
+        // with an in-memory offset that resets to 0 on restart. Multi-bot
+        // listeners use [`TelegramChannel::spawn_poll`] instead, which shares
+        // one receiver across every bot and persists each bot's offset.
+        self.spawn_poll(tx, None);
+        Ok(rx)
+    }
+}
+
+impl TelegramChannel {
+    /// Long-poll THIS bot's `getUpdates` queue, forwarding every decoded
+    /// [`IncomingMessage`] into `tx`.
+    ///
+    /// This is the shared engine behind both the legacy single-bot
+    /// [`listen`](NotificationChannel::listen) and the multi-bot listener in
+    /// `commands::telegram::run_listen`. The multi-bot caller builds one
+    /// [`TelegramChannel`] per configured bot (see
+    /// [`all_from_notify_config`](Self::all_from_notify_config)), then calls
+    /// `spawn_poll` on each with a *clone of one shared `tx`* — so a single
+    /// routing pipeline consumes every bot's queue concurrently. Each
+    /// [`IncomingMessage`] carries this bot's `channel_type` tag so the
+    /// downstream router knows which bot received it.
+    ///
+    /// `offset_path`:
+    /// - `Some(path)` — persist the `getUpdates` offset to `path` (one file
+    ///   per bot, keyed by `bot_id` by the caller) so a listener restart does
+    ///   not replay already-acknowledged updates. The offset is seeded from
+    ///   the file at startup and rewritten after each update is consumed.
+    /// - `None` — keep the offset in memory only (legacy `listen` behaviour).
+    ///
+    /// Returns the spawned task handle so the caller can await/abort it.
+    pub fn spawn_poll(
+        &self,
+        tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+        offset_path: Option<std::path::PathBuf>,
+    ) -> tokio::task::JoinHandle<()> {
         let bot = self.bot.clone();
         let client = self.client.clone();
         // Pre-compute the channel-type tag so each IncomingMessage carries
@@ -381,7 +417,7 @@ impl NotificationChannel for TelegramChannel {
         let channel_tag = self.channel_type.clone();
 
         tokio::spawn(async move {
-            let mut offset: i64 = 0;
+            let mut offset: i64 = offset_path.as_deref().map(load_offset).unwrap_or(0);
             loop {
                 let url = format!("https://api.telegram.org/bot{}/getUpdates", bot.bot_token);
                 let body = serde_json::json!({
@@ -416,130 +452,168 @@ impl NotificationChannel for TelegramChannel {
                 for update in &updates {
                     if let Some(uid) = update.get("update_id").and_then(|u| u.as_i64()) {
                         offset = uid + 1;
-                    }
-
-                    // Handle callback queries (button presses)
-                    if let Some(cb) = update.get("callback_query") {
-                        let sender = cb
-                            .get("from")
-                            .and_then(|f| f.get("username"))
-                            .and_then(|u| u.as_str())
-                            .or_else(|| {
-                                cb.get("from")
-                                    .and_then(|f| f.get("id"))
-                                    .and_then(|i| i.as_i64())
-                                    .map(|_| "unknown")
-                            })
-                            .unwrap_or("unknown");
-
-                        let action_id = cb
-                            .get("data")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        let reply_to = cb
-                            .get("message")
-                            .and_then(|m| m.get("message_id"))
-                            .and_then(|m| m.as_i64())
-                            .map(|mid| MessageId(mid.to_string()));
-
-                        // A button press carries the chat it was pressed in so
-                        // the response goes back to that chat (group or DM).
-                        let chat_id = cb
-                            .get("message")
-                            .and_then(|m| m.get("chat"))
-                            .and_then(|c| c.get("id"))
-                            .and_then(|id| id.as_i64())
-                            .map(|id| id.to_string());
-                        let chat_type = cb
-                            .get("message")
-                            .and_then(|m| m.get("chat"))
-                            .and_then(|c| c.get("type"))
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string());
-
-                        let msg = IncomingMessage {
-                            channel: channel_tag.clone(),
-                            sender: sender.to_string(),
-                            body: action_id.clone(),
-                            action_id: Some(action_id),
-                            reply_to,
-                            chat_id,
-                            chat_type,
-                            mention_usernames: Vec::new(),
-                            reply_to_bot: None,
-                        };
-
-                        if tx.send(msg).await.is_err() {
-                            return; // receiver dropped
+                        // Persist BEFORE dispatch so a crash mid-processing
+                        // still advances the cursor (the update was pulled off
+                        // Telegram's queue the moment we sent `offset`).
+                        if let Some(ref path) = offset_path {
+                            save_offset(path, offset);
                         }
-                        continue;
                     }
 
-                    // Handle regular messages
-                    if let Some(message) = update.get("message") {
-                        let sender = message
-                            .get("from")
-                            .and_then(|f| f.get("username"))
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("unknown");
-
-                        let body = message
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        let reply_to = message
-                            .get("reply_to_message")
-                            .and_then(|r| r.get("message_id"))
-                            .and_then(|m| m.as_i64())
-                            .map(|mid| MessageId(mid.to_string()));
-
-                        // Chat context for group @mention routing (R17): the
-                        // chat id is the reply target (in a group, the group
-                        // itself — never the bot's default chat) and the chat
-                        // type drives privacy-mode filtering downstream.
-                        let chat_id = message
-                            .get("chat")
-                            .and_then(|c| c.get("id"))
-                            .and_then(|id| id.as_i64())
-                            .map(|id| id.to_string());
-                        let chat_type = message
-                            .get("chat")
-                            .and_then(|c| c.get("type"))
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string());
-                        let mention_usernames = super::telegram_group::parse_mention_usernames(
-                            message.get("text").and_then(|t| t.as_str()).unwrap_or(""),
-                            message.get("entities").unwrap_or(&serde_json::Value::Null),
-                        );
-                        // Reply-chain: if this replies to a bot's own message,
-                        // name that bot so the reply routes to its agent.
-                        let reply_to_bot = super::telegram_group::reply_to_bot_username(message);
-
-                        let msg = IncomingMessage {
-                            channel: channel_tag.clone(),
-                            sender: sender.to_string(),
-                            body,
-                            action_id: None,
-                            reply_to,
-                            chat_id,
-                            chat_type,
-                            mention_usernames,
-                            reply_to_bot,
-                        };
-
+                    if let Some(msg) = decode_update(update, &channel_tag) {
                         if tx.send(msg).await.is_err() {
-                            return; // receiver dropped
+                            return; // receiver dropped — stop polling this bot
                         }
                     }
                 }
             }
-        });
+        })
+    }
+}
 
-        Ok(rx)
+/// Decode a single Telegram `getUpdates` element into an [`IncomingMessage`],
+/// tagging it with `channel_tag` (the receiving bot's channel type). Returns
+/// `None` for updates that are neither a callback query nor a text message.
+///
+/// Extracted from the poll loop so the single-bot and multi-bot pollers share
+/// exactly one decoder — the two must never diverge in how they parse a
+/// button press vs. a group @mention.
+fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<IncomingMessage> {
+    // Handle callback queries (button presses)
+    if let Some(cb) = update.get("callback_query") {
+        let sender = cb
+            .get("from")
+            .and_then(|f| f.get("username"))
+            .and_then(|u| u.as_str())
+            .or_else(|| {
+                cb.get("from")
+                    .and_then(|f| f.get("id"))
+                    .and_then(|i| i.as_i64())
+                    .map(|_| "unknown")
+            })
+            .unwrap_or("unknown");
+
+        let action_id = cb
+            .get("data")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let reply_to = cb
+            .get("message")
+            .and_then(|m| m.get("message_id"))
+            .and_then(|m| m.as_i64())
+            .map(|mid| MessageId(mid.to_string()));
+
+        // A button press carries the chat it was pressed in so
+        // the response goes back to that chat (group or DM).
+        let chat_id = cb
+            .get("message")
+            .and_then(|m| m.get("chat"))
+            .and_then(|c| c.get("id"))
+            .and_then(|id| id.as_i64())
+            .map(|id| id.to_string());
+        let chat_type = cb
+            .get("message")
+            .and_then(|m| m.get("chat"))
+            .and_then(|c| c.get("type"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string());
+
+        return Some(IncomingMessage {
+            channel: channel_tag.to_string(),
+            sender: sender.to_string(),
+            body: action_id.clone(),
+            action_id: Some(action_id),
+            reply_to,
+            chat_id,
+            chat_type,
+            mention_usernames: Vec::new(),
+            reply_to_bot: None,
+        });
+    }
+
+    // Handle regular messages
+    if let Some(message) = update.get("message") {
+        let sender = message
+            .get("from")
+            .and_then(|f| f.get("username"))
+            .and_then(|u| u.as_str())
+            .unwrap_or("unknown");
+
+        let body = message
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let reply_to = message
+            .get("reply_to_message")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|m| m.as_i64())
+            .map(|mid| MessageId(mid.to_string()));
+
+        // Chat context for group @mention routing (R17): the
+        // chat id is the reply target (in a group, the group
+        // itself — never the bot's default chat) and the chat
+        // type drives privacy-mode filtering downstream.
+        let chat_id = message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(|id| id.as_i64())
+            .map(|id| id.to_string());
+        let chat_type = message
+            .get("chat")
+            .and_then(|c| c.get("type"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string());
+        let mention_usernames = super::telegram_group::parse_mention_usernames(
+            message.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+            message.get("entities").unwrap_or(&serde_json::Value::Null),
+        );
+        // Reply-chain: if this replies to a bot's own message,
+        // name that bot so the reply routes to its agent.
+        let reply_to_bot = super::telegram_group::reply_to_bot_username(message);
+
+        return Some(IncomingMessage {
+            channel: channel_tag.to_string(),
+            sender: sender.to_string(),
+            body,
+            action_id: None,
+            reply_to,
+            chat_id,
+            chat_type,
+            mention_usernames,
+            reply_to_bot,
+        });
+    }
+
+    None
+}
+
+/// Load a persisted `getUpdates` offset from `path`. A missing or malformed
+/// file yields `0` (start from the front of the queue) — the same default the
+/// in-memory poller uses on a cold start.
+fn load_offset(path: &std::path::Path) -> i64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the next `getUpdates` offset to `path`, creating the parent
+/// directory if needed. Failures are logged and swallowed — a listener that
+/// cannot checkpoint its cursor must keep running (it will simply re-see
+/// recent updates after a restart), never crash.
+fn save_offset(path: &std::path::Path, offset: i64) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("Failed to create Telegram offset dir {}: {e}", parent.display());
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(path, offset.to_string()) {
+        eprintln!("Failed to persist Telegram offset {}: {e}", path.display());
     }
 }
 
@@ -809,5 +883,129 @@ agent_id = "nora"
         let json = serde_json::json!({"ok": true});
         let mid = TelegramChannel::extract_message_id(&json);
         assert_eq!(mid.0, "0");
+    }
+
+    // ---- multi-poll dispatch ----------------------------------------------
+    //
+    // The poll fan-out (one `spawn_poll` task per bot, all feeding one shared
+    // receiver) rests on three units below: (1) `decode_update` tags each
+    // message with the *receiving* bot's channel type, so a merged stream
+    // still tells the router which bot got the update; (2) offset persistence
+    // survives a restart; (3) the shared-tx merge delivers every bot's
+    // messages onto one receiver.
+
+    #[test]
+    fn decode_update_tags_message_with_receiving_bot() {
+        // Same raw update, decoded under two different bot tags, must come out
+        // tagged with whichever bot polled it — this is the identity plumbing
+        // that lets one pipeline serve every bot's queue.
+        let update = serde_json::json!({
+            "update_id": 100,
+            "message": {
+                "message_id": 7,
+                "from": { "username": "luca" },
+                "chat": { "id": -1001, "type": "supergroup" },
+                "text": "hey @bruno_chef_bot what's for dinner",
+                "entities": [
+                    { "type": "mention", "offset": 4, "length": 15 }
+                ]
+            }
+        });
+
+        let as_bruno = decode_update(&update, "telegram:bruno").unwrap();
+        assert_eq!(as_bruno.channel, "telegram:bruno");
+        assert_eq!(as_bruno.sender, "luca");
+        assert_eq!(as_bruno.chat_id.as_deref(), Some("-1001"));
+        assert_eq!(as_bruno.chat_type.as_deref(), Some("supergroup"));
+        assert_eq!(
+            as_bruno.mention_usernames,
+            vec!["bruno_chef_bot".to_string()],
+            "group @mention parsed for routing"
+        );
+        assert!(as_bruno.action_id.is_none());
+
+        let as_mira = decode_update(&update, "telegram:mira").unwrap();
+        assert_eq!(as_mira.channel, "telegram:mira");
+    }
+
+    #[test]
+    fn decode_update_handles_callback_query() {
+        let update = serde_json::json!({
+            "update_id": 200,
+            "callback_query": {
+                "from": { "username": "luca" },
+                "data": "approve:my-task",
+                "message": {
+                    "message_id": 9,
+                    "chat": { "id": 555, "type": "private" }
+                }
+            }
+        });
+        let msg = decode_update(&update, "telegram:otto").unwrap();
+        assert_eq!(msg.channel, "telegram:otto");
+        assert_eq!(msg.action_id.as_deref(), Some("approve:my-task"));
+        assert_eq!(msg.body, "approve:my-task");
+        assert_eq!(msg.chat_id.as_deref(), Some("555"));
+    }
+
+    #[test]
+    fn decode_update_ignores_non_message_updates() {
+        // e.g. an edited_message / poll update we didn't ask for — no panic,
+        // no phantom IncomingMessage.
+        let update = serde_json::json!({ "update_id": 300, "edited_message": {} });
+        assert!(decode_update(&update, "telegram:otto").is_none());
+    }
+
+    #[test]
+    fn offset_persist_roundtrip_and_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Nested path exercises the create_dir_all in save_offset.
+        let path = dir.path().join("nested").join("telegram_update_id_bruno");
+
+        // Cold start: missing file → 0 (front of the queue).
+        assert_eq!(load_offset(&path), 0);
+
+        save_offset(&path, 4242);
+        assert_eq!(load_offset(&path), 4242, "offset survives a restart");
+
+        // A garbage file also defaults to 0 rather than crashing the poller.
+        std::fs::write(&path, "not-a-number").unwrap();
+        assert_eq!(load_offset(&path), 0);
+    }
+
+    #[tokio::test]
+    async fn shared_tx_merges_every_bots_messages() {
+        // Mirrors run_listen's fan-in: N producers (one per bot) each send
+        // their decoded messages into ONE shared receiver. The single pipeline
+        // must see all of them, tagged per bot.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
+        let bots = ["telegram:nora", "telegram:bruno", "telegram:mira", "telegram:otto"];
+        for tag in bots {
+            let tx = tx.clone();
+            let tag = tag.to_string();
+            tokio::spawn(async move {
+                let update = serde_json::json!({
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1,
+                        "from": { "username": "luca" },
+                        "chat": { "id": -1, "type": "supergroup" },
+                        "text": "ping"
+                    }
+                });
+                let msg = decode_update(&update, &tag).unwrap();
+                tx.send(msg).await.unwrap();
+            });
+        }
+        drop(tx); // so the loop terminates once all producers finish
+
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            seen.push(msg.channel);
+        }
+        seen.sort();
+        let mut expected: Vec<String> = bots.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(seen, expected, "every bot's message reached the one receiver");
     }
 }

@@ -1943,6 +1943,7 @@ mod tests {
             requires: vec![],
             tags: vec![],
             skills: vec![],
+            choices: vec![],
             inputs: vec![],
             deliverables: vec![],
             artifacts: vec![],
