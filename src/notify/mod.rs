@@ -15,6 +15,7 @@ pub mod push;
 pub mod slack;
 pub mod sms;
 pub mod telegram;
+pub mod telegram_group;
 pub mod voice;
 pub mod webhook;
 
@@ -86,6 +87,20 @@ pub struct IncomingMessage {
     pub action_id: Option<String>,
     /// If this is a reply, the original message id.
     pub reply_to: Option<MessageId>,
+    /// The id of the chat this message arrived in, when the transport exposes
+    /// it (Telegram always does). Replies MUST target this chat — in a group
+    /// that is the group's chat id, not the bot's configured default chat.
+    /// `None` for transports that don't surface a chat id.
+    pub chat_id: Option<String>,
+    /// The chat kind: `"private"`, `"group"`, `"supergroup"`, or `"channel"`
+    /// for Telegram. `None` when unknown. Group/supergroup inbound is subject
+    /// to privacy-mode filtering (only @mentions, replies and commands route).
+    pub chat_type: Option<String>,
+    /// Bot @usernames mentioned in this message via the transport's native
+    /// mention entities (Telegram `entities` of type `mention`), lower-cased
+    /// and stripped of the leading `@`. Empty when there are none. Used to
+    /// route a group @mention to the agent the mentioned bot fronts.
+    pub mention_usernames: Vec<String>,
 }
 
 /// Classification of notification events for routing.

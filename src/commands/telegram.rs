@@ -11,6 +11,7 @@ use std::path::Path;
 use worksgood::notify::NotificationChannel;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
+use worksgood::notify::telegram_group::{GroupRoute, route_group_message};
 
 /// Run the Telegram listener.
 ///
@@ -29,6 +30,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
 
+    // Keep a copy of the full multi-bot config for group @mention resolution;
+    // `config` itself is moved into the channel below.
+    let route_config = config.clone();
+
     rt.block_on(async {
         let channel = TelegramChannel::new(config);
         let mut rx = channel
@@ -38,8 +43,78 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
 
         let workgraph_dir = dir.to_path_buf();
         while let Some(msg) = rx.recv().await {
+            // Reply target: the chat the message came from (in a group, the
+            // group itself — never the bot's default DM). Falls back to the
+            // configured chat when the transport didn't surface a chat id.
+            let reply_target = msg
+                .chat_id
+                .clone()
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| effective_chat_id.clone());
+
+            // Button presses are handled first — they carry an action id, not
+            // text to route by @mention.
+            if let Some(ref action_id) = msg.action_id {
+                println!(
+                    "[{}] Button press from {}: {}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    msg.sender,
+                    action_id
+                );
+
+                // Action IDs follow the pattern "action:task_id" (e.g. "approve:my-task")
+                let response = handle_action(&workgraph_dir, action_id, &msg.sender);
+
+                if let Err(e) = channel.send_text(&reply_target, &response).await {
+                    eprintln!("Failed to send response: {e}");
+                }
+                continue;
+            }
+
+            // R17 group @mention routing + privacy filter. In a private chat
+            // this is a passthrough. In a group/supergroup, only @mentions,
+            // replies, and commands survive; an @mention of a configured bot is
+            // routed "like a 1:1" to that bot's agent (its channel type and the
+            // mention-stripped body), and the reply always goes to the group.
+            let route = route_group_message(
+                msg.chat_type.as_deref(),
+                msg.chat_id.as_deref(),
+                &msg.body,
+                &msg.mention_usernames,
+                msg.reply_to.is_some(),
+                &route_config,
+            );
+            let (route_channel, route_body) = match route {
+                GroupRoute::IgnoredByPrivacy => {
+                    println!(
+                        "[{}] Group message from {} ignored (no @mention / reply / command)",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        msg.sender,
+                    );
+                    continue;
+                }
+                GroupRoute::RouteToBot {
+                    ref bot,
+                    ref body,
+                    ref reply_chat,
+                } => {
+                    println!(
+                        "[{}] Group @mention from {} -> {} (agent {})",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        msg.sender,
+                        bot.bot_id,
+                        bot.agent_id.as_deref().unwrap_or("(unbound)"),
+                    );
+                    debug_assert_eq!(reply_chat, &reply_target);
+                    (bot.channel_type.clone(), body.clone())
+                }
+                GroupRoute::Private | GroupRoute::Unaddressed { .. } => {
+                    (msg.channel.clone(), msg.body.clone())
+                }
+            };
+
             // Try to parse as a command
-            if let Some(cmd) = worksgood::telegram_commands::parse(&msg.body) {
+            if let Some(cmd) = worksgood::telegram_commands::parse(&route_body) {
                 println!(
                     "[{}] Command from {}: {}",
                     chrono::Utc::now().format("%H:%M:%S"),
@@ -51,22 +126,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     worksgood::telegram_commands::execute(&workgraph_dir, &cmd, &msg.sender);
 
                 // Send response back
-                if let Err(e) = channel.send_text(&effective_chat_id, &response).await {
-                    eprintln!("Failed to send response: {e}");
-                }
-            } else if let Some(ref action_id) = msg.action_id {
-                // Handle callback button presses
-                println!(
-                    "[{}] Button press from {}: {}",
-                    chrono::Utc::now().format("%H:%M:%S"),
-                    msg.sender,
-                    action_id
-                );
-
-                // Action IDs follow the pattern "action:task_id" (e.g. "approve:my-task")
-                let response = handle_action(&workgraph_dir, action_id, &msg.sender);
-
-                if let Err(e) = channel.send_text(&effective_chat_id, &response).await {
+                if let Err(e) = channel.send_text(&reply_target, &response).await {
                     eprintln!("Failed to send response: {e}");
                 }
             } else {
@@ -76,8 +136,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // awaiting-human task routing. Doing routing first (as the naive
                 // merge did) let the router swallow a "YES" handshake reply so
                 // the binding never confirmed. See `classify_inbound_message`.
-                match classify_inbound_message(&workgraph_dir, &msg.channel, &msg.sender, &msg.body)
-                {
+                // In a group route, `route_channel` is the addressed bot's
+                // channel type so the reply lands on the right agent's task.
+                match classify_inbound_message(
+                    &workgraph_dir,
+                    &route_channel,
+                    &msg.sender,
+                    &route_body,
+                ) {
                     InboundOutcome::Confirmed { name, routed_task } => {
                         // A bound-but-unconfirmed human replied YES — the
                         // inbound half of the `wg agency human add` handshake.
@@ -88,7 +154,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             msg.sender
                         );
                         let welcome = format!("Welcome aboard, {}! You're all set. \u{2705}", name);
-                        if let Err(e) = channel.send_text(&effective_chat_id, &welcome).await {
+                        if let Err(e) = channel.send_text(&reply_target, &welcome).await {
                             eprintln!("Failed to send welcome: {e}");
                         }
                         // A single message can be both a confirmation AND a
@@ -102,7 +168,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             );
                             if let Err(e) = channel
                                 .send_text(
-                                    &effective_chat_id,
+                                    &reply_target,
                                     &format!("✓ Recorded your reply on task '{}'.", task_id),
                                 )
                                 .await
@@ -124,7 +190,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         );
                         if let Err(e) = channel
                             .send_text(
-                                &effective_chat_id,
+                                &reply_target,
                                 &format!("✓ Recorded your reply on task '{}'.", task_id),
                             )
                             .await
@@ -579,6 +645,9 @@ async fn poll_once(
                     body: action_id.clone(),
                     action_id: Some(action_id),
                     reply_to,
+                    chat_id,
+                    chat_type: None,
+                    mention_usernames: Vec::new(),
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -612,12 +681,25 @@ async fn poll_once(
                     .and_then(|m| m.as_i64())
                     .map(|mid| worksgood::notify::MessageId(mid.to_string()));
 
+                let chat_type = message
+                    .get("chat")
+                    .and_then(|c| c.get("type"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string());
+                let mention_usernames = worksgood::notify::telegram_group::parse_mention_usernames(
+                    message.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+                    message.get("entities").unwrap_or(&serde_json::Value::Null),
+                );
+
                 let msg = worksgood::notify::IncomingMessage {
                     channel: "telegram".to_string(),
                     sender: sender.to_string(),
                     body,
                     action_id: None,
                     reply_to,
+                    chat_id: chat_id.clone(),
+                    chat_type,
+                    mention_usernames,
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -796,6 +878,7 @@ mod tests {
                 bot_token: "111:AAA".to_string(),
                 chat_id: "1".to_string(),
                 agent_id: Some("nora".to_string()),
+                username: None,
             },
         );
         bots.insert(
@@ -804,6 +887,7 @@ mod tests {
                 bot_token: "222:BBB".to_string(),
                 chat_id: "2".to_string(),
                 agent_id: Some("bruno".to_string()),
+                username: None,
             },
         );
         let config = TelegramConfig {
