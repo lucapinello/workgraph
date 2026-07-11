@@ -11,7 +11,7 @@ use std::path::Path;
 use worksgood::notify::NotificationChannel;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
-use worksgood::notify::telegram_group::{GroupRoute, route_group_message};
+use worksgood::notify::telegram_group::{NaturalRoute, route_natural};
 
 /// Run the Telegram listener.
 ///
@@ -71,46 +71,51 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 continue;
             }
 
-            // R17 group @mention routing + privacy filter. In a private chat
-            // this is a passthrough. In a group/supergroup, only @mentions,
-            // replies, and commands survive; an @mention of a configured bot is
-            // routed "like a 1:1" to that bot's agent (its channel type and the
-            // mention-stripped body), and the reply always goes to the group.
-            let route = route_group_message(
+            // Natural group routing (layered on R17's privacy-aware core). In a
+            // private chat this is a passthrough. In a group/supergroup the
+            // message is routed to a family voice by, in order: an explicit
+            // @mention, the first family name in the text, the bot a reply is
+            // threaded onto, and finally the concierge (otto) when no one is
+            // named. The reply always goes back to the group, and the target
+            // bot's channel type is what the downstream 1:1 router lands on.
+            // This assumes the listening (concierge) bot runs with Telegram
+            // privacy mode OFF so plain chatter reaches it — see docs/09
+            // §natural-group.
+            let route = route_natural(
                 msg.chat_type.as_deref(),
                 msg.chat_id.as_deref(),
                 &msg.body,
                 &msg.mention_usernames,
-                msg.reply_to.is_some(),
+                msg.reply_to_bot.as_deref(),
                 &route_config,
             );
             let (route_channel, route_body) = match route {
-                GroupRoute::IgnoredByPrivacy => {
+                NaturalRoute::Drop => {
                     println!(
-                        "[{}] Group message from {} ignored (no @mention / reply / command)",
+                        "[{}] Group message from {} dropped (no chat id / no voice to route to)",
                         chrono::Utc::now().format("%H:%M:%S"),
                         msg.sender,
                     );
                     continue;
                 }
-                GroupRoute::RouteToBot {
+                NaturalRoute::ToBot {
                     ref bot,
                     ref body,
                     ref reply_chat,
+                    addressed_by,
                 } => {
                     println!(
-                        "[{}] Group @mention from {} -> {} (agent {})",
+                        "[{}] Group message from {} routed by {} -> {} (agent {})",
                         chrono::Utc::now().format("%H:%M:%S"),
                         msg.sender,
+                        addressed_by,
                         bot.bot_id,
                         bot.agent_id.as_deref().unwrap_or("(unbound)"),
                     );
                     debug_assert_eq!(reply_chat, &reply_target);
                     (bot.channel_type.clone(), body.clone())
                 }
-                GroupRoute::Private | GroupRoute::Unaddressed { .. } => {
-                    (msg.channel.clone(), msg.body.clone())
-                }
+                NaturalRoute::Private => (msg.channel.clone(), msg.body.clone()),
             };
 
             // `/standup` — the whole-team check-in. It is NOT an ordinary
@@ -332,6 +337,90 @@ pub fn run_send(chat_id: Option<&str>, message: &str) -> Result<()> {
         println!("Message sent to chat {}", effective_chat_id);
         Ok(())
     })
+}
+
+/// `wg telegram route` — show how a group message would be routed to a family
+/// voice, without sending anything.
+///
+/// Runs the exact [`route_natural`] decision the listener uses, so it verifies
+/// natural-group routing (docs/09 §natural-group) end-to-end against the real
+/// `notify.toml` bots. Mentions are approximated from any `@handle` tokens in
+/// the text (the live listener reads them from Telegram entities). Prints the
+/// resolved voice and *how* it was addressed (@mention / name / reply-chain /
+/// concierge), and flags a `/standup` that the listener would intercept for the
+/// whole roster.
+pub fn run_route(
+    message: &str,
+    reply_to_bot: Option<&str>,
+    chat_type: &str,
+    chat_id: &str,
+    json: bool,
+) -> Result<()> {
+    let config = load_telegram_config()?;
+
+    // Approximate the listener's mention extraction: any @handle token.
+    let mention_usernames: Vec<String> = message
+        .split_whitespace()
+        .filter(|t| t.starts_with('@'))
+        .map(|t| t.trim_start_matches('@').to_ascii_lowercase())
+        .collect();
+
+    let route = route_natural(
+        Some(chat_type),
+        Some(chat_id),
+        message,
+        &mention_usernames,
+        reply_to_bot,
+        &config,
+    );
+
+    // The listener intercepts `/standup` (for the whole roster) on the routed
+    // body before the per-agent handler, so report that specially.
+    let (kind, agent, addressed_by, routed_body) = match &route {
+        NaturalRoute::Private => ("private", None, None, message.to_string()),
+        NaturalRoute::Drop => ("drop", None, None, message.to_string()),
+        NaturalRoute::ToBot {
+            bot,
+            body,
+            addressed_by,
+            ..
+        } => {
+            let is_standup = worksgood::notify::telegram_standup::is_standup_command(body);
+            let kind = if is_standup { "standup" } else { "agent" };
+            (
+                kind,
+                bot.agent_id.clone().or_else(|| Some(bot.bot_id.clone())),
+                Some(addressed_by.to_string()),
+                body.clone(),
+            )
+        }
+    };
+
+    if json {
+        let out = serde_json::json!({
+            "kind": kind,
+            "agent": agent,
+            "addressed_by": addressed_by,
+            "routed_body": routed_body,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    match kind {
+        "private" => println!("private chat — 1:1 passthrough (not group-routed)"),
+        "drop" => println!("dropped — no chat id, or no voice to route to"),
+        "standup" => {
+            println!("/standup — intercepted; posts the whole roster (nora, bruno, mira, otto)")
+        }
+        _ => println!(
+            "routed to {} (by {}): {}",
+            agent.as_deref().unwrap_or("(unbound)"),
+            addressed_by.as_deref().unwrap_or("?"),
+            routed_body,
+        ),
+    }
+    Ok(())
 }
 
 /// Orchestrate a `/standup` in a group: post one family-voice message per named
@@ -765,6 +854,7 @@ async fn poll_once(
                     chat_id,
                     chat_type: None,
                     mention_usernames: Vec::new(),
+                    reply_to_bot: None,
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -807,6 +897,8 @@ async fn poll_once(
                     message.get("text").and_then(|t| t.as_str()).unwrap_or(""),
                     message.get("entities").unwrap_or(&serde_json::Value::Null),
                 );
+                let reply_to_bot =
+                    worksgood::notify::telegram_group::reply_to_bot_username(message);
 
                 let msg = worksgood::notify::IncomingMessage {
                     channel: "telegram".to_string(),
@@ -817,6 +909,7 @@ async fn poll_once(
                     chat_id: chat_id.clone(),
                     chat_type,
                     mention_usernames,
+                    reply_to_bot,
                 };
 
                 return Ok(Some((msg, new_offset)));

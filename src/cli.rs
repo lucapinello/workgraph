@@ -6402,6 +6402,32 @@ pub enum TelegramCommands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Show how a group message would be routed to a family voice (diagnostic)
+    ///
+    /// Runs the exact `route_natural` decision the `wg telegram listen`
+    /// listener uses for an inbound group message — resolving @mentions, the
+    /// first family name in the text, reply-chains, and the concierge fallback
+    /// — and prints which voice it lands on, without sending anything. Use it
+    /// to verify natural-group routing (docs/09 §natural-group) end-to-end
+    /// against your real `notify.toml` bots, no live group needed.
+    Route {
+        /// The group message text to route (e.g. "nora, what's for dinner?")
+        message: String,
+
+        /// The `@username` of the bot this message replies to, if any
+        /// (drives reply-chain routing).
+        #[arg(long)]
+        reply_to_bot: Option<String>,
+
+        /// Chat kind: group | supergroup | private (defaults to supergroup).
+        #[arg(long, default_value = "supergroup")]
+        chat_type: String,
+
+        /// The group chat id the message arrived in (the reply target).
+        #[arg(long, default_value = "-1000000000001")]
+        chat_id: String,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

@@ -468,6 +468,7 @@ impl NotificationChannel for TelegramChannel {
                             chat_id,
                             chat_type,
                             mention_usernames: Vec::new(),
+                            reply_to_bot: None,
                         };
 
                         if tx.send(msg).await.is_err() {
@@ -514,6 +515,9 @@ impl NotificationChannel for TelegramChannel {
                             message.get("text").and_then(|t| t.as_str()).unwrap_or(""),
                             message.get("entities").unwrap_or(&serde_json::Value::Null),
                         );
+                        // Reply-chain: if this replies to a bot's own message,
+                        // name that bot so the reply routes to its agent.
+                        let reply_to_bot = super::telegram_group::reply_to_bot_username(message);
 
                         let msg = IncomingMessage {
                             channel: channel_tag.clone(),
@@ -524,6 +528,7 @@ impl NotificationChannel for TelegramChannel {
                             chat_id,
                             chat_type,
                             mention_usernames,
+                            reply_to_bot,
                         };
 
                         if tx.send(msg).await.is_err() {
