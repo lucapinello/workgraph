@@ -6550,6 +6550,31 @@ pub enum TelegramCommands {
         #[arg(long)]
         session_reply: Option<String>,
     },
+
+    /// Classify an inbound message exactly as `wg telegram listen` would
+    ///
+    /// Runs the real `classify_inbound_message` — the pure, filesystem-only core
+    /// of the listener's inbound branch — against your `.wg` (bindings, graph,
+    /// `notify.toml`), without sending anything. Prints the decision: `confirmed`
+    /// (onboarding YES), `routed` (recorded on an awaiting-human task), or
+    /// `unmatched` (falls through to the conversational composer). This is the
+    /// diagnostic for the pr51-auth swallow: a CONFIRMED human's chat turn that
+    /// the hardened awaiting-task auth rejects MUST classify `unmatched`, never
+    /// be silently consumed.
+    Classify {
+        /// Receiving channel_type: `telegram` or `telegram:<bot_id>` (the
+        /// elected bot in a group).
+        #[arg(long, default_value = "telegram")]
+        channel: String,
+
+        /// The Telegram user id of the sender.
+        #[arg(long)]
+        sender: String,
+
+        /// The message body.
+        #[arg(long)]
+        message: String,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

@@ -2054,6 +2054,7 @@ name = "telegram_conversation"
 script = "scenarios/telegram_conversation.sh"
 owners = [
     "telegram-1to1-chat",
+    "fix-conversation-swallow",
 ]
 description = "Pins the conversational reply path that closed the gap Luca hit live TWICE: a plain (non-command) message from a CONFIRMED human that routes to a SINGLE agent — whether DMed 1:1 or name/mention/reply-elected in the GROUP — used to fall through to the silent `Unmatched` arm (only collective addresses and /commands had reply composers). Now both entry points share ONE conversational composer that runs a chat turn against the agent's persistent session and replies WHERE ASKED. Drives the real binary via `wg telegram conversation` (the dry-run of the exact composer the live listener invokes on `Unmatched`); with `--session-reply` it exercises the FULL persistent-session round-trip (create → bind → inbox → outbox → relay). Locks: unknown sender → one polite jargon-free onboarding line and nothing more; confirmed 1:1 → round-trips the session and replies in the 1:1 via the messaged bot (otto); confirmed group-elected → round-trips the session and replies IN THE GROUP via the elected bot (bruno); and no bot token ever leaks into a reply. Also pinned by the notify::telegram_conversation unit/tokio tests (plan, round-trip, ack-on-slow, timeout, onboard) and the commands::telegram precedence tests (awaiting-human task routing still wins over conversation). Credential-free: a recording sink captures the sends instead of hitting Telegram, so no live group or real tokens are needed."
 timeout_seconds = 30
@@ -2065,4 +2066,13 @@ owners = [
     "listener-reconnect",
 ]
 description = "Pins the `wg telegram send` token-resolution fix from task listener-reconnect: with a bots-map-only notify.toml (no legacy top-level [telegram] bot_token) send must fall back to the first [telegram.bots.*] entry instead of slicing the empty top-level token — which produced the URL https://api.telegram.org/bot/sendMessage and a bare 404 for every send. Drives the real binary via `wg telegram send --dry-run` (resolution-only, nothing sent) and asserts the resolved API URL carries a real numeric bot id, that the empty-token bot/sendMessage 404 shape never appears, that an explicit --chat-id overrides the bot default, and that the legacy top-level bot still wins when present. Also pinned by the commands::telegram send_* unit tests. Credential-free: --dry-run resolves and prints, no live Telegram or real tokens needed."
+timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_conversation_swallow"
+script = "scenarios/telegram_conversation_swallow.sh"
+owners = [
+    "fix-conversation-swallow",
+]
+description = "Pins the pr51-auth conversational SWALLOW regression Luca hit live (fix-conversation-swallow): after the pr51-auth deploy, EVERY group message from a confirmed human — 'otto, are you there?', collective greetings — was consumed with NO reply and NO log line. The hardened awaiting-human-task router (route_inbound_reply, PR #51) authorizes the inbound sender against their CONFIRMED Telegram binding, and in Casa the human speaks THROUGH an AI-persona bot, so its defense-in-depth check (a per-agent bot must front the same human the sender is bound to) REJECTS the turn. That hardening is correct for recording a reply onto a TASK, but a confirmed human's ordinary chat turn must fall through to the conversational composer, never be silently swallowed. Drives the real binary via `wg telegram classify` — the dry-run of the exact classify_inbound_message the live `wg telegram listen` loop invokes once a message survives dedupe + election. Locks: confirmed human + persona bot + hardened rejection → classifies `unmatched` (⇒ composer), never `routed`/`confirmed`; the server-side log names the pr51 hardened-auth rejection so the swallow path is really exercised; an unknown sender is `unmatched` too (onboarded), never mis-recorded as a human's reply; no bot token leaks. Complements telegram_conversation.sh (the composer dry-run) and the commands::telegram unit test hardened_auth_rejection_falls_through_to_conversation. Credential-free: nothing is ever sent."
 timeout_seconds = 30

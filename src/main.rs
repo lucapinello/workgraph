@@ -3675,6 +3675,17 @@ fn main() -> Result<()> {
                 session_reply.as_deref(),
                 cli.json,
             ),
+            TelegramCommands::Classify {
+                channel,
+                sender,
+                message,
+            } => commands::telegram::run_classify(
+                &workgraph_dir,
+                &channel,
+                &sender,
+                &message,
+                cli.json,
+            ),
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),

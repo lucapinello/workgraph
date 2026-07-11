@@ -795,6 +795,66 @@ pub fn run_elect(
     Ok(())
 }
 
+/// `wg telegram classify` — show how the listener would CLASSIFY an inbound
+/// (non-command, non-button) message once it has survived dedupe + election,
+/// without sending anything.
+///
+/// This drives the exact [`classify_inbound_message`] the live `wg telegram
+/// listen` loop invokes — the pure, filesystem-only core of the inbound branch
+/// — against the real `.wg` (bindings, graph, `notify.toml`). It is the
+/// diagnostic that would have made the pr51-auth swallow obvious: a CONFIRMED
+/// human's plain chat turn that the hardened awaiting-task router rejects must
+/// classify as `unmatched` (⇒ the conversational composer answers), never be
+/// silently consumed. `--json` prints `{ kind, name?, task? }` where `kind` is
+/// one of `confirmed` | `routed` | `unmatched`.
+pub fn run_classify(
+    workgraph_dir: &Path,
+    channel: &str,
+    sender: &str,
+    message: &str,
+    json: bool,
+) -> Result<()> {
+    let outcome = classify_inbound_message(workgraph_dir, channel, sender, message);
+
+    // (kind, name, task) — flattened for a stable, scriptable shape.
+    let (kind, name, task): (&str, Option<String>, Option<String>) = match &outcome {
+        InboundOutcome::Confirmed { name, routed_task } => {
+            ("confirmed", Some(name.clone()), routed_task.clone())
+        }
+        InboundOutcome::Routed { task_id } => ("routed", None, Some(task_id.clone())),
+        InboundOutcome::Unmatched => ("unmatched", None, None),
+    };
+
+    if json {
+        let out = serde_json::json!({
+            "kind": kind,
+            "name": name,
+            "task": task,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    match kind {
+        "confirmed" => println!(
+            "confirmed — onboarding binding for {} confirmed{}",
+            name.as_deref().unwrap_or("?"),
+            task.as_deref()
+                .map(|t| format!(" (and reply recorded on task '{t}')"))
+                .unwrap_or_default(),
+        ),
+        "routed" => println!(
+            "routed — reply recorded on awaiting-human task '{}'",
+            task.as_deref().unwrap_or("?"),
+        ),
+        // `unmatched` is the arm the live listener hands to the conversational
+        // composer — a confirmed human's chat turn (incl. one the hardened
+        // awaiting-task auth rejected) lands here, never swallowed.
+        _ => println!("unmatched — falls through to the conversational composer"),
+    }
+    Ok(())
+}
+
 /// Orchestrate a `/standup` in a group: post one family-voice message per named
 /// voice, in roster order, each AS that bot.
 ///
@@ -2230,6 +2290,36 @@ mod tests {
         save_agent(&agent, &agents_dir).unwrap();
     }
 
+    /// Write an AI persona agent (native executor ⇒ `is_human()` is false) —
+    /// the family voice a per-agent Telegram bot fronts (e.g. "otto"). Used to
+    /// exercise pr51's defense-in-depth check that a per-agent bot must front
+    /// the same human the inbound sender is bound to.
+    fn write_persona_agent(workgraph_dir: &Path, id: &str, name: &str) {
+        use worksgood::agency::{Agent, PerformanceRecord, save_agent};
+        let agents_dir = workgraph_dir.join("agency").join("cache/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let agent = Agent {
+            id: id.to_string(),
+            role_id: "concierge".to_string(),
+            tradeoff_id: "default".to_string(),
+            name: name.to_string(),
+            performance: PerformanceRecord::default(),
+            lineage: Default::default(),
+            capabilities: vec![],
+            rate: None,
+            capacity: None,
+            trust_level: Default::default(),
+            contact: None,
+            executor: "native".to_string(),
+            preferred_model: None,
+            preferred_provider: None,
+            deployment_history: vec![],
+            attractor_weight: 0.5,
+            staleness_flags: vec![],
+        };
+        save_agent(&agent, &agents_dir).unwrap();
+    }
+
     /// A parked awaiting-human task exists AND the sender is a confirmed human.
     /// The classifier MUST route the plain reply to the task (task wins), NOT
     /// fall through to `Unmatched` where the conversational composer runs. This
@@ -2284,6 +2374,66 @@ mod tests {
             outcome,
             InboundOutcome::Unmatched,
             "no awaiting task ⇒ Unmatched ⇒ conversational composer handles it"
+        );
+    }
+
+    /// Regression — the pr51-auth swallow. A CONFIRMED human's plain chat turn
+    /// that the awaiting-task router HARDENS to `Rejected` must STILL fall
+    /// through to `Unmatched` (⇒ the conversational composer), never be silently
+    /// consumed. This is the exact failure the live report described: after the
+    /// pr51-auth deploy, a confirmed human's message in the group produced no
+    /// reply and no log line. The auth hardening (Erik's fix) guards recording a
+    /// reply onto an awaiting-human TASK; it must never gate ordinary
+    /// conversation.
+    ///
+    /// The rejection is produced the realistic Casa way: the human speaks
+    /// through an AI-persona bot ("otto"), so pr51's defense-in-depth check
+    /// ("a per-agent bot must front the same human the sender is bound to")
+    /// rejects it — bound to `human-luca`, arriving on a bot fronting `otto`.
+    /// Whatever the rejection reason, the listener must converse, not swallow.
+    #[test]
+    fn hardened_auth_rejection_falls_through_to_conversation() {
+        use crate::commands::service::human_dispatch::{InboundReplyOutcome, route_inbound_reply};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+        write_persona_agent(dir, "otto", "Otto");
+        seed_confirmed_binding(dir, "luca-1", "human-luca", "Luca");
+
+        // A per-agent bot "otto" that fronts the AI persona (NOT human-luca).
+        std::fs::write(
+            dir.join("notify.toml"),
+            "[telegram.bots.otto]\n\
+             bot_token = \"111:AAA\"\n\
+             chat_id = \"-100777\"\n\
+             agent_id = \"otto\"\n\
+             username = \"otto_casapinello_bot\"\n",
+        )
+        .unwrap();
+
+        // No parked task; persist an empty graph the router loads from disk.
+        worksgood::parser::save_graph(
+            &worksgood::graph::WorkGraph::new(),
+            crate::commands::graph_path(dir),
+        )
+        .unwrap();
+
+        // Precondition: the hardened router DOES reject this confirmed human's
+        // turn (the sender is bound to human-luca but arrives on otto's bot).
+        match route_inbound_reply(dir, "telegram:otto", "luca-1", "otto, are you there?") {
+            InboundReplyOutcome::Rejected(_) => {}
+            other => panic!("expected hardened Rejected precondition, got {other:?}"),
+        }
+
+        // The listener MUST fall through to conversation, not swallow.
+        let outcome =
+            classify_inbound_message(dir, "telegram:otto", "luca-1", "otto, are you there?");
+        assert_eq!(
+            outcome,
+            InboundOutcome::Unmatched,
+            "a hardened-auth REJECTION of a confirmed human's chat turn must fall through to \
+             conversation, never be silently swallowed (pr51-auth regression)"
         );
     }
 }
