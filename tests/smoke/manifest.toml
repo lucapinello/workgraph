@@ -2066,3 +2066,12 @@ owners = [
 ]
 description = "Pins the `wg telegram send` token-resolution fix from task listener-reconnect: with a bots-map-only notify.toml (no legacy top-level [telegram] bot_token) send must fall back to the first [telegram.bots.*] entry instead of slicing the empty top-level token — which produced the URL https://api.telegram.org/bot/sendMessage and a bare 404 for every send. Drives the real binary via `wg telegram send --dry-run` (resolution-only, nothing sent) and asserts the resolved API URL carries a real numeric bot id, that the empty-token bot/sendMessage 404 shape never appears, that an explicit --chat-id overrides the bot default, and that the legacy top-level bot still wins when present. Also pinned by the commands::telegram send_* unit tests. Credential-free: --dry-run resolves and prints, no live Telegram or real tokens needed."
 timeout_seconds = 30
+
+[[scenario]]
+name = "casa_feed_write"
+script = "scenarios/casa_feed_write.sh"
+owners = [
+    "listener-write-inbound",
+]
+description = "Pins the WRITE side of the constellation split view's live conversation pane (docs/15 §chat-split): the `wg telegram listen` process appends one JSONL line to <project-root>/.casa/group-feed.jsonl for every inbound GROUP message and every AGENT reply it relays into the group, which the casa gateway tails and serves at GET /conversation. Drives the real binary end-to-end through the exact casa_feed writer the listener uses (`wg telegram feed-write`, the scripted seam — same pattern as `wg telegram elect` exposing the listener's decision without a live socket): an inbound group message lands as a well-formed `group` line (agentId null for a human, empty emoji), and a relayed agent reply lands as a well-formed `agent` line (agentId mapped from the roster and lower-cased, emoji from the roster, newlines folded). PRIVACY gate: the feed file carries ONLY the six display-safe fields (ts/sender/agentId/emoji/kind/text) and contains NO bot token, chat id, or user id substring. Also pinned by the notify::casa_feed unit tests (roster mapping, six-field JSON, two-lines-no-secrets). Credential-free: nothing is sent to Telegram."
+timeout_seconds = 30

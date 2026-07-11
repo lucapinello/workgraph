@@ -223,8 +223,9 @@ pub fn bot_id_for_channel(config: &TelegramConfig, channel_type: &str) -> Option
 }
 
 /// The agency agent a bot fronts (its `agent_id`), falling back to the bot id
-/// itself when no explicit binding is configured.
-fn agent_for_bot(config: &TelegramConfig, bot_id: &str) -> String {
+/// itself when no explicit binding is configured. Exposed for the listener's
+/// casa-feed mirror, which maps the replying `bot_id` back to its persona id.
+pub fn agent_for_bot(config: &TelegramConfig, bot_id: &str) -> String {
     config
         .all_bots()
         .iter()

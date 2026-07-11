@@ -4,6 +4,7 @@
 //! Matrix, Slack, email, SMS, webhooks, etc.). The [`NotificationRouter`] selects
 //! channels based on event type and supports escalation chains.
 
+pub mod casa_feed;
 pub mod config;
 pub mod discord;
 pub mod dispatch;

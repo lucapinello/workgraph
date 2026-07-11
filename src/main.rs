@@ -3675,6 +3675,19 @@ fn main() -> Result<()> {
                 session_reply.as_deref(),
                 cli.json,
             ),
+            TelegramCommands::FeedWrite {
+                root,
+                kind,
+                sender,
+                agent_id,
+                text,
+            } => commands::telegram::run_feed_write(
+                &root,
+                &kind,
+                sender.as_deref(),
+                agent_id.as_deref(),
+                &text,
+            ),
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),

@@ -6,10 +6,12 @@
 //! - `wg telegram status` - Show Telegram configuration status
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use worksgood::notify::NotificationChannel;
+use worksgood::notify::casa_feed;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
@@ -91,6 +93,16 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         let dedupe = DedupeSet::new();
 
         let workgraph_dir = dir.to_path_buf();
+
+        // The constellation split view's conversation pane reads this feed (the
+        // casa gateway tails it and serves `GET /conversation`). We are the only
+        // process holding the Telegram sockets, so we mirror every inbound GROUP
+        // message and every agent reply we relay into the group here. The feed
+        // lives at `<project-root>/.casa/group-feed.jsonl` and carries ONLY the
+        // six display-safe fields — never a token, chat id, or user id. See
+        // `notify::casa_feed` and docs/15 §chat-split.
+        let feed_path = casa_feed::feed_path_for(&project_root(&workgraph_dir));
+
         while let Some(msg) = rx.recv().await {
             // De-duplicate first: a text message with a (chat_id, message_id)
             // that we have already processed on another bot's queue is a
@@ -110,6 +122,27 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         );
                         continue;
                     }
+                }
+            }
+
+            // Mirror the inbound GROUP message to the conversation pane's feed.
+            // Only group/supergroup text messages (not 1:1 DMs, not button
+            // presses) — the pane is "our end of the family group chat". This
+            // runs post-dedupe so a message the fan-out delivered on four bots'
+            // queues is written exactly once. `msg.sender` is a Telegram
+            // @username (a display handle, never a numeric user id), and only
+            // the six allow-listed fields are written — no token or chat id ever
+            // touches the file. See `notify::casa_feed`.
+            if msg.action_id.is_none()
+                && matches!(msg.chat_type.as_deref(), Some("group") | Some("supergroup"))
+                && !msg.body.trim().is_empty()
+            {
+                let entry = casa_feed::group_entry(&msg.sender, &msg.body, casa_feed::now_ms());
+                if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
+                    eprintln!(
+                        "[{}] casa feed: failed to mirror inbound group message: {e}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                    );
                 }
             }
 
@@ -224,7 +257,8 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     // the sequential sends so no bot double-posts. The composed
                     // turn logs its own compose-start + per-voice sent message_id.
                     if let Err(e) =
-                        run_group_collective(&workgraph_dir, &route_config, reply_chat).await
+                        run_group_collective(&workgraph_dir, &route_config, reply_chat, &feed_path)
+                            .await
                     {
                         eprintln!("Failed to run collective reply: {e}");
                     }
@@ -411,15 +445,25 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             sender,
                         );
                         let timing = convo::AckTiming::from_env();
+                        // Mirror the persona's reply into the conversation pane's
+                        // feed ONLY for a group-elected turn — a 1:1 DM is private
+                        // and must never land in the shared group feed.
+                        let mirror_group = matches!(entry, convo::Entry::GroupElected);
+                        let feed_path_owned = feed_path.clone();
                         tokio::spawn(async move {
-                            let sink = convo::BotReplySink::new(cfg_owned);
+                            let base = convo::BotReplySink::new(cfg_owned.clone());
+                            let sink: Box<dyn convo::ReplySink> = if mirror_group {
+                                Box::new(FeedMirrorSink::new(base, feed_path_owned, cfg_owned))
+                            } else {
+                                Box::new(base)
+                            };
                             match convo::run_conversation_turn(
                                 &dir_owned,
                                 &plan,
                                 &human_message,
                                 &request_id,
                                 timing,
-                                &sink,
+                                sink.as_ref(),
                             )
                             .await
                             {
@@ -854,6 +898,7 @@ pub async fn run_group_collective(
     workgraph_dir: &Path,
     config: &TelegramConfig,
     target: &str,
+    feed_path: &Path,
 ) -> Result<()> {
     use worksgood::notify::telegram_standup as standup;
 
@@ -885,15 +930,110 @@ pub async fn run_group_collective(
 
         let channel = TelegramChannel::from_bot(member.bot_id.clone(), member.bot.clone());
         match channel.send_text(target, &post.text).await {
-            Ok(sent) => println!(
-                "[{}] collective: {} replied (sent message_id {})",
-                chrono::Utc::now().format("%H:%M:%S"),
-                post.bot_id,
-                sent.0,
-            ),
+            Ok(sent) => {
+                println!(
+                    "[{}] collective: {} replied (sent message_id {})",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    post.bot_id,
+                    sent.0,
+                );
+                // Mirror this voice's reply into the conversation pane's feed as
+                // an `agent` line (the persona's answer relayed into the group).
+                let entry =
+                    casa_feed::agent_entry(member.agent_id(), &post.text, casa_feed::now_ms());
+                if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
+                    eprintln!("collective: failed to mirror {} reply to feed: {e}", post.bot_id);
+                }
+            }
             Err(e) => eprintln!("collective: {} failed to reply: {e}", post.bot_id),
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Casa conversation-pane feed mirror (group-elected agent replies)
+// ---------------------------------------------------------------------------
+
+/// A [`ReplySink`](worksgood::notify::telegram_conversation::ReplySink) decorator
+/// that mirrors every reply it relays into the group to the conversation pane's
+/// feed as an `agent` line, then delegates the real Telegram send to the wrapped
+/// [`BotReplySink`].
+///
+/// Only ever wraps a **group-elected** turn (a 1:1 DM uses the bare sink) so a
+/// private reply never leaks into the shared group feed. The replying `bot_id`
+/// is mapped back to its persona id via [`agent_for_bot`]; the feed line carries
+/// only the six display-safe fields — no token or chat id. A feed-write failure
+/// is logged and swallowed so a full disk can never break the Telegram reply.
+struct FeedMirrorSink {
+    inner: worksgood::notify::telegram_conversation::BotReplySink,
+    feed_path: PathBuf,
+    config: TelegramConfig,
+}
+
+impl FeedMirrorSink {
+    fn new(
+        inner: worksgood::notify::telegram_conversation::BotReplySink,
+        feed_path: PathBuf,
+        config: TelegramConfig,
+    ) -> Self {
+        Self {
+            inner,
+            feed_path,
+            config,
+        }
+    }
+}
+
+#[async_trait]
+impl worksgood::notify::telegram_conversation::ReplySink for FeedMirrorSink {
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
+        // Send for real first; only mirror what actually went out to the group.
+        self.inner.send(bot_id, chat_id, text).await?;
+        let agent_id =
+            worksgood::notify::telegram_conversation::agent_for_bot(&self.config, bot_id);
+        let entry = casa_feed::agent_entry(&agent_id, text, casa_feed::now_ms());
+        if let Err(e) = casa_feed::append_entry(&self.feed_path, &entry) {
+            eprintln!(
+                "[{}] casa feed: failed to mirror agent reply: {e}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Mirror one synthetic line to the casa conversation-pane feed (diagnostic).
+///
+/// Drives the EXACT `casa_feed` writer the listener uses, so a smoke test can
+/// prove the feed writer end-to-end against the real binary without a live
+/// group: `--kind group` writes an inbound human line (needs `--sender`),
+/// `--kind agent` writes a relayed persona reply (needs `--agent-id`). Only the
+/// six display-safe fields are written — never a token or chat id.
+pub fn run_feed_write(
+    root: &Path,
+    kind: &str,
+    sender: Option<&str>,
+    agent_id: Option<&str>,
+    text: &str,
+) -> Result<()> {
+    let entry = match kind {
+        "group" => {
+            let sender = sender.context("--kind group requires --sender")?;
+            casa_feed::group_entry(sender, text, casa_feed::now_ms())
+        }
+        "agent" => {
+            let agent_id = agent_id.context("--kind agent requires --agent-id")?;
+            casa_feed::agent_entry(agent_id, text, casa_feed::now_ms())
+        }
+        other => anyhow::bail!("--kind must be 'group' or 'agent', got '{other}'"),
+    };
+    let feed_path = casa_feed::feed_path_for(root);
+    casa_feed::append_entry(&feed_path, &entry)
+        .with_context(|| format!("failed to append to feed {}", feed_path.display()))?;
+    // The written line is itself display-safe (the six-field allowlist), so
+    // echoing it back cannot leak a secret — handy for the smoke assertion.
+    println!("{}", entry.to_json_line());
     Ok(())
 }
 

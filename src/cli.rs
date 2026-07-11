@@ -6550,6 +6550,38 @@ pub enum TelegramCommands {
         #[arg(long)]
         session_reply: Option<String>,
     },
+
+    /// Mirror one line to the casa conversation-pane feed (diagnostic)
+    ///
+    /// Appends a single line to `<root>/.casa/group-feed.jsonl` through the
+    /// EXACT `casa_feed` writer the `wg telegram listen` process uses for an
+    /// inbound group message (`--kind group`) or a relayed agent reply
+    /// (`--kind agent`). Credential-free — nothing is sent to Telegram; this is
+    /// the scripted entry point that lets a smoke test drive the real feed
+    /// writer end-to-end without a live group. Only the six display-safe fields
+    /// (ts/sender/agentId/emoji/kind/text) are written — never a token or chat
+    /// id. See docs/15 §chat-split.
+    FeedWrite {
+        /// Project root that holds `.casa/` (the feed is created under it).
+        #[arg(long)]
+        root: PathBuf,
+
+        /// `group` (a human's inbound message) or `agent` (a persona's reply).
+        #[arg(long)]
+        kind: String,
+
+        /// For `--kind group`: the sender's display handle (Telegram @username).
+        #[arg(long)]
+        sender: Option<String>,
+
+        /// For `--kind agent`: the replying persona id (e.g. `nora`).
+        #[arg(long)]
+        agent_id: Option<String>,
+
+        /// The message text to mirror.
+        #[arg(long)]
+        text: String,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking
