@@ -240,6 +240,10 @@ pub fn run(
         anyhow::bail!("Task title cannot be empty");
     }
 
+    // R8: a disposable-scoped agent may not mint a persistent persona via
+    // `wg add --tag persistent`.
+    worksgood::scope_guard::enforce_persistent_tag(tags)?;
+
     // Validate --subtask: requires WG_TASK_ID (must be called from within an agent context)
     let subtask_parent_id = if subtask {
         let parent_id = std::env::var("WG_TASK_ID").map_err(|_| {
@@ -862,6 +866,10 @@ pub fn run_remote(
     if title.trim().is_empty() {
         anyhow::bail!("Task title cannot be empty");
     }
+
+    // R8: a disposable-scoped agent may not mint a persistent persona via
+    // `wg add --tag persistent` (also gated for cross-repo adds).
+    worksgood::scope_guard::enforce_persistent_tag(tags)?;
 
     // Deprecation warning for --provider flag
     if let Some(p) = provider {

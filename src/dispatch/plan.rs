@@ -557,6 +557,13 @@ pub fn plan_spawn(
     );
     env.insert("WG_MODEL".to_string(), model.raw.clone());
 
+    // R8: propagate the task's privilege scope (`scope:<value>` tag, set by
+    // `wg add --scope`) so the guard can deny persistent spawns from a
+    // disposable worker. See `crate::scope_guard`.
+    if let Some(scope) = crate::scope_guard::scope_from_tags(&task.tags) {
+        env.insert(crate::scope_guard::WG_SCOPE_ENV.to_string(), scope);
+    }
+
     let provenance = SpawnProvenance {
         executor_source,
         model_source,

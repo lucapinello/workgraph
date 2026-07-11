@@ -78,6 +78,7 @@ pub mod registry {
 }
 pub mod review;
 pub mod runs;
+pub mod scope_guard;
 pub mod secret;
 pub mod service;
 pub mod session_lock;
