@@ -2050,6 +2050,15 @@ description = "Pins the family command set from docs/09 §commands: each command
 timeout_seconds = 30
 
 [[scenario]]
+name = "telegram_conversation"
+script = "scenarios/telegram_conversation.sh"
+owners = [
+    "telegram-1to1-chat",
+]
+description = "Pins the conversational reply path that closed the gap Luca hit live TWICE: a plain (non-command) message from a CONFIRMED human that routes to a SINGLE agent — whether DMed 1:1 or name/mention/reply-elected in the GROUP — used to fall through to the silent `Unmatched` arm (only collective addresses and /commands had reply composers). Now both entry points share ONE conversational composer that runs a chat turn against the agent's persistent session and replies WHERE ASKED. Drives the real binary via `wg telegram conversation` (the dry-run of the exact composer the live listener invokes on `Unmatched`); with `--session-reply` it exercises the FULL persistent-session round-trip (create → bind → inbox → outbox → relay). Locks: unknown sender → one polite jargon-free onboarding line and nothing more; confirmed 1:1 → round-trips the session and replies in the 1:1 via the messaged bot (otto); confirmed group-elected → round-trips the session and replies IN THE GROUP via the elected bot (bruno); and no bot token ever leaks into a reply. Also pinned by the notify::telegram_conversation unit/tokio tests (plan, round-trip, ack-on-slow, timeout, onboard) and the commands::telegram precedence tests (awaiting-human task routing still wins over conversation). Credential-free: a recording sink captures the sends instead of hitting Telegram, so no live group or real tokens are needed."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_send_bots_map_only"
 script = "scenarios/telegram_send_bots_map_only.sh"
 owners = [

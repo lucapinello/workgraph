@@ -6515,6 +6515,41 @@ pub enum TelegramCommands {
         #[arg(long)]
         today: Option<String>,
     },
+
+    /// Dry-run the conversational composer for a plain (non-command) message
+    ///
+    /// Exercises the 1:1 / group-name-addressed reply path without a live bot:
+    /// prints the route decision (which bot answers, in which chat, how it was
+    /// addressed) and the outbound replies it WOULD send. With `--session-reply`
+    /// it runs the full persistent-session round-trip against an ephemeral
+    /// fixture session. Credential-free — nothing is sent.
+    Conversation {
+        /// Elected/receiving channel_type: `telegram` or `telegram:<bot_id>`.
+        #[arg(long, default_value = "telegram")]
+        channel: String,
+
+        /// The chat id to reply in (the 1:1 chat, or the group chat).
+        #[arg(long)]
+        chat: String,
+
+        /// The Telegram user id of the sender.
+        #[arg(long)]
+        sender: String,
+
+        /// The message body.
+        #[arg(long)]
+        message: String,
+
+        /// Treat this as a group-elected message (reply in the group) rather
+        /// than a 1:1.
+        #[arg(long)]
+        group: bool,
+
+        /// Fixture mode: bind an ephemeral session to the addressed agent and
+        /// have it reply with this text, exercising the full round-trip.
+        #[arg(long)]
+        session_reply: Option<String>,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking
