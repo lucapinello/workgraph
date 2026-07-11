@@ -6406,6 +6406,49 @@ pub enum TelegramCommands {
     /// truncated token preview. Use this to verify multi-bot setups before
     /// starting `wg telegram listen`.
     ListBots,
+
+    /// Post a family standup: one message per named voice, in roster order
+    ///
+    /// Walks the roster (`nora, bruno, mira, otto`, then any other configured
+    /// bot) and posts each persona's family-voice check-in AS that bot,
+    /// grounded in its live graph state. This is the on-demand equivalent of
+    /// typing `/standup` in the group. Use `--dry-run` to print the posts in
+    /// roster order without sending (verifiable without a live group).
+    Standup {
+        /// Group chat ID to post to (defaults to the configured group chat)
+        #[arg(long)]
+        chat_id: Option<String>,
+
+        /// Print the posts in roster order instead of sending them
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show how a group message would be routed to a family voice (diagnostic)
+    ///
+    /// Runs the exact `route_natural` decision the `wg telegram listen`
+    /// listener uses for an inbound group message — resolving @mentions, the
+    /// first family name in the text, reply-chains, and the concierge fallback
+    /// — and prints which voice it lands on, without sending anything. Use it
+    /// to verify natural-group routing (docs/09 §natural-group) end-to-end
+    /// against your real `notify.toml` bots, no live group needed.
+    Route {
+        /// The group message text to route (e.g. "nora, what's for dinner?")
+        message: String,
+
+        /// The `@username` of the bot this message replies to, if any
+        /// (drives reply-chain routing).
+        #[arg(long)]
+        reply_to_bot: Option<String>,
+
+        /// Chat kind: group | supergroup | private (defaults to supergroup).
+        #[arg(long, default_value = "supergroup")]
+        chat_type: String,
+
+        /// The group chat id the message arrived in (the reply target).
+        #[arg(long, default_value = "-1000000000001")]
+        chat_id: String,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

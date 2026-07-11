@@ -16,6 +16,7 @@ pub mod slack;
 pub mod sms;
 pub mod telegram;
 pub mod telegram_group;
+pub mod telegram_standup;
 pub mod voice;
 pub mod webhook;
 
@@ -101,6 +102,12 @@ pub struct IncomingMessage {
     /// and stripped of the leading `@`. Empty when there are none. Used to
     /// route a group @mention to the agent the mentioned bot fronts.
     pub mention_usernames: Vec<String>,
+    /// If this message is a reply to a message a **bot** posted, that bot's
+    /// `@username` (lower-cased, no leading `@`). `None` when it is not a reply,
+    /// or replies to a human. Drives reply-chain routing: a threaded reply to a
+    /// bot's own group message lands on that bot's agent even with no name in
+    /// the text. See `telegram_group::route_natural`.
+    pub reply_to_bot: Option<String>,
 }
 
 /// Classification of notification events for routing.

@@ -2012,3 +2012,21 @@ owners = [
 ]
 description = "Pins the disposable ingest step from docs/14-disposable-lifecycle.md §ingest: when a bound named agent spawns a disposable (linked via a `spawned-by:<agent>` tag from `wg add --spawned-by`), the disposable's artifact + `wg log` breadcrumb are folded into that agent's persistent `session-summary.md` on `wg done`, riding the #50 binding — so the result persists into the spawner's next-task memory (`wg agent session` reports it 'injected into this agent's next spawn'). Asserts the artifact + breadcrumb appear in the spawner summary, the ingest APPENDS (prior memory preserved) and does NOT leak the 'Task marked as done' system log entry, that it is idempotent (a second `wg done` does not double-append — exactly one ingest marker), and that a disposable whose spawner has no bound session is a benign no-op that still completes. Additionally pinned by the test_disposable_artifact_ingested_into_spawner_session unit test. Credential-free: drives the real `wg agent` / `wg add` / `wg artifact` / `wg log` / `wg done` CLI paths; no worker spawn or LLM auth needed."
 timeout_seconds = 60
+
+[[scenario]]
+name = "telegram_standup_roster_order"
+script = "scenarios/telegram_standup_roster_order.sh"
+owners = [
+    "group-standup",
+]
+description = "Pins the /standup contract from docs/09 §3: `wg telegram standup --dry-run` (the on-demand equivalent of the group listener's /standup intercept) emits EXACTLY four posts — nora, bruno, mira, otto — in that fixed roster order regardless of config/HashMap insertion order, with no duplicate and no token leak. Each post carries its family-voice header (Nora 🥗, Coach Mira 💪, Otto 📋). Additionally pinned by the notify::telegram_standup::standup_produces_exactly_four_posts_in_roster_order unit test. Credential-free: dry-run prints the plan instead of sending, so no live group or real tokens are needed."
+timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_natural_routing"
+script = "scenarios/telegram_natural_routing.sh"
+owners = [
+    "group-natural-routing",
+]
+description = "Pins the natural-group routing contract from docs/09 §natural-group: `wg telegram route` (the exact route_natural decision the group listener runs) resolves an inbound group message to a family voice by @mention, then the first family name in the text, then the replied-to bot (reply-chain), then the concierge (otto) when no one is named — and intercepts /standup for the whole roster. Drives the real binary against a fixture Casa-Pinello notify.toml so it exercises the user-visible flow (type in the group → the right voice answers), not just the library. Also pinned by the notify::telegram_group natural-routing unit tests. Credential-free: routing is a pure decision, nothing is sent, no live group or real tokens needed."
+timeout_seconds = 30

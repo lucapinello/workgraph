@@ -3616,6 +3616,21 @@ fn main() -> Result<()> {
                 task_id.as_deref(),
             ),
             TelegramCommands::ListBots => commands::telegram::run_list_bots(cli.json),
+            TelegramCommands::Standup { chat_id, dry_run } => {
+                commands::telegram::run_standup(&workgraph_dir, chat_id.as_deref(), dry_run)
+            }
+            TelegramCommands::Route {
+                message,
+                reply_to_bot,
+                chat_type,
+                chat_id,
+            } => commands::telegram::run_route(
+                &message,
+                reply_to_bot.as_deref(),
+                &chat_type,
+                &chat_id,
+                cli.json,
+            ),
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),
