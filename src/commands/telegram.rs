@@ -104,6 +104,22 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         let feed_path = casa_feed::feed_path_for(&project_root(&workgraph_dir));
 
         while let Some(msg) = rx.recv().await {
+            // Fix #0 — the bot-loop guard, FIRST (before dedupe, feed mirror,
+            // commands, and election). The family bots run as group admins, so
+            // each bot's poller RECEIVES the replies the OTHER bots send. A
+            // message whose sender is a bot must never be mirrored, commanded,
+            // elected, routed, or composed — otherwise one human message fans
+            // out into a self-amplifying storm (roster reply → other pollers see
+            // it → re-election → 12 replies). One compact line, then drop.
+            if msg.sender_is_bot {
+                println!(
+                    "[{}] ignored bot-sent msg {}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    msg.message_id.as_deref().unwrap_or("none"),
+                );
+                continue;
+            }
+
             // De-duplicate first: a text message with a (chat_id, message_id)
             // that we have already processed on another bot's queue is a
             // duplicate delivery — drop it before it can trigger a second
@@ -218,12 +234,23 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // back to the group. This assumes every bot runs with Telegram
             // privacy mode OFF so plain chatter reaches the listener — see
             // docs/09 §natural-group.
+            // Fix #5 — resolve the sender ONCE against the binding map at the
+            // boundary. `auth_sender` is the binding's stored key when the sender
+            // (by numeric id or @username) is recognized, so the verbatim
+            // `find_by_user` lookups downstream (classify + the 1:1 AND collective
+            // conversation composers) match a confirmed human even with no public
+            // @username. Falls back to the raw display label for unbound senders.
+            let auth_sender = resolve_auth_sender(&workgraph_dir, &msg);
+
             let election = elect_responders(
                 msg.chat_type.as_deref(),
                 msg.chat_id.as_deref(),
                 &msg.body,
                 &msg.mention_usernames,
                 msg.reply_to_bot.as_deref(),
+                // Defense in depth behind the boundary guard above — a bot-sent
+                // message never reaches here, but the election refuses it too.
+                msg.sender_is_bot,
                 &route_config,
             );
 
@@ -250,15 +277,26 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     continue;
                 }
                 Election::All {
-                    ref reply_chat, ..
+                    ref reply_chat,
+                    ref body,
                 } => {
                     // Collective address — the whole roster answers, briefly and
                     // in-voice, in roster order. The single listener orchestrates
-                    // the sequential sends so no bot double-posts. The composed
-                    // turn logs its own compose-start + per-voice sent message_id.
-                    if let Err(e) =
-                        run_group_collective(&workgraph_dir, &route_config, reply_chat, &feed_path)
-                            .await
+                    // the sequential sends so no bot double-posts. Fix #4b: each
+                    // voice answers the MESSAGE CONTENT through the SAME
+                    // persistent-session composer the 1:1 path uses (grounded
+                    // reply), falling back to a task-grounded in-voice line only
+                    // when that voice has no bound session. The composed turn
+                    // logs its own compose-start + per-voice sent message_id.
+                    if let Err(e) = run_group_collective(
+                        &workgraph_dir,
+                        &route_config,
+                        reply_chat,
+                        &feed_path,
+                        body,
+                        &auth_sender,
+                    )
+                    .await
                     {
                         eprintln!("Failed to run collective reply: {e}");
                     }
@@ -334,10 +372,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // the binding never confirmed. See `classify_inbound_message`.
                 // In a group route, `route_channel` is the addressed bot's
                 // channel type so the reply lands on the right agent's task.
+                // `auth_sender` (resolved once above) is what classify + the
+                // conversation composer authorize against, so a confirmed human
+                // with no public @username still resolves. See Fix #5.
                 match classify_inbound_message(
                     &workgraph_dir,
                     &route_channel,
-                    &msg.sender,
+                    &auth_sender,
                     &route_body,
                 ) {
                     InboundOutcome::Confirmed { name, routed_task } => {
@@ -417,7 +458,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             &route_config,
                             &route_channel,
                             &reply_target,
-                            &msg.sender,
+                            &auth_sender,
                             entry,
                         );
                         // Route-decision log line (no tokens): every handled
@@ -514,6 +555,31 @@ fn try_confirm_binding(workgraph_dir: &Path, sender: &str, body: &str) -> Option
         return None;
     }
     Some(name)
+}
+
+/// Resolve an inbound message's sender to the identity downstream auth uses
+/// (Fix #5 — the lead bug).
+///
+/// The listener now carries both the numeric Telegram user id (`sender_id`) and
+/// the display label (`sender`). Binding lookups downstream
+/// (`classify_inbound_message`, `plan_conversation`) match `telegram_user`
+/// **verbatim**, so a human bound by their numeric id but arriving with only a
+/// @username (or no username at all) never resolved — the "unrecognized sender
+/// 'unknown'" live failure. Here we resolve ONCE at the boundary against the
+/// binding map, trying the numeric id first then the username, and return the
+/// binding's stored key so the verbatim downstream lookups match. When no
+/// binding claims the sender we fall back to the raw display label (an unbound
+/// human is handled exactly as before).
+fn resolve_auth_sender(workgraph_dir: &Path, msg: &worksgood::notify::IncomingMessage) -> String {
+    use worksgood::agency::TelegramBindingMap;
+    let agency_dir = workgraph_dir.join("agency");
+    match TelegramBindingMap::load(&agency_dir) {
+        Ok(map) => map
+            .find_by_identity(msg.sender_id.as_deref(), Some(&msg.sender))
+            .map(|b| b.telegram_user.clone())
+            .unwrap_or_else(|| msg.sender.clone()),
+        Err(_) => msg.sender.clone(),
+    }
 }
 
 /// Classification of an inbound (non-command, non-button) Telegram message.
@@ -738,6 +804,47 @@ pub fn run_route(
     Ok(())
 }
 
+/// `wg telegram resolve-sender` — the Fix #5 diagnostic. Resolve the sender of
+/// a raw Telegram update against the binding map through the exact boundary path
+/// the listener uses, and print the result.
+///
+/// `update` is the raw `getUpdates` element as JSON — inline, or `@path` to read
+/// it from a file. Bindings are loaded from `<workgraph_dir>/agency`. Nothing is
+/// sent; this only reads. Proves a human bound by their numeric id resolves even
+/// with no @username (the "unrecognized sender 'unknown'" live failure).
+pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> {
+    use worksgood::agency::TelegramBindingMap;
+    use worksgood::notify::telegram_sender;
+
+    let raw = if let Some(path) = update.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read update fixture {path}"))?
+    } else {
+        update.to_string()
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).context("update is not valid JSON")?;
+
+    let agency_dir = workgraph_dir.join("agency");
+    let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+    let resolved = telegram_sender::resolve_inbound(&value, &bindings);
+
+    if json {
+        let out = serde_json::json!({
+            "sender_id": resolved.identity.user_id,
+            "username": resolved.identity.username,
+            "is_bot": resolved.identity.is_bot,
+            "agent_id": resolved.agent_id,
+            "name": resolved.name,
+            "confirmed": resolved.confirmed,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("{}", telegram_sender::resolve_inbound_summary(&value, &bindings));
+    }
+    Ok(())
+}
+
 /// `wg telegram elect` — show who would respond to a group message in
 /// all-bots-privacy-off mode, without sending anything.
 ///
@@ -768,6 +875,9 @@ pub fn run_elect(
         message,
         &mention_usernames,
         reply_to_bot,
+        // The `wg telegram elect` diagnostic is always run by a human operator,
+        // never a bot — the bot-loop guard is exercised by the unit tests.
+        false,
         &config,
     );
 
@@ -885,21 +995,32 @@ pub async fn run_group_standup(
     Ok(())
 }
 
-/// Orchestrate a **collective-address reply** (election rule d): post one brief
-/// in-voice hello per named voice, in roster order, each AS that bot and each
-/// grounded in that persona's live graph state.
+/// Orchestrate a **collective-address reply** (election rule d): one reply per
+/// named voice, in roster order, each AS that bot.
 ///
 /// This is the conversational sibling of [`run_group_standup`] — same sole
 /// orchestrator (the single listener), same strict roster order, same
-/// no-double-post guarantee — but the bodies answer a greeting rather than file
-/// a status report (see `telegram_standup::render_conversational`). `target` is
-/// the group chat id every reply is sent to.
+/// no-double-post guarantee. `target` is the group chat id every reply is sent
+/// to; `human_message` is the text the family sent; `sender` is the resolved
+/// (binding-key) identity of who sent it.
+///
+/// **Fix #4b — content grounding.** Every voice answers the MESSAGE CONTENT
+/// through the *same persistent-session composer the 1:1 path uses*
+/// ([`telegram_conversation::run_conversation_turn`]): the human's text is the
+/// turn, so a concrete question (`"what's for dinner?"`) gets each voice's real
+/// answer, not a canned greeting-shaped status line. Only when a voice has **no
+/// bound session** (or the sender isn't a confirmed human) do we fall back to
+/// the task-grounded in-voice line ([`telegram_standup::render_conversational`])
+/// — never silence, never a status dump.
 pub async fn run_group_collective(
     workgraph_dir: &Path,
     config: &TelegramConfig,
     target: &str,
     feed_path: &Path,
+    human_message: &str,
+    sender: &str,
 ) -> Result<()> {
+    use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_standup as standup;
 
     let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
@@ -908,8 +1029,9 @@ pub async fn run_group_collective(
         return Ok(());
     }
 
-    // Ground every voice against the live graph (missing graph → empty plate,
-    // an honest "all quiet" line rather than a crash).
+    // Ground the fallback line against the live graph (missing graph → empty
+    // plate, an honest "all quiet" line rather than a crash). The session path
+    // grounds itself against each persona's own session context.
     let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
 
     // Compose-start line for this composed turn — pairs with the per-voice sent
@@ -921,7 +1043,53 @@ pub async fn run_group_collective(
         roster.len(),
     );
 
+    let timing = convo::AckTiming::from_env();
+
     for member in &roster {
+        // The SAME composer the 1:1 path uses: does this voice have a bound
+        // session and is the sender a confirmed human? If so, answer the actual
+        // message content grounded in that voice's session.
+        let plan = convo::plan_conversation(
+            workgraph_dir,
+            config,
+            &member.channel_type(),
+            target,
+            sender,
+            convo::Entry::GroupElected,
+        );
+
+        if matches!(plan, convo::ConversationPlan::Converse { .. }) {
+            // Grounded per-voice answer to the human's message. The FeedMirror
+            // sink relays the reply into the conversation pane's feed too.
+            let sink = FeedMirrorSink::new(
+                convo::BotReplySink::new(config.clone()),
+                feed_path.to_path_buf(),
+                config.clone(),
+            );
+            let request_id = format!("tg-collective-{}-{}", target, member.bot_id);
+            match convo::run_conversation_turn(
+                workgraph_dir,
+                &plan,
+                human_message,
+                &request_id,
+                timing,
+                &sink,
+            )
+            .await
+            {
+                Ok(outcome) => println!(
+                    "[{}] collective: {} answered content [{}]",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    member.bot_id,
+                    outcome.label(),
+                ),
+                Err(e) => eprintln!("collective: {} content turn failed: {e}", member.bot_id),
+            }
+            continue;
+        }
+
+        // Fallback: no bound session (or unconfirmed sender) — an honest,
+        // task-grounded in-voice line rather than silence.
         let (in_progress, open) = match &graph {
             Some(g) => standup::agent_task_lines(g, member.agent_id()),
             None => (Vec::new(), Vec::new()),
@@ -1827,17 +1995,8 @@ async fn poll_once(
                 .map(|id| id.to_string());
 
             if chat_id.as_deref() == Some(target_chat_id) {
-                let sender = cb
-                    .get("from")
-                    .and_then(|f| f.get("username"))
-                    .and_then(|u| u.as_str())
-                    .or_else(|| {
-                        cb.get("from")
-                            .and_then(|f| f.get("id"))
-                            .and_then(|i| i.as_i64())
-                            .map(|_| "unknown")
-                    })
-                    .unwrap_or("unknown");
+                let identity = worksgood::notify::telegram_sender::extract_sender(update);
+                let sender = identity.display();
 
                 let action_id = cb
                     .get("data")
@@ -1853,7 +2012,9 @@ async fn poll_once(
 
                 let msg = worksgood::notify::IncomingMessage {
                     channel: "telegram".to_string(),
-                    sender: sender.to_string(),
+                    sender,
+                    sender_id: identity.user_id,
+                    sender_is_bot: identity.is_bot,
                     body: action_id.clone(),
                     action_id: Some(action_id),
                     reply_to,
@@ -1877,11 +2038,9 @@ async fn poll_once(
                 .map(|id| id.to_string());
 
             if chat_id.as_deref() == Some(target_chat_id) {
-                let sender = message
-                    .get("from")
-                    .and_then(|f| f.get("username"))
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("unknown");
+                let identity =
+                    worksgood::notify::telegram_sender::identity_from_message(message);
+                let sender = identity.display();
 
                 let body = message
                     .get("text")
@@ -1914,7 +2073,9 @@ async fn poll_once(
 
                 let msg = worksgood::notify::IncomingMessage {
                     channel: "telegram".to_string(),
-                    sender: sender.to_string(),
+                    sender,
+                    sender_id: identity.user_id,
+                    sender_is_bot: identity.is_bot,
                     body,
                     action_id: None,
                     reply_to,

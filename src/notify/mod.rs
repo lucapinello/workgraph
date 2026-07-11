@@ -21,6 +21,7 @@ pub mod telegram_conversation;
 pub mod telegram_dedupe;
 pub mod telegram_family_commands;
 pub mod telegram_group;
+pub mod telegram_sender;
 pub mod telegram_standup;
 pub mod voice;
 pub mod webhook;
@@ -85,8 +86,23 @@ pub struct Action {
 pub struct IncomingMessage {
     /// Channel type that received this message.
     pub channel: String,
-    /// Sender identifier (platform-specific).
+    /// Sender identifier (platform-specific). For Telegram this is the display
+    /// label from [`telegram_sender::SenderIdentity::display`]: the @username
+    /// when present, else the numeric user id, else `"unknown"` — never
+    /// `"unknown"` when an id was available. Used for logs and the casa feed.
     pub sender: String,
+    /// The sender's stable numeric Telegram user id (`from.id`), when the
+    /// transport surfaces one. `None` for transports (or updates) without a
+    /// numeric id. Auth/binding resolution matches this FIRST so a human bound
+    /// by their numeric id resolves even when they have no public @username —
+    /// the Fix #5 lead bug. See `telegram_sender`.
+    pub sender_id: Option<String>,
+    /// Whether the sender is a **bot** (`from.is_bot`). The Fix #0 bot-loop
+    /// guard drops any inbound message with this set before election/routing:
+    /// with the family bots running as group admins they receive each other's
+    /// replies, and electing on a bot-sent message caused the 12-replies-per-
+    /// message feedback storm. `false` for transports that don't surface it.
+    pub sender_is_bot: bool,
     /// Message body text.
     pub body: String,
     /// If the human clicked an action button, its id.

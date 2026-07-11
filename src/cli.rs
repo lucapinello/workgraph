@@ -6489,6 +6489,20 @@ pub enum TelegramCommands {
         chat_id: String,
     },
 
+    /// Resolve the sender of a raw Telegram update against the binding map
+    ///
+    /// The Fix #5 diagnostic. Feeds a raw `getUpdates` element through the SAME
+    /// boundary path the `wg telegram listen` listener uses — `extract_sender`
+    /// (id + username + is_bot) then `find_by_identity` (numeric id first, then
+    /// @username) — and prints who it resolved to. Proves a human bound by their
+    /// numeric id resolves even with no public @username (the "unrecognized
+    /// sender 'unknown'" live failure). Reads bindings from the current
+    /// project's `agency/`; nothing is sent.
+    ResolveSender {
+        /// The raw update JSON, inline or `@path/to/update.json` to read a file.
+        update: String,
+    },
+
     /// Register the family command set with Telegram for autocomplete
     ///
     /// Calls `setMyCommands` for EVERY configured bot with the shared set

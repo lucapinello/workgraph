@@ -133,6 +133,41 @@ impl TelegramBindingMap {
         self.bindings.iter().find(|b| b.agent_id == agent_id)
     }
 
+    /// Resolve an inbound sender to its binding by trying, in order of
+    /// reliability: the numeric Telegram **user id**, then the **@username**
+    /// (both the bare handle and the `@`-prefixed form the operator may have
+    /// typed into `wg agency human add --telegram @handle`).
+    ///
+    /// This is the Fix #5 resolver: `wg agency human add --telegram <id>`
+    /// records the numeric id as `telegram_user`, but the old listener only ever
+    /// knew the sender's @username (or `"unknown"`), so the id-keyed binding
+    /// never matched. Passing BOTH the id and the username here makes a confirmed
+    /// human resolve regardless of which form their binding was created with, and
+    /// regardless of whether they have a public @username at all.
+    ///
+    /// `user_id` is `from.id` as a string; `username` is the lower-cased handle
+    /// without a leading `@`. Either may be `None`. Returns `None` when neither
+    /// identifies a binding.
+    pub fn find_by_identity(
+        &self,
+        user_id: Option<&str>,
+        username: Option<&str>,
+    ) -> Option<&TelegramBinding> {
+        if let Some(id) = user_id.filter(|s| !s.is_empty()) {
+            if let Some(b) = self.find_by_user(id) {
+                return Some(b);
+            }
+        }
+        if let Some(name) = username.filter(|s| !s.is_empty()) {
+            let bare = name.trim_start_matches('@');
+            return self.bindings.iter().find(|b| {
+                let stored = b.telegram_user.trim_start_matches('@');
+                stored.eq_ignore_ascii_case(bare)
+            });
+        }
+        None
+    }
+
     /// Add a binding, enforcing one-human-one-agent.
     ///
     /// Errors if the Telegram user is already bound, or if the agent id is
@@ -218,6 +253,45 @@ mod tests {
             "111"
         );
         assert!(map.find_by_user("999").is_none());
+    }
+
+    #[test]
+    fn find_by_identity_resolves_id_keyed_binding_from_numeric_id() {
+        // The Fix #5 acceptance case: Luca is bound by his numeric Telegram user
+        // id and has no public @username. The old path saw sender "unknown" and
+        // rejected him; find_by_identity resolves him from `from.id` alone.
+        let mut map = TelegramBindingMap::default();
+        map.add(binding("8905220378", "human-luca", "Luca")).unwrap();
+
+        let hit = map
+            .find_by_identity(Some("8905220378"), None)
+            .expect("numeric id must resolve the id-keyed binding");
+        assert_eq!(hit.agent_id, "human-luca");
+    }
+
+    #[test]
+    fn find_by_identity_prefers_id_but_falls_back_to_username() {
+        let mut map = TelegramBindingMap::default();
+        map.add(binding("8905220378", "human-luca", "Luca")).unwrap();
+        map.add(binding("@nadin", "human-nadin", "Nadin")).unwrap();
+
+        // id wins when present.
+        assert_eq!(
+            map.find_by_identity(Some("8905220378"), Some("someone"))
+                .unwrap()
+                .agent_id,
+            "human-luca"
+        );
+        // username falls through (case-insensitive, `@`-tolerant on both sides).
+        assert_eq!(
+            map.find_by_identity(Some("999999"), Some("NADIN"))
+                .unwrap()
+                .agent_id,
+            "human-nadin"
+        );
+        // neither identifies anyone → None.
+        assert!(map.find_by_identity(Some("999999"), Some("ghost")).is_none());
+        assert!(map.find_by_identity(None, None).is_none());
     }
 
     #[test]

@@ -479,7 +479,7 @@ pub const ADDRESSING_CUES: &[&str] = &[
 pub const ADDRESS_FOLLOWERS: &[&str] = &[
     "can", "could", "would", "will", "please", "pls", "plz", "what", "what's",
     "whats", "when", "where", "why", "how", "do", "does", "did", "are", "is",
-    "you", "u", "help", "we", "let's", "lets", "i'm", "im",
+    "you", "u", "help", "we", "let's", "lets", "i'm", "im", "i",
 ];
 
 /// Indefinite-agent words that ask "someone in the group" rather than a named
@@ -490,7 +490,8 @@ pub const INDEFINITE_AGENTS: &[&str] = &["someone", "somebody", "anyone", "anybo
 /// these is plausibly *for the team* (the concierge) rather than idle chatter.
 /// Tunable — this is the heart of the e-vs-f (ask-vs-small-talk) boundary.
 pub const DOMAIN_KEYWORDS: &[&str] = &[
-    "dinner", "lunch", "breakfast", "meal", "meals", "cook", "cooking", "recipe",
+    "dinner", "lunch", "breakfast", "meal", "meals", "menu", "food", "cook",
+    "cooking", "recipe",
     "recipes", "grocery", "groceries", "shopping", "shop", "fridge", "pantry",
     "plan", "planning", "schedule", "scheduling", "calendar", "remind", "reminder",
     "reminders", "book", "booking", "appointment", "appointments", "week",
@@ -541,6 +542,13 @@ pub enum SilenceReason {
     SmallTalk,
     /// The message was team-directed but the concierge voice isn't configured.
     NoVoicesConfigured,
+    /// The inbound message was **sent by a bot** (`from.is_bot`). The Fix #0
+    /// bot-loop guard: with the family bots running as group admins they receive
+    /// each other's replies, so electing on a bot-sent message spawned a
+    /// feedback storm (one human message → roster reply → each bot's poller sees
+    /// the other bots' replies → re-election → 12 replies). This guard is
+    /// unconditional and fires before any rule.
+    BotSender,
 }
 
 impl std::fmt::Display for SilenceReason {
@@ -549,6 +557,7 @@ impl std::fmt::Display for SilenceReason {
             SilenceReason::NoChatId => "no-chat-id",
             SilenceReason::SmallTalk => "small-talk",
             SilenceReason::NoVoicesConfigured => "no-voices-configured",
+            SilenceReason::BotSender => "bot-sender",
         };
         f.write_str(s)
     }
@@ -760,8 +769,18 @@ pub fn elect_responders(
     text: &str,
     mention_usernames: &[String],
     reply_to_bot: Option<&str>,
+    sender_is_bot: bool,
     config: &TelegramConfig,
 ) -> Election {
+    // Fix #0 — the bot-loop guard. UNCONDITIONAL and first: a message sent by a
+    // bot (ANY bot, including our own four seen on a sibling bot's poller) is
+    // never elected, routed, or composed. Without this a single human message
+    // fanned out into a self-amplifying storm of roster replies. Applies in
+    // every chat type — a bot DMing a bot must not compose either.
+    if sender_is_bot {
+        return Election::Silence(SilenceReason::BotSender);
+    }
+
     let is_group = matches!(chat_type, Some("group") | Some("supergroup"));
     if !is_group {
         return Election::Private;
@@ -805,15 +824,14 @@ pub fn elect_responders(
         }
     }
 
-    // d. Collective address — the whole roster answers.
-    if is_collective_address(text) {
-        return Election::All {
-            reply_chat,
-            body: text.to_string(),
-        };
-    }
-
-    // e. Team-directed but unaddressed ask — otto as the group coordinator.
+    // e-before-d for ASKS (Fix #4a). Collective (rule d) is reserved for
+    // *greetings that address everyone* — "hey guys", "ciao a tutti". A message
+    // that carries an actual question or request must NOT trigger a four-way
+    // roster broadcast (that produced Luca's "elected collective, answered with
+    // generic greetings, wrong answer"): it is a single ask, answered by ONE
+    // voice. A named voice already won above (rules a–c); an unaddressed ask is
+    // the concierge's (otto). So a team-directed ask is routed to otto here even
+    // when it also happens to contain a collective trigger word.
     if is_team_directed_ask(text) {
         return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
             Some(bot) => Election::One {
@@ -823,6 +841,15 @@ pub fn elect_responders(
                 addressed_by: AddressedBy::Concierge,
             },
             None => Election::Silence(SilenceReason::NoVoicesConfigured),
+        };
+    }
+
+    // d. Collective address — a greeting to the whole family, no specific ask.
+    // The whole roster answers, each briefly and in-voice, in roster order.
+    if is_collective_address(text) {
+        return Election::All {
+            reply_chat,
+            body: text.to_string(),
         };
     }
 
@@ -1383,6 +1410,7 @@ mod tests {
             text,
             &mentions,
             reply_to_bot,
+            false, // human sender in the a–f election tests
             &casa_config(),
         )
     }
@@ -1613,6 +1641,7 @@ mod tests {
             "nora, hi",
             &[],
             None,
+            false,
             &casa_config(),
         );
         assert_eq!(e, Election::Private);
@@ -1620,7 +1649,7 @@ mod tests {
 
     #[test]
     fn elect_group_without_chat_id_is_silence_no_chat() {
-        let e = elect_responders(Some("group"), None, "hey guys", &[], None, &casa_config());
+        let e = elect_responders(Some("group"), None, "hey guys", &[], None, false, &casa_config());
         assert_eq!(e, Election::Silence(SilenceReason::NoChatId));
     }
 
@@ -1637,9 +1666,125 @@ mod tests {
             "can someone plan dinner?",
             &[],
             None,
+            false,
             &cfg,
         );
         assert_eq!(e, Election::Silence(SilenceReason::NoVoicesConfigured));
+    }
+
+    // ---- Fix #0: the bot-loop guard --------------------------------------
+
+    #[test]
+    fn elect_bot_sender_produces_zero_elections_even_for_collective_text() {
+        // The exact storm trigger: a roster reply ("Hey everyone!…") composed and
+        // sent by one of our OWN bots, received on a sibling bot's poller. It is
+        // collective-shaped text that WOULD elect the whole roster — but because
+        // the sender is a bot the guard fires FIRST and nobody is elected.
+        let e = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "Hey everyone! All quiet on my end",
+            &[],
+            None,
+            true, // sender is a bot
+            &casa_config(),
+        );
+        assert_eq!(e, Election::Silence(SilenceReason::BotSender));
+    }
+
+    #[test]
+    fn elect_bot_sender_guard_is_unconditional() {
+        // The guard beats EVERY rule — an explicit @mention, an addressed name,
+        // and even a private 1:1 — so no path can compose on a bot-sent message.
+        assert_eq!(
+            elect_responders(
+                Some("supergroup"),
+                Some("-100999"),
+                "nora can you plan dinner?",
+                &["bruno_casapinello_bot".to_string()],
+                Some("mira_casapinello_bot"),
+                true,
+                &casa_config(),
+            ),
+            Election::Silence(SilenceReason::BotSender)
+        );
+        assert_eq!(
+            elect_responders(
+                Some("private"),
+                Some("111"),
+                "hi",
+                &[],
+                None,
+                true,
+                &casa_config(),
+            ),
+            Election::Silence(SilenceReason::BotSender)
+        );
+    }
+
+    #[test]
+    fn decision_line_for_bot_sender_silence() {
+        let e = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "hey everyone",
+            &[],
+            None,
+            true,
+            &casa_config(),
+        );
+        let line = election_decision_summary(Some("55"), Some("supergroup"), &e);
+        assert_eq!(
+            line,
+            "msg=55 chat=supergroup rule=silence:bot-sender target=silence"
+        );
+    }
+
+    // ---- Fix #4a: content questions do NOT elect collective --------------
+
+    #[test]
+    fn elect_menu_question_routes_to_otto_not_silence() {
+        // Luca's realistic question. It names no one and carries no greeting, so
+        // it must reach otto-as-concierge (rule e) — NOT be silenced and NOT fan
+        // out to the whole roster.
+        assert_one(
+            &elect("what is on the menu tomorrow?", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
+    }
+
+    #[test]
+    fn elect_named_leading_then_i_routes_to_that_agent() {
+        // "otto I am heading to the gym, where is my bag?" — a leading name
+        // followed by "I" is a vocative address, so it lands on the named agent
+        // (otto), whose session then answers the actual question.
+        assert_one(
+            &elect("otto I am heading to the gym, where is my bag?", &[], None),
+            "otto",
+            AddressedBy::Name,
+        );
+    }
+
+    #[test]
+    fn elect_greeting_plus_question_prefers_ask_over_collective() {
+        // A collective trigger ("everyone") AND a real ask ("what's for
+        // dinner?") → the ask wins: one grounded answer from otto, not a
+        // four-way roster broadcast of greetings.
+        assert_one(
+            &elect("hey everyone what's for dinner tonight?", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
+    }
+
+    #[test]
+    fn elect_pure_greeting_still_collective() {
+        // Regression guard: a greeting with NO ask stays collective (rule d).
+        assert!(matches!(
+            elect("hey everyone, how's it going?", &[], None),
+            Election::All { .. }
+        ));
     }
 
     // ---- helper-level unit checks ----------------------------------------
@@ -1739,7 +1884,7 @@ mod tests {
 
     #[test]
     fn decision_line_for_silence_no_chat_id() {
-        let election = elect_responders(Some("group"), None, "hey guys", &[], None, &casa_config());
+        let election = elect_responders(Some("group"), None, "hey guys", &[], None, false, &casa_config());
         let line = election_decision_summary(None, Some("group"), &election);
         // No transport message id → "none"; reason surfaced in the rule.
         assert_eq!(
@@ -1760,6 +1905,7 @@ mod tests {
             "can someone plan dinner?",
             &[],
             None,
+            false,
             &cfg,
         );
         let line = election_decision_summary(Some("7"), Some("supergroup"), &election);
@@ -1772,7 +1918,7 @@ mod tests {
     #[test]
     fn decision_line_for_private_passthrough() {
         let election =
-            elect_responders(Some("private"), Some("111"), "nora, hi", &[], None, &casa_config());
+            elect_responders(Some("private"), Some("111"), "nora, hi", &[], None, false, &casa_config());
         let line = election_decision_summary(Some("9"), Some("private"), &election);
         assert_eq!(line, "msg=9 chat=private rule=private target=passthrough");
     }
@@ -1788,6 +1934,7 @@ mod tests {
             "can someone help?",
             &[],
             None,
+            false,
             &cfg,
         );
         let line = election_decision_summary(Some("3"), Some("supergroup"), &election);

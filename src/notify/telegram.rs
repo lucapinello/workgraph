@@ -678,17 +678,11 @@ impl PollBackoffState {
 fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<IncomingMessage> {
     // Handle callback queries (button presses)
     if let Some(cb) = update.get("callback_query") {
-        let sender = cb
-            .get("from")
-            .and_then(|f| f.get("username"))
-            .and_then(|u| u.as_str())
-            .or_else(|| {
-                cb.get("from")
-                    .and_then(|f| f.get("id"))
-                    .and_then(|i| i.as_i64())
-                    .map(|_| "unknown")
-            })
-            .unwrap_or("unknown");
+        // Sender identity (id + username + is_bot), read once at the boundary so
+        // a button press from a human with no @username still resolves to their
+        // binding rather than decoding to "unknown". See `telegram_sender`.
+        let identity = super::telegram_sender::extract_sender(update);
+        let sender = identity.display();
 
         let action_id = cb
             .get("data")
@@ -719,7 +713,9 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
 
         return Some(IncomingMessage {
             channel: channel_tag.to_string(),
-            sender: sender.to_string(),
+            sender,
+            sender_id: identity.user_id,
+            sender_is_bot: identity.is_bot,
             body: action_id.clone(),
             action_id: Some(action_id),
             reply_to,
@@ -735,11 +731,12 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
 
     // Handle regular messages
     if let Some(message) = update.get("message") {
-        let sender = message
-            .get("from")
-            .and_then(|f| f.get("username"))
-            .and_then(|u| u.as_str())
-            .unwrap_or("unknown");
+        // Sender identity (id + username + is_bot), read once at the boundary.
+        // `sender` is the display label (username → id → "unknown"); the numeric
+        // id and bot flag ride alongside for binding resolution and the Fix #0
+        // bot-loop guard. See `telegram_sender`.
+        let identity = super::telegram_sender::identity_from_message(message);
+        let sender = identity.display();
 
         let body = message
             .get("text")
@@ -784,7 +781,9 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
 
         return Some(IncomingMessage {
             channel: channel_tag.to_string(),
-            sender: sender.to_string(),
+            sender,
+            sender_id: identity.user_id,
+            sender_is_bot: identity.is_bot,
             body,
             action_id: None,
             reply_to,

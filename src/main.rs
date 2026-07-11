@@ -3652,6 +3652,9 @@ fn main() -> Result<()> {
                 &chat_id,
                 cli.json,
             ),
+            TelegramCommands::ResolveSender { update } => {
+                commands::telegram::run_resolve_sender(&workgraph_dir, &update, cli.json)
+            }
             TelegramCommands::RegisterCommands => {
                 commands::telegram::run_register_commands(cli.json)
             }
