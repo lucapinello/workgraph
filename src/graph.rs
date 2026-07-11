@@ -813,11 +813,47 @@ impl Default for Task {
 /// agent breadcrumb). See docs/14-disposable-lifecycle.md.
 pub const DISPOSABLE_TAG: &str = "disposable";
 
+/// Tag prefix recording which named agent spawned a disposable. A disposable
+/// carries at most one `spawned-by:<agent>` tag (the spawner's agent
+/// content-hash), written at `wg add` time — either explicitly via
+/// `wg add --spawned-by <agent>` or auto-derived from the spawning task's
+/// `agent` when a named agent runs `wg add … -t disposable` inside a task
+/// context (`WG_TASK_ID` set). At `wg done` the disposable's durable outputs
+/// are ingested into that agent's persistent session memory. See
+/// docs/14-disposable-lifecycle.md §ingest.
+pub const SPAWNED_BY_TAG_PREFIX: &str = "spawned-by:";
+
 impl Task {
     /// True when this task opts into the disposable lifecycle by carrying the
     /// [`DISPOSABLE_TAG`].
     pub fn is_disposable(&self) -> bool {
         self.tags.iter().any(|t| t == DISPOSABLE_TAG)
+    }
+
+    /// The agent (content-hash / id) of the named agent that spawned this
+    /// disposable, if recorded via a [`SPAWNED_BY_TAG_PREFIX`] tag. This is the
+    /// key `chat_sessions::session_for_agent` uses to resolve the spawner's
+    /// bound session, so a completed disposable can fold its result into that
+    /// agent's `session-summary.md`. Returns `None` when no (non-empty)
+    /// spawned-by tag is present. See docs/14-disposable-lifecycle.md §ingest.
+    pub fn spawned_by(&self) -> Option<&str> {
+        self.tags
+            .iter()
+            .find_map(|t| t.strip_prefix(SPAWNED_BY_TAG_PREFIX))
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Messages of the agent-authored `wg log` breadcrumbs on this task, in
+    /// order. An agent breadcrumb is a [`LogEntry`] with no `actor` (see
+    /// [`Task::has_agent_log_breadcrumb`]); system-authored entries all set an
+    /// `actor` and are excluded. These are the human-readable findings a
+    /// disposable hands back to its spawner at ingest time.
+    pub fn agent_log_breadcrumbs(&self) -> Vec<&str> {
+        self.log
+            .iter()
+            .filter(|e| e.actor.is_none())
+            .map(|e| e.message.as_str())
+            .collect()
     }
 
     /// True when the task carries at least one agent/human `wg log` breadcrumb.

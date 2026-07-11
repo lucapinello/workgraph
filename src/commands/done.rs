@@ -2489,6 +2489,14 @@ fn run_inner(
         parse_token_usage(&abs_path).or_else(|| parse_wg_tokens(&abs_path))
     });
 
+    // Snapshot the disposable's durable outputs BEFORE the Done transition so
+    // the ingest folds in exactly the artifacts + agent breadcrumbs the
+    // disposable produced — not the "Task marked as done" system entry the
+    // transition itself appends (which carries actor = task.assigned, i.e.
+    // None for an unassigned task, and would otherwise be mistaken for an
+    // agent breadcrumb). See docs/14-disposable-lifecycle.md §ingest.
+    let disposable_ingest_snapshot = graph.get_task(id).filter(|t| t.is_disposable()).cloned();
+
     let id_owned = id.to_string();
     let mut transitioned_to_pending_eval = false;
     let graph = modify_graph(&path, |graph| {
@@ -2591,6 +2599,58 @@ fn run_inner(
     }
 
     super::notify_graph_changed(dir);
+
+    // Disposable ingest: a disposable's only durable value is the artifact +
+    // breadcrumb it leaves for its spawner (the disposable contract gate above
+    // guarantees both exist). Now that it has reached Done, fold those outputs
+    // into the spawning named agent's persistent `session-summary.md` (riding
+    // the #50 binding) so the result persists into that agent's memory and is
+    // injected into its next task via `{{bound_session_summary}}`. Ingest is
+    // idempotent and a benign no-op when the disposable has no bound spawner.
+    // See docs/14-disposable-lifecycle.md §ingest. Skipped when the task only
+    // transitioned to PendingEval — it is not yet Done.
+    if !transitioned_to_pending_eval
+        && let Some(ref task) = disposable_ingest_snapshot
+    {
+        match worksgood::disposable_ingest::ingest_disposable_into_spawner(dir, task) {
+            Ok(Some(report)) => {
+                let note = if report.already_present {
+                    format!(
+                        "disposable already ingested into spawner '{}' session memory",
+                        report.spawner
+                    )
+                } else {
+                    format!(
+                        "ingested disposable result into spawner '{}' session memory ({})",
+                        report.spawner,
+                        report.summary_path.display()
+                    )
+                };
+                let id_owned = id.to_string();
+                let _ = modify_graph(&path, |g| {
+                    if let Some(t) = g.get_task_mut(&id_owned) {
+                        t.log.push(LogEntry {
+                            timestamp: Utc::now().to_rfc3339(),
+                            actor: Some("disposable-ingest".to_string()),
+                            user: Some(worksgood::current_user()),
+                            message: note.clone(),
+                        });
+                    }
+                    true
+                });
+            }
+            Ok(None) => { /* not a disposable with a bound spawner — nothing to fold */ }
+            Err(e) => {
+                // Ingest is best-effort: a disposable is already Done, and its
+                // artifact/log survive on the task row regardless. Surface the
+                // failure but do not fail `wg done`.
+                eprintln!(
+                    "warning: failed to ingest disposable '{}' into spawner session memory: {:#}",
+                    id, e
+                );
+            }
+        }
+    }
 
     // Update agent registry to reflect task completion.
     // Without this, the registry entry stays at Working until the daemon's

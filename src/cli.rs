@@ -380,6 +380,15 @@ pub enum Commands {
         /// Create as a blocking subtask: child is created, parent waits for child to complete
         #[arg(long)]
         subtask: bool,
+
+        /// Record the named agent that spawned this disposable (its agent
+        /// content-hash / id). On `wg done`, the disposable's artifact + log
+        /// are folded into that agent's persistent session memory. For a
+        /// `-t disposable` task created inside a task context (WG_TASK_ID set),
+        /// the spawner is auto-derived from the parent task's agent when this
+        /// flag is omitted. See docs/14-disposable-lifecycle.md §ingest.
+        #[arg(long, value_name = "AGENT")]
+        spawned_by: Option<String>,
     },
 
     /// Edit an existing task

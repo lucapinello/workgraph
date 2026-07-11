@@ -33,6 +33,7 @@ pub mod context_scope;
 pub mod cron;
 pub mod cycle;
 pub mod dispatch;
+pub mod disposable_ingest;
 pub mod executor;
 pub mod executor_discovery;
 pub mod federation;

@@ -110,3 +110,81 @@ surfaced as a real, retryable failure instead of a phantom success.
   a no-artifact disposable is refused, an artifact-only disposable is still
   refused for the missing breadcrumb, and once both are present `wg done`
   succeeds and clears the marker — while an ordinary task is unaffected.
+
+## §ingest
+
+Enforcement guarantees a completed disposable left an artifact + breadcrumb
+behind. **Ingest** is what makes that value *persist*: on `wg done`, the
+disposable's durable outputs are folded into the **spawning** named agent's
+persistent `session-summary.md`, riding the #50 agent↔session binding. This is
+the disposable **middle path** (iteration-2 directive 6b) — the disposable
+itself stays ephemeral (worktree, transcript, process all discarded), but the
+answer it produced survives in its spawner's memory and is injected into the
+spawner's *next* task via `{{bound_session_summary}}` — the same recall path
+`bind-named-agents` proved in `docs/09`.
+
+So Bruno's recipe-scrape disposable vanishes, but "found 3 recipes;
+lemon-garlic is the family favourite" and the artifact path land in Bruno's
+memory and colour how Bruno plans next week.
+
+### The spawner link — `spawned-by:<agent>`
+
+A disposable records who spawned it with a single `spawned-by:<agent>` tag
+(`worksgood::graph::SPAWNED_BY_TAG_PREFIX`; read via `Task::spawned_by()`),
+where `<agent>` is the spawner's **agent content-hash** — exactly the key
+`chat_sessions::session_for_agent` matches against a bound session's
+`agent_id`. Storing the link as a tag (rather than a new `Task` field) mirrors
+the `disposable` tag idiom and touches no `Task` construction site.
+
+The tag is written at `wg add` time in one of two ways:
+
+- **Explicit:** `wg add "…" -t disposable --spawned-by <agent-hash>`.
+- **Auto-derived:** for a `-t disposable` task created *inside* a task context
+  (`WG_TASK_ID` set) with no explicit `--spawned-by`, `wg add` resolves the
+  spawning task's `agent` (the running named agent's content-hash) and records
+  it. So when Bruno — a bound named agent — runs `wg add … -t disposable`
+  mid-task, the spawner is captured automatically.
+
+### Where the ingest runs
+
+The ingest lives in `wg done` (`src/commands/done.rs`), immediately after the
+task is promoted to `Done` (so the enforcement contract has already
+guaranteed the artifact + breadcrumb) and `notify_graph_changed`. It calls
+`disposable_ingest::ingest_disposable_into_spawner`, which:
+
+1. no-ops unless the task is a disposable **and** carries a `spawned-by:` tag
+   **and** that agent has a bound session (a disposable with no bound spawner
+   is a benign no-op — there is simply no memory to fold into);
+2. resolves the spawner's session via `session_for_agent` → appends a markdown
+   block (title, artifacts, and the agent `wg log` breadcrumbs) to
+   `.wg/chat/<uuid>/session-summary.md`, in the first-person "your own memory"
+   voice `resolve_bound_session_summary` frames bound memory with;
+3. is **idempotent** — the block carries a per-disposable
+   `<!-- disposable-ingest:<id> -->` marker, so a re-run of `wg done` detects
+   it and leaves the file untouched (no double-append).
+
+The breadcrumbs folded in are snapshotted **before** the `Done` transition, so
+the "Task marked as done" system log entry the transition itself appends (which
+carries `actor = task.assigned`, i.e. `None` for an unassigned task) is never
+mistaken for an agent breadcrumb. Ingest is best-effort: it never fails
+`wg done` (the disposable is already Done and its outputs survive on the row
+regardless); a failure is surfaced as a warning and logged as a
+`disposable-ingest` breadcrumb on the task.
+
+### Test & regression coverage
+
+- Unit: `test_disposable_artifact_ingested_into_spawner_session` (the named
+  failing test written first) in `src/disposable_ingest.rs`, plus
+  `ingest_is_idempotent`, `non_disposable_is_not_ingested`, and
+  `disposable_without_spawner_or_binding_is_noop`. The named test also asserts
+  the ingested string is exactly what `chat_sessions::agent_session_summary`
+  (the function the spawn path injects) returns — i.e. it lands in the
+  spawner's *next-task* memory, not just on disk.
+- Smoke: `tests/smoke/scenarios/disposable_ingest.sh`, owned by
+  `disposable-ingest` in `tests/smoke/manifest.toml`. It drives the real
+  `wg agent` / `wg add --spawned-by` / `wg artifact` / `wg log` / `wg done`
+  CLI paths end-to-end: a disposable spawned by a bound "bruno" agent folds its
+  artifact + breadcrumb into bruno's session summary, the ingest appends (prior
+  memory preserved) without leaking the "Task marked as done" line, is
+  idempotent (exactly one marker after two `wg done` calls), and a disposable
+  with an unbound spawner still completes as a no-op.

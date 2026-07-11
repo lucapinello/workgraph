@@ -1004,7 +1004,37 @@ fn main() -> Result<()> {
             priority,
             cron,
             subtask,
+            spawned_by,
         } => {
+            // Disposable spawner tag: record which named agent spawned this
+            // disposable so `wg done` can fold its result into that agent's
+            // persistent session memory (docs/14 §ingest). Explicit
+            // `--spawned-by` wins; otherwise, for a `-t disposable` task created
+            // inside a task context, auto-derive the spawner from the parent
+            // task's agent. The link is stored as a `spawned-by:<agent>` tag so
+            // no Task field / construction site changes are needed.
+            let mut tag = tag;
+            if !tag.iter().any(|t| t.starts_with(worksgood::graph::SPAWNED_BY_TAG_PREFIX)) {
+                let is_disposable = tag.iter().any(|t| t == worksgood::graph::DISPOSABLE_TAG);
+                let resolved_spawner = spawned_by.clone().or_else(|| {
+                    if !is_disposable {
+                        return None;
+                    }
+                    // Auto-derive from the spawning task's agent content-hash.
+                    let parent_id = std::env::var("WG_TASK_ID").ok()?;
+                    let graph =
+                        worksgood::parser::load_graph(commands::graph_path(&workgraph_dir)).ok()?;
+                    graph.get_task(&parent_id).and_then(|p| p.agent.clone())
+                });
+                if let Some(spawner) = resolved_spawner.filter(|s| !s.trim().is_empty()) {
+                    tag.push(format!(
+                        "{}{}",
+                        worksgood::graph::SPAWNED_BY_TAG_PREFIX,
+                        spawner
+                    ));
+                }
+            }
+
             // Determine effective paused/unplaced state:
             // - --paused always pauses (user-managed draft, skips placement)
             // - --no-place: unplaced=true, paused=false (immediate dispatch)
