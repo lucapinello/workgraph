@@ -6385,6 +6385,23 @@ pub enum TelegramCommands {
     /// truncated token preview. Use this to verify multi-bot setups before
     /// starting `wg telegram listen`.
     ListBots,
+
+    /// Post a family standup: one message per named voice, in roster order
+    ///
+    /// Walks the roster (`nora, bruno, mira, otto`, then any other configured
+    /// bot) and posts each persona's family-voice check-in AS that bot,
+    /// grounded in its live graph state. This is the on-demand equivalent of
+    /// typing `/standup` in the group. Use `--dry-run` to print the posts in
+    /// roster order without sending (verifiable without a live group).
+    Standup {
+        /// Group chat ID to post to (defaults to the configured group chat)
+        #[arg(long)]
+        chat_id: Option<String>,
+
+        /// Print the posts in roster order instead of sending them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

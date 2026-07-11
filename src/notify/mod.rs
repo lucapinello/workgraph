@@ -16,6 +16,7 @@ pub mod slack;
 pub mod sms;
 pub mod telegram;
 pub mod telegram_group;
+pub mod telegram_standup;
 pub mod voice;
 pub mod webhook;
 

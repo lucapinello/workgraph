@@ -113,6 +113,29 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 }
             };
 
+            // `/standup` — the whole-team check-in. It is NOT an ordinary
+            // single-response command: it must post ONE message per named voice
+            // in roster order, each AS that bot. The single listener is the sole
+            // orchestrator, so order is guaranteed and no bot double-posts. We
+            // intercept it before the generic command parse (which does not know
+            // `/standup`) and before the human-reply classifier (which would
+            // otherwise treat the slash text as a reply). See
+            // `notify::telegram_standup` for the design rationale.
+            if worksgood::notify::telegram_standup::is_standup_command(&route_body) {
+                println!(
+                    "[{}] /standup from {} — posting roster check-in to {}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    msg.sender,
+                    reply_target,
+                );
+                if let Err(e) =
+                    run_group_standup(&workgraph_dir, &route_config, &reply_target).await
+                {
+                    eprintln!("Failed to run standup: {e}");
+                }
+                continue;
+            }
+
             // Try to parse as a command
             if let Some(cmd) = worksgood::telegram_commands::parse(&route_body) {
                 println!(
@@ -309,6 +332,100 @@ pub fn run_send(chat_id: Option<&str>, message: &str) -> Result<()> {
         println!("Message sent to chat {}", effective_chat_id);
         Ok(())
     })
+}
+
+/// Orchestrate a `/standup` in a group: post one family-voice message per named
+/// voice, in roster order, each AS that bot.
+///
+/// This is the sole orchestrator (the single listener process), so the four
+/// posts are strictly sequential and no bot double-posts. Each post is grounded
+/// in that persona's live graph state (its open / in-progress tasks). `target`
+/// is the group chat id every post is sent to. Tokens come from `config` and
+/// are used only to construct each bot's channel — never logged.
+pub async fn run_group_standup(
+    workgraph_dir: &Path,
+    config: &TelegramConfig,
+    target: &str,
+) -> Result<()> {
+    use worksgood::notify::telegram_standup as standup;
+
+    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    if roster.is_empty() {
+        eprintln!("No named bots configured — /standup has no voices to post.");
+        return Ok(());
+    }
+
+    // Load the graph once; ground every persona's report against it. A missing
+    // or unreadable graph is not fatal — the standup still runs with each voice
+    // reporting an empty plate (honest "all caught up").
+    let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
+
+    for member in &roster {
+        let (in_progress, open) = match &graph {
+            Some(g) => standup::agent_task_lines(g, member.agent_id()),
+            None => (Vec::new(), Vec::new()),
+        };
+        let post = standup::render_report(member, &in_progress, &open);
+
+        let channel = TelegramChannel::from_bot(member.bot_id.clone(), member.bot.clone());
+        match channel.send_text(target, &post.text).await {
+            Ok(_) => println!(
+                "[{}] standup: {} posted",
+                chrono::Utc::now().format("%H:%M:%S"),
+                post.bot_id,
+            ),
+            Err(e) => eprintln!("standup: {} failed to post: {e}", post.bot_id),
+        }
+    }
+    Ok(())
+}
+
+/// `wg telegram standup` — run a standup on demand (for the live demo and the
+/// scripted end-to-end test). With `--dry-run` the posts are printed to stdout
+/// in roster order instead of being sent, so the flow is verifiable without a
+/// live group or real tokens.
+pub fn run_standup(workgraph_dir: &Path, chat_id: Option<&str>, dry_run: bool) -> Result<()> {
+    use worksgood::notify::telegram_standup as standup;
+
+    let config = load_telegram_config()?;
+    let roster = standup::plan_roster(&config, standup::DEFAULT_ROSTER);
+    if roster.is_empty() {
+        anyhow::bail!("No named bots configured under [telegram.bots.*] — nothing to post.");
+    }
+
+    // Target: explicit --chat-id, else the first named bot's configured chat id
+    // (in Casa Pinello every bot shares the group chat id).
+    let target = chat_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| roster[0].bot.chat_id.clone());
+
+    if dry_run {
+        let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
+        let posts: Vec<standup::StandupPost> = roster
+            .iter()
+            .map(|member| {
+                let (in_progress, open) = match &graph {
+                    Some(g) => standup::agent_task_lines(g, member.agent_id()),
+                    None => (Vec::new(), Vec::new()),
+                };
+                standup::render_report(member, &in_progress, &open)
+            })
+            .collect();
+        println!("STANDUP DRY-RUN — {} posts (roster order):", posts.len());
+        for (i, post) in posts.iter().enumerate() {
+            println!(
+                "--- [{}] {} ({}) ---",
+                i + 1,
+                post.bot_id,
+                post.channel_type
+            );
+            println!("{}", post.text);
+        }
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    rt.block_on(async { run_group_standup(workgraph_dir, &config, &target).await })
 }
 
 /// List all configured Telegram bots — the legacy single-bot from `[telegram]`
