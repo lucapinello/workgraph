@@ -258,6 +258,7 @@ fn create_test_task() -> Task {
         after: vec![],
         requires: vec![],
         tags: vec![],
+        choices: vec![],
         skills: vec![],
         inputs: vec![],
         deliverables: vec![],

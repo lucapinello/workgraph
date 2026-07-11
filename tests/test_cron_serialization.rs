@@ -16,6 +16,7 @@ fn test_cron_task_serialization() {
         after: vec![],
         requires: vec![],
         tags: vec![],
+        choices: vec![],
         skills: vec![],
         inputs: vec![],
         deliverables: vec![],
