@@ -401,6 +401,12 @@ pub enum Commands {
         /// flag is omitted. See docs/14-disposable-lifecycle.md §ingest.
         #[arg(long, value_name = "AGENT")]
         spawned_by: Option<String>,
+
+        /// Privilege scope for the spawned agent (R8). `--scope disposable`
+        /// runs the worker with WG_SCOPE=disposable and forbids it from minting
+        /// a persistent persona (`wg agent create`, `wg add --tag persistent`).
+        #[arg(long)]
+        scope: Option<String>,
     },
 
     /// Edit an existing task

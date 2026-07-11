@@ -1045,6 +1045,7 @@ fn main() -> Result<()> {
             cron,
             subtask,
             spawned_by,
+            scope,
         } => {
             // Disposable spawner tag: record which named agent spawned this
             // disposable so `wg done` can fold its result into that agent's
@@ -1073,6 +1074,12 @@ fn main() -> Result<()> {
                         spawner
                     ));
                 }
+            }
+
+            // R8: persist an explicit --scope as a `scope:<value>` tag so the
+            // dispatcher can propagate WG_SCOPE to the spawned worker.
+            if let Some(scope_val) = scope.as_deref() {
+                tag.push(worksgood::scope_guard::scope_tag(scope_val)?);
             }
 
             // R18: assemble the task's inline-button choices from --choice
