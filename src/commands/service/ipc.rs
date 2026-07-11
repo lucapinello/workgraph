@@ -1245,6 +1245,7 @@ fn handle_add_task(
         skills: skills.to_vec(),
         inputs: vec![],
         deliverables: deliverables.to_vec(),
+        choices: vec![],
         artifacts: vec![],
         exec: None,
         timeout: None,

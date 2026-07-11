@@ -409,6 +409,7 @@ mod tests {
             skills: vec![],
             inputs: vec![],
             deliverables: vec![],
+            choices: vec![],
             artifacts: vec![],
             exec: None,
             timeout: None,

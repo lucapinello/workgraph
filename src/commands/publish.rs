@@ -673,6 +673,7 @@ Edit via `wg html publish edit` or remove via `wg html publish remove {}`.\n",
         &[],            // skills
         &[],            // inputs
         &[],            // deliverables
+        &[],            // choices
         None,           // max_retries
         None,           // model
         None,           // provider

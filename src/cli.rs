@@ -243,6 +243,18 @@ pub enum Commands {
         #[arg(long)]
         deliverable: Vec<String>,
 
+        /// Human choice offered as an inline button when this task is handed to
+        /// a person (R18). Repeatable. Format `key=Label` or just `Label` (the
+        /// key is slugified from the label). Tapping a button records its label
+        /// as the human's reply via the generic `<task>#<key>` callback routing.
+        #[arg(long = "choice")]
+        choice: Vec<String>,
+
+        /// Shorthand for the default confirmation choices `[Looks good]` /
+        /// `[Change something]` (R18). Combine with or in place of --choice.
+        #[arg(long)]
+        confirm: bool,
+
         /// Maximum number of retries allowed for this task
         #[arg(long)]
         max_retries: Option<u32>,

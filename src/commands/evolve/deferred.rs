@@ -102,6 +102,7 @@ pub(crate) fn defer_self_mutation(
         skills: vec![],
         inputs: vec![],
         deliverables: vec![],
+        choices: vec![],
         artifacts: vec![],
         exec: None,
         timeout: None,

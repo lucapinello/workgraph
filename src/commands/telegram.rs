@@ -419,7 +419,27 @@ pub fn run_status(json: bool) -> Result<()> {
 }
 
 /// Handle an action button callback.
+///
+/// R18: the generic scheme is `<task_id>#<button_key>` — the button routes back
+/// to its originating task and records the chosen option's label as the human's
+/// reply (completing the task via the human-dispatch tail). We try that FIRST so
+/// any task can declare its own buttons without the listener knowing the verbs.
+/// The legacy `<verb>:<task>` action ids (approve/claim/done/fail) remain
+/// supported as a fallback for older DMs still in a chat.
 fn handle_action(workgraph_dir: &Path, action_id: &str, sender: &str) -> String {
+    use crate::commands::service::human_dispatch::route_button_callback;
+
+    // Generic `<task_id>#<key>` routing (the R18 replacement).
+    if action_id.contains('#') {
+        return match route_button_callback(workgraph_dir, action_id, sender) {
+            Some((task_id, label)) => {
+                format!("✓ Recorded your choice \u{201c}{label}\u{201d} on task '{task_id}'.")
+            }
+            None => format!("Unknown or expired button: {action_id}"),
+        };
+    }
+
+    // Legacy `<verb>:<task>` action ids.
     let parts: Vec<&str> = action_id.splitn(2, ':').collect();
     if parts.len() != 2 {
         return format!("Unknown action: {action_id}");
@@ -942,5 +962,44 @@ mod tests {
     fn handle_action_malformed() {
         let result = handle_action(Path::new("/nonexistent"), "no-colon", "testuser");
         assert!(result.contains("Unknown action"));
+    }
+
+    /// R18: a generic `<task>#<key>` button routes back to the originating task
+    /// and records the tapped choice's label as the human's reply — the full
+    /// listener callback path, not just the parser.
+    #[test]
+    fn handle_action_generic_button_records_choice() {
+        use worksgood::graph::{Node, Status, Task, TaskChoice, WorkGraph};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(Task {
+            id: "plan-review".to_string(),
+            title: "Review the plan".to_string(),
+            status: Status::Waiting,
+            choices: TaskChoice::confirmation_pair(),
+            ..Default::default()
+        }));
+        worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
+
+        let result = handle_action(dir, "plan-review#change_something", "lucapinello");
+        assert!(
+            result.contains("Change something") && result.contains("plan-review"),
+            "ack names the chosen label and task: {result}"
+        );
+
+        let msgs = worksgood::messages::list_messages(dir, "plan-review").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, "Change something");
+    }
+
+    /// A `#`-form token for an unknown/stale button is reported, not silently
+    /// swallowed, and records nothing.
+    #[test]
+    fn handle_action_generic_button_unknown_is_reported() {
+        let result = handle_action(Path::new("/nonexistent"), "ghost#looks_good", "lucapinello");
+        assert!(result.contains("Unknown or expired button"), "{result}");
     }
 }
