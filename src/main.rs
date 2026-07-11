@@ -3643,6 +3643,12 @@ fn main() -> Result<()> {
                 &chat_id,
                 cli.json,
             ),
+            TelegramCommands::RegisterCommands => {
+                commands::telegram::run_register_commands(cli.json)
+            }
+            TelegramCommands::Command { name, today } => {
+                commands::telegram::run_command(&workgraph_dir, &name, today.as_deref(), cli.json)
+            }
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),

@@ -2039,3 +2039,12 @@ owners = [
 ]
 description = "Pins the all-bots-privacy-off responder-election contract from docs/09 §natural-group: `wg telegram elect` (the exact elect_responders decision the listener runs on a deduped message) resolves an inbound group message via Luca's ordered table — @mention (beats name), explicit addressed name, reply-chain, collective address (ALL four answer in roster order), team-directed unaddressed ask (otto coordinates), else silence for pure human-to-human small talk (including a name talking ABOUT a human, which must NOT summon the bot). Drives the real binary against a fixture Casa-Pinello notify.toml so it exercises the user-visible flow (type in the group → the right voice(s) answer or stay silent), not just the library. Also pinned by the notify::telegram_group election unit tests and the notify::telegram_dedupe race/exactly-once tests. Credential-free: election is a pure decision, nothing is sent, no live group or real tokens needed."
 timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_family_commands"
+script = "scenarios/telegram_family_commands.sh"
+owners = [
+    "family-command-set",
+]
+description = "Pins the family command set from docs/09 §commands: each command is one row of the shared table (keyword · owner · data source · compose fn) and its reply is GROUNDED in the real week plan (plans/*.md), never a placeholder, in the owning voice (docs/04). Drives the real binary via `wg telegram command <name> --today <date>` (the dry-run composer the live listener also uses): /dinner → Bruno's tonight-dish from the plan covering today (honest fallback when none does), /shopping → Otto's current-week list under store sections with phone-friendly bullets and no leaked markdown, /week → Otto's meals as weekday names + a workouts line (no raw dates), /reminders → Otto's cheerful all-caught-up on an empty graph, /help → lists every command in the table, and --json reports each command's owner (bruno for /dinner, otto for the rest) and standup's Roster kind. Also pinned by the notify::telegram_family_commands and notify::family_plan unit tests. Credential-free: the composer prints the reply instead of sending, so no live group or real tokens are needed."
+timeout_seconds = 30

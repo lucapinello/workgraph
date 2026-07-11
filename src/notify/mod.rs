@@ -9,6 +9,7 @@ pub mod discord;
 pub mod dispatch;
 #[cfg(feature = "email")]
 pub mod email;
+pub mod family_plan;
 #[cfg(feature = "matrix-lite")]
 pub mod matrix;
 pub mod push;
@@ -16,6 +17,7 @@ pub mod slack;
 pub mod sms;
 pub mod telegram;
 pub mod telegram_dedupe;
+pub mod telegram_family_commands;
 pub mod telegram_group;
 pub mod telegram_standup;
 pub mod voice;

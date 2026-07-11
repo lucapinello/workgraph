@@ -6475,6 +6475,33 @@ pub enum TelegramCommands {
         #[arg(long, default_value = "-1000000000001")]
         chat_id: String,
     },
+
+    /// Register the family command set with Telegram for autocomplete
+    ///
+    /// Calls `setMyCommands` for EVERY configured bot with the shared set
+    /// (`/dinner`, `/shopping`, `/week`, `/reminders`, `/standup`, `/help`), so
+    /// the commands autocomplete when a user types `/` in the group or a 1:1.
+    /// Every bot registers the full set (any bot can receive a `/command`; the
+    /// listener's election decides who answers). Each registration is verified
+    /// by reading the menu back with `getMyCommands`; no tokens are logged.
+    RegisterCommands,
+
+    /// Compose a family command's reply against live data, without sending
+    ///
+    /// Renders one command (`dinner`, `shopping`, `week`, `reminders`,
+    /// `standup`, `help`) from the real `plans/` + graph and prints it — the
+    /// dry-run / scripted-test entry point proving each command returns grounded
+    /// content in the owner's voice. Use `--today` to pin the date so the
+    /// "current week" / "tonight's dinner" selection is deterministic.
+    Command {
+        /// The command name, with or without the leading slash (e.g. `dinner`).
+        name: String,
+
+        /// Resolve "today" to this date (YYYY-MM-DD) instead of the system
+        /// clock, so dinner/week selection is deterministic.
+        #[arg(long)]
+        today: Option<String>,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

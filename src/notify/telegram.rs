@@ -288,6 +288,29 @@ impl TelegramChannel {
         Ok(json)
     }
 
+    /// Register this bot's slash-command menu via the Telegram `setMyCommands`
+    /// API, so the commands autocomplete when a user types `/` in any chat the
+    /// bot is in. `commands` is a list of `(name, description)` pairs — the name
+    /// is the bare command WITHOUT the leading slash (`"dinner"`), lowercase,
+    /// as the Bot API requires. Every bot registers the full shared set so any
+    /// bot can receive a `/command`; the listener's election then decides who
+    /// actually answers. Returns the raw API response (contains no token).
+    pub async fn set_my_commands(&self, commands: &[(String, String)]) -> Result<serde_json::Value> {
+        let cmds: Vec<serde_json::Value> = commands
+            .iter()
+            .map(|(name, desc)| serde_json::json!({ "command": name, "description": desc }))
+            .collect();
+        let body = serde_json::json!({ "commands": cmds });
+        self.api_call("setMyCommands", &body).await
+    }
+
+    /// Read back this bot's registered command menu via `getMyCommands` — used
+    /// to VERIFY a `set_my_commands` call landed. Returns the raw API response
+    /// (a `result` array of `{command, description}`); contains no token.
+    pub async fn get_my_commands(&self) -> Result<serde_json::Value> {
+        self.api_call("getMyCommands", &serde_json::json!({})).await
+    }
+
     /// Extract the message_id from a sendMessage response.
     fn extract_message_id(json: &serde_json::Value) -> MessageId {
         let mid = json

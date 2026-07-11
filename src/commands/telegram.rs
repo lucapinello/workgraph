@@ -6,11 +6,14 @@
 //! - `wg telegram status` - Show Telegram configuration status
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use worksgood::notify::NotificationChannel;
 use worksgood::notify::config::NotifyConfig;
+use worksgood::notify::family_plan;
 use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
+use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::telegram_group::{
     CONCIERGE_BOT, Election, NaturalRoute, SilenceReason, elect_responders, route_natural,
@@ -137,6 +140,41 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 continue;
             }
 
+            // Family command set (/dinner /shopping /week /reminders /standup
+            // /help). Commands ride ABOVE the election table: the surviving
+            // (deduped) copy is exactly-once, and a bare slash command must
+            // never be silenced as small-talk — so we resolve it here, before
+            // election. In a group the command's OWNER answers (Bruno for
+            // /dinner) regardless of which bot's queue delivered the surviving
+            // copy; in a 1:1 the bot you messaged answers. `/standup` fans out
+            // to the whole roster. See `notify::telegram_family_commands`.
+            if let Some(cmd) = worksgood::notify::telegram_family_commands::match_command(&msg.body)
+            {
+                let is_group =
+                    matches!(msg.chat_type.as_deref(), Some("group") | Some("supergroup"));
+                println!(
+                    "[{}] Command {} from {} -> {} ({})",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    cmd.keyword,
+                    msg.sender,
+                    reply_target,
+                    if is_group { "group" } else { "direct" },
+                );
+                if let Err(e) = run_family_command(
+                    &workgraph_dir,
+                    &route_config,
+                    cmd,
+                    &reply_target,
+                    is_group,
+                    &msg.channel,
+                )
+                .await
+                {
+                    eprintln!("Failed to run command {}: {e}", cmd.keyword);
+                }
+                continue;
+            }
+
             // All-bots-privacy-off responder election (layered on R17's
             // privacy-aware core + natural routing). In a private chat this is a
             // passthrough. In a group/supergroup the deduped message is resolved
@@ -206,25 +244,35 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 Election::Private => (msg.channel.clone(), msg.body.clone()),
             };
 
-            // `/standup` — the whole-team check-in. It is NOT an ordinary
-            // single-response command: it must post ONE message per named voice
-            // in roster order, each AS that bot. The single listener is the sole
-            // orchestrator, so order is guaranteed and no bot double-posts. We
-            // intercept it before the generic command parse (which does not know
-            // `/standup`) and before the human-reply classifier (which would
-            // otherwise treat the slash text as a reply). See
-            // `notify::telegram_standup` for the design rationale.
-            if worksgood::notify::telegram_standup::is_standup_command(&route_body) {
+            // Family command with a leading @mention (e.g. "@otto /shopping").
+            // The bare and `@bot`-suffixed forms were already handled before
+            // election; this catches the case where election stripped a leading
+            // mention off the front. `/standup` is one such command (whole-team
+            // check-in — one post per voice in roster order); it and the rest of
+            // the family set now flow through the SAME table. See
+            // `notify::telegram_family_commands`. Only groups reach here (a
+            // private command was resolved pre-election), so the owner answers.
+            if let Some(cmd) =
+                worksgood::notify::telegram_family_commands::match_command(&route_body)
+            {
                 println!(
-                    "[{}] /standup from {} — posting roster check-in to {}",
+                    "[{}] Command {} from {} (post-mention) -> {}",
                     chrono::Utc::now().format("%H:%M:%S"),
+                    cmd.keyword,
                     msg.sender,
                     reply_target,
                 );
-                if let Err(e) =
-                    run_group_standup(&workgraph_dir, &route_config, &reply_target).await
+                if let Err(e) = run_family_command(
+                    &workgraph_dir,
+                    &route_config,
+                    cmd,
+                    &reply_target,
+                    true,
+                    &msg.channel,
+                )
+                .await
                 {
-                    eprintln!("Failed to run standup: {e}");
+                    eprintln!("Failed to run command {}: {e}", cmd.keyword);
                 }
                 continue;
             }
@@ -700,6 +748,277 @@ pub async fn run_group_collective(
             ),
             Err(e) => eprintln!("collective: {} failed to reply: {e}", post.bot_id),
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Family command set (/dinner /shopping /week /reminders /standup /help)
+// ---------------------------------------------------------------------------
+
+/// The project root that holds `plans/`. The graph dir is `<root>/.wg`, so when
+/// `workgraph_dir` is a `.wg`/`.workgraph` subdir we step up to its parent;
+/// otherwise we treat it as the root itself.
+fn project_root(workgraph_dir: &Path) -> PathBuf {
+    match workgraph_dir.file_name().and_then(|n| n.to_str()) {
+        Some(".wg") | Some(".workgraph") => workgraph_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| workgraph_dir.to_path_buf()),
+        _ => workgraph_dir.to_path_buf(),
+    }
+}
+
+/// The set of agent ids that are human operators — the grounding for
+/// `/reminders` and `/week` pending confirmations. Mirrors the private helper
+/// in `service::human_dispatch` (kept here so the family-command path stays
+/// self-contained).
+fn human_agent_id_set(workgraph_dir: &Path) -> HashSet<String> {
+    use worksgood::agency;
+    let agents_dir = workgraph_dir.join("agency").join("cache/agents");
+    agency::load_all_agents_or_warn(&agents_dir)
+        .into_iter()
+        .filter(|a| a.is_human())
+        .map(|a| a.id)
+        .collect()
+}
+
+/// Orchestrate a single family command (`/dinner`, `/shopping`, `/week`,
+/// `/reminders`, `/help`) or the whole-roster `/standup`.
+///
+/// * **Group** — a single-reply command is composed once and sent AS the
+///   command's owner bot (Bruno for `/dinner`), regardless of which bot's queue
+///   delivered the surviving (deduped) copy. `/standup` fans out to the whole
+///   roster via [`run_group_standup`].
+/// * **1:1** — the bot the user messaged (identified by `receiving_channel`,
+///   its `channel_type`) answers directly, with the same composed content.
+///
+/// Grounding — the live graph, the roster config, and the parsed `plans/` — is
+/// loaded once and handed to the pure composer. Tokens live only on the send
+/// channel and are never logged.
+pub async fn run_family_command(
+    workgraph_dir: &Path,
+    config: &TelegramConfig,
+    cmd: &family_commands::FamilyCommand,
+    target: &str,
+    is_group: bool,
+    receiving_channel: &str,
+) -> Result<()> {
+    // `/standup` posts one message per voice — reuse the standup orchestrator so
+    // the group gets the four-voice check-in in roster order, no double-posts.
+    if cmd.kind == family_commands::CommandKind::Roster {
+        return run_group_standup(workgraph_dir, config, target).await;
+    }
+
+    let text = compose_family_reply(workgraph_dir, config, cmd);
+
+    // Which bot sends: in a group, the command's owner; in a 1:1, the bot the
+    // user actually messaged (mapped from its channel_type). Fall back to the
+    // owner, then to any configured bot, so a reply always goes out.
+    let bots = config.all_bots();
+    let want_id = if is_group {
+        cmd.owner.to_string()
+    } else {
+        receiving_channel
+            .strip_prefix("telegram:")
+            .unwrap_or(receiving_channel)
+            .to_string()
+    };
+    let chosen = bots
+        .iter()
+        .find(|(id, _)| id == &want_id)
+        .or_else(|| bots.iter().find(|(id, _)| id == cmd.owner))
+        .or_else(|| bots.first());
+    let (bot_id, bot) = match chosen {
+        Some((id, bot)) => (id.clone(), bot.clone()),
+        None => {
+            eprintln!("No Telegram bots configured — cannot answer {}.", cmd.keyword);
+            return Ok(());
+        }
+    };
+
+    let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
+    channel
+        .send_text(target, &text)
+        .await
+        .with_context(|| format!("{} failed to send {}", bot_id, cmd.keyword))?;
+    println!(
+        "[{}] {} answered by {}",
+        chrono::Utc::now().format("%H:%M:%S"),
+        cmd.keyword,
+        bot_id,
+    );
+    Ok(())
+}
+
+/// Load grounding (plans + graph + human agents) and compose a single family
+/// command's reply. Shared by the live listener and the `wg telegram command`
+/// dry-run so both render identical text. `today`/`now` come from the local
+/// clock (overridable in the dry-run via [`compose_family_reply_on`]).
+fn compose_family_reply(
+    workgraph_dir: &Path,
+    config: &TelegramConfig,
+    cmd: &family_commands::FamilyCommand,
+) -> String {
+    compose_family_reply_on(
+        workgraph_dir,
+        config,
+        cmd,
+        chrono::Local::now().date_naive(),
+        chrono::Utc::now(),
+    )
+}
+
+/// [`compose_family_reply`] with an explicit `today`/`now` (for deterministic
+/// tests and the `--today` dry-run flag).
+fn compose_family_reply_on(
+    workgraph_dir: &Path,
+    config: &TelegramConfig,
+    cmd: &family_commands::FamilyCommand,
+    today: chrono::NaiveDate,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let plans = family_plan::load_plans(&project_root(workgraph_dir));
+    let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
+    let humans = human_agent_id_set(workgraph_dir);
+    let ctx = family_commands::CommandContext {
+        graph: graph.as_ref(),
+        config,
+        plans: &plans,
+        today,
+        now,
+        human_agents: &humans,
+    };
+    family_commands::compose(cmd, &ctx)
+}
+
+/// `wg telegram register-commands` — register the shared family command set with
+/// Telegram (via `setMyCommands`) for EVERY configured bot, so the commands
+/// autocomplete when a user types `/` in the group or a 1:1. Each bot registers
+/// the full set (any bot can receive a `/command`; the listener's election
+/// decides who answers). After each `setMyCommands` we read the menu back with
+/// `getMyCommands` and report the count — verification, no tokens logged.
+pub fn run_register_commands(json: bool) -> Result<()> {
+    let notify = NotifyConfig::load(Some(Path::new(".")))
+        .context("Failed to load notification config")?
+        .context("No notify.toml found. Create one at ~/.config/workgraph/notify.toml")?;
+    let channels = TelegramChannel::all_from_notify_config(&notify)
+        .context("Failed to build Telegram channels")?;
+    if channels.is_empty() {
+        anyhow::bail!("No Telegram bots configured — nothing to register");
+    }
+
+    let cmds: Vec<(String, String)> = family_commands::FAMILY_COMMANDS
+        .iter()
+        .map(|c| (c.name().to_string(), c.description.to_string()))
+        .collect();
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    rt.block_on(async {
+        let mut summaries = Vec::new();
+        for ch in &channels {
+            ch.set_my_commands(&cmds)
+                .await
+                .with_context(|| format!("setMyCommands failed for bot {}", ch.bot_id()))?;
+            let got = ch
+                .get_my_commands()
+                .await
+                .with_context(|| format!("getMyCommands failed for bot {}", ch.bot_id()))?;
+            let registered = got
+                .get("result")
+                .and_then(|r| r.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if !json {
+                println!(
+                    "✓ {} — {} command(s) registered and verified",
+                    ch.bot_id(),
+                    registered
+                );
+            }
+            summaries.push(serde_json::json!({
+                "bot_id": ch.bot_id(),
+                "registered": registered,
+                "commands": got.get("result").cloned().unwrap_or(serde_json::Value::Null),
+            }));
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "bots": summaries,
+                    "command_set": cmds.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                }))?
+            );
+        } else {
+            println!(
+                "\nRegistered {} command(s) across {} bot(s): {}",
+                cmds.len(),
+                channels.len(),
+                cmds.iter()
+                    .map(|(n, _)| format!("/{n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `wg telegram command <name>` — compose a family command's reply against live
+/// data and print it, WITHOUT sending anything. This is the scripted-test and
+/// dry-run entry point: it proves each command returns grounded content (from
+/// the real `plans/` + graph) in the owner's voice. `--today` pins the date so
+/// the "current week" / "tonight's dinner" selection is deterministic.
+pub fn run_command(
+    workgraph_dir: &Path,
+    name: &str,
+    today: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let cmd = family_commands::match_command(name)
+        .or_else(|| family_commands::match_command(&format!("/{name}")))
+        .with_context(|| {
+            format!(
+                "unknown command '{name}' — known: {}",
+                family_commands::FAMILY_COMMANDS
+                    .iter()
+                    .map(|c| c.keyword)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        })?;
+
+    // Config is only needed for /standup's roster; tolerate its absence so the
+    // plan-grounded commands compose even without a [telegram] section.
+    let config = load_telegram_config().unwrap_or_default();
+
+    let today = match today {
+        Some(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .with_context(|| format!("invalid --today '{s}', expected YYYY-MM-DD"))?,
+        None => chrono::Local::now().date_naive(),
+    };
+    let now = today
+        .and_hms_opt(9, 0, 0)
+        .map(|dt| dt.and_utc())
+        .unwrap_or_else(chrono::Utc::now);
+
+    let text = compose_family_reply_on(workgraph_dir, &config, cmd, today, now);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "command": cmd.keyword,
+                "owner": cmd.owner,
+                "kind": format!("{:?}", cmd.kind),
+                "data_source": cmd.data_source,
+                "text": text,
+            }))?
+        );
+    } else {
+        println!("{text}");
     }
     Ok(())
 }
