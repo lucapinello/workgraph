@@ -87,9 +87,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         // Cross-bot de-duplication for all-bots-privacy-off mode. With privacy
         // off, Telegram delivers every plain group message to ALL four bots'
         // queues; the fan-out above polls all four, so the SAME physical message
-        // arrives four times. Keyed by (chat_id, message_id) — stable across
-        // every bot that received it — the first copy wins and the other three
-        // are dropped silently. See `notify::telegram_dedupe`.
+        // arrives four times. Keyed by a CONTENT FINGERPRINT
+        // (chat_id, from.id, date, hash(text)) — NOT (chat_id, message_id),
+        // because the wire shows each bot assigns the message its OWN
+        // message_id (observed 58/36/45/39 for one Luca message), so a
+        // message_id key never collides across bots and never dedupes. The
+        // fingerprint IS identical across all four deliveries, so the first
+        // copy wins and the other three are dropped silently. See
+        // `notify::telegram_dedupe`.
         let dedupe = DedupeSet::new();
 
         let workgraph_dir = dir.to_path_buf();
@@ -129,21 +134,31 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 continue;
             }
 
-            // De-duplicate first: a text message with a (chat_id, message_id)
-            // that we have already processed on another bot's queue is a
-            // duplicate delivery — drop it before it can trigger a second
-            // election. Button presses (action_id) carry no message text to
-            // route and only ever reach the one bot whose message held the
-            // button, so they are exempt.
+            // De-duplicate first: a text message whose CONTENT FINGERPRINT
+            // (chat_id, from.id, date, hash(text)) we have already processed on
+            // another bot's queue is a duplicate delivery — drop it before it
+            // can trigger a second election. We key on content, not message_id,
+            // because each bot stamps the same physical message with a
+            // different message_id (see `telegram_dedupe` docs). The fingerprint
+            // needs a chat id and a send timestamp; when the sender's numeric
+            // `from.id` is absent we fall back to the display sender (still
+            // identical across the four deliveries). A message missing chat_id
+            // or a timestamp skips dedupe and is always processed — matching the
+            // prior "None → process" contract. Button presses (action_id) carry
+            // no message text to route and only ever reach the one bot whose
+            // message held the button, so they are exempt.
             if msg.action_id.is_none() {
-                if let (Some(cid), Some(mid)) = (msg.chat_id.as_deref(), msg.message_id.as_deref())
-                {
-                    if !dedupe.first_delivery(DedupeKey::new(cid, mid)) {
+                if let (Some(cid), Some(date)) = (msg.chat_id.as_deref(), msg.sent_at) {
+                    let sender = msg.sender_id.as_deref().unwrap_or(msg.sender.as_str());
+                    let key = DedupeKey::from_content(cid, sender, date, &msg.body);
+                    if !dedupe.first_delivery(key) {
                         println!(
-                            "[{}] Duplicate group message (chat {}, msg {}) dropped — already handled",
+                            "[{}] Duplicate group message (chat {}, from {}, date {}, msg {}) dropped — already handled",
                             chrono::Utc::now().format("%H:%M:%S"),
                             cid,
-                            mid,
+                            sender,
+                            date,
+                            msg.message_id.as_deref().unwrap_or("none"),
                         );
                         continue;
                     }

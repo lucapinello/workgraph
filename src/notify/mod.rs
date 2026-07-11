@@ -117,11 +117,13 @@ pub struct IncomingMessage {
     /// If this is a reply, the original message id.
     pub reply_to: Option<MessageId>,
     /// This message's OWN transport message id (Telegram `message.message_id`),
-    /// when available. Stable across every bot that receives the same physical
-    /// group message, so `(chat_id, message_id)` is the cross-bot dedupe key the
-    /// all-bots-privacy-off listener uses to drop the 3 duplicate copies. `None`
-    /// for transports (or updates) that don't surface one — such messages skip
-    /// dedupe and are always processed. See `telegram_dedupe::DedupeSet`.
+    /// when available. NOTE: this is per-bot, NOT stable across bots — the wire
+    /// shows each of the four privacy-off bots stamps the same physical group
+    /// message with a *different* `message_id` (observed 58/36/45/39), so it is
+    /// NOT usable as a cross-bot dedupe key. Cross-bot dedupe instead uses a
+    /// content fingerprint (see `telegram_dedupe::DedupeKey`); `message_id` is
+    /// kept only for per-bot logging and reply-threading. `None` for transports
+    /// (or updates) that don't surface one.
     pub message_id: Option<String>,
     /// The id of the chat this message arrived in, when the transport exposes
     /// it (Telegram always does). Replies MUST target this chat — in a group
