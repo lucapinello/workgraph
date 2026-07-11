@@ -3602,9 +3602,11 @@ fn main() -> Result<()> {
             TelegramCommands::Listen { chat_id } => {
                 commands::telegram::run_listen(&workgraph_dir, chat_id.as_deref())
             }
-            TelegramCommands::Send { message, chat_id } => {
-                commands::telegram::run_send(chat_id.as_deref(), &message)
-            }
+            TelegramCommands::Send {
+                message,
+                chat_id,
+                dry_run,
+            } => commands::telegram::run_send(chat_id.as_deref(), &message, dry_run),
             TelegramCommands::Status => commands::telegram::run_status(cli.json),
             TelegramCommands::Poll { timeout, chat_id } => {
                 commands::telegram::run_poll(chat_id.as_deref(), timeout)

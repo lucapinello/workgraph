@@ -2048,3 +2048,12 @@ owners = [
 ]
 description = "Pins the family command set from docs/09 §commands: each command is one row of the shared table (keyword · owner · data source · compose fn) and its reply is GROUNDED in the real week plan (plans/*.md), never a placeholder, in the owning voice (docs/04). Drives the real binary via `wg telegram command <name> --today <date>` (the dry-run composer the live listener also uses): /dinner → Bruno's tonight-dish from the plan covering today (honest fallback when none does), /shopping → Otto's current-week list under store sections with phone-friendly bullets and no leaked markdown, /week → Otto's meals as weekday names + a workouts line (no raw dates), /reminders → Otto's cheerful all-caught-up on an empty graph, /help → lists every command in the table, and --json reports each command's owner (bruno for /dinner, otto for the rest) and standup's Roster kind. Also pinned by the notify::telegram_family_commands and notify::family_plan unit tests. Credential-free: the composer prints the reply instead of sending, so no live group or real tokens are needed."
 timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_send_bots_map_only"
+script = "scenarios/telegram_send_bots_map_only.sh"
+owners = [
+    "listener-reconnect",
+]
+description = "Pins the `wg telegram send` token-resolution fix from task listener-reconnect: with a bots-map-only notify.toml (no legacy top-level [telegram] bot_token) send must fall back to the first [telegram.bots.*] entry instead of slicing the empty top-level token — which produced the URL https://api.telegram.org/bot/sendMessage and a bare 404 for every send. Drives the real binary via `wg telegram send --dry-run` (resolution-only, nothing sent) and asserts the resolved API URL carries a real numeric bot id, that the empty-token bot/sendMessage 404 shape never appears, that an explicit --chat-id overrides the bot default, and that the legacy top-level bot still wins when present. Also pinned by the commands::telegram send_* unit tests. Credential-free: --dry-run resolves and prints, no live Telegram or real tokens needed."
+timeout_seconds = 30

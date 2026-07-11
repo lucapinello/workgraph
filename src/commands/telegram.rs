@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use worksgood::notify::NotificationChannel;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
-use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
+use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
 use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::telegram_group::{
@@ -456,16 +456,26 @@ fn classify_inbound_message(
 }
 
 /// Send a message to the configured Telegram chat.
-pub fn run_send(chat_id: Option<&str>, message: &str) -> Result<()> {
+pub fn run_send(chat_id: Option<&str>, message: &str, dry_run: bool) -> Result<()> {
     let config = load_telegram_config()?;
-    let effective_chat_id = chat_id
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| config.chat_id.clone());
+    let (bot_id, bot, effective_chat_id) = resolve_send_bot(&config, chat_id)?;
+
+    if dry_run {
+        // Resolution-only path: prove which bot + chat + URL a real send would
+        // use, with the token redacted. The URL host segment MUST be
+        // `bot<digits>:...` — an empty token (the old bots-map-only 404 bug)
+        // would render `bot/sendMessage`.
+        println!("[dry-run] would send via bot '{}'", bot_id);
+        println!("[dry-run] target chat: {}", effective_chat_id);
+        println!("[dry-run] api url: {}", redacted_send_url(&bot.bot_token));
+        println!("[dry-run] message: {}", message);
+        return Ok(());
+    }
 
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
 
     rt.block_on(async {
-        let channel = TelegramChannel::new(config);
+        let channel = TelegramChannel::from_bot(bot_id, bot);
         channel
             .send_text(&effective_chat_id, message)
             .await
@@ -473,6 +483,45 @@ pub fn run_send(chat_id: Option<&str>, message: &str) -> Result<()> {
         println!("Message sent to chat {}", effective_chat_id);
         Ok(())
     })
+}
+
+/// The `sendMessage` API URL a send would hit, with the token body redacted but
+/// the numeric bot id kept (so a real token renders `bot123456:REDACTED` and an
+/// unresolved/empty token renders the tell-tale `bot:REDACTED` → the 404 shape).
+fn redacted_send_url(bot_token: &str) -> String {
+    let id = bot_token.split(':').next().unwrap_or("");
+    format!("https://api.telegram.org/bot{}:REDACTED/sendMessage", id)
+}
+
+/// Resolve which bot + chat `wg telegram send` should use.
+///
+/// Prefers the legacy top-level `[telegram]` bot, falling back to the first
+/// `[telegram.bots.*]` entry. Previously `run_send` always built the channel
+/// from the top-level `bot_token`, which is EMPTY in a bots-map-only config —
+/// producing the URL `https://api.telegram.org/bot/sendMessage` and a bare 404
+/// (task `listener-reconnect`). `all_bots()` lists the legacy bot first when
+/// present, so `.next()` picks the correct default either way. The effective
+/// chat id defaults to the resolved bot's own chat when the caller passes none.
+fn resolve_send_bot(
+    config: &TelegramConfig,
+    chat_id: Option<&str>,
+) -> Result<(String, TelegramBotConfig, String)> {
+    let mut bots = config.all_bots();
+    // The legacy top-level bot (always id "default") is listed first by
+    // `all_bots` and wins when present. Otherwise pick the lexicographically-
+    // first named bot: the `bots` map is a HashMap, so a bare `.next()` would
+    // target a RANDOM bot each run — this keeps `wg telegram send` stable.
+    let (bot_id, bot) = if bots.first().map(|(id, _)| id == "default").unwrap_or(false) {
+        bots.remove(0)
+    } else {
+        bots.into_iter().min_by(|a, b| a.0.cmp(&b.0)).context(
+            "No Telegram bots configured — set [telegram] bot_token/chat_id or a [telegram.bots.*] entry",
+        )?
+    };
+    let effective_chat_id = chat_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| bot.chat_id.clone());
+    Ok((bot_id, bot, effective_chat_id))
 }
 
 /// `wg telegram route` — show how a group message would be routed to a family
@@ -1734,6 +1783,110 @@ mod tests {
         };
 
         assert_eq!(bot_banner(&config), "Bots configured: none");
+    }
+
+    #[test]
+    fn send_with_bots_map_only_resolves_a_real_token_not_404() {
+        // Regression: with a bots-map-only config the legacy top-level
+        // `bot_token` is empty, so `run_send` used to build the URL
+        // `https://api.telegram.org/bot/sendMessage` → 404. `resolve_send_bot`
+        // must fall back to the first configured bot's real token + chat.
+        let mut bots = HashMap::new();
+        bots.insert(
+            "nora".to_string(),
+            TelegramBotConfig {
+                bot_token: "111:AAA".to_string(),
+                chat_id: "1001".to_string(),
+                agent_id: Some("nora".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        let (bot_id, bot, chat) = resolve_send_bot(&config, None).unwrap();
+        assert_eq!(bot_id, "nora");
+        assert_eq!(bot.bot_token, "111:AAA", "must not slice an empty token");
+        assert!(!bot.bot_token.is_empty(), "empty token would yield a 404 URL");
+        assert_eq!(chat, "1001", "defaults to the resolved bot's own chat");
+    }
+
+    #[test]
+    fn send_with_bots_map_only_is_deterministic_lexicographically_first() {
+        // The `bots` map is a HashMap; without a deterministic pick `send`
+        // would target a random bot each run. Resolution must be stable on the
+        // lexicographically-first id ("bruno" < "nora") regardless of map order.
+        let mut bots = HashMap::new();
+        bots.insert(
+            "nora".to_string(),
+            TelegramBotConfig {
+                bot_token: "7654321:NORA".to_string(),
+                chat_id: "1".to_string(),
+                agent_id: Some("nora".to_string()),
+                username: None,
+            },
+        );
+        bots.insert(
+            "bruno".to_string(),
+            TelegramBotConfig {
+                bot_token: "1234567:BRUNO".to_string(),
+                chat_id: "2".to_string(),
+                agent_id: Some("bruno".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        // Resolve several times — the pick must never change.
+        for _ in 0..8 {
+            let (bot_id, bot, _chat) = resolve_send_bot(&config, None).unwrap();
+            assert_eq!(bot_id, "bruno", "must pick the lexicographically-first bot");
+            assert_eq!(bot.bot_token, "1234567:BRUNO");
+        }
+    }
+
+    #[test]
+    fn send_prefers_legacy_bot_and_honors_explicit_chat() {
+        // When the legacy [telegram] bot IS present it wins (all_bots lists it
+        // first), and an explicit --chat-id overrides the bot's default chat.
+        let mut bots = HashMap::new();
+        bots.insert(
+            "nora".to_string(),
+            TelegramBotConfig {
+                bot_token: "222:BBB".to_string(),
+                chat_id: "2".to_string(),
+                agent_id: Some("nora".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: "999:LEGACY".to_string(),
+            chat_id: "500".to_string(),
+            bots,
+        };
+
+        let (bot_id, bot, chat) = resolve_send_bot(&config, Some("777")).unwrap();
+        assert_eq!(bot_id, "default");
+        assert_eq!(bot.bot_token, "999:LEGACY");
+        assert_eq!(chat, "777", "explicit chat id overrides the default");
+    }
+
+    #[test]
+    fn send_with_no_bots_errors_clearly() {
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots: HashMap::new(),
+        };
+        let err = resolve_send_bot(&config, None).unwrap_err().to_string();
+        assert!(err.contains("No Telegram bots configured"), "got: {err}");
     }
 
     #[test]

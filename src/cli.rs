@@ -6360,6 +6360,13 @@ pub enum TelegramCommands {
         /// Target chat ID (uses configured chat_id if not specified)
         #[arg(long)]
         chat_id: Option<String>,
+
+        /// Resolve and print the target bot + chat + API URL (token redacted)
+        /// WITHOUT sending. Credential-free way to verify send resolution —
+        /// notably that a bots-map-only config picks a real token instead of
+        /// the empty-token `bot//sendMessage` 404.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Show Telegram configuration status

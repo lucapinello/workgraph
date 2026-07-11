@@ -198,7 +198,7 @@ impl TelegramChannel {
             bot_id,
             bot,
             channel_type,
-            client: reqwest::Client::new(),
+            client: build_poll_client(),
         }
     }
 
@@ -431,45 +431,72 @@ impl TelegramChannel {
         offset_path: Option<std::path::PathBuf>,
     ) -> tokio::task::JoinHandle<()> {
         let bot = self.bot.clone();
-        let client = self.client.clone();
+        // Reuse ONE reqwest client across every poll iteration (its clone
+        // shares the underlying connection pool). `mut` so we can REBUILD it
+        // after a sustained failure streak — see `POLL_REBUILD_AFTER`.
+        let mut client = self.client.clone();
         // Pre-compute the channel-type tag so each IncomingMessage carries
         // the bot identity ("telegram" for the legacy bot, "telegram:<id>"
         // for named ones). The awaiting-human router
         // (`commands::service::human_dispatch::route_inbound_reply`) uses this
         // to decide which open `awaiting-human` task should receive the reply.
         let channel_tag = self.channel_type.clone();
+        let bot_id = self.bot_id.clone();
 
         tokio::spawn(async move {
             let mut offset: i64 = offset_path.as_deref().map(load_offset).unwrap_or(0);
+            // Tracks the consecutive-failure streak; drives exponential backoff
+            // and the periodic client rebuild.
+            let mut backoff_state = PollBackoffState::default();
+
             loop {
-                let url = format!("https://api.telegram.org/bot{}/getUpdates", bot.bot_token);
-                let body = serde_json::json!({
-                    "offset": offset,
-                    "timeout": 30,
-                    "allowed_updates": ["message", "callback_query"],
-                });
-
-                let resp = match client.post(&url).json(&body).send().await {
-                    Ok(r) => r,
+                let updates = match get_updates_once(
+                    &client,
+                    TELEGRAM_API_BASE,
+                    &bot.bot_token,
+                    offset,
+                    POLL_TIMEOUT_SECS,
+                )
+                .await
+                {
+                    Ok(updates) => {
+                        // Recovery breadcrumb: log once when a bot starts
+                        // succeeding again after a failure streak, so an
+                        // operator can see the wedge clear without having to
+                        // notice the *absence* of error lines.
+                        if let Some(streak) = backoff_state.on_success() {
+                            eprintln!(
+                                "polling {} resumed after {} consecutive failure(s)",
+                                bot_id, streak
+                            );
+                        }
+                        updates
+                    }
                     Err(e) => {
-                        eprintln!("Telegram poll error: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let action = backoff_state.on_failure();
+                        eprintln!(
+                            "polling {} error (failure #{}, backing off {}s): {:#}",
+                            bot_id,
+                            backoff_state.consecutive_failures,
+                            action.backoff.as_secs(),
+                            e
+                        );
+                        // After a sustained streak the connection pool itself
+                        // may be wedged (half-dead sockets, a lost IPv6 path,
+                        // leaked FDs). Rebuilding drops every pooled connection
+                        // and forces fresh DNS + happy-eyeballs on the next
+                        // poll — recovering from failures a single reused
+                        // connection cannot.
+                        if action.rebuild_client {
+                            eprintln!(
+                                "polling {}: rebuilding HTTP client after {} consecutive failures",
+                                bot_id, backoff_state.consecutive_failures
+                            );
+                            client = build_poll_client();
+                        }
+                        tokio::time::sleep(action.backoff).await;
                         continue;
                     }
-                };
-
-                let json: serde_json::Value = match resp.json().await {
-                    Ok(j) => j,
-                    Err(e) => {
-                        eprintln!("Telegram parse error: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        continue;
-                    }
-                };
-
-                let updates = match json.get("result").and_then(|r| r.as_array()) {
-                    Some(arr) => arr.clone(),
-                    None => continue,
                 };
 
                 for update in &updates {
@@ -484,6 +511,16 @@ impl TelegramChannel {
                     }
 
                     if let Some(msg) = decode_update(update, &channel_tag) {
+                        // One line per handled message: which bot received a
+                        // message from whom, in which chat. Closes the earlier
+                        // observability gap where inbound traffic was invisible
+                        // in the logs until a reply was sent.
+                        eprintln!(
+                            "polling {}: handling message from {} in chat {}",
+                            bot_id,
+                            msg.sender,
+                            msg.chat_id.as_deref().unwrap_or("?")
+                        );
                         if tx.send(msg).await.is_err() {
                             return; // receiver dropped — stop polling this bot
                         }
@@ -491,6 +528,143 @@ impl TelegramChannel {
                 }
             }
         })
+    }
+}
+
+/// Telegram Bot API base URL. A constant (rather than inlined) so the
+/// resilience tests can point [`get_updates_once`] at a local mock server.
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
+/// Server-side long-poll timeout (seconds) sent to `getUpdates`. Telegram holds
+/// the request open up to this long when no update is pending, so the loop
+/// blocks cheaply instead of hot-spinning.
+const POLL_TIMEOUT_SECS: u64 = 30;
+
+/// After this many *consecutive* failed polls, drop and rebuild the reqwest
+/// client. A rebuild purges the connection pool — including any sockets stuck
+/// half-closed after an IPv6/NAT path loss — and forces fresh DNS resolution,
+/// recovering from a wedge that a single long-lived connection cannot.
+const POLL_REBUILD_AFTER: u32 = 5;
+
+/// Build the reqwest client shared by the send path and reused across every
+/// long-poll iteration.
+///
+/// Why the explicit config matters (root cause of the recurring listener wedge,
+/// task `listener-reconnect`): the poll loop long-polls `getUpdates` forever.
+/// With the default client and NO request timeout, a half-dead socket (IPv6
+/// path loss, NAT rebind) leaves the `send()` future hanging indefinitely while
+/// its file descriptor stays open; with four bots polling, blocked/leaked FDs
+/// eventually exhaust the process limit and *every* request fails until a
+/// restart. A bounded `timeout` guarantees a wedged connection errors out
+/// (freeing its FD) so the loop can back off and rebuild, and
+/// `pool_max_idle_per_host(1)` keeps exactly one warm connection per bot so we
+/// reuse — not reopen — a socket on each poll instead of leaking a fresh one.
+pub(crate) fn build_poll_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        // getUpdates long-polls up to POLL_TIMEOUT_SECS server-side; a 60s
+        // ceiling bounds a wedged socket without cutting off a healthy poll.
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(1)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()
+        // A builder failure is a TLS-backend init problem, not per-call — fall
+        // back to the default client rather than taking the whole listener down.
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Perform ONE `getUpdates` long-poll round-trip against `api_base`, returning
+/// the decoded `result` array (empty when the response carries no updates).
+/// Transport errors and non-JSON bodies propagate so the caller can apply
+/// backoff + client rebuild.
+///
+/// Extracted from [`TelegramChannel::spawn_poll`] so the FD-stability test can
+/// drive it in a tight loop against a local mock and assert the process's
+/// open-socket count stays flat across iterations.
+async fn get_updates_once(
+    client: &reqwest::Client,
+    api_base: &str,
+    bot_token: &str,
+    offset: i64,
+    timeout_secs: u64,
+) -> Result<Vec<serde_json::Value>> {
+    let url = format!("{}/bot{}/getUpdates", api_base, bot_token);
+    let body = serde_json::json!({
+        "offset": offset,
+        "timeout": timeout_secs,
+        "allowed_updates": ["message", "callback_query"],
+    });
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("getUpdates request failed")?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .context("getUpdates response was not valid JSON")?;
+    Ok(json
+        .get("result")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Exponential backoff for the poll loop: `2^(failures-1)` seconds, capped at
+/// 60s. `failures` is the count of *consecutive* failures (1 on the first), so
+/// the sequence is 1, 2, 4, 8, 16, 32, 60, 60, … A single blip costs ~1s while
+/// a sustained outage settles at one retry per minute.
+fn poll_backoff(failures: u32) -> std::time::Duration {
+    let secs = 1u64
+        .checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u64::MAX)
+        .min(60);
+    std::time::Duration::from_secs(secs)
+}
+
+/// What the poll loop should do after a failed poll.
+#[derive(Debug, PartialEq, Eq)]
+struct FailureAction {
+    /// How long to sleep before the next attempt.
+    backoff: std::time::Duration,
+    /// Whether to drop and rebuild the reqwest client before the next attempt.
+    rebuild_client: bool,
+}
+
+/// Failure-streak state for the poll loop, extracted from [`spawn_poll`] so the
+/// streak → backoff → rebuild → recovery transitions are unit-testable without
+/// touching the network. Each bot's loop owns exactly one.
+#[derive(Debug, Default)]
+struct PollBackoffState {
+    /// Number of consecutive failed polls; reset to 0 on any success.
+    consecutive_failures: u32,
+}
+
+impl PollBackoffState {
+    /// Record a successful poll. Returns `Some(streak)` — the length of the
+    /// failure streak that just ended — when recovering (so the caller can emit
+    /// the "resumed" breadcrumb), or `None` on a normal success.
+    fn on_success(&mut self) -> Option<u32> {
+        if self.consecutive_failures > 0 {
+            let streak = self.consecutive_failures;
+            self.consecutive_failures = 0;
+            Some(streak)
+        } else {
+            None
+        }
+    }
+
+    /// Record a failed poll and return the resulting backoff plus whether the
+    /// client should be rebuilt (every [`POLL_REBUILD_AFTER`] consecutive
+    /// failures).
+    fn on_failure(&mut self) -> FailureAction {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        FailureAction {
+            backoff: poll_backoff(self.consecutive_failures),
+            rebuild_client: self.consecutive_failures % POLL_REBUILD_AFTER == 0,
+        }
     }
 }
 
@@ -1041,5 +1215,275 @@ agent_id = "nora"
         let mut expected: Vec<String> = bots.iter().map(|s| s.to_string()).collect();
         expected.sort();
         assert_eq!(seen, expected, "every bot's message reached the one receiver");
+    }
+
+    // -----------------------------------------------------------------------
+    // Listener resilience: backoff / rebuild / recovery + FD stability
+    // (task `listener-reconnect`)
+    // -----------------------------------------------------------------------
+
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    #[test]
+    fn poll_backoff_grows_exponentially_and_caps_at_60s() {
+        assert_eq!(poll_backoff(1), Duration::from_secs(1));
+        assert_eq!(poll_backoff(2), Duration::from_secs(2));
+        assert_eq!(poll_backoff(3), Duration::from_secs(4));
+        assert_eq!(poll_backoff(4), Duration::from_secs(8));
+        assert_eq!(poll_backoff(5), Duration::from_secs(16));
+        assert_eq!(poll_backoff(6), Duration::from_secs(32));
+        assert_eq!(poll_backoff(7), Duration::from_secs(60), "capped at 60s");
+        assert_eq!(poll_backoff(100), Duration::from_secs(60), "huge streak stays capped");
+        // A pathological streak must never panic on the shift overflow.
+        assert_eq!(poll_backoff(u32::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn poll_state_streak_then_rebuild_then_recovery() {
+        let mut s = PollBackoffState::default();
+        // Clean start: nothing to recover, no "resumed" line.
+        assert_eq!(s.on_success(), None);
+
+        // Failures 1–4: growing backoff, no rebuild yet.
+        assert_eq!(
+            s.on_failure(),
+            FailureAction { backoff: Duration::from_secs(1), rebuild_client: false }
+        );
+        assert_eq!(
+            s.on_failure(),
+            FailureAction { backoff: Duration::from_secs(2), rebuild_client: false }
+        );
+        assert!(!s.on_failure().rebuild_client); // #3
+        assert!(!s.on_failure().rebuild_client); // #4
+
+        // Failure 5: rebuild fires (5 % POLL_REBUILD_AFTER == 0).
+        let a5 = s.on_failure();
+        assert_eq!(a5.backoff, Duration::from_secs(16));
+        assert!(a5.rebuild_client, "client rebuilds after {POLL_REBUILD_AFTER} consecutive failures");
+        assert_eq!(s.consecutive_failures, 5);
+
+        // Recovery: the ended streak length is reported, then the state resets.
+        assert_eq!(s.on_success(), Some(5));
+        assert_eq!(s.consecutive_failures, 0);
+        assert_eq!(s.on_success(), None, "already recovered — no duplicate breadcrumb");
+
+        // A fresh failure restarts the streak from 1s with no immediate rebuild.
+        let b1 = s.on_failure();
+        assert_eq!(b1.backoff, Duration::from_secs(1));
+        assert!(!b1.rebuild_client);
+    }
+
+    /// Count file descriptors open by THIS process. macOS exposes `/dev/fd`,
+    /// Linux `/proc/self/fd`; either lists one entry per open fd.
+    fn open_fd_count() -> usize {
+        for p in ["/dev/fd", "/proc/self/fd"] {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                return rd.count();
+            }
+        }
+        0
+    }
+
+    /// Read one HTTP/1.1 request (headers + Content-Length body) off `stream`,
+    /// so the keep-alive mock can serve the next request on the same socket.
+    fn drain_one_http_request(stream: &mut TcpStream) -> std::io::Result<()> {
+        let mut header = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if stream.read(&mut byte)? == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "peer closed"));
+            }
+            header.push(byte[0]);
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&header);
+        let content_length = text
+            .lines()
+            .find_map(|l| {
+                let l = l.trim();
+                let lower = l.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            stream.read_exact(&mut body)?;
+        }
+        Ok(())
+    }
+
+    /// Spin an HTTP/1.1 **keep-alive** server that answers every request on a
+    /// connection with `body`. Reusing one connection across many requests is
+    /// exactly what a non-leaking pooled client should do — the FD test relies
+    /// on this to prove the socket count stays flat.
+    fn spawn_keepalive_json_server(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                // Serve requests until the client drops the connection.
+                loop {
+                    if drain_one_http_request(&mut stream).is_err() {
+                        break;
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if stream.write_all(resp.as_bytes()).is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                }
+            }
+        });
+        base
+    }
+
+    /// Like [`spawn_keepalive_json_server`] but also counts how many distinct
+    /// TCP connections it accepts, so a test can prove the poll loop REUSES one
+    /// connection instead of opening (and leaking) a fresh one per poll.
+    fn spawn_conn_counting_server(
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let conns = std::sync::Arc::new(AtomicUsize::new(0));
+        let conns_srv = conns.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                conns_srv.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    if drain_one_http_request(&mut stream).is_err() {
+                        break;
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    if stream.write_all(resp.as_bytes()).is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                }
+            }
+        });
+        (base, conns)
+    }
+
+    /// Soak the poll round-trip for thousands of iterations against a local
+    /// mock, asserting (a) the process's open-FD count stays flat and (b) the
+    /// client opens only a HANDFUL of TCP connections total — i.e. it REUSES
+    /// one pooled connection instead of a fresh one per poll (the root cause of
+    /// the FD-exhaustion wedge). Ignored by default (thousands of round-trips);
+    /// run with `cargo test -- --ignored poll_loop_fd_and_connection_soak`.
+    #[tokio::test]
+    #[ignore = "soak: thousands of round-trips; run explicitly with --ignored"]
+    async fn poll_loop_fd_and_connection_soak() {
+        use std::sync::atomic::Ordering;
+        let (base, conns) = spawn_conn_counting_server(r#"{"ok":true,"result":[]}"#);
+        let client = build_poll_client();
+
+        // Warm up so pool + runtime FDs are established before the baseline.
+        for _ in 0..5 {
+            get_updates_once(&client, &base, "SOAKTOKEN", 0, 0).await.unwrap();
+        }
+        let baseline_fds = open_fd_count();
+        eprintln!("soak baseline: open_fds={baseline_fds}");
+
+        const ITERS: u32 = 5000;
+        let mut max_fds = baseline_fds;
+        for i in 1..=ITERS {
+            get_updates_once(&client, &base, "SOAKTOKEN", 0, 0).await.unwrap();
+            if i % 1000 == 0 {
+                let fds = open_fd_count();
+                max_fds = max_fds.max(fds);
+                eprintln!(
+                    "soak iter {i}: open_fds={fds} conns_accepted={}",
+                    conns.load(Ordering::SeqCst)
+                );
+            }
+        }
+
+        let total_conns = conns.load(Ordering::SeqCst);
+        eprintln!("soak done: baseline_fds={baseline_fds} max_fds={max_fds} total_conns={total_conns}");
+        assert!(
+            max_fds <= baseline_fds + 5,
+            "poll loop leaked FDs over {ITERS} iters: baseline={baseline_fds} max={max_fds}"
+        );
+        assert!(
+            total_conns <= 5,
+            "poll loop opened {total_conns} connections over {ITERS} polls — a reused pooled \
+             connection should open only a handful (the per-poll-connection bug is back)"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_updates_once_decodes_result_array() {
+        let base = spawn_keepalive_json_server(
+            r#"{"ok":true,"result":[{"update_id":42,"message":{"message_id":1}}]}"#,
+        );
+        let client = build_poll_client();
+        let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["update_id"].as_i64(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn get_updates_once_errors_on_non_json_body() {
+        let base = spawn_keepalive_json_server("<html>502 bad gateway</html>");
+        let client = build_poll_client();
+        let err = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await;
+        assert!(err.is_err(), "a non-JSON body must surface as an error the loop can back off on");
+    }
+
+    /// The core FD-leak regression guard: many poll iterations against a
+    /// keep-alive server must NOT grow the process's open-socket count. A
+    /// per-poll client (the old bug) opened a fresh connection every iteration
+    /// and leaked FDs until the process limit was hit; a reused pooled client
+    /// keeps the count flat.
+    #[tokio::test]
+    async fn poll_loop_does_not_leak_file_descriptors() {
+        let base = spawn_keepalive_json_server(r#"{"ok":true,"result":[]}"#);
+        let client = build_poll_client();
+
+        // Warm up so the pooled connection + runtime FDs are established before
+        // we take the baseline.
+        for _ in 0..5 {
+            let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await.unwrap();
+            assert!(updates.is_empty());
+        }
+
+        let before = open_fd_count();
+        for _ in 0..50 {
+            let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await.unwrap();
+            assert!(updates.is_empty());
+        }
+        let after = open_fd_count();
+
+        assert!(
+            after <= before + 3,
+            "poll loop leaked file descriptors: before={before} after={after} \
+             (a reused pooled connection should keep this flat; a per-poll client leaks)"
+        );
     }
 }
