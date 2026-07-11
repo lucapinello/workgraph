@@ -6575,6 +6575,68 @@ pub enum TelegramCommands {
         #[arg(long)]
         message: String,
     },
+
+    /// Append one line to a per-agent 1:1 conversation ledger (diagnostic).
+    ///
+    /// Records a turn to `<root>/.casa/threads/<human>__<agent>.jsonl` through
+    /// the EXACT `casa_ledger` writer the `wg telegram listen` process uses for
+    /// an inbound 1:1 DM (`--role human`) or a relayed agent reply (`--role
+    /// agent`). Credential-free — nothing is sent to Telegram; this is the
+    /// scripted entry point that lets a smoke test drive the real ledger writer
+    /// end-to-end without a live socket. `--role human` is idempotent on
+    /// `--src-id`. Only the eight display-safe fields are written — never a
+    /// token, chat id, or user id. See docs/15 §ledger.
+    LedgerWrite {
+        /// Project root that holds `.casa/` (the thread is created under it).
+        #[arg(long)]
+        root: PathBuf,
+
+        /// `human` (an inbound 1:1 message) or `agent` (a persona's reply).
+        #[arg(long)]
+        role: String,
+
+        /// The human thread key (e.g. `luca`; a `human-` prefix is stripped).
+        #[arg(long)]
+        human: String,
+
+        /// The agent (persona) thread key (e.g. `nora`).
+        #[arg(long)]
+        agent: String,
+
+        /// Display name for the sender (defaults to `Luca` for a human turn).
+        #[arg(long)]
+        sender: Option<String>,
+
+        /// The message text.
+        #[arg(long)]
+        text: String,
+
+        /// Opaque source-message id for durable dedupe (a Telegram message id).
+        /// Re-recording the same `--src-id` on a `--role human` turn is a no-op.
+        #[arg(long)]
+        src_id: Option<String>,
+    },
+
+    /// Print the consumed-not-composed turns in a 1:1 thread (diagnostic).
+    ///
+    /// Reports the `pendingReplies` count (human turns with no agent turn after
+    /// them) for `<root>/.casa/threads/<human>__<agent>.jsonl` — the primitive
+    /// that drives the listener's startup replay. A smoke test asserts this is 1
+    /// after a human-only write and 0 after the agent reply, proving the
+    /// exactly-once replay contract without a live session.
+    LedgerPending {
+        /// Project root that holds `.casa/`.
+        #[arg(long)]
+        root: PathBuf,
+
+        /// The human thread key (e.g. `luca`).
+        #[arg(long)]
+        human: String,
+
+        /// The agent (persona) thread key (e.g. `nora`).
+        #[arg(long)]
+        agent: String,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

@@ -6,10 +6,12 @@
 //! - `wg telegram status` - Show Telegram configuration status
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use worksgood::notify::NotificationChannel;
+use worksgood::notify::casa_ledger;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
@@ -91,6 +93,28 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         let dedupe = DedupeSet::new();
 
         let workgraph_dir = dir.to_path_buf();
+
+        // The per-agent 1:1 conversation ledger lives under the project root at
+        // `.casa/threads/<human>__<agent>.jsonl` (the Node gateway READS it; the
+        // kiosk/office render it). We are the only process holding the Telegram
+        // sockets, so we WRITE a Telegram 1:1 turn here — record the human turn
+        // BEFORE composing (durable "handled" mark) and the agent reply AFTER.
+        // Only display-safe fields are written — never a token, chat id, or user
+        // id. See `notify::casa_ledger` and docs/15 §ledger.
+        let ledger_root = project_root(&workgraph_dir);
+
+        // Startup replay of consumed-not-composed 1:1 turns (the 2026-07-11
+        // lost-reply fix on the Rust side): the offset is persisted BEFORE
+        // dispatch, so getUpdates will NOT re-deliver a message a crash ate
+        // between record-inbound and compose — the ledger is the only recovery.
+        // Spawned so a slow session turn never blocks the poll loop from
+        // starting; each pending turn is composed exactly once.
+        tokio::spawn(replay_pending_ledger(
+            workgraph_dir.clone(),
+            route_config.clone(),
+            ledger_root.clone(),
+        ));
+
         while let Some(msg) = rx.recv().await {
             // De-duplicate first: a text message with a (chat_id, message_id)
             // that we have already processed on another bot's queue is a
@@ -398,6 +422,49 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             plan.route().bot_id,
                             plan.kind_label(),
                         );
+                        // Per-agent 1:1 ledger (docs/15 §ledger). Record the
+                        // human turn DURABLY, BEFORE composing — that is the
+                        // "handled" mark, so a crash before the reply replays on
+                        // restart instead of eating the message. Only a `Direct`
+                        // (1:1) `Converse` turn (confirmed human + bound session)
+                        // is a real conversation worth a thread: a group-elected
+                        // turn belongs to the GROUP feed, and an onboarding line
+                        // to a stranger or a sessionless holding line is not a
+                        // conversation. Idempotent on srcId (the Telegram
+                        // message_id) so a re-delivered copy records at most once.
+                        let mut ledger_mirror: Option<(PathBuf, String, String)> = None;
+                        if let (
+                            convo::Entry::Direct,
+                            convo::ConversationPlan::Converse { agent_id, .. },
+                        ) = (entry, &plan)
+                        {
+                            let (human_key, human_name) =
+                                resolve_ledger_human(&workgraph_dir, &msg.sender);
+                            let path =
+                                casa_ledger::ledger_path_for(&ledger_root, &human_key, agent_id);
+                            let turn = casa_ledger::human_turn(
+                                &human_key,
+                                agent_id,
+                                &human_name,
+                                &route_body,
+                                msg.message_id.clone(),
+                                casa_ledger::now_ms(),
+                            );
+                            let rec = casa_ledger::record_inbound(&path, &turn);
+                            if rec.duplicate {
+                                // Already durably recorded in a prior run — the
+                                // startup replay owns composing its reply, so do
+                                // NOT compose again here (exactly-once guarantee).
+                                println!(
+                                    "[{}] 1:1 turn from {} already recorded (srcId dup) — startup replay owns the reply",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    msg.sender,
+                                );
+                                continue;
+                            }
+                            ledger_mirror = Some((path, human_key, agent_id.clone()));
+                        }
+
                         // Run the turn off the poll loop so waiting on one agent's
                         // session reply never blocks the next inbound message.
                         let dir_owned = workgraph_dir.clone();
@@ -412,14 +479,23 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         );
                         let timing = convo::AckTiming::from_env();
                         tokio::spawn(async move {
-                            let sink = convo::BotReplySink::new(cfg_owned);
+                            // A confirmed 1:1 turn mirrors the agent's reply into
+                            // the ledger via a decorator sink; every other turn
+                            // uses the bare bot sink (no thread write).
+                            let base = convo::BotReplySink::new(cfg_owned);
+                            let sink: Box<dyn convo::ReplySink> = match ledger_mirror {
+                                Some((path, human, agent)) => {
+                                    Box::new(LedgerReplySink::new(base, path, human, agent))
+                                }
+                                None => Box::new(base),
+                            };
                             match convo::run_conversation_turn(
                                 &dir_owned,
                                 &plan,
                                 &human_message,
                                 &request_id,
                                 timing,
-                                &sink,
+                                sink.as_ref(),
                             )
                             .await
                             {
@@ -444,6 +520,276 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
 
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Casa per-agent 1:1 conversation ledger (write side)
+// ---------------------------------------------------------------------------
+
+/// A [`ReplySink`](worksgood::notify::telegram_conversation::ReplySink) decorator
+/// that mirrors a persona's 1:1 reply into the per-agent conversation ledger as
+/// an `agent` turn, then delegates the real send to the wrapped sink.
+///
+/// The latency ack ("On it — one sec…") is deliberately NOT recorded: it is a
+/// filler line, not a conversational turn, and recording it would make the human
+/// turn look "answered" and defeat the restart-replay guarantee (the human turn
+/// would no longer be pending even though no real reply ever came). Only the
+/// actual reply is written. The ledger line carries only the eight display-safe
+/// fields — no token or chat id. A ledger-write failure is logged and swallowed
+/// so a full disk can never break the Telegram reply.
+struct LedgerReplySink {
+    inner: Box<dyn worksgood::notify::telegram_conversation::ReplySink>,
+    path: PathBuf,
+    human: String,
+    agent: String,
+}
+
+impl LedgerReplySink {
+    fn new(
+        inner: impl worksgood::notify::telegram_conversation::ReplySink + 'static,
+        path: PathBuf,
+        human: String,
+        agent: String,
+    ) -> Self {
+        Self {
+            inner: Box::new(inner),
+            path,
+            human,
+            agent,
+        }
+    }
+}
+
+#[async_trait]
+impl worksgood::notify::telegram_conversation::ReplySink for LedgerReplySink {
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
+        // Send for real first; only mirror what actually went out.
+        self.inner.send(bot_id, chat_id, text).await?;
+        if text == worksgood::notify::telegram_conversation::ack_line() {
+            return Ok(()); // the latency ack is not a conversational turn
+        }
+        let turn = casa_ledger::agent_turn(&self.human, &self.agent, text, casa_ledger::now_ms());
+        if let Err(e) = casa_ledger::append_turn(&self.path, &turn) {
+            eprintln!(
+                "[{}] casa ledger: failed to record agent reply: {e}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Resolve the ledger `(human_key, display_name)` for an inbound Telegram
+/// sender. A confirmed sender has a binding whose `agent_id` (e.g. `human-luca`)
+/// gives the thread key and whose `name` gives the display name. An unbound
+/// sender — which should never reach a `Converse` turn — falls back to the
+/// sanitized sender so a line is still well-formed.
+fn resolve_ledger_human(workgraph_dir: &Path, sender: &str) -> (String, String) {
+    use worksgood::agency::TelegramBindingMap;
+    let agency_dir = workgraph_dir.join("agency");
+    if let Ok(map) = TelegramBindingMap::load(&agency_dir) {
+        if let Some(b) = map.find_by_user(sender) {
+            return (casa_ledger::human_key(&b.agent_id), b.name.clone());
+        }
+    }
+    (casa_ledger::human_key(sender), sender.to_string())
+}
+
+/// The bot id fronting an agency agent — the reverse of `agent_for_bot`. Used by
+/// the startup replay to know which bot answers a pending 1:1 turn. Prefers a
+/// bot whose configured `agent_id` matches; falls back to a bot whose id equals
+/// the agent (the casa convention where `bot_id == persona id`).
+fn bot_for_agent(config: &TelegramConfig, agent_id: &str) -> Option<String> {
+    let bots = config.all_bots();
+    bots.iter()
+        .find(|(_, b)| b.agent_id.as_deref() == Some(agent_id))
+        .map(|(id, _)| id.clone())
+        .or_else(|| {
+            bots.iter()
+                .find(|(id, _)| id == agent_id)
+                .map(|(id, _)| id.clone())
+        })
+}
+
+/// Startup replay of consumed-not-composed 1:1 turns — the Rust side of the
+/// 2026-07-11 lost-reply fix. For each thread with pending human turns (recorded
+/// but never answered), reconstruct the reply route from the binding map (the
+/// human's 1:1 chat = their Telegram user id) plus the bot fronting the agent,
+/// then compose each pending turn EXACTLY ONCE. The reply is recorded via the
+/// same [`LedgerReplySink`], so an answered turn is no longer pending on the next
+/// restart; a turn that still times out stays pending and is retried — the
+/// intended "answered exactly once, eventually" behaviour. Neither the chat id
+/// nor the bot token is stored in the ledger (privacy), so both are
+/// reconstructed here from live config + bindings.
+async fn replay_pending_ledger(
+    workgraph_dir: PathBuf,
+    config: TelegramConfig,
+    ledger_root: PathBuf,
+) {
+    use worksgood::agency::TelegramBindingMap;
+    use worksgood::notify::telegram_conversation as convo;
+
+    let threads = casa_ledger::list_threads(&ledger_root);
+    if threads.is_empty() {
+        return;
+    }
+    let bindings = TelegramBindingMap::load(&workgraph_dir.join("agency")).ok();
+
+    for thread in threads {
+        let pending = casa_ledger::pending_replies(&thread.path);
+        if pending.is_empty() {
+            continue;
+        }
+        let chat_id = bindings.as_ref().and_then(|m| {
+            m.bindings
+                .iter()
+                .find(|b| casa_ledger::human_key(&b.agent_id) == thread.human)
+                .map(|b| b.telegram_user.clone())
+        });
+        let bot_id = bot_for_agent(&config, &thread.agent);
+        let (chat_id, bot_id) = match (chat_id, bot_id) {
+            (Some(c), Some(b)) => (c, b),
+            _ => {
+                eprintln!(
+                    "casa ledger replay: cannot resolve reply route for thread {}__{} ({} pending) — skipping",
+                    thread.human,
+                    thread.agent,
+                    pending.len(),
+                );
+                continue;
+            }
+        };
+        let route_channel = format!("telegram:{bot_id}");
+        println!(
+            "[{}] casa ledger replay: {} pending 1:1 turn(s) for {}__{} — composing",
+            chrono::Utc::now().format("%H:%M:%S"),
+            pending.len(),
+            thread.human,
+            thread.agent,
+        );
+        for turn in pending {
+            // Re-plan against live state — the sender (== chat_id == the human's
+            // Telegram user id) re-derives confirmation + the agent's session.
+            let plan = convo::plan_conversation(
+                &workgraph_dir,
+                &config,
+                &route_channel,
+                &chat_id,
+                &chat_id,
+                convo::Entry::Direct,
+            );
+            let mirror = matches!(plan, convo::ConversationPlan::Converse { .. });
+            let base = convo::BotReplySink::new(config.clone());
+            let sink: Box<dyn convo::ReplySink> = if mirror {
+                Box::new(LedgerReplySink::new(
+                    base,
+                    thread.path.clone(),
+                    thread.human.clone(),
+                    thread.agent.clone(),
+                ))
+            } else {
+                Box::new(base)
+            };
+            let request_id = format!(
+                "tg-replay-{}-{}",
+                thread.agent,
+                turn.src_id.clone().unwrap_or_else(|| turn.id.to_string()),
+            );
+            match convo::run_conversation_turn(
+                &workgraph_dir,
+                &plan,
+                &turn.text,
+                &request_id,
+                convo::AckTiming::from_env(),
+                sink.as_ref(),
+            )
+            .await
+            {
+                Ok(outcome) => println!(
+                    "[{}] casa ledger replay: {}__{} turn {} — {}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    thread.human,
+                    thread.agent,
+                    turn.id,
+                    outcome.label(),
+                ),
+                Err(e) => eprintln!(
+                    "[{}] casa ledger replay: {}__{} turn {} failed: {e}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    thread.human,
+                    thread.agent,
+                    turn.id,
+                ),
+            }
+        }
+    }
+}
+
+/// Diagnostic: append ONE line to a per-agent thread through the EXACT
+/// `casa_ledger` writer the listener uses — the scripted seam a smoke test drives
+/// against the real binary without a live socket.
+///
+/// `--role human` records an inbound turn idempotently (pass `--src-id` to
+/// exercise the dedupe); `--role agent` appends a reply. Only the eight
+/// display-safe fields are written — never a token, chat id, or user id. Prints
+/// the thread path and, for a human turn, whether it was recorded or a srcId
+/// duplicate.
+#[allow(clippy::too_many_arguments)]
+pub fn run_ledger_write(
+    root: &Path,
+    role: &str,
+    human: &str,
+    agent: &str,
+    sender: Option<&str>,
+    text: &str,
+    src_id: Option<&str>,
+) -> Result<()> {
+    let human_key = casa_ledger::human_key(human);
+    let path = casa_ledger::ledger_path_for(root, &human_key, agent);
+    match role {
+        "human" => {
+            let display = sender.unwrap_or("Luca");
+            let turn = casa_ledger::human_turn(
+                &human_key,
+                agent,
+                display,
+                text,
+                src_id.map(|s| s.to_string()),
+                casa_ledger::now_ms(),
+            );
+            let rec = casa_ledger::record_inbound(&path, &turn);
+            if rec.duplicate {
+                println!("duplicate (srcId already recorded): {}", path.display());
+            } else if rec.recorded {
+                println!("recorded human turn: {}", path.display());
+            } else {
+                anyhow::bail!("failed to record human turn to {}", path.display());
+            }
+        }
+        "agent" => {
+            let turn = casa_ledger::agent_turn(&human_key, agent, text, casa_ledger::now_ms());
+            casa_ledger::append_turn(&path, &turn)
+                .with_context(|| format!("failed to append agent turn to {}", path.display()))?;
+            println!("recorded agent turn: {}", path.display());
+        }
+        other => anyhow::bail!("--role must be 'human' or 'agent', got '{other}'"),
+    }
+    Ok(())
+}
+
+/// Diagnostic: print the count (and texts) of consumed-not-composed turns in a
+/// thread — the `pendingReplies` primitive that drives the startup replay. A
+/// smoke test asserts this is 1 after a human-only write and 0 after the agent
+/// reply, proving the exactly-once replay contract without a live session.
+pub fn run_ledger_pending(root: &Path, human: &str, agent: &str) -> Result<()> {
+    let human_key = casa_ledger::human_key(human);
+    let path = casa_ledger::ledger_path_for(root, &human_key, agent);
+    let pending = casa_ledger::pending_replies(&path);
+    println!("pending {}", pending.len());
+    for t in &pending {
+        println!("  [{}] {}", t.id, t.text);
+    }
+    Ok(())
 }
 
 /// Try to confirm a human-onboarding binding from an inbound message.
@@ -2435,5 +2781,138 @@ mod tests {
             "a hardened-auth REJECTION of a confirmed human's chat turn must fall through to \
              conversation, never be silently swallowed (pr51-auth regression)"
         );
+    }
+
+    // -- Casa per-agent ledger write side --------------------------------
+
+    /// A recording [`ReplySink`] that captures every send instead of hitting
+    /// Telegram, so the ledger decorator can be asserted without a live bot.
+    #[derive(Default)]
+    struct RecSink {
+        sent: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+    #[async_trait]
+    impl worksgood::notify::telegram_conversation::ReplySink for RecSink {
+        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((bot_id.to_string(), chat_id.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    fn cfg_with_bots(bots: &[(&str, Option<&str>)]) -> TelegramConfig {
+        let mut map = HashMap::new();
+        for (id, agent) in bots {
+            map.insert(
+                id.to_string(),
+                TelegramBotConfig {
+                    bot_token: format!("token-{id}"),
+                    chat_id: "100".to_string(),
+                    agent_id: agent.map(|a| a.to_string()),
+                    username: Some(format!("{id}_bot")),
+                },
+            );
+        }
+        TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots: map,
+        }
+    }
+
+    /// The decorator relays every send for real, but records ONLY genuine
+    /// conversational turns in the ledger — the latency ack ("On it — one sec…")
+    /// must be skipped, else the human turn would look "answered" and the
+    /// restart-replay guarantee would break.
+    #[tokio::test]
+    async fn ledger_sink_records_reply_but_skips_the_latency_ack() {
+        use worksgood::notify::telegram_conversation as convo;
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = casa_ledger::ledger_path_for(tmp.path(), "luca", "nora");
+
+        // A human turn is already on disk (recorded before composing).
+        casa_ledger::record_inbound(
+            &path,
+            &casa_ledger::human_turn("luca", "nora", "Luca", "you there?", Some("42".into()), 1),
+        );
+        assert_eq!(casa_ledger::pending_replies(&path).len(), 1);
+
+        let rec = std::sync::Arc::new(RecSink::default());
+        let sink = LedgerReplySink::new(
+            RecSinkHandle(rec.clone()),
+            path.clone(),
+            "luca".to_string(),
+            "nora".to_string(),
+        );
+
+        // The ack goes out but is NOT a conversational turn → not recorded.
+        sink.send("nora", "555", &convo::ack_line()).await.unwrap();
+        assert_eq!(
+            casa_ledger::pending_replies(&path).len(),
+            1,
+            "the ack must NOT satisfy the pending human turn"
+        );
+
+        // The real reply is recorded as an agent turn → no longer pending.
+        sink.send("nora", "555", "here at last").await.unwrap();
+        assert!(
+            casa_ledger::pending_replies(&path).is_empty(),
+            "the real reply must be recorded and clear the pending turn"
+        );
+
+        // Both sends went out for real (ack + reply); exactly one agent LINE.
+        assert_eq!(rec.sent.lock().unwrap().len(), 2, "both sends relayed");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let agent_lines = contents
+            .lines()
+            .filter(|l| l.contains("\"role\":\"agent\""))
+            .count();
+        assert_eq!(agent_lines, 1, "exactly one agent turn recorded (ack skipped)");
+        assert!(
+            contents.contains("here at last") && !contents.contains("On it"),
+            "reply recorded, ack not: {contents}"
+        );
+    }
+
+    /// A shim so a shared `Arc<RecSink>` can be moved into the decorator (which
+    /// takes ownership of its inner sink) while the test still inspects the Arc.
+    struct RecSinkHandle(std::sync::Arc<RecSink>);
+    #[async_trait]
+    impl worksgood::notify::telegram_conversation::ReplySink for RecSinkHandle {
+        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
+            self.0.send(bot_id, chat_id, text).await
+        }
+    }
+
+    #[test]
+    fn resolve_ledger_human_uses_binding_then_falls_back() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        seed_unconfirmed_binding(dir, "luca-1", "human-luca", "Luca");
+        // A bound sender → (stripped key, display name).
+        assert_eq!(
+            resolve_ledger_human(dir, "luca-1"),
+            ("luca".to_string(), "Luca".to_string())
+        );
+        // An unbound sender → sanitized fallback, no crash.
+        assert_eq!(
+            resolve_ledger_human(dir, "stranger"),
+            ("stranger".to_string(), "stranger".to_string())
+        );
+    }
+
+    #[test]
+    fn bot_for_agent_prefers_agent_id_then_bot_id() {
+        // agent_id binding wins.
+        let cfg = cfg_with_bots(&[("otto", Some("otto")), ("nora_bot", Some("nora"))]);
+        assert_eq!(bot_for_agent(&cfg, "nora").as_deref(), Some("nora_bot"));
+        // Falls back to bot_id == agent when no agent_id matches.
+        let cfg2 = cfg_with_bots(&[("nora", None)]);
+        assert_eq!(bot_for_agent(&cfg2, "nora").as_deref(), Some("nora"));
+        // Unknown agent → None.
+        assert_eq!(bot_for_agent(&cfg, "zed"), None);
     }
 }

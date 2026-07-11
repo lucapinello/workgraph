@@ -3686,6 +3686,28 @@ fn main() -> Result<()> {
                 &message,
                 cli.json,
             ),
+            TelegramCommands::LedgerWrite {
+                root,
+                role,
+                human,
+                agent,
+                sender,
+                text,
+                src_id,
+            } => commands::telegram::run_ledger_write(
+                &root,
+                &role,
+                &human,
+                &agent,
+                sender.as_deref(),
+                &text,
+                src_id.as_deref(),
+            ),
+            TelegramCommands::LedgerPending {
+                root,
+                human,
+                agent,
+            } => commands::telegram::run_ledger_pending(&root, &human, &agent),
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),
