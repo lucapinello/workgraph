@@ -3649,6 +3649,23 @@ fn main() -> Result<()> {
             TelegramCommands::Command { name, today } => {
                 commands::telegram::run_command(&workgraph_dir, &name, today.as_deref(), cli.json)
             }
+            TelegramCommands::Conversation {
+                channel,
+                chat,
+                sender,
+                message,
+                group,
+                session_reply,
+            } => commands::telegram::run_conversation_dryrun(
+                &workgraph_dir,
+                &channel,
+                &chat,
+                &sender,
+                &message,
+                group,
+                session_reply.as_deref(),
+                cli.json,
+            ),
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),

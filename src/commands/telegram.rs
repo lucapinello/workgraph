@@ -363,12 +363,82 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         }
                     }
                     InboundOutcome::Unmatched => {
-                        println!(
-                            "[{}] Message from {} (no awaiting-human task matched): {}",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                            msg.sender,
-                            msg.body
+                        // Not a command, not a button, not an onboarding YES, and
+                        // not a reply to a parked awaiting-human task — so it is a
+                        // plain conversational turn that routed to ONE agent. This
+                        // is the shared dead-end both entry points used to hit
+                        // (1:1 `Election::Private` and group `Election::One`); the
+                        // conversational composer answers it here. Awaiting-human
+                        // task routing above still wins — this only runs when it
+                        // returned Unmatched, so precedence is preserved.
+                        use worksgood::notify::telegram_conversation as convo;
+                        let entry = if matches!(
+                            msg.chat_type.as_deref(),
+                            Some("group") | Some("supergroup")
+                        ) {
+                            convo::Entry::GroupElected
+                        } else {
+                            convo::Entry::Direct
+                        };
+                        let plan = convo::plan_conversation(
+                            &workgraph_dir,
+                            &route_config,
+                            &route_channel,
+                            &reply_target,
+                            &msg.sender,
+                            entry,
                         );
+                        // Route-decision log line (no tokens): every handled
+                        // inbound is now visible, so a silent success can never
+                        // again make diagnosis hard.
+                        println!(
+                            "[{}] Conversation ({}) from {} -> {} via {} [{}]",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            entry.label(),
+                            msg.sender,
+                            plan.route().chat_id,
+                            plan.route().bot_id,
+                            plan.kind_label(),
+                        );
+                        // Run the turn off the poll loop so waiting on one agent's
+                        // session reply never blocks the next inbound message.
+                        let dir_owned = workgraph_dir.clone();
+                        let cfg_owned = route_config.clone();
+                        let human_message = route_body.clone();
+                        let sender = msg.sender.clone();
+                        let request_id = format!(
+                            "tg-{}-{}-{}",
+                            reply_target,
+                            msg.message_id.as_deref().unwrap_or("na"),
+                            sender,
+                        );
+                        let timing = convo::AckTiming::from_env();
+                        tokio::spawn(async move {
+                            let sink = convo::BotReplySink::new(cfg_owned);
+                            match convo::run_conversation_turn(
+                                &dir_owned,
+                                &plan,
+                                &human_message,
+                                &request_id,
+                                timing,
+                                &sink,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => println!(
+                                    "[{}] Conversation from {} via {} — {}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    sender,
+                                    plan.route().bot_id,
+                                    outcome.label(),
+                                ),
+                                Err(e) => eprintln!(
+                                    "[{}] Conversation turn from {} failed: {e}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    sender,
+                                ),
+                            }
+                        });
                     }
                 }
             }
@@ -1019,6 +1089,153 @@ pub fn run_command(
         );
     } else {
         println!("{text}");
+    }
+    Ok(())
+}
+
+/// `wg telegram conversation` — dry-run the conversational composer for a plain
+/// message (the 1:1 and group-name-addressed path), without a live bot.
+///
+/// Prints the route decision (which bot answers, in which chat, how it was
+/// addressed, and the plan kind) and the outbound replies the listener WOULD
+/// send — captured by a recording sink, never sent, so it is credential-free.
+///
+/// With `--session-reply <text>` it exercises the FULL persistent-session
+/// round-trip: an ephemeral session is created and bound to the addressed
+/// agent (making the plan `converse`), the human's message is written to that
+/// session's inbox, a fixture responder writes `<text>` to the outbox, and the
+/// relayed reply is captured — proving both entry points round-trip through a
+/// real session and reply in the correct chat via the correct bot.
+#[allow(clippy::too_many_arguments)]
+pub fn run_conversation_dryrun(
+    workgraph_dir: &Path,
+    channel: &str,
+    chat: &str,
+    sender: &str,
+    message: &str,
+    group: bool,
+    session_reply: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    use worksgood::notify::telegram_conversation as convo;
+
+    let config = load_telegram_config().unwrap_or_default();
+    let entry = if group {
+        convo::Entry::GroupElected
+    } else {
+        convo::Entry::Direct
+    };
+
+    // Fixture mode: bind an ephemeral session to the addressed agent so the
+    // plan resolves to `converse` and the round-trip has somewhere to land.
+    if session_reply.is_some() {
+        if let Some(agent_id) = convo::agent_for_channel(&config, channel) {
+            let uuid = worksgood::chat_sessions::create_session(
+                workgraph_dir,
+                worksgood::chat_sessions::SessionKind::Interactive,
+                &[],
+                None,
+            )?;
+            worksgood::chat_sessions::bind_agent(workgraph_dir, &agent_id, &uuid)?;
+        }
+    }
+
+    let plan = convo::plan_conversation(workgraph_dir, &config, channel, chat, sender, entry);
+
+    // Recording sink: capture every send instead of hitting the network.
+    #[derive(Clone, Default)]
+    struct DryRunSink {
+        sent: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+    #[async_trait::async_trait]
+    impl convo::ReplySink for DryRunSink {
+        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
+            self.sent.lock().unwrap().push((
+                bot_id.to_string(),
+                chat_id.to_string(),
+                text.to_string(),
+            ));
+            Ok(())
+        }
+    }
+    let sink = DryRunSink::default();
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    let outcome = rt.block_on(async {
+        // Fixture responder: when a bound session is present, echo the canned
+        // reply to the outbox as a live session would.
+        if let (Some(reply), convo::ConversationPlan::Converse { session_ref, .. }) =
+            (session_reply, &plan)
+        {
+            let dir = workgraph_dir.to_path_buf();
+            let session_ref = session_ref.clone();
+            let reply = reply.to_string();
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    let inbox = worksgood::chat::read_inbox_ref(&dir, &session_ref)
+                        .unwrap_or_default();
+                    if let Some(m) = inbox.iter().find(|m| m.role == "user") {
+                        let _ = worksgood::chat::append_outbox_ref(
+                            &dir,
+                            &session_ref,
+                            &reply,
+                            &m.request_id,
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            });
+        }
+        // Fast timing so the dry-run doesn't stall; onboarding/sessionless send
+        // immediately regardless.
+        let timing = convo::AckTiming {
+            ack_after: std::time::Duration::from_millis(50),
+            reply_timeout: std::time::Duration::from_secs(5),
+            poll: std::time::Duration::from_millis(15),
+        };
+        convo::run_conversation_turn(
+            workgraph_dir,
+            &plan,
+            message,
+            &format!("dryrun-{sender}"),
+            timing,
+            &sink,
+        )
+        .await
+    })?;
+
+    let sends = sink.sent.lock().unwrap().clone();
+    if json {
+        let sends_json: Vec<_> = sends
+            .iter()
+            .map(|(bot, chat, text)| {
+                serde_json::json!({ "bot": bot, "chat": chat, "text": text })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "entry": entry.label(),
+                "kind": plan.kind_label(),
+                "route": { "bot": plan.route().bot_id, "chat": plan.route().chat_id },
+                "outcome": outcome.label(),
+                "sends": sends_json,
+            }))?
+        );
+    } else {
+        println!(
+            "route: {} via {} in {} [{}] — {}",
+            entry.label(),
+            plan.route().bot_id,
+            plan.route().chat_id,
+            plan.kind_label(),
+            outcome.label(),
+        );
+        for (bot, chat, text) in &sends {
+            println!("  send[{bot} -> {chat}]: {text}");
+        }
     }
     Ok(())
 }
@@ -1792,5 +2009,102 @@ mod tests {
     fn handle_action_generic_button_unknown_is_reported() {
         let result = handle_action(Path::new("/nonexistent"), "ghost#looks_good", "lucapinello");
         assert!(result.contains("Unknown or expired button"), "{result}");
+    }
+
+    // ----- Precedence: awaiting-human task routing wins over conversation ----
+
+    /// Seed a confirmed human binding (so the sender is conversation-eligible).
+    fn seed_confirmed_binding(workgraph_dir: &Path, user: &str, agent: &str, name: &str) {
+        let agency_dir = workgraph_dir.join("agency");
+        let mut map = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+        let mut b = TelegramBinding::new(user, agent, name, None, ts());
+        b.confirmed = true;
+        b.confirmed_at = Some(ts());
+        map.add(b).unwrap();
+        map.save(&agency_dir).unwrap();
+    }
+
+    /// Write a human operator agent so a task assigned to it parks on HumanInput.
+    fn write_human_agent(workgraph_dir: &Path, id: &str, name: &str) {
+        use worksgood::agency::{Agent, PerformanceRecord, save_agent};
+        let agents_dir = workgraph_dir.join("agency").join("cache/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let agent = Agent {
+            id: id.to_string(),
+            role_id: "human".to_string(),
+            tradeoff_id: "default".to_string(),
+            name: name.to_string(),
+            performance: PerformanceRecord::default(),
+            lineage: Default::default(),
+            capabilities: vec![],
+            rate: None,
+            capacity: None,
+            trust_level: Default::default(),
+            contact: None,
+            executor: "shell".to_string(),
+            preferred_model: None,
+            preferred_provider: None,
+            deployment_history: vec![],
+            attractor_weight: 0.5,
+            staleness_flags: vec![],
+        };
+        save_agent(&agent, &agents_dir).unwrap();
+    }
+
+    /// A parked awaiting-human task exists AND the sender is a confirmed human.
+    /// The classifier MUST route the plain reply to the task (task wins), NOT
+    /// fall through to `Unmatched` where the conversational composer runs. This
+    /// is the precedence the composer must never override.
+    #[test]
+    fn awaiting_human_task_reply_wins_over_conversation() {
+        use worksgood::graph::{Node, Status, Task, WorkGraph};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+        seed_confirmed_binding(dir, "luca-1", "human-luca", "Luca");
+
+        // A ready task assigned to the human, parked on HumanInput and persisted.
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(Task {
+            id: "groceries".to_string(),
+            title: "groceries".to_string(),
+            status: Status::Open,
+            agent: Some("human-luca".to_string()),
+            ..Default::default()
+        }));
+        crate::commands::service::human_dispatch::park_ready_human_tasks(&mut graph, dir);
+        worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
+
+        // A plain (non-YES) message from the confirmed human.
+        let outcome = classify_inbound_message(dir, "telegram", "luca-1", "eggs, milk, bread");
+        match outcome {
+            InboundOutcome::Routed { task_id } => assert_eq!(task_id, "groceries"),
+            other => panic!("awaiting-human task must win over conversation, got {other:?}"),
+        }
+    }
+
+    /// With NO awaiting-human task, the same confirmed human's plain message is
+    /// `Unmatched` — the exact arm that dispatches the conversational composer.
+    /// This is the complement of the precedence test: conversation only runs
+    /// when task routing found nothing.
+    #[test]
+    fn plain_message_without_awaiting_task_is_unmatched_for_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+        seed_confirmed_binding(dir, "luca-1", "human-luca", "Luca");
+        // No parked task, empty graph on disk.
+        worksgood::parser::save_graph(
+            &worksgood::graph::WorkGraph::new(),
+            crate::commands::graph_path(dir),
+        )
+        .unwrap();
+
+        let outcome = classify_inbound_message(dir, "telegram", "luca-1", "hey otto, you around?");
+        assert_eq!(
+            outcome,
+            InboundOutcome::Unmatched,
+            "no awaiting task ⇒ Unmatched ⇒ conversational composer handles it"
+        );
     }
 }
