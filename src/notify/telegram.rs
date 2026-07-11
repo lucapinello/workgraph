@@ -68,6 +68,12 @@ pub struct TelegramBotConfig {
     /// no agent-specific bot matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// The bot's Telegram @username (e.g. `"bruno_chef_bot"`), WITHOUT the
+    /// leading `@`. Used to map a group @mention back to this bot (and thus
+    /// its `agent_id`) without a live `getMe` call. When `None`, group
+    /// @mention routing falls back to matching the `[telegram.bots.<id>]` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// Telegram-specific configuration parsed from the `[telegram]` section.
@@ -123,6 +129,7 @@ impl TelegramConfig {
                     bot_token: self.bot_token.clone(),
                     chat_id: self.chat_id.clone(),
                     agent_id: None,
+                    username: None,
                 },
             ));
         }
@@ -173,6 +180,7 @@ impl TelegramChannel {
                 bot_token: config.bot_token,
                 chat_id: config.chat_id,
                 agent_id: None,
+                username: None,
             },
         )
     }
@@ -436,12 +444,30 @@ impl NotificationChannel for TelegramChannel {
                             .and_then(|m| m.as_i64())
                             .map(|mid| MessageId(mid.to_string()));
 
+                        // A button press carries the chat it was pressed in so
+                        // the response goes back to that chat (group or DM).
+                        let chat_id = cb
+                            .get("message")
+                            .and_then(|m| m.get("chat"))
+                            .and_then(|c| c.get("id"))
+                            .and_then(|id| id.as_i64())
+                            .map(|id| id.to_string());
+                        let chat_type = cb
+                            .get("message")
+                            .and_then(|m| m.get("chat"))
+                            .and_then(|c| c.get("type"))
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string());
+
                         let msg = IncomingMessage {
                             channel: channel_tag.clone(),
                             sender: sender.to_string(),
                             body: action_id.clone(),
                             action_id: Some(action_id),
                             reply_to,
+                            chat_id,
+                            chat_type,
+                            mention_usernames: Vec::new(),
                         };
 
                         if tx.send(msg).await.is_err() {
@@ -470,12 +496,34 @@ impl NotificationChannel for TelegramChannel {
                             .and_then(|m| m.as_i64())
                             .map(|mid| MessageId(mid.to_string()));
 
+                        // Chat context for group @mention routing (R17): the
+                        // chat id is the reply target (in a group, the group
+                        // itself — never the bot's default chat) and the chat
+                        // type drives privacy-mode filtering downstream.
+                        let chat_id = message
+                            .get("chat")
+                            .and_then(|c| c.get("id"))
+                            .and_then(|id| id.as_i64())
+                            .map(|id| id.to_string());
+                        let chat_type = message
+                            .get("chat")
+                            .and_then(|c| c.get("type"))
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string());
+                        let mention_usernames = super::telegram_group::parse_mention_usernames(
+                            message.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+                            message.get("entities").unwrap_or(&serde_json::Value::Null),
+                        );
+
                         let msg = IncomingMessage {
                             channel: channel_tag.clone(),
                             sender: sender.to_string(),
                             body,
                             action_id: None,
                             reply_to,
+                            chat_id,
+                            chat_type,
+                            mention_usernames,
                         };
 
                         if tx.send(msg).await.is_err() {
@@ -680,6 +728,7 @@ chat_id = "456"
                 bot_token: "222:BBB".into(),
                 chat_id: "222".into(),
                 agent_id: Some("nora".into()),
+                username: None,
             },
         );
         assert_eq!(ch.channel_type(), "telegram:nora");
@@ -699,6 +748,7 @@ chat_id = "456"
                 bot_token: "111:AAA".into(),
                 chat_id: "111".into(),
                 agent_id: None,
+                username: None,
             },
         );
         assert_eq!(ch.channel_type(), "telegram");
