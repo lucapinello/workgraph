@@ -554,6 +554,61 @@ impl std::fmt::Display for SilenceReason {
     }
 }
 
+/// A concise, PII-safe, single-line summary of an [`Election`] decision for the
+/// listener's per-message observability log.
+///
+/// Exactly one such line is emitted per consumed group message — **including
+/// silence** — so "why did no bot reply?" is answerable from the logs alone
+/// (small-talk silence previously produced no line at all, making a missing
+/// reply indistinguishable from a dropped message). The format is:
+///
+/// ```text
+/// msg=<id> chat=<type> rule=<rule> target=<target>
+/// ```
+///
+/// * `rule` — which election rule fired, one of `mention` / `name` / `reply` /
+///   `otto-concierge` / `collective` / `silence:<reason>` / `private`.
+/// * `target` — the elected agent id (or `<bot_id>(unbound)` when the bot fronts
+///   no agent), `roster` for a collective address, `silence` when no one
+///   answers, or `passthrough` for a private 1:1 chat.
+///
+/// No message text and no bot tokens are ever included — the caller logs the
+/// message *id*, never its body, from this function.
+pub fn election_decision_summary(
+    msg_id: Option<&str>,
+    chat_type: Option<&str>,
+    election: &Election,
+) -> String {
+    let (rule, target): (String, String) = match election {
+        Election::Private => ("private".to_string(), "passthrough".to_string()),
+        Election::Silence(reason) => (format!("silence:{reason}"), "silence".to_string()),
+        Election::All { .. } => ("collective".to_string(), "roster".to_string()),
+        Election::One {
+            bot, addressed_by, ..
+        } => {
+            let rule = match addressed_by {
+                AddressedBy::Mention => "mention",
+                AddressedBy::Name => "name",
+                AddressedBy::ReplyChain => "reply",
+                AddressedBy::Concierge => "otto-concierge",
+            }
+            .to_string();
+            let target = bot
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| format!("{}(unbound)", bot.bot_id));
+            (rule, target)
+        }
+    };
+    format!(
+        "msg={} chat={} rule={} target={}",
+        msg_id.unwrap_or("none"),
+        chat_type.unwrap_or("none"),
+        rule,
+        target,
+    )
+}
+
 /// Lower-case whole-word set of `text` (alphanumeric runs, apostrophes kept so
 /// `y'all` survives). Used by the collective/ask heuristics.
 fn word_set(text: &str) -> std::collections::HashSet<String> {
@@ -1622,6 +1677,135 @@ mod tests {
         assert_eq!(
             addressed_name_bot("hey mira", &cfg).unwrap().agent_id.as_deref(),
             Some("mira")
+        );
+    }
+
+    // =======================================================================
+    // election_decision_summary — one PII-safe log line per election case
+    // =======================================================================
+
+    /// Run the real election and format its decision line, as the listener does.
+    fn decision(text: &str, mentions: &[&str], reply_to_bot: Option<&str>) -> String {
+        let election = elect(text, mentions, reply_to_bot);
+        election_decision_summary(Some("42"), Some("supergroup"), &election)
+    }
+
+    #[test]
+    fn decision_line_for_mention_names_agent_and_rule() {
+        // Text names nora, but bruno is @mentioned → mention rule, target bruno.
+        let line = decision(
+            "nora can you ask @bruno_casapinello_bot about dinner",
+            &["bruno_casapinello_bot"],
+            None,
+        );
+        assert_eq!(line, "msg=42 chat=supergroup rule=mention target=bruno");
+    }
+
+    #[test]
+    fn decision_line_for_name() {
+        let line = decision("nora, what's for dinner?", &[], None);
+        assert_eq!(line, "msg=42 chat=supergroup rule=name target=nora");
+    }
+
+    #[test]
+    fn decision_line_for_reply_chain() {
+        let line = decision("yes that works", &[], Some("mira_casapinello_bot"));
+        assert_eq!(line, "msg=42 chat=supergroup rule=reply target=mira");
+    }
+
+    #[test]
+    fn decision_line_for_otto_concierge() {
+        // Unaddressed team ask with otto present → otto coordinates.
+        let line = decision("can someone plan dinner?", &[], None);
+        assert_eq!(line, "msg=42 chat=supergroup rule=otto-concierge target=otto");
+    }
+
+    #[test]
+    fn decision_line_for_collective() {
+        let line = decision("hey guys, how's it going?", &[], None);
+        assert_eq!(line, "msg=42 chat=supergroup rule=collective target=roster");
+    }
+
+    #[test]
+    fn decision_line_for_silence_small_talk() {
+        // Human-to-human small talk → silence, and it STILL logs a line (this is
+        // the observability gap this task closes).
+        let line = decision("did you eat yet?", &[], None);
+        assert_eq!(
+            line,
+            "msg=42 chat=supergroup rule=silence:small-talk target=silence"
+        );
+    }
+
+    #[test]
+    fn decision_line_for_silence_no_chat_id() {
+        let election = elect_responders(Some("group"), None, "hey guys", &[], None, &casa_config());
+        let line = election_decision_summary(None, Some("group"), &election);
+        // No transport message id → "none"; reason surfaced in the rule.
+        assert_eq!(
+            line,
+            "msg=none chat=group rule=silence:no-chat-id target=silence"
+        );
+    }
+
+    #[test]
+    fn decision_line_for_silence_no_voices_configured() {
+        let cfg = cfg_with_bots(&[
+            ("nora", "-100999", Some("nora"), Some("nora_bot")),
+            ("bruno", "-100999", Some("bruno"), Some("bruno_bot")),
+        ]);
+        let election = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "can someone plan dinner?",
+            &[],
+            None,
+            &cfg,
+        );
+        let line = election_decision_summary(Some("7"), Some("supergroup"), &election);
+        assert_eq!(
+            line,
+            "msg=7 chat=supergroup rule=silence:no-voices-configured target=silence"
+        );
+    }
+
+    #[test]
+    fn decision_line_for_private_passthrough() {
+        let election =
+            elect_responders(Some("private"), Some("111"), "nora, hi", &[], None, &casa_config());
+        let line = election_decision_summary(Some("9"), Some("private"), &election);
+        assert_eq!(line, "msg=9 chat=private rule=private target=passthrough");
+    }
+
+    #[test]
+    fn decision_line_targets_bot_id_when_agent_unbound() {
+        // A bot fronting no agent falls back to "<bot_id>(unbound)" — the target
+        // is never blank, so the log always names a landing point.
+        let cfg = cfg_with_bots(&[("otto", "-100999", None, Some("otto_bot"))]);
+        let election = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "can someone help?",
+            &[],
+            None,
+            &cfg,
+        );
+        let line = election_decision_summary(Some("3"), Some("supergroup"), &election);
+        assert_eq!(
+            line,
+            "msg=3 chat=supergroup rule=otto-concierge target=otto(unbound)"
+        );
+    }
+
+    #[test]
+    fn decision_line_never_contains_message_text() {
+        // The summary takes only the message id + chat type + election — never
+        // the body — so no PII/tokens can leak into the log line.
+        let secret = "my password is hunter2 and my token is 987:ABC";
+        let line = decision(secret, &[], None);
+        assert!(
+            !line.contains("hunter2") && !line.contains("987:ABC"),
+            "decision line must not echo message text, got {line:?}"
         );
     }
 }

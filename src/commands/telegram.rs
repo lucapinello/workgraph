@@ -16,7 +16,8 @@ use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramCo
 use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::telegram_group::{
-    CONCIERGE_BOT, Election, NaturalRoute, SilenceReason, elect_responders, route_natural,
+    CONCIERGE_BOT, Election, NaturalRoute, elect_responders, election_decision_summary,
+    route_natural,
 };
 
 /// Run the Telegram listener.
@@ -192,17 +193,27 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 msg.reply_to_bot.as_deref(),
                 &route_config,
             );
+
+            // Observability: exactly ONE decision line per consumed message —
+            // which election rule fired and where it landed — emitted for EVERY
+            // case, silence included (small-talk silence previously logged
+            // nothing, so "no reply" was indistinguishable from a dropped
+            // message). PII-safe: the message id, not its text, and no tokens.
+            // See `telegram_group::election_decision_summary`.
+            println!(
+                "[{}] election {}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                election_decision_summary(
+                    msg.message_id.as_deref(),
+                    msg.chat_type.as_deref(),
+                    &election,
+                ),
+            );
+
             let (route_channel, route_body) = match election {
-                Election::Silence(reason) => {
-                    // Small-talk / no-chat-id / no-voice — bots stay quiet.
-                    if !matches!(reason, SilenceReason::SmallTalk) {
-                        println!(
-                            "[{}] Group message from {} not answered ({})",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                            msg.sender,
-                            reason,
-                        );
-                    }
+                Election::Silence(_) => {
+                    // Small-talk / no-chat-id / no-voice — bots stay quiet. The
+                    // decision line above already recorded the reason.
                     continue;
                 }
                 Election::All {
@@ -210,13 +221,8 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 } => {
                     // Collective address — the whole roster answers, briefly and
                     // in-voice, in roster order. The single listener orchestrates
-                    // the sequential sends so no bot double-posts.
-                    println!(
-                        "[{}] Collective address from {} — roster reply to {}",
-                        chrono::Utc::now().format("%H:%M:%S"),
-                        msg.sender,
-                        reply_chat,
-                    );
+                    // the sequential sends so no bot double-posts. The composed
+                    // turn logs its own compose-start + per-voice sent message_id.
                     if let Err(e) =
                         run_group_collective(&workgraph_dir, &route_config, reply_chat).await
                     {
@@ -228,16 +234,8 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     ref bot,
                     ref body,
                     ref reply_chat,
-                    addressed_by,
+                    ..
                 } => {
-                    println!(
-                        "[{}] Group message from {} elected by {} -> {} (agent {})",
-                        chrono::Utc::now().format("%H:%M:%S"),
-                        msg.sender,
-                        addressed_by,
-                        bot.bot_id,
-                        bot.agent_id.as_deref().unwrap_or("(unbound)"),
-                    );
                     debug_assert_eq!(reply_chat, &reply_target);
                     (bot.channel_type.clone(), body.clone())
                 }
@@ -869,6 +867,15 @@ pub async fn run_group_collective(
     // an honest "all quiet" line rather than a crash).
     let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
 
+    // Compose-start line for this composed turn — pairs with the per-voice sent
+    // message_id lines below so the log shows the full compose→send arc.
+    println!(
+        "[{}] compose collective -> {} ({} voice(s) in roster order)",
+        chrono::Utc::now().format("%H:%M:%S"),
+        target,
+        roster.len(),
+    );
+
     for member in &roster {
         let (in_progress, open) = match &graph {
             Some(g) => standup::agent_task_lines(g, member.agent_id()),
@@ -878,10 +885,11 @@ pub async fn run_group_collective(
 
         let channel = TelegramChannel::from_bot(member.bot_id.clone(), member.bot.clone());
         match channel.send_text(target, &post.text).await {
-            Ok(_) => println!(
-                "[{}] collective: {} replied",
+            Ok(sent) => println!(
+                "[{}] collective: {} replied (sent message_id {})",
                 chrono::Utc::now().format("%H:%M:%S"),
                 post.bot_id,
+                sent.0,
             ),
             Err(e) => eprintln!("collective: {} failed to reply: {e}", post.bot_id),
         }
