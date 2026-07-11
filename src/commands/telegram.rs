@@ -11,7 +11,10 @@ use std::path::Path;
 use worksgood::notify::NotificationChannel;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
-use worksgood::notify::telegram_group::{CONCIERGE_BOT, NaturalRoute, route_natural};
+use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
+use worksgood::notify::telegram_group::{
+    CONCIERGE_BOT, Election, NaturalRoute, SilenceReason, elect_responders, route_natural,
+};
 
 /// Run the Telegram listener.
 ///
@@ -75,8 +78,37 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
 
         let channel = &channels[reply_idx];
 
+        // Cross-bot de-duplication for all-bots-privacy-off mode. With privacy
+        // off, Telegram delivers every plain group message to ALL four bots'
+        // queues; the fan-out above polls all four, so the SAME physical message
+        // arrives four times. Keyed by (chat_id, message_id) — stable across
+        // every bot that received it — the first copy wins and the other three
+        // are dropped silently. See `notify::telegram_dedupe`.
+        let dedupe = DedupeSet::new();
+
         let workgraph_dir = dir.to_path_buf();
         while let Some(msg) = rx.recv().await {
+            // De-duplicate first: a text message with a (chat_id, message_id)
+            // that we have already processed on another bot's queue is a
+            // duplicate delivery — drop it before it can trigger a second
+            // election. Button presses (action_id) carry no message text to
+            // route and only ever reach the one bot whose message held the
+            // button, so they are exempt.
+            if msg.action_id.is_none() {
+                if let (Some(cid), Some(mid)) = (msg.chat_id.as_deref(), msg.message_id.as_deref())
+                {
+                    if !dedupe.first_delivery(DedupeKey::new(cid, mid)) {
+                        println!(
+                            "[{}] Duplicate group message (chat {}, msg {}) dropped — already handled",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            cid,
+                            mid,
+                        );
+                        continue;
+                    }
+                }
+            }
+
             // Reply target: the chat the message came from (in a group, the
             // group itself — never the bot's default DM). Falls back to the
             // configured chat when the transport didn't surface a chat id.
@@ -105,17 +137,16 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 continue;
             }
 
-            // Natural group routing (layered on R17's privacy-aware core). In a
-            // private chat this is a passthrough. In a group/supergroup the
-            // message is routed to a family voice by, in order: an explicit
-            // @mention, the first family name in the text, the bot a reply is
-            // threaded onto, and finally the concierge (otto) when no one is
-            // named. The reply always goes back to the group, and the target
-            // bot's channel type is what the downstream 1:1 router lands on.
-            // This assumes the listening (concierge) bot runs with Telegram
-            // privacy mode OFF so plain chatter reaches it — see docs/09
-            // §natural-group.
-            let route = route_natural(
+            // All-bots-privacy-off responder election (layered on R17's
+            // privacy-aware core + natural routing). In a private chat this is a
+            // passthrough. In a group/supergroup the deduped message is resolved
+            // to responder(s) by Luca's ordered table: @mention, addressed name,
+            // reply-chain, collective-address (ALL four answer), team-directed
+            // unaddressed ask (otto coordinates), else silence. Replies always go
+            // back to the group. This assumes every bot runs with Telegram
+            // privacy mode OFF so plain chatter reaches the listener — see
+            // docs/09 §natural-group.
+            let election = elect_responders(
                 msg.chat_type.as_deref(),
                 msg.chat_id.as_deref(),
                 &msg.body,
@@ -123,23 +154,46 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 msg.reply_to_bot.as_deref(),
                 &route_config,
             );
-            let (route_channel, route_body) = match route {
-                NaturalRoute::Drop => {
-                    println!(
-                        "[{}] Group message from {} dropped (no chat id / no voice to route to)",
-                        chrono::Utc::now().format("%H:%M:%S"),
-                        msg.sender,
-                    );
+            let (route_channel, route_body) = match election {
+                Election::Silence(reason) => {
+                    // Small-talk / no-chat-id / no-voice — bots stay quiet.
+                    if !matches!(reason, SilenceReason::SmallTalk) {
+                        println!(
+                            "[{}] Group message from {} not answered ({})",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            msg.sender,
+                            reason,
+                        );
+                    }
                     continue;
                 }
-                NaturalRoute::ToBot {
+                Election::All {
+                    ref reply_chat, ..
+                } => {
+                    // Collective address — the whole roster answers, briefly and
+                    // in-voice, in roster order. The single listener orchestrates
+                    // the sequential sends so no bot double-posts.
+                    println!(
+                        "[{}] Collective address from {} — roster reply to {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        msg.sender,
+                        reply_chat,
+                    );
+                    if let Err(e) =
+                        run_group_collective(&workgraph_dir, &route_config, reply_chat).await
+                    {
+                        eprintln!("Failed to run collective reply: {e}");
+                    }
+                    continue;
+                }
+                Election::One {
                     ref bot,
                     ref body,
                     ref reply_chat,
                     addressed_by,
                 } => {
                     println!(
-                        "[{}] Group message from {} routed by {} -> {} (agent {})",
+                        "[{}] Group message from {} elected by {} -> {} (agent {})",
                         chrono::Utc::now().format("%H:%M:%S"),
                         msg.sender,
                         addressed_by,
@@ -149,7 +203,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     debug_assert_eq!(reply_chat, &reply_target);
                     (bot.channel_type.clone(), body.clone())
                 }
-                NaturalRoute::Private => (msg.channel.clone(), msg.body.clone()),
+                Election::Private => (msg.channel.clone(), msg.body.clone()),
             };
 
             // `/standup` — the whole-team check-in. It is NOT an ordinary
@@ -457,6 +511,107 @@ pub fn run_route(
     Ok(())
 }
 
+/// `wg telegram elect` — show who would respond to a group message in
+/// all-bots-privacy-off mode, without sending anything.
+///
+/// Runs the exact [`elect_responders`] decision the listener uses on a deduped
+/// message and prints the outcome: `mention` / `name` / `reply-chain` route to
+/// one voice, `collective` fans out to the whole roster, `otto` coordinates a
+/// team-directed ask, and `silence` means the bots stay out. Mentions are
+/// approximated from any `@handle` tokens (the live listener reads Telegram
+/// entities). See docs/09 §natural-group.
+pub fn run_elect(
+    message: &str,
+    reply_to_bot: Option<&str>,
+    chat_type: &str,
+    chat_id: &str,
+    json: bool,
+) -> Result<()> {
+    let config = load_telegram_config()?;
+
+    let mention_usernames: Vec<String> = message
+        .split_whitespace()
+        .filter(|t| t.starts_with('@'))
+        .map(|t| t.trim_start_matches('@').to_ascii_lowercase())
+        .collect();
+
+    let election = elect_responders(
+        Some(chat_type),
+        Some(chat_id),
+        message,
+        &mention_usernames,
+        reply_to_bot,
+        &config,
+    );
+
+    // (kind, who, addressed_by, body) — `who` is the elected agent for the
+    // single-voice arms, the roster for `collective`, none for silence/private.
+    let (kind, who, addressed_by, body): (&str, Option<String>, Option<String>, String) =
+        match &election {
+            Election::Private => ("private", None, None, message.to_string()),
+            Election::Silence(reason) => ("silence", None, Some(reason.to_string()), message.to_string()),
+            Election::All { body, .. } => {
+                let roster = worksgood::notify::telegram_standup::plan_roster(
+                    &config,
+                    worksgood::notify::telegram_standup::DEFAULT_ROSTER,
+                )
+                .into_iter()
+                .map(|m| m.bot_id)
+                .collect::<Vec<_>>()
+                .join(", ");
+                ("collective", Some(roster), None, body.clone())
+            }
+            Election::One {
+                bot,
+                body,
+                addressed_by,
+                ..
+            } => {
+                let is_standup = worksgood::notify::telegram_standup::is_standup_command(body);
+                let kind = if is_standup { "standup" } else { "agent" };
+                (
+                    kind,
+                    bot.agent_id.clone().or_else(|| Some(bot.bot_id.clone())),
+                    Some(addressed_by.to_string()),
+                    body.clone(),
+                )
+            }
+        };
+
+    if json {
+        let out = serde_json::json!({
+            "kind": kind,
+            "who": who,
+            "addressed_by": addressed_by,
+            "body": body,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    match kind {
+        "private" => println!("private chat — 1:1 passthrough (not group-routed)"),
+        "silence" => println!(
+            "silence ({}) — no one responds",
+            addressed_by.as_deref().unwrap_or("?")
+        ),
+        "collective" => println!(
+            "collective address — the whole roster answers in order: {}",
+            who.as_deref().unwrap_or("(none configured)")
+        ),
+        "standup" => {
+            println!("/standup — intercepted; posts the whole roster (nora, bruno, mira, otto)")
+        }
+        _ => println!(
+            "answered by {} (by {}): {}",
+            who.as_deref().unwrap_or("(unbound)"),
+            addressed_by.as_deref().unwrap_or("?"),
+            body,
+        ),
+    }
+    Ok(())
+}
+
 /// Orchestrate a `/standup` in a group: post one family-voice message per named
 /// voice, in roster order, each AS that bot.
 ///
@@ -498,6 +653,52 @@ pub async fn run_group_standup(
                 post.bot_id,
             ),
             Err(e) => eprintln!("standup: {} failed to post: {e}", post.bot_id),
+        }
+    }
+    Ok(())
+}
+
+/// Orchestrate a **collective-address reply** (election rule d): post one brief
+/// in-voice hello per named voice, in roster order, each AS that bot and each
+/// grounded in that persona's live graph state.
+///
+/// This is the conversational sibling of [`run_group_standup`] — same sole
+/// orchestrator (the single listener), same strict roster order, same
+/// no-double-post guarantee — but the bodies answer a greeting rather than file
+/// a status report (see `telegram_standup::render_conversational`). `target` is
+/// the group chat id every reply is sent to.
+pub async fn run_group_collective(
+    workgraph_dir: &Path,
+    config: &TelegramConfig,
+    target: &str,
+) -> Result<()> {
+    use worksgood::notify::telegram_standup as standup;
+
+    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    if roster.is_empty() {
+        eprintln!("No named bots configured — collective reply has no voices to post.");
+        return Ok(());
+    }
+
+    // Ground every voice against the live graph (missing graph → empty plate,
+    // an honest "all quiet" line rather than a crash).
+    let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
+
+    for member in &roster {
+        let (in_progress, open) = match &graph {
+            Some(g) => standup::agent_task_lines(g, member.agent_id()),
+            None => (Vec::new(), Vec::new()),
+        };
+        let post = standup::render_conversational(member, &in_progress, &open);
+
+        let channel = TelegramChannel::from_bot(member.bot_id.clone(), member.bot.clone());
+        match channel.send_text(target, &post.text).await {
+            Ok(_) => println!(
+                "[{}] collective: {} replied",
+                chrono::Utc::now().format("%H:%M:%S"),
+                post.bot_id,
+            ),
+            Err(e) => eprintln!("collective: {} failed to reply: {e}", post.bot_id),
         }
     }
     Ok(())
@@ -905,6 +1106,7 @@ async fn poll_once(
                     body: action_id.clone(),
                     action_id: Some(action_id),
                     reply_to,
+                    message_id: None,
                     chat_id,
                     chat_type: None,
                     mention_usernames: Vec::new(),
@@ -942,6 +1144,11 @@ async fn poll_once(
                     .and_then(|m| m.as_i64())
                     .map(|mid| worksgood::notify::MessageId(mid.to_string()));
 
+                let message_id = message
+                    .get("message_id")
+                    .and_then(|m| m.as_i64())
+                    .map(|m| m.to_string());
+
                 let chat_type = message
                     .get("chat")
                     .and_then(|c| c.get("type"))
@@ -960,6 +1167,7 @@ async fn poll_once(
                     body,
                     action_id: None,
                     reply_to,
+                    message_id,
                     chat_id: chat_id.clone(),
                     chat_type,
                     mention_usernames,

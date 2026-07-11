@@ -405,6 +405,376 @@ pub fn route_natural(
     NaturalRoute::Drop
 }
 
+// ===========================================================================
+// All-bots-privacy-off responder election
+// ===========================================================================
+//
+// When ALL four bots run with BotFather privacy OFF, every plain group message
+// reaches every bot. After cross-bot dedupe (`telegram_dedupe`) leaves exactly
+// one copy, [`elect_responders`] decides WHO answers, via Luca's confirmed
+// ordered table:
+//
+//   b. @botusername mention          -> that bot          (mention beats name)
+//   a. explicit agent name in text   -> that agent
+//   c. reply to a bot's message      -> that agent        (conversation continuity)
+//   d. COLLECTIVE address            -> ALL FOUR respond   (roster order)
+//   e. team-directed unaddressed ask -> OTTO (coordinator)
+//   f. pure human-to-human small talk-> SILENCE
+//
+// Precedence is most-explicit-first: a single named/mentioned/replied target
+// beats a collective trigger (addressing one person is more specific than "hey
+// guys"); the d/e/f boundary is heuristic and documented on each helper. When
+// unsure between e and f we prefer f (silence) — a missed summon is better than
+// a chatty bot.
+
+/// Collective-address triggers: phrases that address the whole family at once
+/// ("hey guys", "everyone", "ciao a tutti"). Case-insensitive. Multi-word
+/// entries are matched as substrings; single-word entries are matched as whole
+/// words (so `"team"` fires on "hey team" but not on "teamwork"). Tunable — add
+/// or remove greetings here to adjust how broadcast is detected.
+pub const COLLECTIVE_TRIGGERS: &[&str] = &[
+    // English greetings to the group (multi-word: substring-matched)
+    "hey guys",
+    "hi guys",
+    "hello guys",
+    "hey everyone",
+    "hi everyone",
+    "hello everyone",
+    "hey all",
+    "hi all",
+    "hello all",
+    "hey team",
+    "hi team",
+    "hello team",
+    "hey folks",
+    "hi folks",
+    // single-word (whole-word) collective addresses. Kept deliberately tight —
+    // bare "guys"/"folks"/"you all" appear too often in affectionate small talk
+    // ("love you all", "those guys") to be reliable broadcast signals, so they
+    // are excluded; prefer silence over a false four-way reply.
+    "everyone",
+    "everybody",
+    "team",
+    // Italian
+    "ciao ragazzi",
+    "ciao ragazza",
+    "ciao a tutti",
+    "a tutti",
+    "ragazzi",
+];
+
+/// Interjections/verbs that, immediately before a family name, mark it as an
+/// *address* rather than narrative mention ("tell bruno", "hey nora"). Tunable.
+pub const ADDRESSING_CUES: &[&str] = &[
+    "tell", "ask", "hey", "hi", "hello", "get", "ping", "summon", "call", "tag",
+    "notify", "remind", "yo", "ciao",
+];
+
+/// Words that, immediately AFTER a leading family name, signal it is a vocative
+/// opening a request/question ("nora **can** you…", "mira **what's** for
+/// dinner"). This lets a leading name with no comma still count as an address,
+/// while a leading name followed by an ordinary preposition/verb
+/// ("nora **from** work said hi") does NOT — the cheap fix for the
+/// name-about-a-human false positive. Tunable.
+pub const ADDRESS_FOLLOWERS: &[&str] = &[
+    "can", "could", "would", "will", "please", "pls", "plz", "what", "what's",
+    "whats", "when", "where", "why", "how", "do", "does", "did", "are", "is",
+    "you", "u", "help", "we", "let's", "lets", "i'm", "im",
+];
+
+/// Indefinite-agent words that ask "someone in the group" rather than a named
+/// person — a strong signal a request is team-directed ("can *someone* …").
+pub const INDEFINITE_AGENTS: &[&str] = &["someone", "somebody", "anyone", "anybody"];
+
+/// Household/planning domain keywords. A question or request touching one of
+/// these is plausibly *for the team* (the concierge) rather than idle chatter.
+/// Tunable — this is the heart of the e-vs-f (ask-vs-small-talk) boundary.
+pub const DOMAIN_KEYWORDS: &[&str] = &[
+    "dinner", "lunch", "breakfast", "meal", "meals", "cook", "cooking", "recipe",
+    "recipes", "grocery", "groceries", "shopping", "shop", "fridge", "pantry",
+    "plan", "planning", "schedule", "scheduling", "calendar", "remind", "reminder",
+    "reminders", "book", "booking", "appointment", "appointments", "week",
+    "weekend", "workout", "workouts", "exercise", "gym", "training", "chore",
+    "chores", "clean", "cleaning", "budget", "todo", "task", "tasks", "errand",
+    "errands", "dishes", "laundry",
+];
+
+/// Sentence-lead phrases that mark a request aimed at the group ("can we …",
+/// "let's …", "who can …") rather than a specific person.
+pub const REQUEST_LEADS: &[&str] = &[
+    "can we", "could we", "should we", "shall we", "let's", "lets ", "we need",
+    "we should", "who can", "who could", "who wants", "can someone", "can somebody",
+    "could someone", "could somebody", "can anyone", "does anyone", "is anyone",
+];
+
+/// Who should respond to a de-duplicated inbound group message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Election {
+    /// A private (1:1) chat — not a group. Fall through to existing 1:1 handling.
+    Private,
+    /// No one responds. Either there is nothing to reply to, or the message is
+    /// family small-talk that bots deliberately stay out of. Carries the reason
+    /// for logging/tests.
+    Silence(SilenceReason),
+    /// Exactly one family voice answers — an @mention, an addressed name, a
+    /// reply-chain, or otto acting as the group coordinator for an unaddressed
+    /// ask. `addressed_by` records which rule fired.
+    One {
+        bot: ResolvedBot,
+        reply_chat: String,
+        body: String,
+        addressed_by: AddressedBy,
+    },
+    /// A collective address — the WHOLE roster answers, each briefly and
+    /// in-voice, in roster order. The caller composes the per-voice replies
+    /// (reusing the standup composition path, conversationally). If no named
+    /// voices are configured the caller should treat this as silence.
+    All { reply_chat: String, body: String },
+}
+
+/// Why an [`Election`] resolved to silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SilenceReason {
+    /// The update carried no usable chat id — nothing to reply to.
+    NoChatId,
+    /// Family small-talk with no team address and no ask — bots stay quiet.
+    SmallTalk,
+    /// The message was team-directed but the concierge voice isn't configured.
+    NoVoicesConfigured,
+}
+
+impl std::fmt::Display for SilenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SilenceReason::NoChatId => "no-chat-id",
+            SilenceReason::SmallTalk => "small-talk",
+            SilenceReason::NoVoicesConfigured => "no-voices-configured",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Lower-case whole-word set of `text` (alphanumeric runs, apostrophes kept so
+/// `y'all` survives). Used by the collective/ask heuristics.
+fn word_set(text: &str) -> std::collections::HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+        .collect()
+}
+
+/// True if `text` collectively addresses the family (see [`COLLECTIVE_TRIGGERS`]).
+///
+/// Multi-word triggers match as a case-insensitive substring; single-word
+/// triggers match only as a whole word, so "teamwork" or "everyone's" tokens
+/// don't over-fire. (Note `y'all` is kept intact by the tokenizer.)
+pub fn is_collective_address(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let words = word_set(text);
+    for trig in COLLECTIVE_TRIGGERS {
+        if trig.contains(' ') {
+            if lower.contains(trig) {
+                return true;
+            }
+        } else if words.contains(*trig) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Find the first family name in `text` that is used to *address* an agent
+/// (not merely mentioned in passing) and resolve it to a configured bot.
+///
+/// A bare family name only counts when it is in an addressing position:
+/// * a leading vocative — the first word, followed by `,` `:` `!` `?` `-` `;`
+///   `.`, or the whole message ("nora, …" / "nora");
+/// * a trailing vocative — the last word, with a comma on the preceding token
+///   ("what's for dinner, nora?");
+/// * immediately after an addressing cue ("tell bruno …", "hey nora").
+///
+/// This deliberately does NOT match a name buried mid-sentence, so
+/// "**nora** from work said hi" (talking *about* a human named Nora) does not
+/// summon the Nora bot. **Known limitation:** the heuristic keys on position and
+/// cue words, not meaning — "hey nora" from one human to another human also
+/// named Nora would still route to the bot. This is accepted as cheap-and-good;
+/// the escape hatch is that a real summon almost always uses a comma or a cue,
+/// and when in doubt the family can @mention. See docs/09 §natural-group.
+pub fn addressed_name_bot(text: &str, config: &TelegramConfig) -> Option<ResolvedBot> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for (i, raw) in words.iter().enumerate() {
+        // Strip leading noise (keep '@' and '_' so handles survive), then take
+        // the bare word and remember the punctuation that trailed it.
+        let lead_trimmed =
+            raw.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '@');
+        let word = lead_trimmed.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        if word.is_empty() {
+            continue;
+        }
+        let bot = match resolve_mentioned_bot(word, config) {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let trailing = &lead_trimmed[word.len()..];
+        let vocative_punct = trailing.starts_with([',', ':', '!', '?', '-', ';', '.']);
+        let is_first = i == 0;
+        let is_last = i + 1 == words.len();
+        let prev = if i > 0 { Some(words[i - 1]) } else { None };
+        let prev_word = prev
+            .map(|p| {
+                p.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        let prev_is_cue = ADDRESSING_CUES.contains(&prev_word.as_str());
+        let prev_ends_comma = prev.map(|p| p.trim_end().ends_with(',')).unwrap_or(false);
+        // The word after the name (cleaned), for the leading-vocative-without-
+        // comma case ("nora can you …").
+        let next_word = words
+            .get(i + 1)
+            .map(|p| {
+                p.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        let next_is_request = ADDRESS_FOLLOWERS.contains(&next_word.as_str());
+
+        let addressed = (is_first && (vocative_punct || words.len() == 1 || next_is_request))
+            || prev_is_cue
+            || (is_last && prev_ends_comma);
+        if addressed {
+            return Some(bot);
+        }
+    }
+    None
+}
+
+/// True if `text` is a team-directed request/question with no named target —
+/// the e case that routes to otto (the coordinator). This is the deliberately
+/// conservative half of the e-vs-f boundary: it fires only on reasonably clear
+/// asks, and everything else falls through to silence.
+///
+/// It fires when any of:
+/// * an indefinite agent ("can **someone** …") appears with a question, a
+///   request lead, or a domain keyword;
+/// * a group request lead ("can we …", "let's …") touches a [`DOMAIN_KEYWORDS`]
+///   topic;
+/// * a `?`-question touches a domain topic and is NOT aimed at a specific person
+///   ("what's the plan for dinner?" fires; "did you eat?" does not).
+///
+/// The second-person guard (`you`/`your`/`u`) suppresses the domain-question
+/// branch so human-to-human questions ("you free this weekend?") stay silent —
+/// unless an indefinite agent or explicit group lead overrides it.
+pub fn is_team_directed_ask(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let words = word_set(text);
+    let is_question = lower.ends_with('?');
+    let has_indefinite = INDEFINITE_AGENTS.iter().any(|w| words.contains(*w));
+    let has_domain = DOMAIN_KEYWORDS.iter().any(|w| words.contains(*w));
+    let request_lead = REQUEST_LEADS.iter().any(|p| lower.starts_with(p));
+    let human_directed =
+        words.contains("you") || words.contains("your") || words.contains("u");
+
+    // Strongest signal: explicitly asking "someone/anyone" in the group.
+    if has_indefinite && (is_question || has_domain || request_lead) {
+        return true;
+    }
+    // A group request ("can we …", "let's …") about a household domain.
+    if request_lead && has_domain {
+        return true;
+    }
+    // A domain question not aimed at a specific person.
+    if is_question && has_domain && !human_directed {
+        return true;
+    }
+    false
+}
+
+/// Elect the responder(s) for one de-duplicated inbound group message.
+///
+/// See the section header above for the ordered table and the d/e/f boundary
+/// rationale. Non-group chats yield [`Election::Private`]; a group message with
+/// no chat id yields [`Election::Silence`]`(NoChatId)`.
+pub fn elect_responders(
+    chat_type: Option<&str>,
+    chat_id: Option<&str>,
+    text: &str,
+    mention_usernames: &[String],
+    reply_to_bot: Option<&str>,
+    config: &TelegramConfig,
+) -> Election {
+    let is_group = matches!(chat_type, Some("group") | Some("supergroup"));
+    if !is_group {
+        return Election::Private;
+    }
+    let reply_chat = match chat_id {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => return Election::Silence(SilenceReason::NoChatId),
+    };
+
+    // b. @mention — the most explicit signal; mention beats name-in-text.
+    for username in mention_usernames {
+        if let Some(bot) = resolve_mentioned_bot(username, config) {
+            return Election::One {
+                bot,
+                reply_chat,
+                body: strip_mention(text, username),
+                addressed_by: AddressedBy::Mention,
+            };
+        }
+    }
+
+    // a. Explicit addressed name.
+    if let Some(bot) = addressed_name_bot(text, config) {
+        return Election::One {
+            bot,
+            reply_chat,
+            body: text.to_string(),
+            addressed_by: AddressedBy::Name,
+        };
+    }
+
+    // c. Reply threaded onto a bot's own message — conversation continuity.
+    if let Some(uname) = reply_to_bot {
+        if let Some(bot) = resolve_mentioned_bot(uname, config) {
+            return Election::One {
+                bot,
+                reply_chat,
+                body: text.to_string(),
+                addressed_by: AddressedBy::ReplyChain,
+            };
+        }
+    }
+
+    // d. Collective address — the whole roster answers.
+    if is_collective_address(text) {
+        return Election::All {
+            reply_chat,
+            body: text.to_string(),
+        };
+    }
+
+    // e. Team-directed but unaddressed ask — otto as the group coordinator.
+    if is_team_directed_ask(text) {
+        return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
+            Some(bot) => Election::One {
+                bot,
+                reply_chat,
+                body: text.to_string(),
+                addressed_by: AddressedBy::Concierge,
+            },
+            None => Election::Silence(SilenceReason::NoVoicesConfigured),
+        };
+    }
+
+    // f. Pure human-to-human small talk — bots stay silent.
+    Election::Silence(SilenceReason::SmallTalk)
+}
+
 /// True if `text` begins with a Telegram bot command (`/word`). In groups these
 /// are commonly suffixed with the target bot (`/status@bruno_chef_bot`).
 fn is_bot_command(text: &str) -> bool {
@@ -942,5 +1312,316 @@ mod tests {
             Some("mira")
         );
         assert!(first_named_bot("nothing to see here", &cfg).is_none());
+    }
+
+    // =======================================================================
+    // All-bots-privacy-off responder election (Luca's ordered table a–f)
+    // =======================================================================
+
+    /// Run the election in the Casa Pinello group with the given mentions /
+    /// reply-chain against the four-bot roster.
+    fn elect(text: &str, mentions: &[&str], reply_to_bot: Option<&str>) -> Election {
+        let mentions: Vec<String> = mentions.iter().map(|s| s.to_string()).collect();
+        elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            text,
+            &mentions,
+            reply_to_bot,
+            &casa_config(),
+        )
+    }
+
+    /// Assert the election picked exactly one voice, by which rule, replying to
+    /// the group.
+    fn assert_one(election: &Election, agent: &str, by: AddressedBy) {
+        match election {
+            Election::One {
+                bot,
+                reply_chat,
+                addressed_by,
+                ..
+            } => {
+                assert_eq!(bot.agent_id.as_deref(), Some(agent), "elected agent");
+                assert_eq!(*addressed_by, by, "addressed_by");
+                assert_eq!(reply_chat, "-100999", "reply target is the group");
+            }
+            other => panic!("expected One({agent}), got {other:?}"),
+        }
+    }
+
+    // ---- a. explicit name ------------------------------------------------
+
+    #[test]
+    fn elect_leading_name_with_comma_to_that_agent() {
+        assert_one(
+            &elect("nora, what's for dinner?", &[], None),
+            "nora",
+            AddressedBy::Name,
+        );
+    }
+
+    #[test]
+    fn elect_addressing_cue_before_name() {
+        assert_one(
+            &elect("tell bruno the curry was great", &[], None),
+            "bruno",
+            AddressedBy::Name,
+        );
+    }
+
+    #[test]
+    fn elect_leading_name_then_request_word_no_comma() {
+        // "mira can you …" — leading vocative without a comma still addresses.
+        assert_one(
+            &elect("mira can you sort the schedule?", &[], None),
+            "mira",
+            AddressedBy::Name,
+        );
+    }
+
+    #[test]
+    fn elect_trailing_vocative_after_comma() {
+        assert_one(
+            &elect("what's for dinner, bruno?", &[], None),
+            "bruno",
+            AddressedBy::Name,
+        );
+    }
+
+    // ---- b. mention beats name-in-text -----------------------------------
+
+    #[test]
+    fn elect_mention_beats_name_in_text() {
+        // Text names nora, but bruno is @mentioned → mention wins, handle
+        // stripped from the routed body.
+        let election = elect(
+            "nora can you ask @bruno_casapinello_bot about dinner",
+            &["bruno_casapinello_bot"],
+            None,
+        );
+        match &election {
+            Election::One {
+                bot,
+                body,
+                addressed_by,
+                ..
+            } => {
+                assert_eq!(bot.agent_id.as_deref(), Some("bruno"));
+                assert_eq!(*addressed_by, AddressedBy::Mention);
+                assert!(
+                    !body.contains("@bruno_casapinello_bot"),
+                    "addressed handle stripped from body, got {body:?}"
+                );
+            }
+            other => panic!("expected One(bruno) by mention, got {other:?}"),
+        }
+    }
+
+    // ---- c. reply-chain ---------------------------------------------------
+
+    #[test]
+    fn elect_reply_chain_to_replied_bot() {
+        assert_one(
+            &elect("yes that works", &[], Some("mira_casapinello_bot")),
+            "mira",
+            AddressedBy::ReplyChain,
+        );
+    }
+
+    #[test]
+    fn elect_name_overrides_reply_chain() {
+        // Addressed name beats the reply-chain fallback.
+        assert_one(
+            &elect("nora, actually can you?", &[], Some("mira_casapinello_bot")),
+            "nora",
+            AddressedBy::Name,
+        );
+    }
+
+    // ---- d. collective address -> ALL FOUR in roster order ---------------
+
+    #[test]
+    fn elect_collective_hey_guys_is_all() {
+        assert_eq!(
+            elect("hey guys, how's it going?", &[], None),
+            Election::All {
+                reply_chat: "-100999".to_string(),
+                body: "hey guys, how's it going?".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn elect_collective_variants_all_fire() {
+        for t in [
+            "hi everyone!",
+            "hello all",
+            "team, quick update",
+            "ciao a tutti",
+            "ciao ragazzi",
+            "morning everybody",
+        ] {
+            assert!(
+                matches!(elect(t, &[], None), Election::All { .. }),
+                "expected collective for {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn collective_reply_plans_four_posts_in_roster_order() {
+        use crate::graph::WorkGraph;
+        use crate::notify::telegram_standup::{DEFAULT_ROSTER, plan_group_reply};
+        let cfg = casa_config();
+        let posts = plan_group_reply(&WorkGraph::new(), &cfg, DEFAULT_ROSTER);
+        let ids: Vec<&str> = posts.iter().map(|p| p.bot_id.as_str()).collect();
+        assert_eq!(ids, vec!["nora", "bruno", "mira", "otto"], "roster order");
+        // Conversational, not a status report — grounded "all quiet" line.
+        assert!(posts.iter().all(|p| !p.text.is_empty()));
+    }
+
+    // ---- e. team-directed unaddressed ask -> otto coordinator ------------
+
+    #[test]
+    fn elect_unaddressed_someone_ask_to_otto() {
+        assert_one(
+            &elect("can someone plan Saturday dinner?", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
+    }
+
+    #[test]
+    fn elect_unaddressed_group_request_to_otto() {
+        assert_one(
+            &elect("we need to sort the grocery shopping this week", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
+    }
+
+    #[test]
+    fn elect_domain_question_not_second_person_to_otto() {
+        assert_one(
+            &elect("what's the plan for dinner tonight?", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
+    }
+
+    // ---- f. small talk -> SILENCE ----------------------------------------
+
+    #[test]
+    fn elect_small_talk_is_silence() {
+        for t in [
+            "haha that was so funny",
+            "ok see you later",
+            "love you all so much", // affectionate, but not a team ask
+            "did you have a good day?",
+            "you free this weekend?", // 2nd-person human question, domain word present
+        ] {
+            assert_eq!(
+                elect(t, &[], None),
+                Election::Silence(SilenceReason::SmallTalk),
+                "expected silence for {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn elect_name_about_a_human_does_not_summon() {
+        // "nora from work said hi" talks ABOUT a person named Nora — the bot
+        // must not be summoned. Documented cheap-heuristic case.
+        assert_eq!(
+            elect("nora from work said hi to everyone", &[], None),
+            // NB: "everyone" makes this collective — but the point being tested
+            // is that the leading "nora" did NOT route to the Nora bot.
+            Election::All {
+                reply_chat: "-100999".to_string(),
+                body: "nora from work said hi to everyone".to_string(),
+            }
+        );
+        // Without the collective word it is plain small talk → silence, and
+        // still does not summon Nora.
+        assert_eq!(
+            elect("nora from work said hi today", &[], None),
+            Election::Silence(SilenceReason::SmallTalk),
+        );
+    }
+
+    #[test]
+    fn elect_non_group_is_private_passthrough() {
+        let e = elect_responders(
+            Some("private"),
+            Some("111"),
+            "nora, hi",
+            &[],
+            None,
+            &casa_config(),
+        );
+        assert_eq!(e, Election::Private);
+    }
+
+    #[test]
+    fn elect_group_without_chat_id_is_silence_no_chat() {
+        let e = elect_responders(Some("group"), None, "hey guys", &[], None, &casa_config());
+        assert_eq!(e, Election::Silence(SilenceReason::NoChatId));
+    }
+
+    #[test]
+    fn elect_unaddressed_ask_without_otto_is_silence() {
+        // Roster without otto → a team ask has no coordinator to answer.
+        let cfg = cfg_with_bots(&[
+            ("nora", "-100999", Some("nora"), Some("nora_bot")),
+            ("bruno", "-100999", Some("bruno"), Some("bruno_bot")),
+        ]);
+        let e = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "can someone plan dinner?",
+            &[],
+            None,
+            &cfg,
+        );
+        assert_eq!(e, Election::Silence(SilenceReason::NoVoicesConfigured));
+    }
+
+    // ---- helper-level unit checks ----------------------------------------
+
+    #[test]
+    fn is_collective_address_whole_word_only() {
+        assert!(is_collective_address("hey team"));
+        assert!(is_collective_address("everyone ready?"));
+        assert!(!is_collective_address("teamwork makes the dream work"));
+        assert!(!is_collective_address("everyones coming")); // no apostrophe form here
+        assert!(!is_collective_address("just a normal sentence"));
+    }
+
+    #[test]
+    fn is_team_directed_ask_boundary() {
+        assert!(is_team_directed_ask("can someone plan dinner?"));
+        assert!(is_team_directed_ask("what's for dinner tonight?"));
+        assert!(is_team_directed_ask("let's sort the shopping"));
+        // human-to-human, no team signal:
+        assert!(!is_team_directed_ask("did you eat yet?"));
+        assert!(!is_team_directed_ask("how are you?"));
+        assert!(!is_team_directed_ask("that movie was great"));
+    }
+
+    #[test]
+    fn addressed_name_bot_rejects_name_about_human() {
+        let cfg = casa_config();
+        assert!(addressed_name_bot("nora from work said hi", &cfg).is_none());
+        assert!(addressed_name_bot("i saw bruno at the shop", &cfg).is_none());
+        // But real addresses resolve:
+        assert_eq!(
+            addressed_name_bot("nora, thanks", &cfg).unwrap().agent_id.as_deref(),
+            Some("nora")
+        );
+        assert_eq!(
+            addressed_name_bot("hey mira", &cfg).unwrap().agent_id.as_deref(),
+            Some("mira")
+        );
     }
 }

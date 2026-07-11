@@ -526,6 +526,9 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
             body: action_id.clone(),
             action_id: Some(action_id),
             reply_to,
+            // Button presses are 1:1 with the bot whose message carried the
+            // button, so they never arrive four times — no dedupe key needed.
+            message_id: None,
             chat_id,
             chat_type,
             mention_usernames: Vec::new(),
@@ -552,6 +555,13 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
             .and_then(|r| r.get("message_id"))
             .and_then(|m| m.as_i64())
             .map(|mid| MessageId(mid.to_string()));
+
+        // This message's own id — the cross-bot dedupe key half. Stable across
+        // every bot that received this same physical group message.
+        let message_id = message
+            .get("message_id")
+            .and_then(|m| m.as_i64())
+            .map(|m| m.to_string());
 
         // Chat context for group @mention routing (R17): the
         // chat id is the reply target (in a group, the group
@@ -581,6 +591,7 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
             body,
             action_id: None,
             reply_to,
+            message_id,
             chat_id,
             chat_type,
             mention_usernames,

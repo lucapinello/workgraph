@@ -3631,6 +3631,18 @@ fn main() -> Result<()> {
                 &chat_id,
                 cli.json,
             ),
+            TelegramCommands::Elect {
+                message,
+                reply_to_bot,
+                chat_type,
+                chat_id,
+            } => commands::telegram::run_elect(
+                &message,
+                reply_to_bot.as_deref(),
+                &chat_type,
+                &chat_id,
+                cli.json,
+            ),
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),

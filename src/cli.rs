@@ -6449,6 +6449,32 @@ pub enum TelegramCommands {
         #[arg(long, default_value = "-1000000000001")]
         chat_id: String,
     },
+
+    /// Elect the responder(s) for a group message in all-bots-privacy-off mode
+    ///
+    /// Runs the exact `elect_responders` decision the `wg telegram listen`
+    /// listener uses once a message survives cross-bot dedupe: @mention,
+    /// addressed name, reply-chain, collective-address (ALL four answer),
+    /// team-directed unaddressed ask (otto coordinates), else silence. Prints
+    /// who answers without sending anything — verify the election table
+    /// (docs/09 §natural-group) against your real `notify.toml`, no live group
+    /// needed.
+    Elect {
+        /// The group message text to elect on (e.g. "hey guys, dinner?")
+        message: String,
+
+        /// The `@username` of the bot this message replies to, if any.
+        #[arg(long)]
+        reply_to_bot: Option<String>,
+
+        /// Chat kind: group | supergroup | private (defaults to supergroup).
+        #[arg(long, default_value = "supergroup")]
+        chat_type: String,
+
+        /// The group chat id the message arrived in (the reply target).
+        #[arg(long, default_value = "-1000000000001")]
+        chat_id: String,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

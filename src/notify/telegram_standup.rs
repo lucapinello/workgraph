@@ -326,6 +326,54 @@ pub fn plan_standup(
         .collect()
 }
 
+/// Render one persona's **conversational** reply to a collective greeting.
+///
+/// This is the collective-address (rule d) sibling of [`render_report`]: same
+/// grounding in the persona's live tasks, but phrased as *answering a greeting*
+/// rather than *filing a status report* — shorter, warmer, in-voice. Reused by
+/// the all-bots-off election so "hey guys" gets a brief hello from each voice,
+/// grounded in what they're actually doing, not a four-way standup dump.
+pub fn render_conversational(
+    member: &StandupMember,
+    in_progress: &[String],
+    open: &[String],
+) -> StandupPost {
+    let body = if !in_progress.is_empty() {
+        let first = humanize_title(&in_progress[0]);
+        format!("Hey! I'm on {first} right now — shout if you need me.")
+    } else if !open.is_empty() {
+        let first = humanize_title(&open[0]);
+        format!("Hi! Nothing urgent on my side — {first} is next up.")
+    } else {
+        "Hi! All quiet on my end — here if you need anything. \u{1f44b}".to_string()
+    };
+
+    let text = format!("{} {}\n{}", member.display_name, member.emoji, body);
+    StandupPost {
+        bot_id: member.bot_id.clone(),
+        channel_type: member.channel_type(),
+        text,
+    }
+}
+
+/// Plan a whole-roster **conversational** reply (rule d): one brief in-voice
+/// hello per named voice, in roster order, each grounded in that voice's live
+/// graph state. The collective-address analogue of [`plan_standup`]; the pure
+/// function the collective-address test asserts against.
+pub fn plan_group_reply(
+    graph: &WorkGraph,
+    config: &TelegramConfig,
+    order: &[&str],
+) -> Vec<StandupPost> {
+    plan_roster(config, order)
+        .into_iter()
+        .map(|member| {
+            let (in_progress, open) = agent_task_lines(graph, member.agent_id());
+            render_conversational(&member, &in_progress, &open)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

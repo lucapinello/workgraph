@@ -2030,3 +2030,12 @@ owners = [
 ]
 description = "Pins the natural-group routing contract from docs/09 §natural-group: `wg telegram route` (the exact route_natural decision the group listener runs) resolves an inbound group message to a family voice by @mention, then the first family name in the text, then the replied-to bot (reply-chain), then the concierge (otto) when no one is named — and intercepts /standup for the whole roster. Drives the real binary against a fixture Casa-Pinello notify.toml so it exercises the user-visible flow (type in the group → the right voice answers), not just the library. Also pinned by the notify::telegram_group natural-routing unit tests. Credential-free: routing is a pure decision, nothing is sent, no live group or real tokens needed."
 timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_election"
+script = "scenarios/telegram_election.sh"
+owners = [
+    "group-dedupe-responder",
+]
+description = "Pins the all-bots-privacy-off responder-election contract from docs/09 §natural-group: `wg telegram elect` (the exact elect_responders decision the listener runs on a deduped message) resolves an inbound group message via Luca's ordered table — @mention (beats name), explicit addressed name, reply-chain, collective address (ALL four answer in roster order), team-directed unaddressed ask (otto coordinates), else silence for pure human-to-human small talk (including a name talking ABOUT a human, which must NOT summon the bot). Drives the real binary against a fixture Casa-Pinello notify.toml so it exercises the user-visible flow (type in the group → the right voice(s) answer or stay silent), not just the library. Also pinned by the notify::telegram_group election unit tests and the notify::telegram_dedupe race/exactly-once tests. Credential-free: election is a pure decision, nothing is sent, no live group or real tokens needed."
+timeout_seconds = 30
