@@ -158,6 +158,14 @@ pub enum FailureClass {
     /// the retry loop. A real, retryable failure — does NOT suppress
     /// cycle-failure-restart. (guardrail G4)
     NoOperationalOutput,
+    /// A disposable (task tagged `disposable`) reached `wg done` without
+    /// honouring the disposable contract: it recorded no artifact and/or left
+    /// no `wg log` breadcrumb. A disposable's only durable value is what it
+    /// hands back to its spawner, so a no-artifact / no-breadcrumb disposable
+    /// is a silent no-op. A real, retryable failure — does NOT suppress
+    /// cycle-failure-restart. Pairs with the disposable contract gate in
+    /// `wg done`. See docs/14-disposable-lifecycle.md.
+    DisposableContractUnmet,
 }
 
 impl std::fmt::Display for FailureClass {
@@ -172,6 +180,7 @@ impl std::fmt::Display for FailureClass {
             FailureClass::WrapperInternal => "wrapper-internal",
             FailureClass::DeliverableMissing => "deliverable-missing",
             FailureClass::NoOperationalOutput => "no-operational-output",
+            FailureClass::DisposableContractUnmet => "disposable-contract-unmet",
         };
         write!(f, "{}", s)
     }
@@ -797,7 +806,31 @@ impl Default for Task {
     }
 }
 
+/// Tag marking a task as a **disposable**: an ephemeral, spawn-and-discard
+/// unit of work whose only durable value is the artifact(s) it records and the
+/// `wg log` breadcrumb(s) it leaves for its spawner to ingest. Disposables are
+/// held to the contract enforced at `wg done` (must produce ≥1 artifact and ≥1
+/// agent breadcrumb). See docs/14-disposable-lifecycle.md.
+pub const DISPOSABLE_TAG: &str = "disposable";
+
 impl Task {
+    /// True when this task opts into the disposable lifecycle by carrying the
+    /// [`DISPOSABLE_TAG`].
+    pub fn is_disposable(&self) -> bool {
+        self.tags.iter().any(|t| t == DISPOSABLE_TAG)
+    }
+
+    /// True when the task carries at least one agent/human `wg log` breadcrumb.
+    ///
+    /// A plain `wg log <id> "msg"` writes a [`LogEntry`] with no `actor`, while
+    /// every system-authored entry (coordinator spawn, deliverable-preflight,
+    /// verify-defer, this gate's own refusal note, …) always sets `actor`. So
+    /// "the agent logged something before exit" is exactly "there is a log
+    /// entry whose `actor` is `None`".
+    pub fn has_agent_log_breadcrumb(&self) -> bool {
+        self.log.iter().any(|e| e.actor.is_none())
+    }
+
     /// Bump `last_interaction_at` to now (UTC, RFC 3339).
     ///
     /// Called by `modify_graph` for every task whose persistent fields change

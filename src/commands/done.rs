@@ -1269,6 +1269,40 @@ fn check_agent_git_hygiene(dir: &Path, task_id: &str, tags: &[String]) {
     }
 }
 
+/// Evaluate the disposable contract for a task at `wg done` time.
+///
+/// A **disposable** (a task carrying the `disposable` tag) is an ephemeral,
+/// spawn-and-discard unit of work. Its only durable value is what it hands
+/// back to the spawner, so before it may complete it must have:
+///   1. recorded at least one artifact (`wg artifact <id> <path>`), and
+///   2. left at least one `wg log` breadcrumb (an agent-authored log entry).
+///
+/// Returns `None` when the task is not a disposable or the contract is
+/// satisfied. Otherwise returns a human-readable summary naming exactly which
+/// half/halves of the contract are unmet, so the refusal message tells the
+/// agent precisely what to do before retrying.
+fn disposable_contract_violation(task: &Task) -> Option<String> {
+    if !task.is_disposable() {
+        return None;
+    }
+    let mut missing = Vec::new();
+    if task.artifacts.is_empty() {
+        missing.push(
+            "  - no artifact recorded — run `wg artifact <id> <path>` for the output it produced",
+        );
+    }
+    if !task.has_agent_log_breadcrumb() {
+        missing.push(
+            "  - no `wg log` breadcrumb — run `wg log <id> \"<what you found/did>\"` before exit",
+        );
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing.join("\n"))
+    }
+}
+
 /// Run the smoke gate for `wg done`.
 ///
 /// If a smoke manifest exists and the task owns scenarios in it, those
@@ -1557,6 +1591,43 @@ fn run_inner(
                 report.missing_summary()
             );
         }
+    }
+
+    // Disposable contract gate: a task tagged `disposable` may not complete
+    // until it has recorded ≥1 artifact AND left ≥1 agent `wg log` breadcrumb.
+    // A disposable's only durable value is what it hands back to its spawner
+    // (see docs/14-disposable-lifecycle.md), so promoting a no-artifact /
+    // no-breadcrumb disposable to Done would launder a silent no-op into a
+    // "success" the ingest step then has nothing to consume. Mirrors the
+    // deliverable-preflight refusal: record a machine-readable failure class
+    // and a log note, then bail leaving the task in-progress.
+    if let Some(missing) = graph.get_task(id).and_then(disposable_contract_violation) {
+        let id_owned = id.to_string();
+        let reason = format!("disposable contract unmet:\n{}", missing);
+        let reason_for_log = reason.clone();
+        modify_graph(&path, |g| {
+            if let Some(t) = g.get_task_mut(&id_owned) {
+                t.failure_class = Some(FailureClass::DisposableContractUnmet);
+                t.failure_reason = Some(reason_for_log.clone());
+                t.log.push(LogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    actor: Some("disposable-contract".to_string()),
+                    user: Some(worksgood::current_user()),
+                    message: format!("wg done refused: {}", reason_for_log),
+                });
+            }
+            true
+        })
+        .context("Failed to save disposable-contract refusal")?;
+        super::notify_graph_changed(dir);
+        anyhow::bail!(
+            "Cannot mark '{}' as done: this is a disposable and its completion \
+             contract is unmet. `wg done` will keep refusing until both hold:\n{}\n\n\
+             A disposable's only durable value is the artifact it records and the \
+             breadcrumb it logs for its spawner to ingest.",
+            id,
+            missing
+        );
     }
 
     // Smoke gate: a task cannot be marked done while a regression-protecting
@@ -2443,12 +2514,15 @@ fn run_inner(
             transitioned_to_pending_eval = true;
         }
 
-        // Clear any prior deliverable-preflight / no-operational-output
-        // refusal marker now that the run has produced its deliverables and
-        // is being promoted out of InProgress (guardrail G1/G4 cleanup).
+        // Clear any prior deliverable-preflight / no-operational-output /
+        // disposable-contract refusal marker now that the run has produced its
+        // deliverables and is being promoted out of InProgress (guardrail
+        // G1/G4 + disposable-contract cleanup).
         if matches!(
             task.failure_class,
-            Some(FailureClass::DeliverableMissing) | Some(FailureClass::NoOperationalOutput)
+            Some(FailureClass::DeliverableMissing)
+                | Some(FailureClass::NoOperationalOutput)
+                | Some(FailureClass::DisposableContractUnmet)
         ) {
             task.failure_class = None;
             task.failure_reason = None;
@@ -3205,6 +3279,126 @@ mod tests {
             "Log should contain forced-ignore message, got: {:?}",
             task.log.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
+    }
+
+    /// A disposable (task tagged `disposable`) that reaches `wg done` without
+    /// having recorded a single artifact must be refused: a disposable's whole
+    /// value is the artifact it leaves behind for the spawner to ingest, so a
+    /// no-artifact disposable is a silent no-op we must not promote to Done.
+    #[test]
+    fn test_disposable_done_refused_without_artifact() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut task = make_task("d1", "A disposable probe", Status::InProgress);
+        task.tags = vec!["disposable".to_string()];
+        // It DID log a breadcrumb (so the log half of the contract is met) but
+        // produced no artifact.
+        task.log.push(worksgood::graph::LogEntry {
+            timestamp: "2026-07-11T00:00:00+00:00".to_string(),
+            actor: None,
+            user: Some("agent".to_string()),
+            message: "probed the thing".to_string(),
+        });
+        setup_workgraph(dir_path, vec![task]);
+
+        let result = run(dir_path, "d1", false, false, false, false, false);
+        assert!(
+            result.is_err(),
+            "wg done must refuse a disposable with no artifact"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("disposable") && err.contains("artifact"),
+            "error should name the disposable-artifact contract, got: {}",
+            err
+        );
+
+        // Task must stay in-progress, not be promoted to Done, and carry the
+        // machine-readable refusal marker.
+        let graph = load_graph(graph_path(dir_path)).unwrap();
+        let task = graph.get_task("d1").unwrap();
+        assert_eq!(task.status, Status::InProgress);
+        assert_eq!(
+            task.failure_class,
+            Some(worksgood::graph::FailureClass::DisposableContractUnmet)
+        );
+    }
+
+    /// A disposable that recorded an artifact but never logged a breadcrumb is
+    /// also refused — the `wg log before exit` half of the contract. Without a
+    /// breadcrumb the ingest step has nothing to summarise.
+    #[test]
+    fn test_disposable_done_refused_without_log() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut task = make_task("d1", "A disposable probe", Status::InProgress);
+        task.tags = vec!["disposable".to_string()];
+        task.artifacts = vec!["result.json".to_string()];
+        // No agent `wg log` breadcrumb (only, potentially, system entries).
+        setup_workgraph(dir_path, vec![task]);
+
+        let result = run(dir_path, "d1", false, false, false, false, false);
+        assert!(
+            result.is_err(),
+            "wg done must refuse a disposable that never logged"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("disposable") && err.contains("log"),
+            "error should name the disposable-log contract, got: {}",
+            err
+        );
+
+        let graph = load_graph(graph_path(dir_path)).unwrap();
+        let task = graph.get_task("d1").unwrap();
+        assert_eq!(task.status, Status::InProgress);
+    }
+
+    /// A disposable that recorded BOTH an artifact and a breadcrumb satisfies
+    /// the contract and completes normally.
+    #[test]
+    fn test_disposable_done_allowed_with_artifact_and_log() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut task = make_task("d1", "A disposable probe", Status::InProgress);
+        task.tags = vec!["disposable".to_string()];
+        task.artifacts = vec!["result.json".to_string()];
+        task.log.push(worksgood::graph::LogEntry {
+            timestamp: "2026-07-11T00:00:00+00:00".to_string(),
+            actor: None,
+            user: Some("agent".to_string()),
+            message: "probed the thing, wrote result.json".to_string(),
+        });
+        setup_workgraph(dir_path, vec![task]);
+
+        let result = run(dir_path, "d1", false, false, false, false, false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        let graph = load_graph(graph_path(dir_path)).unwrap();
+        let task = graph.get_task("d1").unwrap();
+        assert_eq!(task.status, Status::Done);
+        // A satisfied disposable carries no lingering refusal marker.
+        assert_eq!(task.failure_class, None);
+    }
+
+    /// A non-disposable task with neither artifact nor breadcrumb is unaffected
+    /// — the contract only binds tasks that opt in via the `disposable` tag.
+    #[test]
+    fn test_non_disposable_done_unaffected_by_contract() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let task = make_task("t1", "An ordinary task", Status::InProgress);
+        setup_workgraph(dir_path, vec![task]);
+
+        let result = run(dir_path, "t1", false, false, false, false, false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        let graph = load_graph(graph_path(dir_path)).unwrap();
+        assert_eq!(graph.get_task("t1").unwrap().status, Status::Done);
     }
 
     #[test]

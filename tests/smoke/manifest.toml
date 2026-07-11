@@ -1994,3 +1994,12 @@ owners = [
 ]
 description = "Pins guardrails G1+G3 from docs/research/prevent-intake-as-evaluator-design.md: an intake task with a `## Deliverables` block is refused at `wg done` (failure_class `deliverable-missing`) when the named deliverable is absent; on retry (retry_count=1, failure_class=deliverable-missing) the spawned worker prompt.txt leads with the G3 'PREVIOUS ATTEMPT FAILED — DO NOT REPEAT' directive naming the concrete deliverable (replacing the neutral 'continue from where they left off' framing); after the deliverable is produced `wg done` succeeds and clears the failure_class marker. The G3 directive-injection pure function is additionally pinned by the retry_mutates_prompt_on_deliverable_missing unit test. Credential-free: drives the real `wg done` + `wg spawn --executor claude` CLI paths (prompt.txt is written before any LLM subprocess launches); no claude CLI auth needed."
 timeout_seconds = 90
+
+[[scenario]]
+name = "disposable_artifact_enforcement"
+script = "scenarios/disposable_artifact_enforcement.sh"
+owners = [
+    "disposable-artifact-enforcement",
+]
+description = "Pins the disposable contract from docs/14-disposable-lifecycle.md §enforcement: a task tagged `disposable` is refused at `wg done` (failure_class `disposable-contract-unmet`, task stays in-progress) until it has recorded BOTH ≥1 artifact (`wg artifact`) AND ≥1 agent `wg log` breadcrumb — the refusal message names whichever half/halves are missing. With an artifact but no breadcrumb it is still refused (names the missing `wg log` half); once both are present `wg done` succeeds and clears the failure_class marker. A non-disposable task with neither is unaffected (the contract only binds the `disposable` tag). Additionally pinned by the test_disposable_done_refused_without_artifact unit test. Credential-free: drives the real `wg add` / `wg artifact` / `wg log` / `wg done` CLI paths; no worker spawn or LLM auth needed."
+timeout_seconds = 60

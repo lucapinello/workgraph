@@ -857,6 +857,9 @@ fn print_human_readable(details: &TaskDetails) {
             NoOperationalOutput => {
                 "agent talked but didn't act (no files/artifacts written, non-empty output.log) — re-run and perform the concrete operational work"
             }
+            DisposableContractUnmet => {
+                "disposable exited without recording an artifact and/or a wg log breadcrumb — re-run, `wg artifact` the result and `wg log` a summary before `wg done`"
+            }
         };
         println!("  hint: {}", hint);
     }

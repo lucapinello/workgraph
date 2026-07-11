@@ -4345,6 +4345,7 @@ fn parse_failure_class(s: &str) -> Option<worksgood::graph::FailureClass> {
         "wrapper-internal" => Some(FailureClass::WrapperInternal),
         "deliverable-missing" => Some(FailureClass::DeliverableMissing),
         "no-operational-output" => Some(FailureClass::NoOperationalOutput),
+        "disposable-contract-unmet" => Some(FailureClass::DisposableContractUnmet),
         _ => None,
     }
 }
