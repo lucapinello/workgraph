@@ -38,6 +38,7 @@ fn create_task_with_timeout(id: &str, verify_timeout: Option<String>) -> Task {
         after: vec![],
         requires: vec![],
         tags: vec![],
+        choices: vec![],
         skills: vec![],
         inputs: vec![],
         deliverables: vec![],

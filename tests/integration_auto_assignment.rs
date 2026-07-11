@@ -237,6 +237,7 @@ fn build_assign_subgraph(dir: &Path) {
             after: vec![],
             requires: vec![],
             tags: vec!["assignment".to_string(), "agency".to_string()],
+            choices: vec![],
             skills: vec![],
             inputs: vec![],
             deliverables: vec![],
