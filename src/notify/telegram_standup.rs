@@ -388,6 +388,15 @@ mod tests {
         }
     }
 
+    fn bot_tok(chat: &str, agent: Option<&str>, token: &str) -> TelegramBotConfig {
+        TelegramBotConfig {
+            bot_token: token.to_string(),
+            chat_id: chat.to_string(),
+            agent_id: agent.map(|s| s.to_string()),
+            username: None,
+        }
+    }
+
     fn casa_config() -> TelegramConfig {
         let mut bots = HashMap::new();
         // Insert deliberately OUT of roster order to prove ordering is imposed
@@ -409,6 +418,35 @@ mod tests {
         let roster = plan_roster(&cfg, DEFAULT_ROSTER);
         let ids: Vec<&str> = roster.iter().map(|m| m.bot_id.as_str()).collect();
         assert_eq!(ids, vec!["nora", "bruno", "mira", "otto"]);
+    }
+
+    // Fix #3 regression: each roster member must carry its OWN bot token and
+    // channel_type. A cross-wired roster (mira's slot pointing at bruno's config)
+    // is exactly how a voice would send via — and log — another voice's identity
+    // ("mira logs bruno's id"). This locks the 1:1 pairing at the planning layer,
+    // where every send/log loop reads member.bot / member.bot_id.
+    #[test]
+    fn each_roster_member_carries_its_own_token_and_channel() {
+        let mut bots = HashMap::new();
+        bots.insert("nora".to_string(), bot_tok("-100", Some("nora"), "TOK-NORA"));
+        bots.insert("bruno".to_string(), bot_tok("-100", Some("bruno"), "TOK-BRUNO"));
+        bots.insert("mira".to_string(), bot_tok("-100", Some("mira"), "TOK-MIRA"));
+        bots.insert("otto".to_string(), bot_tok("-100", Some("otto"), "TOK-OTTO"));
+        let cfg = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+        let roster = plan_roster(&cfg, DEFAULT_ROSTER);
+        for member in &roster {
+            let want = format!("TOK-{}", member.bot_id.to_ascii_uppercase());
+            assert_eq!(
+                member.bot.bot_token, want,
+                "{} must carry ITS OWN token, not another voice's",
+                member.bot_id
+            );
+            assert_eq!(member.channel_type(), format!("telegram:{}", member.bot_id));
+        }
     }
 
     #[test]

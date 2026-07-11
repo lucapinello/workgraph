@@ -21,6 +21,7 @@ pub mod telegram_conversation;
 pub mod telegram_dedupe;
 pub mod telegram_family_commands;
 pub mod telegram_group;
+pub mod telegram_pacing;
 pub mod telegram_sender;
 pub mod telegram_standup;
 pub mod voice;
@@ -103,6 +104,12 @@ pub struct IncomingMessage {
     /// replies, and electing on a bot-sent message caused the 12-replies-per-
     /// message feedback storm. `false` for transports that don't surface it.
     pub sender_is_bot: bool,
+    /// When the message was sent, as a Unix timestamp in seconds (Telegram
+    /// `message.date`). `None` for transports/updates without one. Drives the
+    /// Fix #1 startup stale-backlog policy: a message older than a few minutes
+    /// at listener start is not conversationally answered (the listener had been
+    /// down and this is queued backlog, not a live turn).
+    pub sent_at: Option<i64>,
     /// Message body text.
     pub body: String,
     /// If the human clicked an action button, its id.

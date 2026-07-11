@@ -716,6 +716,10 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
             sender,
             sender_id: identity.user_id,
             sender_is_bot: identity.is_bot,
+            sent_at: cb
+                .get("message")
+                .and_then(|m| m.get("date"))
+                .and_then(|d| d.as_i64()),
             body: action_id.clone(),
             action_id: Some(action_id),
             reply_to,
@@ -784,6 +788,7 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
             sender,
             sender_id: identity.user_id,
             sender_is_bot: identity.is_bot,
+            sent_at: message.get("date").and_then(|d| d.as_i64()),
             body,
             action_id: None,
             reply_to,

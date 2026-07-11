@@ -103,6 +103,15 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         // `notify::casa_feed` and docs/15 §chat-split.
         let feed_path = casa_feed::feed_path_for(&project_root(&workgraph_dir));
 
+        // Fix #1 (startup stale-backlog) + Fix #2 (burst coalescing) state. The
+        // start timestamp anchors the staleness test; `backlog_notified` ensures
+        // the "skipped older messages" line is posted at most once; the coalescer
+        // collapses a rapid burst of collective/concierge elections to one reply.
+        use worksgood::notify::telegram_pacing;
+        let listener_start = chrono::Utc::now().timestamp();
+        let mut backlog_notified = false;
+        let mut coalescer = telegram_pacing::BurstCoalescer::default();
+
         while let Some(msg) = rx.recv().await {
             // Fix #0 — the bot-loop guard, FIRST (before dedupe, feed mirror,
             // commands, and election). The family bots run as group admins, so
@@ -170,6 +179,40 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 .clone()
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| effective_chat_id.clone());
+
+            // Fix #1 — startup stale-backlog policy. A text message sent well
+            // before the listener came up is queued backlog, not a live turn: we
+            // do NOT answer it (the household has moved on), and we post ONE
+            // compact concierge line the first time we skip any, so the skip is
+            // visible rather than silent. Button presses are exempt (they carry
+            // no timestamp and are inherently interactive). Messages without a
+            // timestamp are never treated as stale.
+            if msg.action_id.is_none() {
+                if let Some(sent_at) = msg.sent_at {
+                    if telegram_pacing::is_stale_backlog(
+                        sent_at,
+                        listener_start,
+                        telegram_pacing::DEFAULT_STALE_SECS,
+                    ) {
+                        println!(
+                            "[{}] stale backlog: not answering msg {} (sent {}s before start)",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            msg.message_id.as_deref().unwrap_or("none"),
+                            listener_start.saturating_sub(sent_at),
+                        );
+                        if !backlog_notified {
+                            backlog_notified = true;
+                            if let Err(e) = channel
+                                .send_text(&reply_target, &telegram_pacing::backlog_skipped_line())
+                                .await
+                            {
+                                eprintln!("Failed to send backlog-skipped line: {e}");
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
 
             // Button presses are handled first — they carry an action id, not
             // text to route by @mention.
@@ -280,6 +323,17 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     ref reply_chat,
                     ref body,
                 } => {
+                    // Fix #2 — burst coalescing. Multiple collective elections
+                    // inside the burst window collapse to ONE roster reply, so a
+                    // rapid flurry of greetings doesn't fire four×N sends.
+                    if !coalescer.admit_collective(chrono::Utc::now().timestamp()) {
+                        println!(
+                            "[{}] collective coalesced (burst) — msg {}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            msg.message_id.as_deref().unwrap_or("none"),
+                        );
+                        continue;
+                    }
                     // Collective address — the whole roster answers, briefly and
                     // in-voice, in roster order. The single listener orchestrates
                     // the sequential sends so no bot double-posts. Fix #4b: each
@@ -306,9 +360,25 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     ref bot,
                     ref body,
                     ref reply_chat,
-                    ..
+                    addressed_by,
                 } => {
                     debug_assert_eq!(reply_chat, &reply_target);
+                    // Fix #2 — burst coalescing for the AUTO-routed concierge
+                    // case (an unaddressed team ask that lands on otto). Repeated
+                    // concierge elections in the window collapse to one reply.
+                    // Explicit @mentions / addressed names / reply-chains are
+                    // deliberate and are ALWAYS answered — never coalesced.
+                    if matches!(addressed_by, worksgood::notify::telegram_group::AddressedBy::Concierge) {
+                        let agent = bot.agent_id.as_deref().unwrap_or(&bot.bot_id);
+                        if !coalescer.admit_named(agent, chrono::Utc::now().timestamp()) {
+                            println!(
+                                "[{}] concierge coalesced (burst) — msg {}",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                msg.message_id.as_deref().unwrap_or("none"),
+                            );
+                            continue;
+                        }
+                    }
                     (bot.channel_type.clone(), body.clone())
                 }
                 Election::Private => (msg.channel.clone(), msg.body.clone()),
@@ -2015,6 +2085,10 @@ async fn poll_once(
                     sender,
                     sender_id: identity.user_id,
                     sender_is_bot: identity.is_bot,
+                    sent_at: cb
+                        .get("message")
+                        .and_then(|m| m.get("date"))
+                        .and_then(|d| d.as_i64()),
                     body: action_id.clone(),
                     action_id: Some(action_id),
                     reply_to,
@@ -2076,6 +2150,7 @@ async fn poll_once(
                     sender,
                     sender_id: identity.user_id,
                     sender_is_bot: identity.is_bot,
+                    sent_at: message.get("date").and_then(|d| d.as_i64()),
                     body,
                     action_id: None,
                     reply_to,
