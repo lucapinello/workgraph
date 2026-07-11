@@ -218,33 +218,48 @@ pub fn run_add(
     Ok(())
 }
 
-/// `wg agency human confirm <telegram-user>` — manually record a human's `YES`
+/// `wg agency human confirm <identifier>` — manually record a human's `YES`
 /// confirmation when the inbound listener isn't running (the no-bot / manual
 /// onboarding path).
-pub fn run_confirm(workgraph_dir: &Path, telegram: &str) -> Result<()> {
-    let telegram = telegram.trim();
+///
+/// `identifier` may be the Telegram user id / `@handle` the binding is keyed on
+/// OR the agency agent id (e.g. `human-luca`) — both are looked up so the
+/// operator doesn't have to remember which one the binding stores. The binding
+/// itself is always keyed by Telegram user, so we resolve the identifier to that
+/// key before applying the confirmation.
+pub fn run_confirm(workgraph_dir: &Path, identifier: &str) -> Result<()> {
+    let identifier = identifier.trim();
     let agency_dir = workgraph_dir.join("agency");
     let mut bindings =
         TelegramBindingMap::load(&agency_dir).context("Failed to load Telegram binding map")?;
 
-    match bindings.find_by_user(telegram) {
-        None => anyhow::bail!(
-            "no Telegram binding for '{}'. Add the human first with `wg agency human add`.",
-            telegram
-        ),
+    // Accept either the Telegram user id/@handle (how the binding is keyed) or
+    // the agency agent id (e.g. `human-luca`). The error message below names
+    // both lookups so a not-found result is not misleading about which key the
+    // binding actually uses.
+    let telegram_user = match bindings
+        .find_by_user(identifier)
+        .or_else(|| bindings.find_by_agent(identifier))
+    {
         Some(b) if b.confirmed => {
-            println!("{} ({}) is already confirmed.", b.name, telegram);
+            println!("{} ({}) is already confirmed.", b.name, b.telegram_user);
             return Ok(());
         }
-        Some(_) => {}
-    }
+        Some(b) => b.telegram_user.clone(),
+        None => anyhow::bail!(
+            "no Telegram binding found for '{id}' (tried both the Telegram \
+             user id/@handle and the agency agent id). Add the human first with \
+             `wg agency human add <name> --telegram <id>`.",
+            id = identifier,
+        ),
+    };
 
-    let name = agency::apply_confirmation(&mut bindings, telegram, "yes", chrono::Utc::now())
+    let name = agency::apply_confirmation(&mut bindings, &telegram_user, "yes", chrono::Utc::now())
         .expect("binding exists and is unconfirmed");
     bindings
         .save(&agency_dir)
         .context("Failed to persist Telegram binding map")?;
-    println!("Confirmed {} ({}) — they've joined.", name, telegram);
+    println!("Confirmed {} ({}) — they've joined.", name, telegram_user);
     Ok(())
 }
 
@@ -407,5 +422,60 @@ mod tests {
         // it's non-empty and not the literal fallback.
         let label = project_label(&dir);
         assert!(!label.is_empty());
+    }
+
+    // --- Bug 3: `wg agency human confirm` accepts telegram id OR agent id ----
+
+    #[test]
+    fn test_confirm_by_telegram_id() {
+        let tmp = setup();
+        let dir = wg_dir(&tmp);
+        run_add(&dir, "Luca", "55501234", None).unwrap();
+
+        run_confirm(&dir, "55501234").unwrap();
+
+        let map = TelegramBindingMap::load(&dir.join("agency")).unwrap();
+        assert!(map.find_by_user("55501234").unwrap().confirmed);
+    }
+
+    #[test]
+    fn test_confirm_by_agent_id() {
+        // Bug 3: the binding is keyed by telegram id, but the operator often
+        // has the agent id (`human-luca`) to hand. Confirming by agent id must
+        // work rather than erroring "no Telegram binding".
+        let tmp = setup();
+        let dir = wg_dir(&tmp);
+        run_add(&dir, "Luca", "55501234", None).unwrap();
+
+        run_confirm(&dir, "human-luca").unwrap();
+
+        let map = TelegramBindingMap::load(&dir.join("agency")).unwrap();
+        assert!(
+            map.find_by_user("55501234").unwrap().confirmed,
+            "confirming by agent id must confirm the telegram-keyed binding"
+        );
+    }
+
+    #[test]
+    fn test_confirm_unknown_identifier_names_both_lookups() {
+        let tmp = setup();
+        let dir = wg_dir(&tmp);
+        run_add(&dir, "Luca", "55501234", None).unwrap();
+
+        let err = run_confirm(&dir, "nobody").unwrap_err().to_string();
+        assert!(
+            err.contains("Telegram user id") && err.contains("agent id"),
+            "not-found error must say which lookups were tried, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_confirm_already_confirmed_is_noop() {
+        let tmp = setup();
+        let dir = wg_dir(&tmp);
+        run_add(&dir, "Luca", "55501234", None).unwrap();
+        run_confirm(&dir, "human-luca").unwrap();
+        // Second confirm (by either key) is a friendly no-op, not an error.
+        run_confirm(&dir, "55501234").unwrap();
     }
 }
