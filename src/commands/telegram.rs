@@ -69,34 +69,53 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 if let Err(e) = channel.send_text(&effective_chat_id, &response).await {
                     eprintln!("Failed to send response: {e}");
                 }
-            } else if let Some(name) = try_confirm_binding(&workgraph_dir, &msg.sender, &msg.body) {
-                // A bound-but-unconfirmed human replied YES — record it and
-                // welcome them. This is the inbound half of the
-                // `wg agency human add` onboarding handshake (R21/R22).
-                println!(
-                    "[{}] {} ({}) confirmed — joined via YES handshake",
-                    chrono::Utc::now().format("%H:%M:%S"),
-                    name,
-                    msg.sender
-                );
-                let welcome = format!("Welcome aboard, {}! You're all set. \u{2705}", name);
-                if let Err(e) = channel.send_text(&effective_chat_id, &welcome).await {
-                    eprintln!("Failed to send welcome: {e}");
-                }
             } else {
-                // Not a command and not a button press: treat as a human's
-                // reply to a task they were handed. Route it onto the awaiting-
-                // human task assigned to the agent this bot fronts and record it
-                // as a message — that satisfies the task's HumanInput wait so the
-                // coordinator resumes/completes it. (The "awaiting-human task
-                // router" formerly deferred at src/notify/telegram.rs:42.)
-                match crate::commands::service::human_dispatch::route_inbound_reply(
-                    &workgraph_dir,
-                    &msg.channel,
-                    &msg.sender,
-                    &msg.body,
-                ) {
-                    Some(task_id) => {
+                // Not a command and not a button press. The merged R21×R10
+                // inbound path (bug fix): classify the message by checking for a
+                // pending onboarding confirmation FIRST, then falling through to
+                // awaiting-human task routing. Doing routing first (as the naive
+                // merge did) let the router swallow a "YES" handshake reply so
+                // the binding never confirmed. See `classify_inbound_message`.
+                match classify_inbound_message(&workgraph_dir, &msg.channel, &msg.sender, &msg.body)
+                {
+                    InboundOutcome::Confirmed { name, routed_task } => {
+                        // A bound-but-unconfirmed human replied YES — the
+                        // inbound half of the `wg agency human add` handshake.
+                        println!(
+                            "[{}] {} ({}) confirmed — joined via YES handshake",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            name,
+                            msg.sender
+                        );
+                        let welcome = format!("Welcome aboard, {}! You're all set. \u{2705}", name);
+                        if let Err(e) = channel.send_text(&effective_chat_id, &welcome).await {
+                            eprintln!("Failed to send welcome: {e}");
+                        }
+                        // A single message can be both a confirmation AND a
+                        // reply to a task the human was handed; ack the task too.
+                        if let Some(task_id) = routed_task {
+                            println!(
+                                "[{}] Reply from {} also recorded on awaiting-human task '{}'",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                msg.sender,
+                                task_id
+                            );
+                            if let Err(e) = channel
+                                .send_text(
+                                    &effective_chat_id,
+                                    &format!("✓ Recorded your reply on task '{}'.", task_id),
+                                )
+                                .await
+                            {
+                                eprintln!("Failed to send ack: {e}");
+                            }
+                        }
+                    }
+                    InboundOutcome::Routed { task_id } => {
+                        // A human's reply to a task they were handed. Recording
+                        // it as a message satisfies the task's HumanInput wait so
+                        // the coordinator completes it. (The "awaiting-human task
+                        // router" formerly deferred at src/notify/telegram.rs:42.)
                         println!(
                             "[{}] Reply from {} recorded on awaiting-human task '{}'",
                             chrono::Utc::now().format("%H:%M:%S"),
@@ -113,7 +132,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             eprintln!("Failed to send ack: {e}");
                         }
                     }
-                    None => {
+                    InboundOutcome::Unmatched => {
                         println!(
                             "[{}] Message from {} (no awaiting-human task matched): {}",
                             chrono::Utc::now().format("%H:%M:%S"),
@@ -153,6 +172,57 @@ fn try_confirm_binding(workgraph_dir: &Path, sender: &str, body: &str) -> Option
         return None;
     }
     Some(name)
+}
+
+/// Classification of an inbound (non-command, non-button) Telegram message.
+#[derive(Debug, PartialEq)]
+enum InboundOutcome {
+    /// A bound-but-unconfirmed human replied YES: their binding is now
+    /// confirmed. `routed_task` is `Some` when the same message ALSO matched an
+    /// awaiting-human task (confirm + answer in one message); `None` when it was
+    /// a pure confirmation (confirmed silently, no task to answer).
+    Confirmed {
+        name: String,
+        routed_task: Option<String>,
+    },
+    /// Not a confirmation, but recorded on an awaiting-human task.
+    Routed { task_id: String },
+    /// Neither confirmed a pending binding nor matched an awaiting task.
+    Unmatched,
+}
+
+/// Classify an inbound message from the Telegram listener.
+///
+/// The merged R21 (onboarding handshake) × R10 (human-dispatch tail) path had a
+/// bug: routing ran first and the awaiting-human-task router swallowed a plain
+/// "YES" handshake reply, so the onboarding binding never confirmed. The fix is
+/// ordering — check for a pending unconfirmed binding for `sender` FIRST and
+/// apply the confirmation, THEN fall through to awaiting-human task routing. A
+/// single message can be both (a confirmation that also answers a parked task);
+/// a confirmation with no matching task confirms silently.
+///
+/// This is the pure, filesystem-only core of the listener's inbound branch (no
+/// network), so it is unit-testable without a live bot.
+fn classify_inbound_message(
+    workgraph_dir: &Path,
+    channel_type: &str,
+    sender: &str,
+    body: &str,
+) -> InboundOutcome {
+    // 1. Confirmation check first — this is the ordering fix.
+    let confirmed_name = try_confirm_binding(workgraph_dir, sender, body);
+    // 2. Then awaiting-human task routing (records the reply as a message).
+    let routed = crate::commands::service::human_dispatch::route_inbound_reply(
+        workgraph_dir,
+        channel_type,
+        sender,
+        body,
+    );
+    match (confirmed_name, routed) {
+        (Some(name), routed_task) => InboundOutcome::Confirmed { name, routed_task },
+        (None, Some(task_id)) => InboundOutcome::Routed { task_id },
+        (None, None) => InboundOutcome::Unmatched,
+    }
 }
 
 /// Send a message to the configured Telegram chat.
@@ -634,7 +704,86 @@ fn load_telegram_config() -> Result<TelegramConfig> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use worksgood::agency::{TelegramBinding, TelegramBindingMap};
     use worksgood::notify::telegram::TelegramBotConfig;
+
+    fn ts() -> chrono::DateTime<chrono::Utc> {
+        "2026-07-10T12:00:00Z".parse().unwrap()
+    }
+
+    /// Record an unconfirmed binding exactly as `wg agency human add` would,
+    /// under `<workgraph_dir>/agency`.
+    fn seed_unconfirmed_binding(workgraph_dir: &Path, user: &str, agent: &str, name: &str) {
+        let agency_dir = workgraph_dir.join("agency");
+        let mut map = TelegramBindingMap::default();
+        map.add(TelegramBinding::new(user, agent, name, None, ts()))
+            .unwrap();
+        map.save(&agency_dir).unwrap();
+    }
+
+    /// Bug 1 — the merged R21×R10 inbound path. An unconfirmed binding exists
+    /// and the human replies "yes" (in any case/whitespace). The classifier
+    /// MUST confirm the binding first (not let awaiting-task routing swallow
+    /// it), and — with no awaiting task present — confirm silently.
+    #[test]
+    fn inbound_yes_confirms_pending_binding_case_insensitive() {
+        for body in ["yes", "YES", "  Yes  ", "y", "Y"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path();
+            seed_unconfirmed_binding(dir, "55501234", "human-luca", "Luca");
+
+            let outcome = classify_inbound_message(dir, "telegram", "55501234", body);
+            match outcome {
+                InboundOutcome::Confirmed { name, routed_task } => {
+                    assert_eq!(name, "Luca", "body {body:?}");
+                    assert_eq!(
+                        routed_task, None,
+                        "no awaiting task ⇒ confirm silently (body {body:?})"
+                    );
+                }
+                other => panic!("expected Confirmed for body {body:?}, got {other:?}"),
+            }
+
+            // The confirmation was persisted to disk.
+            let reloaded = TelegramBindingMap::load(&dir.join("agency")).unwrap();
+            assert!(
+                reloaded.find_by_user("55501234").unwrap().confirmed,
+                "binding must be persisted as confirmed (body {body:?})"
+            );
+        }
+    }
+
+    /// A non-affirmative message from a bound-but-unconfirmed human with no
+    /// awaiting task is Unmatched (and does NOT confirm the binding).
+    #[test]
+    fn inbound_non_affirmative_does_not_confirm_and_is_unmatched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        seed_unconfirmed_binding(dir, "55501234", "human-luca", "Luca");
+
+        let outcome = classify_inbound_message(dir, "telegram", "55501234", "who is this?");
+        assert_eq!(outcome, InboundOutcome::Unmatched);
+
+        let reloaded = TelegramBindingMap::load(&dir.join("agency")).unwrap();
+        assert!(!reloaded.find_by_user("55501234").unwrap().confirmed);
+    }
+
+    /// An already-confirmed binding replying "yes" again with no awaiting task
+    /// is Unmatched — confirmation is idempotent and does not re-fire.
+    #[test]
+    fn inbound_yes_from_confirmed_binding_is_unmatched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let agency_dir = dir.join("agency");
+        let mut map = TelegramBindingMap::default();
+        let mut b = TelegramBinding::new("55501234", "human-luca", "Luca", None, ts());
+        b.confirmed = true;
+        map.bindings.push(b);
+        map.save(&agency_dir).unwrap();
+
+        let outcome = classify_inbound_message(dir, "telegram", "55501234", "yes");
+        assert_eq!(outcome, InboundOutcome::Unmatched);
+    }
 
     #[test]
     fn bot_banner_bots_map_only_does_not_panic() {
