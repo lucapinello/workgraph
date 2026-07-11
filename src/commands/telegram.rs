@@ -94,6 +94,26 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
 
         let workgraph_dir = dir.to_path_buf();
 
+        // The wg config drives the conversational reply COMPOSER — the one-shot
+        // `claude` spawn that actually produces an agent's reply to a plain
+        // message. Loaded once here; each converse turn builds an
+        // `OneshotComposer` from a clone. Before this, a converse turn wrote the
+        // human message to the bound-session inbox and polled the outbox for a
+        // reply that only a live `wg nex` daemon could produce — none runs in the
+        // deployment, so every turn acked then TIMED OUT at 120s. Loading it may
+        // fail (no config); we log and fall back to the legacy poll path only
+        // then. See `notify::telegram_conversation::OneshotComposer`.
+        let wg_config = match worksgood::config::Config::load_merged(&workgraph_dir) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!(
+                    "[telegram] could not load wg config for the reply composer ({e:#}) — \
+                     converse turns will use the legacy session-outbox path"
+                );
+                None
+            }
+        };
+
         // The constellation split view's conversation pane reads this feed (the
         // casa gateway tails it and serves `GET /conversation`). We are the only
         // process holding the Telegram sockets, so we mirror every inbound GROUP
@@ -561,6 +581,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         // and must never land in the shared group feed.
                         let mirror_group = matches!(entry, convo::Entry::GroupElected);
                         let feed_path_owned = feed_path.clone();
+                        let wg_config_owned = wg_config.clone();
                         tokio::spawn(async move {
                             let base = convo::BotReplySink::new(cfg_owned.clone());
                             let sink: Box<dyn convo::ReplySink> = if mirror_group {
@@ -568,12 +589,21 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             } else {
                                 Box::new(base)
                             };
+                            // The composer is the fix: it drives a bounded one-shot
+                            // `claude` turn so the reply COMPLETES (or fails fast into
+                            // the "glitched" follow-up) instead of the open-loop hang.
+                            let composer = wg_config_owned
+                                .map(convo::OneshotComposer::from_config);
+                            let composer_ref = composer
+                                .as_ref()
+                                .map(|c| c as &dyn convo::ReplyComposer);
                             match convo::run_conversation_turn(
                                 &dir_owned,
                                 &plan,
                                 &human_message,
                                 &request_id,
                                 timing,
+                                composer_ref,
                                 sink.as_ref(),
                             )
                             .await
@@ -1175,6 +1205,11 @@ pub async fn run_group_collective(
 
     let timing = convo::AckTiming::from_env();
 
+    // The reply composer (one-shot `claude` spawn) — same fix as the 1:1 path:
+    // each voice COMPOSES a real answer rather than polling an outbox no daemon
+    // fills. Best-effort load; on failure the turns use the legacy poll path.
+    let wg_config = worksgood::config::Config::load_merged(workgraph_dir).ok();
+
     for member in &roster {
         // The SAME composer the 1:1 path uses: does this voice have a bound
         // session and is the sender a confirmed human? If so, answer the actual
@@ -1197,12 +1232,17 @@ pub async fn run_group_collective(
                 config.clone(),
             );
             let request_id = format!("tg-collective-{}-{}", target, member.bot_id);
+            let composer = wg_config
+                .clone()
+                .map(convo::OneshotComposer::from_config);
+            let composer_ref = composer.as_ref().map(|c| c as &dyn convo::ReplyComposer);
             match convo::run_conversation_turn(
                 workgraph_dir,
                 &plan,
                 human_message,
                 &request_id,
                 timing,
+                composer_ref,
                 &sink,
             )
             .await
@@ -1283,13 +1323,16 @@ impl FeedMirrorSink {
     }
 }
 
-#[async_trait]
-impl worksgood::notify::telegram_conversation::ReplySink for FeedMirrorSink {
-    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
-        // Send for real first; only mirror what actually went out to the group.
-        self.inner.send(bot_id, chat_id, text).await?;
-        let agent_id =
-            worksgood::notify::telegram_conversation::agent_for_bot(&self.config, bot_id);
+impl FeedMirrorSink {
+    /// Mirror `text` into the casa feed as this bot's persona reply — but never
+    /// the transient latency ack (it's edited away into the real answer, so the
+    /// feed should carry only the answer/glitch line).
+    fn mirror(&self, bot_id: &str, text: &str) {
+        use worksgood::notify::telegram_conversation as convo;
+        if text == convo::ack_line() {
+            return;
+        }
+        let agent_id = convo::agent_for_bot(&self.config, bot_id);
         let entry = casa_feed::agent_entry(&agent_id, text, casa_feed::now_ms());
         if let Err(e) = casa_feed::append_entry(&self.feed_path, &entry) {
             eprintln!(
@@ -1297,6 +1340,23 @@ impl worksgood::notify::telegram_conversation::ReplySink for FeedMirrorSink {
                 chrono::Utc::now().format("%H:%M:%S"),
             );
         }
+    }
+}
+
+#[async_trait]
+impl worksgood::notify::telegram_conversation::ReplySink for FeedMirrorSink {
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
+        // Send for real first; only mirror what actually went out to the group.
+        let mid = self.inner.send(bot_id, chat_id, text).await?;
+        self.mirror(bot_id, text);
+        Ok(mid)
+    }
+
+    async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        // The ack is being turned into the final answer (or glitch line) —
+        // mirror that final text into the feed.
+        self.inner.edit(bot_id, chat_id, message_id, text).await?;
+        self.mirror(bot_id, text);
         Ok(())
     }
 }
@@ -1613,12 +1673,20 @@ pub fn run_command(
 /// addressed, and the plan kind) and the outbound replies the listener WOULD
 /// send — captured by a recording sink, never sent, so it is credential-free.
 ///
-/// With `--session-reply <text>` it exercises the FULL persistent-session
+/// With `--session-reply <text>` it exercises the legacy persistent-session
 /// round-trip: an ephemeral session is created and bound to the addressed
 /// agent (making the plan `converse`), the human's message is written to that
 /// session's inbox, a fixture responder writes `<text>` to the outbox, and the
-/// relayed reply is captured — proving both entry points round-trip through a
-/// real session and reply in the correct chat via the correct bot.
+/// relayed reply is captured.
+///
+/// With `--compose` it exercises the REAL fix end-to-end: the converse turn is
+/// driven by the production [`OneshotComposer`] (a live one-shot `claude`
+/// spawn), so the captured reply is an actual session-generated answer — no
+/// fixture, no mock. This is the credential-bearing "real turn" validation.
+///
+/// With `--compose-error` a deliberately-failing composer is injected so the
+/// fail-fast + graceful "glitched" follow-up path is provable through the built
+/// binary without a live model (the induced-failure test).
 #[allow(clippy::too_many_arguments)]
 pub fn run_conversation_dryrun(
     workgraph_dir: &Path,
@@ -1628,6 +1696,8 @@ pub fn run_conversation_dryrun(
     message: &str,
     group: bool,
     session_reply: Option<&str>,
+    compose: bool,
+    compose_error: bool,
     json: bool,
 ) -> Result<()> {
     use std::sync::{Arc, Mutex};
@@ -1640,9 +1710,10 @@ pub fn run_conversation_dryrun(
         convo::Entry::Direct
     };
 
-    // Fixture mode: bind an ephemeral session to the addressed agent so the
-    // plan resolves to `converse` and the round-trip has somewhere to land.
-    if session_reply.is_some() {
+    // Bind an ephemeral session to the addressed agent so the plan resolves to
+    // `converse` and the turn has somewhere to land — needed for the fixture
+    // round-trip AND both compose modes.
+    if session_reply.is_some() || compose || compose_error {
         if let Some(agent_id) = convo::agent_for_channel(&config, channel) {
             let uuid = worksgood::chat_sessions::create_session(
                 workgraph_dir,
@@ -1656,17 +1727,38 @@ pub fn run_conversation_dryrun(
 
     let plan = convo::plan_conversation(workgraph_dir, &config, channel, chat, sender, entry);
 
-    // Recording sink: capture every send instead of hitting the network.
+    // Recording sink: capture every send AND edit instead of hitting the
+    // network. Sends return a monotonic fake message id so the ack-edit path
+    // works; edits are recorded so the printed output shows the final text.
     #[derive(Clone, Default)]
     struct DryRunSink {
         sent: Arc<Mutex<Vec<(String, String, String)>>>,
+        edited: Arc<Mutex<Vec<(String, String, String, String)>>>,
+        next_id: Arc<Mutex<u64>>,
     }
     #[async_trait::async_trait]
     impl convo::ReplySink for DryRunSink {
-        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
+        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
             self.sent.lock().unwrap().push((
                 bot_id.to_string(),
                 chat_id.to_string(),
+                text.to_string(),
+            ));
+            let mut n = self.next_id.lock().unwrap();
+            *n += 1;
+            Ok(Some(n.to_string()))
+        }
+        async fn edit(
+            &self,
+            bot_id: &str,
+            chat_id: &str,
+            message_id: &str,
+            text: &str,
+        ) -> Result<()> {
+            self.edited.lock().unwrap().push((
+                bot_id.to_string(),
+                chat_id.to_string(),
+                message_id.to_string(),
                 text.to_string(),
             ));
             Ok(())
@@ -1674,39 +1766,82 @@ pub fn run_conversation_dryrun(
     }
     let sink = DryRunSink::default();
 
+    // Injected failing composer for `--compose-error`.
+    struct FailingComposer;
+    #[async_trait::async_trait]
+    impl convo::ReplyComposer for FailingComposer {
+        async fn compose(
+            &self,
+            _wg: &Path,
+            _s: &str,
+            _a: &str,
+            _m: &str,
+        ) -> Result<String> {
+            anyhow::bail!("induced compose failure (--compose-error)")
+        }
+    }
+
+    // Build the composer for whichever mode is active.
+    let real_composer = if compose {
+        Some(convo::OneshotComposer::from_config(
+            worksgood::config::Config::load_merged(workgraph_dir)
+                .context("--compose needs a loadable wg config")?,
+        ))
+    } else {
+        None
+    };
+    let failing_composer = FailingComposer;
+    let composer_ref: Option<&dyn convo::ReplyComposer> = if compose_error {
+        Some(&failing_composer)
+    } else {
+        real_composer.as_ref().map(|c| c as &dyn convo::ReplyComposer)
+    };
+
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
     let outcome = rt.block_on(async {
-        // Fixture responder: when a bound session is present, echo the canned
-        // reply to the outbox as a live session would.
-        if let (Some(reply), convo::ConversationPlan::Converse { session_ref, .. }) =
-            (session_reply, &plan)
-        {
-            let dir = workgraph_dir.to_path_buf();
-            let session_ref = session_ref.clone();
-            let reply = reply.to_string();
-            tokio::spawn(async move {
-                for _ in 0..200 {
-                    let inbox = worksgood::chat::read_inbox_ref(&dir, &session_ref)
-                        .unwrap_or_default();
-                    if let Some(m) = inbox.iter().find(|m| m.role == "user") {
-                        let _ = worksgood::chat::append_outbox_ref(
-                            &dir,
-                            &session_ref,
-                            &reply,
-                            &m.request_id,
-                        );
-                        return;
+        // Legacy fixture responder: only when NOT using a composer — echo the
+        // canned reply to the outbox as a live session would.
+        if composer_ref.is_none() {
+            if let (Some(reply), convo::ConversationPlan::Converse { session_ref, .. }) =
+                (session_reply, &plan)
+            {
+                let dir = workgraph_dir.to_path_buf();
+                let session_ref = session_ref.clone();
+                let reply = reply.to_string();
+                tokio::spawn(async move {
+                    for _ in 0..200 {
+                        let inbox = worksgood::chat::read_inbox_ref(&dir, &session_ref)
+                            .unwrap_or_default();
+                        if let Some(m) = inbox.iter().find(|m| m.role == "user") {
+                            let _ = worksgood::chat::append_outbox_ref(
+                                &dir,
+                                &session_ref,
+                                &reply,
+                                &m.request_id,
+                            );
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            });
+                });
+            }
         }
-        // Fast timing so the dry-run doesn't stall; onboarding/sessionless send
-        // immediately regardless.
-        let timing = convo::AckTiming {
-            ack_after: std::time::Duration::from_millis(50),
-            reply_timeout: std::time::Duration::from_secs(5),
-            poll: std::time::Duration::from_millis(15),
+        // Timing: in compose modes keep the ack point far out so a normal reply
+        // (or a fast induced failure) lands as a single direct send that the
+        // test can capture; the reply timeout bounds a genuinely hung child. In
+        // the legacy fixture mode, fast timing so the dry-run doesn't stall.
+        let timing = if composer_ref.is_some() {
+            convo::AckTiming {
+                ack_after: std::time::Duration::from_secs(60),
+                reply_timeout: std::time::Duration::from_secs(120),
+                poll: std::time::Duration::from_millis(50),
+            }
+        } else {
+            convo::AckTiming {
+                ack_after: std::time::Duration::from_millis(50),
+                reply_timeout: std::time::Duration::from_secs(5),
+                poll: std::time::Duration::from_millis(15),
+            }
         };
         convo::run_conversation_turn(
             workgraph_dir,
@@ -1714,12 +1849,18 @@ pub fn run_conversation_dryrun(
             message,
             &format!("dryrun-{sender}"),
             timing,
+            composer_ref,
             &sink,
         )
         .await
     })?;
 
-    let sends = sink.sent.lock().unwrap().clone();
+    // Fold edits into the send list for output so the final text (when the ack
+    // was edited in place) is always visible.
+    let mut sends = sink.sent.lock().unwrap().clone();
+    for (bot, chat, _mid, text) in sink.edited.lock().unwrap().iter() {
+        sends.push((bot.clone(), chat.clone(), text.clone()));
+    }
     if json {
         let sends_json: Vec<_> = sends
             .iter()

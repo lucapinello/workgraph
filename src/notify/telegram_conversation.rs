@@ -44,12 +44,13 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use crate::agency::TelegramBindingMap;
 use crate::chat;
 use crate::chat_sessions;
+use crate::config::Config;
 
 use super::NotificationChannel;
 use super::telegram::{TelegramChannel, TelegramConfig};
@@ -143,6 +144,11 @@ pub enum TurnOutcome {
     /// The session never replied within the timeout. `acked` records whether the
     /// human at least got the "on it" ack (so it was not pure silence).
     TimedOut { acked: bool },
+    /// The reply composer failed fast (child errored / non-zero exit) or the
+    /// compose deadline elapsed, so the human got the graceful "glitched"
+    /// follow-up (editing the ack in place when one was sent) rather than a
+    /// permanent hourglass. `acked` records whether an ack preceded it.
+    Glitched { acked: bool },
     /// An unknown sender got the onboarding one-liner.
     Onboarded,
     /// A confirmed human addressed an agent with no bound session; sent the
@@ -157,6 +163,9 @@ impl TurnOutcome {
             TurnOutcome::Replied { acked: true } => "replied (after ack)".to_string(),
             TurnOutcome::TimedOut { acked } => {
                 format!("timed-out (acked={acked})")
+            }
+            TurnOutcome::Glitched { acked } => {
+                format!("glitched-fallback (acked={acked})")
             }
             TurnOutcome::Onboarded => "onboarded".to_string(),
             TurnOutcome::Sessionless => "sessionless-fallback".to_string(),
@@ -186,6 +195,13 @@ pub fn onboarding_line() -> String {
 pub fn sessionless_line() -> String {
     "I'm here! \u{1f642} Give me a little while to get settled and I'll be able to help properly."
         .to_string()
+}
+
+/// Human-facing line sent when the reply composition fails or times out — the
+/// turn never silently strands the human on a stuck hourglass. Warm, no jargon,
+/// invites a retry. Replaces the ack in place when one was sent.
+pub fn glitch_line() -> String {
+    "Sorry, I glitched for a second there \u{1f605} — mind trying me again?".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +376,21 @@ impl AckTiming {
 /// round-trip can be asserted without a live bot.
 #[async_trait]
 pub trait ReplySink: Send + Sync {
-    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()>;
+    /// Send a message and return the platform message id when known, so the
+    /// caller can later [`edit`](ReplySink::edit) it in place — e.g. replace the
+    /// latency ack with the final answer. `Ok(None)` means the id is
+    /// unavailable; the caller then falls back to sending a fresh message.
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>>;
+
+    /// Edit a previously-sent message in place (Telegram `editMessageText`) so
+    /// the "On it — one sec…" ack becomes the final answer rather than a stale
+    /// hourglass followed by a second message. The default falls back to sending
+    /// a fresh message, so a sink that cannot edit still never strands the human
+    /// on the ack.
+    async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        let _ = message_id;
+        self.send(bot_id, chat_id, text).await.map(|_| ())
+    }
 }
 
 /// Production sink: resolves `bot_id` against the config and sends via that
@@ -379,7 +409,7 @@ impl BotReplySink {
 
 #[async_trait]
 impl ReplySink for BotReplySink {
-    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
         let bots = self.config.all_bots();
         let (id, bot) = bots
             .iter()
@@ -387,8 +417,179 @@ impl ReplySink for BotReplySink {
             .or_else(|| bots.first())
             .ok_or_else(|| anyhow::anyhow!("no Telegram bots configured — cannot reply"))?;
         let channel = TelegramChannel::from_bot(id.clone(), bot.clone());
-        channel.send_text(chat_id, text).await?;
+        let mid = channel.send_text(chat_id, text).await?;
+        Ok(Some(mid.0))
+    }
+
+    async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        let bots = self.config.all_bots();
+        let (id, bot) = bots
+            .iter()
+            .find(|(id, _)| id == bot_id)
+            .or_else(|| bots.first())
+            .ok_or_else(|| anyhow::anyhow!("no Telegram bots configured — cannot edit"))?;
+        let channel = TelegramChannel::from_bot(id.clone(), bot.clone());
+        // If the edit fails (e.g. message too old, or a non-numeric id), fall
+        // back to a fresh send so the human still gets the answer — never a
+        // stranded hourglass.
+        if let Err(e) = channel.edit_text(chat_id, message_id, text).await {
+            eprintln!("[convo] editMessageText failed ({e:#}) — sending fresh message instead");
+            channel.send_text(chat_id, text).await?;
+        }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reply composition (the think-spawn seam — mockable in tests)
+// ---------------------------------------------------------------------------
+
+/// Composes the agent's actual reply to a human turn.
+///
+/// This is the seam the `fix-converse-hang` bug lived behind: the previous
+/// design wrote the human turn to the bound-session inbox and *polled the
+/// outbox forever* for a reply that only a live `wg nex` daemon could produce.
+/// In the real deployment no such daemon runs, so every converse turn acked at
+/// `ack_after` and then TIMED OUT at `reply_timeout` — the real answer never
+/// sent. The composer replaces that open-loop wait with a bounded, directly
+/// driven turn: the production impl spawns a one-shot `claude` CLI call
+/// ([`OneshotComposer`]); tests substitute a synchronous fake so the round-trip
+/// and the failure/timeout paths are provable without a live model.
+#[async_trait]
+pub trait ReplyComposer: Send + Sync {
+    /// Produce the reply text for `human_message`, grounded in the persona's
+    /// bound session (`session_ref`). Returns `Err` fast on any failure so the
+    /// caller can send the graceful "glitched" follow-up instead of hanging.
+    async fn compose(
+        &self,
+        workgraph_dir: &Path,
+        session_ref: &str,
+        agent_id: &str,
+        human_message: &str,
+    ) -> Result<String>;
+}
+
+/// Production composer: a **one-shot** LLM turn via
+/// [`crate::service::llm::run_model_oneshot`] (which shells out to the `claude`
+/// CLI in `--print --output-format json` non-interactive mode, prompt on stdin
+/// with EOF, wrapped in the platform timeout, Claude-Code env stripped, `[auth]`
+/// OAuth injected — see `call_claude_cli`). This is the exact spawn the task
+/// asked to drive: non-interactive, self-authenticating, and time-bounded, so
+/// it either returns the answer or fails fast with the child's stderr.
+pub struct OneshotComposer {
+    config: Config,
+    model_spec: String,
+    timeout_secs: u64,
+}
+
+impl OneshotComposer {
+    /// Build from the merged workgraph config. The model spec and per-call
+    /// timeout are env-tunable without a rebuild:
+    /// - `WG_TELEGRAM_COMPOSE_MODEL` (default `claude:haiku` — fast, cheap,
+    ///   self-authenticating CLI, right-sized for a short family-chat reply)
+    /// - `WG_TELEGRAM_COMPOSE_TIMEOUT_SECS` (default 90)
+    pub fn from_config(config: Config) -> Self {
+        let model_spec = std::env::var("WG_TELEGRAM_COMPOSE_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "claude:haiku".to_string());
+        let timeout_secs = std::env::var("WG_TELEGRAM_COMPOSE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(90);
+        Self {
+            config,
+            model_spec,
+            timeout_secs,
+        }
+    }
+}
+
+/// Assemble the composer prompt: the persona's session-summary (voice + role),
+/// a short slice of recent conversation for continuity, and the human's new
+/// message — with explicit family-voice guidance (warm, no jargon, no task ids;
+/// see the `family-voice-no-jargon` project rule). Pure/filesystem-only.
+fn build_compose_prompt(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    agent_id: &str,
+    human_message: &str,
+) -> String {
+    let chat_dir = chat::chat_dir_for_ref(workgraph_dir, session_ref);
+    let summary = std::fs::read_to_string(chat_dir.join("session-summary.md"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // A few recent turns for continuity (best-effort; empty on a fresh session).
+    let mut history: Vec<String> = Vec::new();
+    if let Ok(inbox) = chat::read_inbox_ref(workgraph_dir, session_ref) {
+        for m in inbox.iter().rev().take(4).rev() {
+            if m.role == "user" {
+                history.push(format!("Human: {}", m.content.trim()));
+            }
+        }
+    }
+    if let Ok(outbox) = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0) {
+        for m in outbox.iter().rev().take(4).rev() {
+            history.push(format!("You: {}", m.content.trim()));
+        }
+    }
+
+    let mut prompt = String::new();
+    match &summary {
+        Some(s) => {
+            prompt.push_str("You are answering as this person, in their voice:\n\n");
+            prompt.push_str(s);
+            prompt.push_str("\n\n");
+        }
+        None => {
+            prompt.push_str(&format!(
+                "You are '{agent_id}', a warm, helpful member of the family team.\n\n"
+            ));
+        }
+    }
+    if !history.is_empty() {
+        prompt.push_str("Recent conversation:\n");
+        prompt.push_str(&history.join("\n"));
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(
+        "Reply to the message below in a natural, friendly way. Keep it short and \
+         conversational. Talk like a person texting family — no jargon, no task ids, no \
+         status dumps, no markdown headings. Just answer.\n\n",
+    );
+    prompt.push_str(&format!("Message: {}\n\nYour reply:", human_message.trim()));
+    prompt
+}
+
+#[async_trait]
+impl ReplyComposer for OneshotComposer {
+    async fn compose(
+        &self,
+        workgraph_dir: &Path,
+        session_ref: &str,
+        agent_id: &str,
+        human_message: &str,
+    ) -> Result<String> {
+        let prompt =
+            build_compose_prompt(workgraph_dir, session_ref, agent_id, human_message);
+        let config = self.config.clone();
+        let model = self.model_spec.clone();
+        let timeout = self.timeout_secs;
+        // `run_model_oneshot` is synchronous and spawns+waits a child CLI, so it
+        // must run on a blocking thread rather than stalling the async runtime.
+        let result = tokio::task::spawn_blocking(move || {
+            crate::service::llm::run_model_oneshot(&config, &model, &prompt, timeout)
+        })
+        .await
+        .context("compose task panicked")??;
+        let text = result.text.trim().to_string();
+        if text.is_empty() {
+            anyhow::bail!("compose model returned an empty reply");
+        }
+        Ok(text)
     }
 }
 
@@ -428,12 +629,14 @@ fn read_new_reply(
 /// bound session inbox and polls the outbox for the reply, emitting the latency
 /// ack if the turn runs past `timing.ack_after`. For the other variants it
 /// sends the corresponding one-liner. Returns the [`TurnOutcome`] for logging.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_conversation_turn(
     workgraph_dir: &Path,
     plan: &ConversationPlan,
     human_message: &str,
     request_id: &str,
     timing: AckTiming,
+    composer: Option<&dyn ReplyComposer>,
     sink: &dyn ReplySink,
 ) -> Result<TurnOutcome> {
     match plan {
@@ -448,21 +651,150 @@ pub async fn run_conversation_turn(
             Ok(TurnOutcome::Sessionless)
         }
         ConversationPlan::Converse {
-            session_ref, route, ..
-        } => {
-            let baseline = outbox_baseline(workgraph_dir, session_ref);
-            // Deliver the human's turn to the agent's persistent session.
-            chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id)?;
-            await_session_reply(
-                workgraph_dir,
-                session_ref,
-                baseline,
-                request_id,
-                timing,
-                route,
-                sink,
-            )
+            session_ref,
+            route,
+            agent_id,
+            ..
+        } => match composer {
+            // The real path: directly drive a bounded compose turn (a one-shot
+            // `claude` spawn in production). Completes with the real answer or
+            // fails fast into the graceful "glitched" follow-up — never the
+            // open-loop 120s hang that this task fixes.
+            Some(composer) => {
+                run_composed_turn(
+                    workgraph_dir,
+                    session_ref,
+                    agent_id,
+                    human_message,
+                    request_id,
+                    timing,
+                    route,
+                    sink,
+                    composer,
+                )
+                .await
+            }
+            // Legacy path (no composer injected): write the human turn to the
+            // session inbox and poll the outbox for a reply a live session
+            // produces. Retained for callers/tests that supply their own
+            // outbox producer.
+            None => {
+                let baseline = outbox_baseline(workgraph_dir, session_ref);
+                chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id)?;
+                await_session_reply(
+                    workgraph_dir,
+                    session_ref,
+                    baseline,
+                    request_id,
+                    timing,
+                    route,
+                    sink,
+                )
+                .await
+            }
+        },
+    }
+}
+
+/// Deliver `text` to the human: edit the latency ack in place when one was sent
+/// (turning the hourglass into the final answer), else send a fresh message.
+async fn deliver_reply(
+    sink: &dyn ReplySink,
+    route: &ReplyRoute,
+    ack_mid: Option<&str>,
+    text: &str,
+) -> Result<()> {
+    match ack_mid {
+        Some(mid) if !mid.is_empty() => {
+            sink.edit(&route.bot_id, &route.chat_id, mid, text).await
+        }
+        _ => sink
+            .send(&route.bot_id, &route.chat_id, text)
             .await
+            .map(|_| ()),
+    }
+}
+
+/// Drive a bounded compose turn: race the composer against the ack/timeout
+/// clock. Emits the latency ack once past `ack_after`; on success relays the
+/// answer (editing the ack in place); on failure OR at `reply_timeout` sends the
+/// graceful "glitched" follow-up (also editing the ack) so the human never sees
+/// a permanent hourglass. The composed reply is also written to the session
+/// outbox so the TUI / casa feed stay consistent with what was sent.
+#[allow(clippy::too_many_arguments)]
+async fn run_composed_turn(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    agent_id: &str,
+    human_message: &str,
+    request_id: &str,
+    timing: AckTiming,
+    route: &ReplyRoute,
+    sink: &dyn ReplySink,
+    composer: &dyn ReplyComposer,
+) -> Result<TurnOutcome> {
+    // Persist the human turn so a live nex session and the TUI stay consistent
+    // with the answer we compose here (best-effort — a write failure must not
+    // block the reply).
+    let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+
+    let compose = composer.compose(workgraph_dir, session_ref, agent_id, human_message);
+    tokio::pin!(compose);
+
+    let start = Instant::now();
+    let mut acked = false;
+    let mut ack_mid: Option<String> = None;
+
+    loop {
+        let elapsed = start.elapsed();
+        // Wake at the next deadline we still care about: the ack point (if not
+        // yet acked) or the hard reply timeout.
+        let deadline = if !acked && elapsed < timing.ack_after {
+            timing.ack_after
+        } else {
+            timing.reply_timeout
+        };
+        let sleep_for = deadline.saturating_sub(elapsed);
+
+        tokio::select! {
+            res = &mut compose => {
+                match res {
+                    Ok(text) => {
+                        let text = text.trim().to_string();
+                        let _ = chat::append_outbox_ref(
+                            workgraph_dir, session_ref, &text, request_id,
+                        );
+                        deliver_reply(sink, route, ack_mid.as_deref(), &text).await?;
+                        return Ok(TurnOutcome::Replied { acked });
+                    }
+                    Err(e) => {
+                        // Fail fast — surface the child's error (never a token)
+                        // and give the human the graceful follow-up.
+                        eprintln!(
+                            "[{}] convo compose failed for {agent_id}: {e:#}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                        );
+                        deliver_reply(sink, route, ack_mid.as_deref(), &glitch_line()).await?;
+                        return Ok(TurnOutcome::Glitched { acked });
+                    }
+                }
+            }
+            _ = tokio::time::sleep(sleep_for) => {
+                let elapsed = start.elapsed();
+                if !acked && elapsed >= timing.ack_after && elapsed < timing.reply_timeout {
+                    ack_mid = sink.send(&route.bot_id, &route.chat_id, &ack_line()).await?;
+                    acked = true;
+                }
+                if start.elapsed() >= timing.reply_timeout {
+                    eprintln!(
+                        "[{}] convo compose timed out for {agent_id} after {:?}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        timing.reply_timeout,
+                    );
+                    deliver_reply(sink, route, ack_mid.as_deref(), &glitch_line()).await?;
+                    return Ok(TurnOutcome::Glitched { acked });
+                }
+            }
         }
     }
 }
@@ -511,24 +843,93 @@ mod tests {
     use tempfile::tempdir;
 
     /// Recording sink: captures every (bot_id, chat_id, text) send so tests can
-    /// assert *which bot* replied *in which chat* with *what text*.
+    /// assert *which bot* replied *in which chat* with *what text*. Sends return
+    /// a monotonic fake message id so the ack-edit path is exercisable, and
+    /// edits are recorded separately so tests can assert the ack was turned INTO
+    /// the final answer rather than left as a second message.
     #[derive(Default)]
     struct RecSink {
         sent: Mutex<Vec<(String, String, String)>>,
+        edited: Mutex<Vec<(String, String, String, String)>>,
+        next_id: Mutex<u64>,
     }
     #[async_trait]
     impl ReplySink for RecSink {
-        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<()> {
+        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
             self.sent
                 .lock()
                 .unwrap()
                 .push((bot_id.to_string(), chat_id.to_string(), text.to_string()));
+            let mut n = self.next_id.lock().unwrap();
+            *n += 1;
+            Ok(Some(n.to_string()))
+        }
+        async fn edit(
+            &self,
+            bot_id: &str,
+            chat_id: &str,
+            message_id: &str,
+            text: &str,
+        ) -> Result<()> {
+            self.edited.lock().unwrap().push((
+                bot_id.to_string(),
+                chat_id.to_string(),
+                message_id.to_string(),
+                text.to_string(),
+            ));
             Ok(())
         }
     }
     impl RecSink {
         fn calls(&self) -> Vec<(String, String, String)> {
             self.sent.lock().unwrap().clone()
+        }
+        fn edits(&self) -> Vec<(String, String, String, String)> {
+            self.edited.lock().unwrap().clone()
+        }
+    }
+
+    /// Fake composer for the round-trip / failure / slow tests — no live model.
+    struct FakeComposer {
+        reply: Result<String, String>,
+        delay: Duration,
+    }
+    impl FakeComposer {
+        fn ok(text: &str) -> Self {
+            Self {
+                reply: Ok(text.to_string()),
+                delay: Duration::ZERO,
+            }
+        }
+        fn ok_after(text: &str, delay: Duration) -> Self {
+            Self {
+                reply: Ok(text.to_string()),
+                delay,
+            }
+        }
+        fn fail(msg: &str) -> Self {
+            Self {
+                reply: Err(msg.to_string()),
+                delay: Duration::ZERO,
+            }
+        }
+    }
+    #[async_trait]
+    impl ReplyComposer for FakeComposer {
+        async fn compose(
+            &self,
+            _workgraph_dir: &Path,
+            _session_ref: &str,
+            _agent_id: &str,
+            _human_message: &str,
+        ) -> Result<String> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            match &self.reply {
+                Ok(t) => Ok(t.clone()),
+                Err(e) => anyhow::bail!("{e}"),
+            }
         }
     }
 
@@ -725,6 +1126,7 @@ mod tests {
             "are we still on for dinner?",
             "req-1",
             fast_timing(),
+            None,
             &sink,
         )
         .await
@@ -768,7 +1170,7 @@ mod tests {
         });
 
         let outcome =
-            run_conversation_turn(&wg, &plan, "bruno what's for dinner?", "req-2", fast_timing(), &sink)
+            run_conversation_turn(&wg, &plan, "bruno what's for dinner?", "req-2", fast_timing(), None, &sink)
                 .await
                 .unwrap();
         responder.await.unwrap();
@@ -803,7 +1205,7 @@ mod tests {
         });
 
         let outcome =
-            run_conversation_turn(&wg, &plan, "you there?", "req-3", fast_timing(), &sink)
+            run_conversation_turn(&wg, &plan, "you there?", "req-3", fast_timing(), None, &sink)
                 .await
                 .unwrap();
         responder.await.unwrap();
@@ -836,7 +1238,7 @@ mod tests {
             reply_timeout: Duration::from_millis(150),
             poll: Duration::from_millis(15),
         };
-        let outcome = run_conversation_turn(&wg, &plan, "hello?", "req-4", timing, &sink)
+        let outcome = run_conversation_turn(&wg, &plan, "hello?", "req-4", timing, None, &sink)
             .await
             .unwrap();
         assert_eq!(outcome, TurnOutcome::TimedOut { acked: true });
@@ -854,7 +1256,7 @@ mod tests {
         // No confirmed binding for this sender.
         let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "stranger", Entry::Direct);
         let sink = RecSink::default();
-        let outcome = run_conversation_turn(&wg, &plan, "hi", "req-5", fast_timing(), &sink)
+        let outcome = run_conversation_turn(&wg, &plan, "hi", "req-5", fast_timing(), None, &sink)
             .await
             .unwrap();
         assert_eq!(outcome, TurnOutcome::Onboarded);
@@ -862,5 +1264,154 @@ mod tests {
         assert_eq!(calls.len(), 1, "onboarding is one line, nothing more");
         assert_eq!(calls[0].0, "otto");
         assert_eq!(calls[0].1, "555");
+    }
+
+    /// Build a `Converse` plan bound to a fresh session for the composer tests.
+    fn converse_fixture(wg: &Path) -> (TelegramConfig, ConversationPlan) {
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(wg, "otto", &uuid).unwrap();
+        confirm_human(wg, "luca-1", "human-luca", "otto");
+        let plan = plan_conversation(wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        assert!(matches!(plan, ConversationPlan::Converse { .. }));
+        (cfg, plan)
+    }
+
+    /// The core fix: with a composer injected, a converse turn COMPLETES with the
+    /// composer's real answer within the timeout — no open-loop outbox poll, no
+    /// 120s hang. This is what the old inbox/outbox-only path could never do in
+    /// production (no daemon produced the outbox reply).
+    #[tokio::test]
+    async fn converse_composes_and_relays_reply_within_timeout() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let (_cfg, plan) = converse_fixture(&wg);
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok("Yep — dinner's at seven, see you there!");
+
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "are we still on for dinner?",
+            "req-c1",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Replied { acked: false });
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 1, "fast compose sends exactly the answer");
+        assert_eq!(calls[0].0, "otto");
+        assert_eq!(calls[0].1, "555");
+        assert_eq!(calls[0].2, "Yep — dinner's at seven, see you there!");
+        // The composed reply is also persisted to the outbox for TUI/feed parity.
+        if let ConversationPlan::Converse { session_ref, .. } = &plan {
+            let out = chat::read_outbox_since_ref(&wg, session_ref, 0).unwrap();
+            assert_eq!(out.last().unwrap().content, "Yep — dinner's at seven, see you there!");
+        }
+    }
+
+    /// Induced failure: the composer errors (the production analogue is the
+    /// `claude` child dying / non-zero exit / auth failure). The human gets the
+    /// graceful "glitched" follow-up fast — never a permanent hourglass, never
+    /// silence.
+    #[tokio::test]
+    async fn compose_failure_sends_glitch_follow_up_fast() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let (_cfg, plan) = converse_fixture(&wg);
+        let sink = RecSink::default();
+        let composer = FakeComposer::fail("claude CLI exited 1: Invalid API key");
+
+        let start = Instant::now();
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "you there?",
+            "req-c2",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert!(start.elapsed() < Duration::from_secs(1), "must fail fast, not hang");
+        assert_eq!(outcome, TurnOutcome::Glitched { acked: false });
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].2.contains("glitched"), "got: {:?}", calls[0].2);
+    }
+
+    /// A slow compose (past `ack_after`) sends the ack, then EDITS it in place
+    /// into the final answer — one clean message, no stale hourglass + second
+    /// message.
+    #[tokio::test]
+    async fn slow_compose_acks_then_edits_ack_into_answer() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let (_cfg, plan) = converse_fixture(&wg);
+        let sink = RecSink::default();
+        // fast_timing ack_after is 80ms; delay 200ms so the ack fires first.
+        let composer = FakeComposer::ok_after("Here at last — all sorted!", Duration::from_millis(200));
+
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "any update?",
+            "req-c3",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Replied { acked: true });
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 1, "only the ack is a fresh send");
+        assert!(calls[0].2.contains("On it"), "first send is the ack");
+        let ack_mid = "1".to_string(); // RecSink's first id
+        let edits = sink.edits();
+        assert_eq!(edits.len(), 1, "the answer edits the ack in place");
+        assert_eq!(edits[0].2, ack_mid, "edit targets the ack's message id");
+        assert_eq!(edits[0].3, "Here at last — all sorted!");
+    }
+
+    /// A slow compose that then FAILS: the ack is edited into the glitch line
+    /// (not left hanging, not duplicated).
+    #[tokio::test]
+    async fn slow_compose_failure_edits_ack_into_glitch() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let (_cfg, plan) = converse_fixture(&wg);
+        let sink = RecSink::default();
+        let composer = FakeComposer {
+            reply: Err("boom".to_string()),
+            delay: Duration::from_millis(200),
+        };
+
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "hello?",
+            "req-c4",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Glitched { acked: true });
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 1, "only the ack was a fresh send");
+        assert!(calls[0].2.contains("On it"));
+        let edits = sink.edits();
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].3.contains("glitched"), "ack edited into glitch: {:?}", edits[0].3);
     }
 }

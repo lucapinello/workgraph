@@ -2060,6 +2060,15 @@ description = "Pins the conversational reply path that closed the gap Luca hit l
 timeout_seconds = 30
 
 [[scenario]]
+name = "telegram_converse_compose"
+script = "scenarios/telegram_converse_compose.sh"
+owners = [
+    "fix-converse-hang",
+]
+description = "Pins the fix for fix-converse-hang: a plain message that routed to one agent used to write the human turn to the bound-session INBOX and poll the OUTBOX forever for a reply only a live `wg nex` daemon could produce — none runs in the deployment, so every converse turn acked at ~4s then TIMED OUT at 120s (the real answer NEVER sent). The old dry-run hid it because `--session-reply` installed a FIXTURE responder that wrote the outbox. The fix drives the converse turn through a real COMPOSER — a one-shot `claude` spawn (`OneshotComposer`, via service::llm::run_model_oneshot / call_claude_cli: `claude --model .. --print --output-format json --dangerously-skip-permissions`, prompt on stdin+EOF, platform-timeout wrapper, Claude-Code env stripped, [auth] OAuth injected) — so the turn either returns the answer within the timeout or FAILS FAST into a graceful `glitched` follow-up that EDITS the ack in place (no permanent hourglass). Drives the REAL binary via `wg telegram conversation`: `--compose-error` injects a failing composer and asserts the fail-fast glitch line + no stuck ack + no token leak (credential-free, always runs); `--compose` drives the production one-shot `claude` composer and asserts an actual session-generated answer lands with outcome `replied` within the timeout (self-authenticating CLI; loud-SKIPs rather than blocks when no usable auth). Also pinned by the notify::telegram_conversation unit/tokio tests (composed round-trip, fail-fast glitch, slow-compose ack→edit, slow-fail ack→glitch)."
+timeout_seconds = 180
+
+[[scenario]]
 name = "telegram_send_bots_map_only"
 script = "scenarios/telegram_send_bots_map_only.sh"
 owners = [
