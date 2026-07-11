@@ -1444,6 +1444,41 @@ fn build_auto_assign_tasks(
                 None => continue,
             };
 
+        // Bug guard (R10): never let the auto-assigner override an explicit
+        // human assignment. If the source task is already pinned to a human
+        // agent (via `wg assign`), the `.assign-*` scaffold must NOT run the
+        // LLM assigner (which would replace the human with an AI agent, e.g.
+        // "her dietitian role is perfect…"). Close the scaffold as Done and
+        // leave the human assignment intact so `park_ready_human_tasks`
+        // (Phase 4.8) parks it for the human instead of spawning an AI worker.
+        let existing_human_assignee = graph
+            .get_task(&source_id)
+            .and_then(|t| t.agent.clone())
+            .filter(|a| human_dispatch::agent_id_is_human(dir, a));
+        if let Some(human_id) = existing_human_assignee {
+            eprintln!(
+                "[dispatcher] Skipping auto-assign for '{}': already assigned to human agent '{}' — the assigner must not override an explicit human assignment.",
+                source_id, human_id,
+            );
+            if let Some(assign_task) = graph.get_task_mut(&assign_task_id) {
+                let now = Utc::now().to_rfc3339();
+                assign_task.status = Status::Done;
+                assign_task.started_at.get_or_insert_with(|| now.clone());
+                assign_task.completed_at = Some(now);
+                assign_task.log.push(LogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    actor: Some("coordinator".to_string()),
+                    user: Some(worksgood::current_user()),
+                    message: format!(
+                        "Auto-assign skipped: source task '{}' is explicitly assigned to human agent '{}'. Left for human parking (R10).",
+                        source_id, human_id,
+                    ),
+                });
+            }
+            modified = true;
+            continue;
+        }
+
         // Determine assignment path — always LLM-based
         let assignment_path =
             run_mode::determine_assignment_path(&config.agency, total_assignments);
@@ -5186,6 +5221,95 @@ mod tests {
         task.assigned = Some("agent-1".to_string());
         graph.add_node(Node::Task(task));
         save_graph(&graph, &graph_path).unwrap();
+    }
+
+    /// Write a human (`is_human`) agent into the agency cache so the assigner's
+    /// human-assignment guard can resolve it.
+    fn write_human_agent(dir: &Path, id: &str, name: &str) {
+        use worksgood::agency::{self, Agent, Lineage, PerformanceRecord};
+        let agents_dir = dir.join("agency").join("cache/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let agent = Agent {
+            id: id.to_string(),
+            role_id: String::new(),
+            tradeoff_id: String::new(),
+            name: name.to_string(),
+            performance: PerformanceRecord::default(),
+            lineage: Lineage::default(),
+            capabilities: vec![],
+            rate: None,
+            capacity: None,
+            trust_level: Default::default(),
+            contact: None,
+            executor: "telegram".to_string(), // is_human executor
+            preferred_model: None,
+            preferred_provider: None,
+            deployment_history: vec![],
+            attractor_weight: 0.5,
+            staleness_flags: vec![],
+        };
+        agency::save_agent(&agent, &agents_dir).unwrap();
+    }
+
+    /// Bug 2: a task explicitly assigned to a human via `wg assign` must NOT be
+    /// re-assigned to an AI agent by the auto-assigner. The `.assign-*` scaffold
+    /// must close cleanly and the human assignment must survive, so
+    /// `park_ready_human_tasks` can park it for the human.
+    #[test]
+    fn auto_assign_never_overrides_explicit_human_assignment() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+
+        let mut graph = WorkGraph::new();
+        // Source task pinned to the human (this is what `wg assign` records).
+        let mut source = Task::default();
+        source.id = "first-human-loop".to_string();
+        source.title = "First human loop".to_string();
+        source.status = Status::Open;
+        source.agent = Some("human-luca".to_string());
+        source.after = vec![".assign-first-human-loop".to_string()];
+        graph.add_node(Node::Task(source));
+        // A stale `.assign-*` scaffold that already exists and is ready to run
+        // (this is the one that stole the assignment in the live incident).
+        let mut assign = Task::default();
+        assign.id = ".assign-first-human-loop".to_string();
+        assign.title = "Assign: first-human-loop".to_string();
+        assign.status = Status::Open;
+        graph.add_node(Node::Task(assign));
+        save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        let config = Config::default();
+        // Run the assignment pass. The guard must short-circuit before any LLM
+        // call, so this is deterministic without a live model.
+        build_auto_assign_tasks(&mut graph, &config, dir);
+
+        // The human assignment survived — the assigner did NOT replace it.
+        let source = graph.get_task("first-human-loop").unwrap();
+        assert_eq!(
+            source.agent.as_deref(),
+            Some("human-luca"),
+            "explicit human assignment must not be overridden by the auto-assigner"
+        );
+        // The `.assign-*` scaffold was closed so it stops blocking / re-running.
+        assert_eq!(
+            graph.get_task(".assign-first-human-loop").unwrap().status,
+            Status::Done,
+            "the assign scaffold must be marked Done, not left to re-run the assigner"
+        );
+
+        // And the human task then parks for the human rather than spawning AI.
+        let parked = human_dispatch::park_ready_human_tasks(&mut graph, dir);
+        assert_eq!(parked.len(), 1, "the human task should be parked");
+        assert_eq!(parked[0].task_id, "first-human-loop");
+        let source = graph.get_task("first-human-loop").unwrap();
+        assert_eq!(source.status, Status::Waiting);
+        assert_eq!(
+            source.wait_condition,
+            Some(worksgood::graph::WaitSpec::All(vec![
+                worksgood::graph::WaitCondition::HumanInput
+            ]))
+        );
     }
 
     fn write_stream_events(agent_dir: &Path, turn_count: u32, start_ms: i64) {
