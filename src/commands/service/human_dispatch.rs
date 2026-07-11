@@ -29,7 +29,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use worksgood::agency::{self, Agent};
+use worksgood::agency::{self, Agent, TelegramBindingMap};
 use worksgood::graph::{
     LogEntry, Status, Task, TaskChoice, WaitCondition, WaitSpec, WorkGraph, is_system_task,
 };
@@ -389,24 +389,66 @@ fn latest_human_reply(dir: &Path, task_id: &str, wait_started: Option<&str>) -> 
         .map(|m| m.body)
 }
 
+/// The result of routing an inbound human reply through sender authorization.
+///
+/// The distinction matters for the listener: a [`Rejected`](Self::Rejected)
+/// reply is a *security* event (an unproven sender tried to answer for a human)
+/// and is logged with its reason, whereas [`NoWaitingTask`](Self::NoWaitingTask)
+/// is the benign "your reply arrived but nothing was waiting" case. The reason
+/// string is log-only — never surfaced verbatim to the sender — so it does not
+/// leak which humans exist or which tasks are parked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundReplyOutcome {
+    /// The reply was authorized and recorded on this task id.
+    Recorded(String),
+    /// The sender proved their confirmed binding, but the human they are bound
+    /// to had no parked task awaiting a reply — nothing to record.
+    NoWaitingTask,
+    /// The reply was rejected before recording. The string is a log-only
+    /// reason (unrecognized/unconfirmed sender, or a sender answering for a
+    /// human they are not bound to).
+    Rejected(String),
+}
+
 /// Route an inbound human reply (delivered by a notification listener) onto the
 /// awaiting-human task it answers, recording it as a message (R13). This is the
-/// "awaiting-human task router" that `src/notify/telegram.rs` deferred: the
-/// listener tags each inbound message with the receiving bot's channel type, and
-/// this maps that back to the human agent — and thus the parked task — the reply
-/// belongs to. Returns the task id the reply was recorded on, if one was found.
+/// "awaiting-human task router" that `src/notify/telegram.rs` deferred.
 ///
-/// Recording the message is exactly what satisfies the task's
-/// `WaitCondition::HumanInput`, so the coordinator's next tick completes the
-/// task via [`try_complete_human_task_on_reply`].
+/// # Sender authorization (PR #51 hardening)
+///
+/// Recording a message on a parked task is exactly what satisfies its
+/// `WaitCondition::HumanInput` and completes it — so *who* is allowed to record
+/// that message is a security boundary. The earlier tail authorized on the
+/// receiving bot's binding plus "freshest waiting task", which let **any**
+/// non-command sender visible to a (shared) bot be recorded as the assigned
+/// human's reply. This function instead proves the sender against the
+/// **confirmed** Telegram binding (`TelegramBindingMap`, R21/R22) for the human
+/// the task is assigned to:
+///
+/// 1. The inbound `sender` must have a binding, and it must be `confirmed`
+///    (the `YES` handshake completed). An unknown or unconfirmed sender is
+///    [`Rejected`](InboundReplyOutcome::Rejected).
+/// 2. The reply is only eligible for tasks assigned to *that binding's* human
+///    agent — not any human, and not the freshest ask across all humans. A
+///    sender confirmed for human A therefore cannot answer human B's task.
+/// 3. Defense in depth: if the receiving bot fronts a specific agent, it must
+///    be the same human the sender is bound to (a confirmed sender for A may
+///    not answer through B's dedicated bot).
+///
+/// Among the authorized human's parked tasks the freshest (newest park time)
+/// wins, matching the coordinator's `HumanInput` completion path.
 pub fn route_inbound_reply(
     dir: &Path,
     channel_type: &str,
     sender: &str,
     body: &str,
-) -> Option<String> {
-    let graph = worksgood::parser::load_graph(&crate::commands::graph_path(dir)).ok()?;
-    let agents_dir = dir.join("agency").join("cache/agents");
+) -> InboundReplyOutcome {
+    let graph = match worksgood::parser::load_graph(&crate::commands::graph_path(dir)) {
+        Ok(g) => g,
+        Err(e) => return InboundReplyOutcome::Rejected(format!("failed to load graph: {e}")),
+    };
+    let agency_dir = dir.join("agency");
+    let agents_dir = agency_dir.join("cache/agents");
     let agents = agency::load_all_agents_or_warn(&agents_dir);
 
     let human_ids: HashSet<&str> = agents
@@ -415,35 +457,65 @@ pub fn route_inbound_reply(
         .map(|a| a.id.as_str())
         .collect();
     if human_ids.is_empty() {
-        return None;
+        return InboundReplyOutcome::NoWaitingTask;
     }
 
-    // If this bot fronts a specific agent, the reply is theirs; otherwise a
-    // shared bot's reply may answer any human's parked task.
-    let bound_agent = bound_agent_for_channel(dir, channel_type, &agents);
+    // Authorization: the sender must prove a CONFIRMED binding. The bound
+    // agent id — not "any human" or the freshest ask — is the only human this
+    // reply may answer for.
+    let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+    let authorized_agent = match bindings.find_by_user(sender) {
+        None => {
+            return InboundReplyOutcome::Rejected(format!(
+                "unrecognized sender '{sender}': no confirmed Telegram binding"
+            ));
+        }
+        Some(b) if !b.confirmed => {
+            return InboundReplyOutcome::Rejected(format!(
+                "sender '{sender}' is bound to '{}' but has not confirmed (YES handshake pending)",
+                b.agent_id
+            ));
+        }
+        Some(b) => b.agent_id.clone(),
+    };
 
-    let mut candidates: Vec<&Task> = graph
+    // The bound agent must actually be a live human agent — a stale binding to
+    // a removed/AI agent must not authorize anything.
+    if !human_ids.contains(authorized_agent.as_str()) {
+        return InboundReplyOutcome::Rejected(format!(
+            "sender '{sender}' is bound to '{authorized_agent}', which is not a known human agent"
+        ));
+    }
+
+    // Defense in depth: a per-human bot must front the same human the sender is
+    // bound to. (Shared/default bots front no specific agent and skip this.)
+    if let Some(bound) = bound_agent_for_channel(dir, channel_type, &agents) {
+        if bound != authorized_agent {
+            return InboundReplyOutcome::Rejected(format!(
+                "sender '{sender}' (bound to '{authorized_agent}') arrived on a bot fronting '{bound}'"
+            ));
+        }
+    }
+
+    // Only the authorized human's own parked tasks are eligible; freshest wins.
+    let target = graph
         .tasks()
         .filter(|t| t.status == Status::Waiting)
         .filter(|t| waits_on_human_input(t))
-        .filter(|t| {
-            t.agent
-                .as_deref()
-                .map(|a| human_ids.contains(a))
-                .unwrap_or(false)
-        })
-        .collect();
+        .filter(|t| t.agent.as_deref() == Some(authorized_agent.as_str()))
+        .max_by_key(|t| park_time(t));
 
-    if let Some(ref agent_id) = bound_agent {
-        candidates.retain(|t| t.agent.as_deref() == Some(agent_id.as_str()));
+    let task_id = match target {
+        Some(t) => t.id.clone(),
+        None => return InboundReplyOutcome::NoWaitingTask,
+    };
+
+    match messages::send_message(dir, &task_id, body, sender, "normal") {
+        Ok(_) => InboundReplyOutcome::Recorded(task_id),
+        Err(e) => {
+            InboundReplyOutcome::Rejected(format!("failed to record reply on '{task_id}': {e}"))
+        }
     }
-
-    // Land the reply on the freshest open ask (newest park time wins).
-    let target = candidates.into_iter().max_by_key(|t| park_time(t))?;
-    let task_id = target.id.clone();
-
-    messages::send_message(dir, &task_id, body, sender, "normal").ok()?;
-    Some(task_id)
 }
 
 /// Route a generic inline-button callback (`<task_id>#<key>`) back to its
@@ -577,6 +649,34 @@ mod tests {
         }
     }
 
+    /// Write a Telegram binding into the agency store for the router's auth
+    /// check. `confirmed` toggles whether the `YES` handshake completed.
+    fn write_binding(dir: &Path, telegram_user: &str, agent_id: &str, name: &str, confirmed: bool) {
+        use worksgood::agency::TelegramBinding;
+        let agency_dir = dir.join("agency");
+        let mut map = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+        let mut b = TelegramBinding::new(
+            telegram_user,
+            agent_id,
+            name,
+            None,
+            "2026-07-10T12:00:00Z".parse().unwrap(),
+        );
+        if confirmed {
+            b.confirmed = true;
+            b.confirmed_at = Some("2026-07-10T12:03:00Z".parse().unwrap());
+        }
+        map.add(b).unwrap();
+        map.save(&agency_dir).unwrap();
+    }
+
+    /// Park a human task and persist the graph so `route_inbound_reply` (which
+    /// loads from disk) can see it.
+    fn park_and_persist(graph: &mut WorkGraph, dir: &Path) {
+        park_ready_human_tasks(graph, dir);
+        worksgood::parser::save_graph(graph, crate::commands::graph_path(dir)).unwrap();
+    }
+
     #[test]
     fn park_transitions_ready_human_task_to_waiting_human_input() {
         let tmp = tempfile::tempdir().unwrap();
@@ -676,18 +776,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         write_human_agent(dir, "human-nadin", "Nadin");
+        // Nadin's confirmed binding: sender "nadin" is proven to be human-nadin.
+        write_binding(dir, "nadin", "human-nadin", "Nadin", true);
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(ready_task("groceries", Some("human-nadin"))));
-        // Park it so it is Waiting on HumanInput, then persist for the router
-        // (which loads the graph from disk).
-        park_ready_human_tasks(&mut graph, dir);
-        worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
+        park_and_persist(&mut graph, dir);
 
-        // A shared bot (no notify config → no agent binding) delivers a reply.
+        // A shared bot (no notify config → no agent binding) delivers a reply
+        // from Nadin's confirmed sender identity.
         let routed = route_inbound_reply(dir, "telegram", "nadin", "eggs, milk, bread");
 
-        assert_eq!(routed.as_deref(), Some("groceries"));
+        assert_eq!(
+            routed,
+            InboundReplyOutcome::Recorded("groceries".to_string())
+        );
         let msgs = messages::list_messages(dir, "groceries").unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].body, "eggs, milk, bread");
@@ -695,6 +798,140 @@ mod tests {
         // The recorded message is a non-agent message, so it satisfies
         // WaitCondition::HumanInput on the next coordinator tick.
         assert!(!msgs[0].sender.starts_with("agent-"));
+    }
+
+    #[test]
+    fn route_inbound_reply_rejects_spoofed_sender() {
+        // A sender with NO binding must not be recorded as the human's reply,
+        // even though a matching parked task exists (the shared-bot spoof Erik
+        // flagged: any sender visible to the bot could answer for the human).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-nadin", "Nadin");
+        write_binding(dir, "nadin", "human-nadin", "Nadin", true);
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(ready_task("groceries", Some("human-nadin"))));
+        park_and_persist(&mut graph, dir);
+
+        // "mallory" is not bound to anyone.
+        let routed = route_inbound_reply(dir, "telegram", "mallory", "eggs, milk, bread");
+
+        match routed {
+            InboundReplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("mallory"),
+                    "reason names the sender: {reason}"
+                );
+            }
+            other => panic!("spoofed sender must be Rejected, got {other:?}"),
+        }
+        // Crucially, nothing was recorded on the task.
+        let msgs = messages::list_messages(dir, "groceries").unwrap_or_default();
+        assert!(
+            msgs.is_empty(),
+            "no message may be recorded for a spoofed sender"
+        );
+    }
+
+    #[test]
+    fn route_inbound_reply_rejects_wrong_task_for_confirmed_sender() {
+        // Erik's mismatch case: a sender confirmed for human A must not answer
+        // human B's parked task, even on a shared bot picking the freshest ask.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-nadin", "Nadin");
+        write_human_agent(dir, "human-erik", "Erik");
+        // Only Erik is confirmed here.
+        write_binding(dir, "erik", "human-erik", "Erik", true);
+
+        let mut graph = WorkGraph::new();
+        // The only parked task is Nadin's — Erik has none.
+        graph.add_node(Node::Task(ready_task("groceries", Some("human-nadin"))));
+        park_and_persist(&mut graph, dir);
+
+        // Erik (confirmed) replies, but nothing is his to answer.
+        let routed = route_inbound_reply(dir, "telegram", "erik", "eggs, milk, bread");
+
+        assert_eq!(
+            routed,
+            InboundReplyOutcome::NoWaitingTask,
+            "confirmed sender with no parked task of their own must not land on another human's task"
+        );
+        let msgs = messages::list_messages(dir, "groceries").unwrap_or_default();
+        assert!(
+            msgs.is_empty(),
+            "Nadin's task must not receive Erik's reply"
+        );
+    }
+
+    #[test]
+    fn route_inbound_reply_confirmed_sender_lands_only_on_own_task() {
+        // Two humans, each with a parked task; a shared bot. The confirmed
+        // sender's reply must land on THEIR task, not the freshest across all.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-nadin", "Nadin");
+        write_human_agent(dir, "human-erik", "Erik");
+        write_binding(dir, "nadin", "human-nadin", "Nadin", true);
+        write_binding(dir, "erik", "human-erik", "Erik", true);
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(ready_task(
+            "nadin-groceries",
+            Some("human-nadin"),
+        )));
+        graph.add_node(Node::Task(ready_task("erik-repairs", Some("human-erik"))));
+        park_and_persist(&mut graph, dir);
+
+        let routed = route_inbound_reply(dir, "telegram", "erik", "fixed the sink");
+
+        assert_eq!(
+            routed,
+            InboundReplyOutcome::Recorded("erik-repairs".to_string())
+        );
+        // Erik's reply landed on Erik's task only.
+        assert_eq!(
+            messages::list_messages(dir, "erik-repairs").unwrap().len(),
+            1
+        );
+        assert!(
+            messages::list_messages(dir, "nadin-groceries")
+                .unwrap_or_default()
+                .is_empty(),
+            "Nadin's task is untouched by Erik's reply"
+        );
+    }
+
+    #[test]
+    fn route_inbound_reply_rejects_unconfirmed_binding() {
+        // A bound but UNCONFIRMED sender (never completed the YES handshake)
+        // must be rejected — a pending onboarding is not authorization.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-nadin", "Nadin");
+        write_binding(dir, "nadin", "human-nadin", "Nadin", false);
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(ready_task("groceries", Some("human-nadin"))));
+        park_and_persist(&mut graph, dir);
+
+        let routed = route_inbound_reply(dir, "telegram", "nadin", "eggs, milk, bread");
+
+        match routed {
+            InboundReplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("confirm"),
+                    "reason cites the missing confirmation: {reason}"
+                );
+            }
+            other => panic!("unconfirmed sender must be Rejected, got {other:?}"),
+        }
+        assert!(
+            messages::list_messages(dir, "groceries")
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 
     #[test]

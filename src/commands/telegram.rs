@@ -509,16 +509,34 @@ fn classify_inbound_message(
     sender: &str,
     body: &str,
 ) -> InboundOutcome {
+    use crate::commands::service::human_dispatch::InboundReplyOutcome;
+
     // 1. Confirmation check first — this is the ordering fix.
     let confirmed_name = try_confirm_binding(workgraph_dir, sender, body);
-    // 2. Then awaiting-human task routing (records the reply as a message).
-    let routed = crate::commands::service::human_dispatch::route_inbound_reply(
+    // 2. Then awaiting-human task routing. The router now authorizes the sender
+    //    against their CONFIRMED Telegram binding before recording anything
+    //    (PR #51 hardening): only a proven sender lands on the human's own task.
+    //    A `Rejected` outcome is a security event (unproven/mismatched sender) —
+    //    we log it server-side and treat it as unmatched for routing purposes.
+    let routed_task = match crate::commands::service::human_dispatch::route_inbound_reply(
         workgraph_dir,
         channel_type,
         sender,
         body,
-    );
-    match (confirmed_name, routed) {
+    ) {
+        InboundReplyOutcome::Recorded(task_id) => Some(task_id),
+        InboundReplyOutcome::NoWaitingTask => None,
+        InboundReplyOutcome::Rejected(reason) => {
+            eprintln!(
+                "[{}] Rejected reply from {}: {}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                sender,
+                reason
+            );
+            None
+        }
+    };
+    match (confirmed_name, routed_task) {
         (Some(name), routed_task) => InboundOutcome::Confirmed { name, routed_task },
         (None, Some(task_id)) => InboundOutcome::Routed { task_id },
         (None, None) => InboundOutcome::Unmatched,
