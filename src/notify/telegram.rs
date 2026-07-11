@@ -311,6 +311,27 @@ impl TelegramChannel {
         self.api_call("getMyCommands", &serde_json::json!({})).await
     }
 
+    /// Edit an already-sent message in place via the Telegram `editMessageText`
+    /// API. Used by the conversational composer to turn the "On it — one sec…"
+    /// latency ack INTO the final answer (or a graceful "glitched" line) rather
+    /// than leaving a stale hourglass and posting a second message. `message_id`
+    /// is the id returned by a prior [`send_text`](NotificationChannel::send_text);
+    /// a non-numeric/empty id is a no-op-safe error the caller falls back from by
+    /// sending a fresh message. Contains no token in its return value.
+    pub async fn edit_text(&self, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        let mid: i64 = message_id
+            .trim()
+            .parse()
+            .with_context(|| format!("editMessageText: non-numeric message_id {message_id:?}"))?;
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": mid,
+            "text": text,
+        });
+        self.api_call("editMessageText", &body).await?;
+        Ok(())
+    }
+
     /// Extract the message_id from a sendMessage response.
     fn extract_message_id(json: &serde_json::Value) -> MessageId {
         let mid = json

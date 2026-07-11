@@ -6563,6 +6563,18 @@ pub enum TelegramCommands {
         /// have it reply with this text, exercising the full round-trip.
         #[arg(long)]
         session_reply: Option<String>,
+
+        /// Real-turn mode: drive the converse turn through the production
+        /// one-shot `claude` composer (no fixture), capturing an actual
+        /// session-generated answer. Requires a loadable wg config and auth.
+        #[arg(long)]
+        compose: bool,
+
+        /// Induced-failure mode: inject a failing composer so the fail-fast +
+        /// graceful "glitched" follow-up path is provable through the binary
+        /// without a live model.
+        #[arg(long)]
+        compose_error: bool,
     },
 
     /// Mirror one line to the casa conversation-pane feed (diagnostic)
