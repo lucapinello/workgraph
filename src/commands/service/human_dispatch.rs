@@ -55,6 +55,20 @@ pub struct ParkedHumanTask {
     pub description: String,
 }
 
+/// True when `agent_id` resolves to a human operator agent (`Agent::is_human()`).
+///
+/// Used by the auto-assigner to refuse to override an explicit human
+/// assignment (R10): a task pinned to a human via `wg assign` must be parked
+/// for that human, never handed to the LLM assigner which would replace the
+/// human with an AI agent. Unknown / unresolvable ids are treated as non-human
+/// (fail open — an id we can't resolve is not a human we must protect).
+pub fn agent_id_is_human(dir: &Path, agent_id: &str) -> bool {
+    let agents_dir = dir.join("agency").join("cache/agents");
+    agency::find_agent_by_prefix(&agents_dir, agent_id)
+        .map(|a| a.is_human())
+        .unwrap_or(false)
+}
+
 /// Load the set of agent ids that are human operators (matrix / email / shell
 /// executors).
 fn human_agent_ids(dir: &Path) -> HashSet<String> {
