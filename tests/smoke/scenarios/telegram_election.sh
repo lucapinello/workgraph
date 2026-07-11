@@ -79,6 +79,19 @@ echo "d. collective address → ALL FOUR in roster order:"
 out="$(elect "hey guys, how's it going?")"
 expect_grep "collective" "$out" "collective address — the whole roster answers in order: nora, bruno, mira, otto"
 
+echo "d2. typo-tolerant summon (fuzzy-summon) → ALL FOUR:"
+# THE LIVE CASE: Luca wrote "hey guyd are you aroind?" — the typos ("guyd",
+# "aroind") missed exact-phrase matching and it wrongly elected small-talk
+# silence. To a human it is an unambiguous group summon → the roster answers.
+out="$(elect "hey guyd are you aroind?")"
+expect_grep "fuzzy-summon/luca-typos" "$out" "collective address — the whole roster answers in order: nora, bruno, mira, otto"
+# Fuzzy trigger phrase ("hi guyz" ~ "hi guys") also summons the roster.
+out="$(elect "hi guyz where is everyone?")"
+expect_grep "fuzzy-summon/hi-guyz" "$out" "collective address — the whole roster answers in order: nora, bruno, mira, otto"
+# Counter-case: a greeting mentioned mid-sentence is narration, NOT a summon —
+# the silence preference for non-greeting-shaped chatter must hold.
+expect_grep "fuzzy-summon/narration-not-summon" "$(elect "he said hey to me yesterday?")" "silence (small-talk)"
+
 echo "e. team-directed unaddressed ask → otto coordinates:"
 expect_grep "ask/someone" "$(elect "can someone plan Saturday dinner?")" "answered by otto (by concierge)"
 expect_grep "ask/domain-q" "$(elect "what's the plan for dinner tonight?")" "answered by otto (by concierge)"

@@ -463,6 +463,17 @@ pub const COLLECTIVE_TRIGGERS: &[&str] = &[
     "ragazzi",
 ];
 
+/// Greeting tokens that *open* a message aimed at whoever is listening ("hey …",
+/// "ciao …"). Used by the structural summon heuristic: a message that STARTS with
+/// one of these AND carries a question mark leans collective even when no trigger
+/// phrase matches — the shape of "hey guyd are you aroind?", a group summon a
+/// human reads unambiguously but exact-phrase matching misses. Fuzzy-matched for
+/// tokens of 4+ chars (so "helo"/"ciap" still open), exact for the short ones
+/// ("hey"/"hi"/"yo") to avoid firing on unrelated 2–3 letter words. Tunable.
+pub const GREETING_TOKENS: &[&str] = &[
+    "hey", "hi", "hello", "hiya", "yo", "ciao", "hola", "hallo",
+];
+
 /// Interjections/verbs that, immediately before a family name, mark it as an
 /// *address* rather than narrative mention ("tell bruno", "hey nora"). Tunable.
 pub const ADDRESSING_CUES: &[&str] = &[
@@ -627,24 +638,124 @@ fn word_set(text: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Ordered, lower-cased whole-word list of `text` (same tokenizer as
+/// [`word_set`], but position-preserving). Needed by the fuzzy multi-word
+/// trigger match, which walks consecutive tokens, and by the greeting heuristic,
+/// which cares which word comes *first*.
+fn word_list(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+        .collect()
+}
+
+/// True when `a` and `b` are within Levenshtein edit distance 1 — at most one
+/// substitution, insertion, or deletion. Bounded (no full DP matrix): a length
+/// gap over 1 short-circuits, equal lengths allow one mismatch, and a
+/// length-1 gap allows a single skip in the longer string. Compares by Unicode
+/// scalar so accented Italian letters count as one char each. `a == b` returns
+/// true (distance 0).
+fn edit_distance_le_1(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (longer, shorter) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let ldiff = longer.len() - shorter.len();
+    if ldiff > 1 {
+        return false;
+    }
+    if ldiff == 0 {
+        // Equal length → at most one substitution.
+        return longer
+            .iter()
+            .zip(shorter.iter())
+            .filter(|(x, y)| x != y)
+            .count()
+            <= 1;
+    }
+    // Length differs by one → `shorter` must embed in `longer` with a single
+    // insertion. Walk both, permitting exactly one skip in `longer`.
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut skipped = false;
+    while i < longer.len() && j < shorter.len() {
+        if longer[i] == shorter[j] {
+            i += 1;
+            j += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            i += 1;
+        }
+    }
+    true
+}
+
+/// A message `word` matches a `trigger` token when it is identical, or — for
+/// triggers of 4+ chars — within edit distance 1 (typo tolerance: "guyd"→"guys",
+/// "aroind"→"around", "helo"→"hello"). Triggers shorter than 4 chars ("hi",
+/// "yo", "hey") require an exact match, so a single-letter slip in a common short
+/// word can't summon the whole roster.
+fn fuzzy_token_matches(word: &str, trigger: &str) -> bool {
+    word == trigger || (trigger.chars().count() >= 4 && edit_distance_le_1(word, trigger))
+}
+
+/// True if the ordered `tokens` contain the consecutive `phrase` tokens, each
+/// matched with [`fuzzy_token_matches`]. Lets "hey guyd" satisfy the "hey guys"
+/// trigger while still requiring both words to line up in order.
+fn contains_fuzzy_phrase(tokens: &[String], phrase: &[&str]) -> bool {
+    if phrase.is_empty() || tokens.len() < phrase.len() {
+        return false;
+    }
+    tokens.windows(phrase.len()).any(|window| {
+        window
+            .iter()
+            .zip(phrase.iter())
+            .all(|(w, p)| fuzzy_token_matches(w, p))
+    })
+}
+
+/// The structural summon heuristic (task fuzzy-summon, part 2): a message that
+/// STARTS with a greeting token ([`GREETING_TOKENS`], fuzzy) AND carries a
+/// question mark reads as a group summon even when no trigger phrase matches —
+/// "hey guyd are you aroind?". The greeting must be the FIRST word, so narrative
+/// chatter that merely mentions a greeting mid-sentence ("he said hey to me
+/// yesterday?") is NOT treated as a summon — that keeps the silence preference
+/// for non-greeting-shaped chatter.
+pub fn is_greeting_shaped_summon(text: &str) -> bool {
+    if !text.contains('?') {
+        return false;
+    }
+    let tokens = word_list(text);
+    match tokens.first() {
+        Some(first) => GREETING_TOKENS
+            .iter()
+            .any(|g| fuzzy_token_matches(first, g)),
+        None => false,
+    }
+}
+
 /// True if `text` collectively addresses the family (see [`COLLECTIVE_TRIGGERS`]).
 ///
-/// Multi-word triggers match as a case-insensitive substring; single-word
-/// triggers match only as a whole word, so "teamwork" or "everyone's" tokens
-/// don't over-fire. (Note `y'all` is kept intact by the tokenizer.)
+/// Matching is typo-tolerant (task fuzzy-summon): multi-word triggers match as
+/// consecutive tokens each within edit distance 1 for 4+-char words (so "hey
+/// guyd" satisfies "hey guys"); single-word triggers still match only as an
+/// exact whole word, so "teamwork" / "everyones" (missing apostrophe) don't
+/// over-fire. Finally, a greeting-shaped question ("hey … ?") counts as a
+/// collective summon via [`is_greeting_shaped_summon`] even with no trigger
+/// phrase at all.
 pub fn is_collective_address(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let words = word_set(text);
+    let tokens = word_list(text);
     for trig in COLLECTIVE_TRIGGERS {
         if trig.contains(' ') {
-            if lower.contains(trig) {
+            let phrase: Vec<&str> = trig.split(' ').collect();
+            if contains_fuzzy_phrase(&tokens, &phrase) {
                 return true;
             }
-        } else if words.contains(*trig) {
+        } else if tokens.iter().any(|w| w == trig) {
             return true;
         }
     }
-    false
+    is_greeting_shaped_summon(text)
 }
 
 /// Find the first family name in `text` that is used to *address* an agent
@@ -1785,6 +1896,101 @@ mod tests {
             elect("hey everyone, how's it going?", &[], None),
             Election::All { .. }
         ));
+    }
+
+    // ---- fuzzy-summon: typo-tolerant collective detection ----------------
+
+    #[test]
+    fn elect_luca_typo_greeting_question_is_collective() {
+        // THE LIVE CASE. Luca wrote "hey guyd are you aroind?" — the typos
+        // ("guyd","aroind") made exact-phrase matching miss, so the roster
+        // wrongly elected silence:small-talk. A human reads this as an
+        // unambiguous group summon → the whole roster now answers.
+        assert!(
+            matches!(elect("hey guyd are you aroind?", &[], None), Election::All { .. }),
+            "Luca's typo'd greeting-question must elect the collective, not silence"
+        );
+    }
+
+    #[test]
+    fn elect_greeting_mentioned_midsentence_stays_silent() {
+        // Counter-case: "he said hey to me yesterday?" is narration about a
+        // greeting, not a summon. "hey" is not the FIRST word and no trigger
+        // phrase matches, so the silence preference for non-greeting-shaped
+        // chatter holds — bots do NOT get chatty.
+        assert_eq!(
+            elect("he said hey to me yesterday?", &[], None),
+            Election::Silence(SilenceReason::SmallTalk)
+        );
+    }
+
+    #[test]
+    fn elect_more_typo_summons_are_collective() {
+        // Fuzzy trigger phrase ("hi guyz") and fuzzy greeting-question openers.
+        assert!(matches!(elect("hi guyz!", &[], None), Election::All { .. }));
+        assert!(matches!(elect("hey are you all aroind?", &[], None), Election::All { .. }));
+        assert!(matches!(elect("helo everyone up yet?", &[], None), Election::All { .. }));
+    }
+
+    #[test]
+    fn elect_nongreeting_typos_still_silent() {
+        // Typo tolerance must not flip ordinary human-to-human chatter. None of
+        // these start with a greeting or hit a trigger phrase.
+        assert_eq!(
+            elect("did you feed the cat?", &[], None),
+            Election::Silence(SilenceReason::SmallTalk)
+        );
+        assert_eq!(
+            elect("those guys were so loud last night", &[], None),
+            Election::Silence(SilenceReason::SmallTalk)
+        );
+    }
+
+    #[test]
+    fn edit_distance_le_1_boundaries() {
+        assert!(edit_distance_le_1("guys", "guys")); // identical
+        assert!(edit_distance_le_1("guyd", "guys")); // substitution
+        assert!(edit_distance_le_1("aroind", "around")); // substitution
+        assert!(edit_distance_le_1("guyz", "guys")); // substitution
+        assert!(edit_distance_le_1("helo", "hello")); // deletion
+        assert!(edit_distance_le_1("helloo", "hello")); // insertion
+        assert!(!edit_distance_le_1("gdyx", "guys")); // two substitutions
+        assert!(!edit_distance_le_1("cat", "guys")); // far apart
+    }
+
+    #[test]
+    fn fuzzy_token_matches_gates_short_triggers() {
+        // 4+ char triggers tolerate one typo…
+        assert!(fuzzy_token_matches("guyd", "guys"));
+        assert!(fuzzy_token_matches("aroind", "around"));
+        // …but short triggers demand an exact match so a slip in a common short
+        // word can't summon the roster.
+        assert!(fuzzy_token_matches("hey", "hey"));
+        assert!(!fuzzy_token_matches("he", "hey"));
+        assert!(!fuzzy_token_matches("ho", "hi"));
+    }
+
+    #[test]
+    fn is_greeting_shaped_summon_needs_leading_greeting_and_question() {
+        assert!(is_greeting_shaped_summon("hey guyd are you aroind?"));
+        assert!(is_greeting_shaped_summon("ciao is dinner ready?"));
+        // Missing the question mark → not a summon shape.
+        assert!(!is_greeting_shaped_summon("hey everyone"));
+        // Greeting not in leading position → narration, not a summon.
+        assert!(!is_greeting_shaped_summon("he said hey to me yesterday?"));
+        // No greeting at all.
+        assert!(!is_greeting_shaped_summon("is the car booked?"));
+    }
+
+    #[test]
+    fn is_collective_address_is_typo_tolerant_but_conservative() {
+        // Fuzzy multi-word trigger + fuzzy greeting-question.
+        assert!(is_collective_address("hey guyd are you aroind?"));
+        assert!(is_collective_address("hi guyz"));
+        // Single-word triggers stay EXACT (regression: "everyones" without the
+        // apostrophe is a statement, not an address).
+        assert!(!is_collective_address("everyones coming"));
+        assert!(!is_collective_address("he said hey to me yesterday?"));
     }
 
     // ---- helper-level unit checks ----------------------------------------
