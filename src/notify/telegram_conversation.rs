@@ -242,6 +242,40 @@ pub fn agent_for_channel(config: &TelegramConfig, channel_type: &str) -> Option<
     Some(agent_for_bot(config, &bot_id))
 }
 
+/// Resolve a roster agent handle (the notify.toml `agent_id`, which for the
+/// Casa family bots is a human-friendly NAME like `"otto"`) to the **canonical
+/// agency agent id** that `wg agent session` uses as the session-binding key.
+///
+/// This is the fix for the `dedupe-key-fix` converse-hang: `wg agent session
+/// <persona>` binds a session under the agent's full 64-hex id (e.g.
+/// `c10fe2fb…`), but the election/roster surface addresses the persona by name
+/// (`agent_for_bot` returns `"otto"`). Looking a session up by the bare name
+/// therefore missed every real binding — nora/bruno/mira resolved to `None`
+/// (→ generic Sessionless reply, no memory) and otto matched only a stray
+/// name-keyed session with no live agent (→ a full `reply_timeout` hang). By
+/// canonicalising the handle first, the lookup lands on the session `wg agent
+/// session` actually bound.
+///
+/// Resolution order: an exact/prefix match on an agency agent **id** wins (so a
+/// config that already uses the canonical id is untouched), then a
+/// case-insensitive match on the agent **name**. Falls back to the input
+/// unchanged when nothing matches — a bot fronting no agency agent, or a test
+/// fixture that binds by the literal handle, both keep working.
+pub fn canonical_agent_id(workgraph_dir: &Path, agent_ref: &str) -> String {
+    let agents_dir = workgraph_dir.join("agency").join("cache/agents");
+    let agents = crate::agency::load_all_agents_or_warn(&agents_dir);
+    if let Some(a) = agents
+        .iter()
+        .find(|a| a.id == agent_ref || a.id.starts_with(agent_ref))
+    {
+        return a.id.clone();
+    }
+    if let Some(a) = agents.iter().find(|a| a.name.eq_ignore_ascii_case(agent_ref)) {
+        return a.id.clone();
+    }
+    agent_ref.to_string()
+}
+
 /// Is this Telegram sender a *confirmed* human? Unknown or unconfirmed senders
 /// are not eligible for conversation — they get the onboarding line. A missing
 /// binding file (first-ever onboard) reads as "not confirmed".
@@ -289,7 +323,11 @@ pub fn plan_conversation(
     }
 
     let agent_id = agent_for_bot(config, &bot_id);
-    match chat_sessions::session_for_agent(workgraph_dir, &agent_id) {
+    // The roster addresses the persona by name ("otto"), but `wg agent session`
+    // binds under the canonical agency id — canonicalise before the lookup so we
+    // find the session that was actually bound (see `canonical_agent_id`).
+    let session_key = canonical_agent_id(workgraph_dir, &agent_id);
+    match chat_sessions::session_for_agent(workgraph_dir, &session_key) {
         Some(session_ref) => ConversationPlan::Converse {
             session_ref,
             agent_id,
@@ -576,6 +614,22 @@ mod tests {
         }
     }
 
+    /// Write a minimal agency agent yaml (id + name) so `canonical_agent_id`
+    /// can resolve a roster NAME to the agent's canonical id — mirrors the real
+    /// `agency/cache/agents/<id>.yaml` shape.
+    fn write_agent(wg: &Path, id: &str, name: &str) {
+        let dir = wg.join("agency").join("cache/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.yaml")),
+            format!(
+                "id: {id}\nrole_id: role-x\ntradeoff_id: mot-x\nname: {name}\n\
+                 performance:\n  task_count: 0\n  avg_score: 0.0\n"
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn bot_id_for_channel_resolves_named_and_default() {
         let cfg = cfg_with_bots(&[("otto", Some("otto")), ("bruno", Some("bruno"))]);
@@ -638,6 +692,41 @@ mod tests {
                 assert_eq!(entry, Entry::Direct);
             }
             other => panic!("expected Converse, got {other:?}"),
+        }
+    }
+
+    /// THE dedupe-key-fix converse-hang regression. The Casa reality: the otto
+    /// persona's canonical agency id is a 64-hex hash, its human-friendly name
+    /// is "otto", and `wg agent session` bound its session under the CANONICAL
+    /// id. The roster (`agent_for_bot`) addresses the persona by NAME, so the
+    /// pre-fix `session_for_agent("otto")` missed the id-keyed binding entirely
+    /// (→ Sessionless / a stray-session hang). Canonicalising the handle first
+    /// lands the lookup on the real bound session.
+    #[test]
+    fn roster_name_resolves_to_canonical_bound_session() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path();
+        let canonical = "c10fe2fb2e60fe5208d8a10c39c1582151eab62c64c934431146e6a054e3d2a4";
+        write_agent(wg, canonical, "otto");
+        let uuid = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+        // `wg agent session <canonical_id>` binds under the full id, NOT "otto".
+        bind_agent(wg, canonical, &uuid).unwrap();
+
+        // The resolver: name → canonical id, id-prefix → canonical id, and an
+        // unknown handle falls through unchanged (bot with no agency agent).
+        assert_eq!(canonical_agent_id(wg, "otto"), canonical);
+        assert_eq!(canonical_agent_id(wg, "OTTO"), canonical, "case-insensitive");
+        assert_eq!(canonical_agent_id(wg, "c10fe2fb"), canonical, "id prefix");
+        assert_eq!(canonical_agent_id(wg, "ghost"), "ghost", "unknown falls through");
+
+        // The plan lands on the canonical-bound session — Converse, not the
+        // pre-fix Sessionless miss.
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        confirm_human(wg, "luca-1", "human-luca", "otto");
+        let plan = plan_conversation(wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        match plan {
+            ConversationPlan::Converse { session_ref, .. } => assert_eq!(session_ref, uuid),
+            other => panic!("expected Converse via the canonical-bound session, got {other:?}"),
         }
     }
 
