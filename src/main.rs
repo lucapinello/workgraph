@@ -386,6 +386,44 @@ mod resolver_tests {
         );
         assert_eq!(result, custom);
     }
+
+    #[test]
+    fn parse_task_choices_key_label_and_confirm() {
+        // Explicit `key=Label`, slugified bare `Label`, then --confirm pair.
+        let raw = vec!["yes=Ship it".to_string(), "Hold on".to_string()];
+        let choices = super::parse_task_choices(&raw, true);
+        let pairs: Vec<(&str, &str)> = choices
+            .iter()
+            .map(|c| (c.key.as_str(), c.label.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("yes", "Ship it"),
+                ("hold_on", "Hold on"),
+                ("looks_good", "Looks good"),
+                ("change_something", "Change something"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_task_choices_skips_blanks_and_dedups_keys() {
+        let raw = vec![
+            "  ".to_string(),              // blank label -> skipped
+            "dup=First".to_string(),
+            "dup=Second".to_string(),      // duplicate key -> first wins
+        ];
+        let choices = super::parse_task_choices(&raw, false);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].key, "dup");
+        assert_eq!(choices[0].label, "First");
+    }
+
+    #[test]
+    fn parse_task_choices_empty_is_empty() {
+        assert!(super::parse_task_choices(&[], false).is_empty());
+    }
 }
 
 /// Print custom help output with usage-based ordering
@@ -971,6 +1009,8 @@ fn main() -> Result<()> {
             skill,
             input,
             deliverable,
+            choice,
+            confirm,
             max_retries,
             model,
             provider,
@@ -1005,6 +1045,9 @@ fn main() -> Result<()> {
             cron,
             subtask,
         } => {
+            // R18: assemble the task's inline-button choices from --choice
+            // entries (`key=Label` or `Label`) plus the --confirm shorthand.
+            let choices = parse_task_choices(&choice, confirm);
             // Determine effective paused/unplaced state:
             // - --paused always pauses (user-managed draft, skips placement)
             // - --no-place: unplaced=true, paused=false (immediate dispatch)
@@ -1054,6 +1097,7 @@ fn main() -> Result<()> {
                     &skill,
                     &input,
                     &deliverable,
+                    &choices,
                     max_retries,
                     model.as_deref(),
                     provider.as_deref(),
@@ -4351,6 +4395,36 @@ fn parse_failure_class(s: &str) -> Option<worksgood::graph::FailureClass> {
 }
 
 /// Parse --propagation and --retry-strategy into an IterationConfig.
+/// Assemble a task's inline-button choices (R18) from `wg add --choice` entries
+/// and the `--confirm` shorthand. Each `--choice` is `key=Label` or just `Label`
+/// (the key is slugified from the label). `--confirm` appends the default
+/// `[Looks good]` / `[Change something]` pair. Blank labels are skipped;
+/// duplicate keys keep the first occurrence so callback tokens stay unambiguous.
+fn parse_task_choices(raw: &[String], confirm: bool) -> Vec<worksgood::graph::TaskChoice> {
+    use worksgood::graph::TaskChoice;
+
+    let mut out: Vec<TaskChoice> = Vec::new();
+    let mut push = |c: TaskChoice| {
+        if !c.label.trim().is_empty() && !out.iter().any(|e| e.key == c.key) {
+            out.push(c);
+        }
+    };
+
+    for entry in raw {
+        let choice = match entry.split_once('=') {
+            Some((key, label)) => TaskChoice::new(key.trim(), label.trim()),
+            None => TaskChoice::new("", entry.trim()),
+        };
+        push(choice);
+    }
+    if confirm {
+        for c in TaskChoice::confirmation_pair() {
+            push(c);
+        }
+    }
+    out
+}
+
 fn parse_iteration_config(
     propagation: Option<&str>,
     retry_strategy: Option<&str>,

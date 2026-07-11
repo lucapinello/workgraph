@@ -31,13 +31,36 @@ use chrono::Utc;
 
 use worksgood::agency::{self, Agent};
 use worksgood::graph::{
-    LogEntry, Status, Task, WaitCondition, WaitSpec, WorkGraph, is_system_task,
+    LogEntry, Status, Task, TaskChoice, WaitCondition, WaitSpec, WorkGraph, is_system_task,
 };
 use worksgood::messages;
-use worksgood::notify::NotificationChannel;
+use worksgood::notify::{Action, ActionStyle, NotificationChannel};
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
 use worksgood::query::ready_tasks_with_peers_cycle_aware;
+
+/// Separator between the task id and the button key in a generic inline-button
+/// callback token (`<task_id>#<key>`). Replaces the legacy hard-coded
+/// `<verb>:<task>` scheme so any task can route its own buttons back to itself
+/// without the listener knowing the verbs in advance (R18).
+pub const BUTTON_TOKEN_SEP: char = '#';
+
+/// Build the generic callback token for a task's choice: `<task_id>#<key>`.
+pub fn button_token(task_id: &str, choice_key: &str) -> String {
+    format!("{task_id}{BUTTON_TOKEN_SEP}{choice_key}")
+}
+
+/// Parse a generic inline-button callback token into `(task_id, button_key)`.
+///
+/// Splits on the FIRST `#` only, so a task id may itself contain no `#` (task
+/// ids are slugs) while the key is whatever follows. Returns `None` for tokens
+/// that carry no separator (e.g. the legacy `<verb>:<task>` form), letting the
+/// caller fall back to legacy handling.
+pub fn parse_button_token(token: &str) -> Option<(&str, &str)> {
+    token
+        .split_once(BUTTON_TOKEN_SEP)
+        .filter(|(task, key)| !task.is_empty() && !key.is_empty())
+}
 
 /// Text embedded in the park log entry. `evaluate_waiting_tasks` derives a
 /// task's `wait_started` timestamp from the most recent log line containing
@@ -53,6 +76,9 @@ pub struct ParkedHumanTask {
     pub agent_id: String,
     pub title: String,
     pub description: String,
+    /// Declared choices (R18). When non-empty the notification is sent with one
+    /// inline button per choice instead of a plain "reply to complete" prompt.
+    pub choices: Vec<TaskChoice>,
 }
 
 /// True when `agent_id` resolves to a human operator agent (`Agent::is_human()`).
@@ -130,6 +156,7 @@ pub fn park_ready_human_tasks(graph: &mut WorkGraph, dir: &Path) -> Vec<ParkedHu
                 agent_id,
                 title: t.title.clone(),
                 description: t.description.clone().unwrap_or_default(),
+                choices: t.choices.clone(),
             });
         }
     }
@@ -198,12 +225,24 @@ fn try_notify_parked_human(dir: &Path, parked: &ParkedHumanTask) -> Result<Optio
     let target = channel.chat_id().to_string();
     let bot_label = channel.channel_type().to_string();
 
+    // R18: when the task declares choices, render them as inline buttons whose
+    // callback data is the generic `<task_id>#<key>` routing token. A tap comes
+    // back through the listener and `route_button_callback` records the chosen
+    // label as the human's reply. With no choices, keep the free-text prompt.
+    let actions = button_actions(&parked.task_id, &parked.choices);
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("building telegram runtime")?;
-    rt.block_on(async { channel.send_text(&target, &text).await })
-        .context("telegram send")?;
+    rt.block_on(async {
+        if actions.is_empty() {
+            channel.send_text(&target, &text).await
+        } else {
+            channel.send_with_actions(&target, &text, &actions).await
+        }
+    })
+    .context("telegram send")?;
     Ok(Some(bot_label))
 }
 
@@ -225,8 +264,36 @@ fn format_human_task_message(parked: &ParkedHumanTask) -> String {
         s.push_str("\n\n");
         s.push_str(desc);
     }
-    s.push_str("\n\nReply to this message to complete the task.");
+    // With declared choices the buttons carry the call-to-action; a free-text
+    // prompt would be misleading (the reply comes from a tap, not typing).
+    if parked.choices.is_empty() {
+        s.push_str("\n\nReply to this message to complete the task.");
+    } else {
+        s.push_str("\n\nTap a button below to answer.");
+    }
     s
+}
+
+/// Build the inline-button [`Action`]s for a parked task's declared choices.
+///
+/// Each button's id is the generic `<task_id>#<key>` routing token; the first
+/// choice is styled `Primary` (the affirmative default), the rest `Secondary`.
+/// Returns an empty vec when the task declares no choices — callers fall back to
+/// a plain text message in that case.
+fn button_actions(task_id: &str, choices: &[TaskChoice]) -> Vec<Action> {
+    choices
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Action {
+            id: button_token(task_id, &c.key),
+            label: c.label.clone(),
+            style: if i == 0 {
+                ActionStyle::Primary
+            } else {
+                ActionStyle::Secondary
+            },
+        })
+        .collect()
 }
 
 /// Close the human loop when a parked task's wait condition is satisfied (R13).
@@ -377,6 +444,34 @@ pub fn route_inbound_reply(
 
     messages::send_message(dir, &task_id, body, sender, "normal").ok()?;
     Some(task_id)
+}
+
+/// Route a generic inline-button callback (`<task_id>#<key>`) back to its
+/// originating task (R18), recording the chosen option as the human's reply.
+///
+/// This is the button analogue of [`route_inbound_reply`]: where a typed reply
+/// lands on the *freshest* awaiting-human task, a button tap carries its target
+/// task id in the callback token, so it routes to that exact task. The button
+/// `key` is resolved to the task's declared [`TaskChoice`] and that choice's
+/// `label` is recorded as an inbound message — identical to what a typed reply
+/// would do, so the coordinator's next tick completes the task and writes the
+/// label as a reply-to-artifact for every declared deliverable.
+///
+/// Returns `(task_id, chosen_label)` on success. Returns `None` when the token
+/// is not a `#`-form button token (the caller then falls back to legacy
+/// `<verb>:<task>` handling), the task is unknown, or `key` matches no declared
+/// choice (a stale button whose choice was removed).
+pub fn route_button_callback(dir: &Path, token: &str, sender: &str) -> Option<(String, String)> {
+    let (task_id, key) = parse_button_token(token)?;
+    let graph = worksgood::parser::load_graph(&crate::commands::graph_path(dir)).ok()?;
+    let task = graph.get_task(task_id)?;
+    let label = task
+        .choices
+        .iter()
+        .find(|c| c.key == key)
+        .map(|c| c.label.clone())?;
+    messages::send_message(dir, task_id, &label, sender, "normal").ok()?;
+    Some((task_id.to_string(), label))
 }
 
 /// True if a task's wait spec includes `WaitCondition::HumanInput`.
@@ -621,5 +716,195 @@ mod tests {
             "AI-assigned task must fall through to generic resume"
         );
         assert_eq!(graph.get_task("build").unwrap().status, Status::Waiting);
+    }
+
+    // ----- R18: generic inline-button -> task routing -----------------------
+
+    fn confirm_task(id: &str, agent: Option<&str>) -> Task {
+        let mut t = ready_task(id, agent);
+        t.choices = TaskChoice::confirmation_pair();
+        t
+    }
+
+    #[test]
+    fn button_token_round_trips() {
+        let tok = button_token("2026-w29-plan", "looks_good");
+        assert_eq!(tok, "2026-w29-plan#looks_good");
+        assert_eq!(
+            parse_button_token(&tok),
+            Some(("2026-w29-plan", "looks_good"))
+        );
+    }
+
+    #[test]
+    fn parse_button_token_rejects_legacy_and_malformed() {
+        // Legacy `<verb>:<task>` carries no `#`, so the caller falls back.
+        assert_eq!(parse_button_token("approve:my-task"), None);
+        assert_eq!(parse_button_token("no-separator"), None);
+        // Empty task or empty key are both rejected.
+        assert_eq!(parse_button_token("#key"), None);
+        assert_eq!(parse_button_token("task#"), None);
+        // Only the FIRST `#` splits, so a key may itself contain `#`.
+        assert_eq!(parse_button_token("t#a#b"), Some(("t", "a#b")));
+    }
+
+    #[test]
+    fn slugify_choice_key_is_short_and_stable() {
+        assert_eq!(worksgood::graph::slugify_choice_key("Looks good"), "looks_good");
+        assert_eq!(worksgood::graph::slugify_choice_key("Change something!"), "change_something");
+        assert_eq!(worksgood::graph::slugify_choice_key("  Yes / No  "), "yes_no");
+        // TaskChoice::new derives the key when one isn't supplied.
+        assert_eq!(TaskChoice::new("", "Change something").key, "change_something");
+    }
+
+    #[test]
+    fn button_actions_use_generic_tokens_and_style() {
+        let choices = TaskChoice::confirmation_pair();
+        let actions = button_actions("plan-review", &choices);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].id, "plan-review#looks_good");
+        assert_eq!(actions[0].label, "Looks good");
+        assert_eq!(actions[0].style, ActionStyle::Primary);
+        assert_eq!(actions[1].id, "plan-review#change_something");
+        assert_eq!(actions[1].style, ActionStyle::Secondary);
+        // No choices -> no buttons -> caller sends a plain text prompt.
+        assert!(button_actions("plan-review", &[]).is_empty());
+    }
+
+    #[test]
+    fn park_carries_choices_and_message_prompts_for_a_tap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(confirm_task("plan-review", Some("human-luca"))));
+
+        let parked = park_ready_human_tasks(&mut graph, dir);
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].choices, TaskChoice::confirmation_pair());
+
+        let msg = format_human_task_message(&parked[0]);
+        assert!(
+            msg.contains("Tap a button"),
+            "choice tasks prompt for a tap, not a free-text reply: {msg}"
+        );
+        assert!(!msg.contains("Reply to this message"));
+    }
+
+    #[test]
+    fn button_callback_routes_to_originating_task_and_records_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(confirm_task("plan-review", Some("human-luca"))));
+        park_ready_human_tasks(&mut graph, dir);
+        worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
+
+        // Luca taps [Looks good]; the callback token routes to THIS task.
+        let routed = route_button_callback(dir, "plan-review#looks_good", "lucapinello");
+        assert_eq!(
+            routed,
+            Some(("plan-review".to_string(), "Looks good".to_string()))
+        );
+
+        // The chosen option's LABEL (not the key) is recorded as the reply, as a
+        // non-agent message that satisfies WaitCondition::HumanInput.
+        let msgs = messages::list_messages(dir, "plan-review").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, "Looks good");
+        assert_eq!(msgs[0].sender, "lucapinello");
+        assert!(!msgs[0].sender.starts_with("agent-"));
+    }
+
+    #[test]
+    fn button_callback_rejects_unknown_task_and_stale_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(confirm_task("plan-review", Some("human-luca"))));
+        park_ready_human_tasks(&mut graph, dir);
+        worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
+
+        // Unknown task id -> None, nothing recorded.
+        assert_eq!(route_button_callback(dir, "ghost#looks_good", "lucapinello"), None);
+        // Known task but a key it never declared (stale button) -> None.
+        assert_eq!(
+            route_button_callback(dir, "plan-review#delete_everything", "lucapinello"),
+            None
+        );
+        // Legacy `<verb>:<task>` (no `#`) is not a button token here.
+        assert_eq!(route_button_callback(dir, "approve:plan-review", "lucapinello"), None);
+        assert!(messages::list_messages(dir, "plan-review").unwrap().is_empty());
+    }
+
+    #[test]
+    fn button_tap_completes_task_and_writes_choice_as_reply_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+
+        let mut graph = WorkGraph::new();
+        let mut task = confirm_task("plan-review", Some("human-luca"));
+        task.deliverables = vec!["plan-decision.txt".to_string()];
+        graph.add_node(Node::Task(task));
+
+        park_ready_human_tasks(&mut graph, dir);
+        let wait_started = graph
+            .get_task("plan-review")
+            .unwrap()
+            .log
+            .iter()
+            .rev()
+            .find(|l| l.message.contains("Agent parked"))
+            .map(|l| l.timestamp.clone());
+        worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
+
+        // Tap records the chosen label as the reply...
+        let routed = route_button_callback(dir, "plan-review#change_something", "lucapinello");
+        assert_eq!(
+            routed,
+            Some(("plan-review".to_string(), "Change something".to_string()))
+        );
+
+        // ...then the coordinator's completion pass writes it as reply-artifact.
+        let handled = try_complete_human_task_on_reply(
+            &mut graph,
+            dir,
+            "plan-review",
+            wait_started.as_deref(),
+        );
+        assert!(handled);
+        let t = graph.get_task("plan-review").unwrap();
+        assert_eq!(t.status, Status::Done);
+        assert!(t.artifacts.contains(&"plan-decision.txt".to_string()));
+        let written = std::fs::read_to_string(dir.parent().unwrap().join("plan-decision.txt"))
+            .expect("reply-artifact written");
+        assert_eq!(
+            written, "Change something",
+            "the tapped choice's label is recorded as the reply-to-artifact"
+        );
+    }
+
+    #[test]
+    fn choices_survive_graph_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(confirm_task("plan-review", Some("human-luca"))));
+        worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
+
+        let reloaded =
+            worksgood::parser::load_graph(&crate::commands::graph_path(dir)).unwrap();
+        assert_eq!(
+            reloaded.get_task("plan-review").unwrap().choices,
+            TaskChoice::confirmation_pair(),
+            "declared choices persist across serialize/deserialize"
+        );
     }
 }

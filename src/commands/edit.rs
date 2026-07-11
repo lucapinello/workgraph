@@ -715,6 +715,7 @@ mod tests {
             &["skill1".to_string()],
             &[],
             &[],
+            &[], // choices,
             None,
             Some("claude:sonnet"),
             None,
@@ -771,6 +772,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[], // choices,
             None,
             None,
             None,
@@ -818,6 +820,7 @@ mod tests {
             &["skill1".to_string()],
             &[],
             &[],
+            &[], // choices,
             None,
             Some("claude:sonnet"),
             None,
@@ -1892,6 +1895,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[], // choices,
             None, // max_retries
             None, // model
             None, // provider
@@ -2081,6 +2085,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[], // choices,
             None, // max_retries
             None, // model
             None, // provider

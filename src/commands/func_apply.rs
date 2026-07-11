@@ -253,6 +253,7 @@ pub fn run(
                 skills: rendered.skills.clone(),
                 inputs: vec![],
                 deliverables: rendered.deliverables.clone(),
+                choices: vec![],
                 artifacts: vec![],
                 exec: None,
                 timeout: None,

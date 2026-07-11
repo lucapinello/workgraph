@@ -421,6 +421,73 @@ pub fn lower_priority(p: Priority) -> Priority {
     }
 }
 
+/// A selectable choice offered to a human on a task (R18).
+///
+/// When a task declares `choices`, the human-dispatch tail renders each one as
+/// an inline button in the Telegram DM. Tapping a button fires a callback whose
+/// data is the generic `<task_id>#<key>` routing token — the coordinator maps
+/// `key` back to this choice and records `label` as the human's reply (which
+/// then satisfies the task's `HumanInput` wait and is written as a
+/// reply-to-artifact). `key` must be short and stable (it travels in the
+/// 64-byte Telegram `callback_data`); `label` is the human-facing button text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskChoice {
+    /// Stable, short identifier used in the `<task_id>#<key>` callback token.
+    pub key: String,
+    /// Human-facing button text (also the reply body recorded when tapped).
+    pub label: String,
+}
+
+impl TaskChoice {
+    /// Build a choice, deriving a slug `key` from `label` when `key` is empty.
+    pub fn new(key: impl Into<String>, label: impl Into<String>) -> Self {
+        let label = label.into();
+        let key = key.into();
+        let key = if key.is_empty() {
+            slugify_choice_key(&label)
+        } else {
+            key
+        };
+        Self { key, label }
+    }
+
+    /// The default confirmation pair Luca asked for: `[Looks good]` /
+    /// `[Change something]`. Any task can opt into it (e.g. a plan-review DM).
+    pub fn confirmation_pair() -> Vec<TaskChoice> {
+        vec![
+            TaskChoice {
+                key: "looks_good".to_string(),
+                label: "Looks good".to_string(),
+            },
+            TaskChoice {
+                key: "change_something".to_string(),
+                label: "Change something".to_string(),
+            },
+        ]
+    }
+}
+
+/// Slugify a button label into a stable callback key: lowercase, non-alphanumerics
+/// collapsed to `_`, trimmed. Keeps callback tokens short and `#`/`:`-free so the
+/// `<task_id>#<key>` split is never ambiguous.
+pub fn slugify_choice_key(label: &str) -> String {
+    let mut out = String::new();
+    let mut prev_us = false;
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_us = false;
+        } else if !prev_us && !out.is_empty() {
+            out.push('_');
+            prev_us = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
 /// A task node.
 ///
 /// A task in the WG task graph with dependencies, status, and execution metadata.
@@ -460,6 +527,12 @@ pub struct Task {
     /// Expected output paths/artifacts
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliverables: Vec<String>,
+    /// Human-facing choices (R18). When non-empty, a task handed to a human is
+    /// rendered with one inline button per choice; tapping one records that
+    /// choice's `label` as the human's reply via the generic `<task_id>#<key>`
+    /// callback routing. Empty for the ordinary free-text reply flow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<TaskChoice>,
     /// Actual produced artifacts (paths/references)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
@@ -732,6 +805,7 @@ impl Default for Task {
             skills: vec![],
             inputs: vec![],
             deliverables: vec![],
+            choices: vec![],
             artifacts: vec![],
             exec: None,
             timeout: None,
@@ -1700,6 +1774,8 @@ struct TaskHelper {
     #[serde(default)]
     deliverables: Vec<String>,
     #[serde(default)]
+    choices: Vec<TaskChoice>,
+    #[serde(default)]
     artifacts: Vec<String>,
     #[serde(default)]
     exec: Option<String>,
@@ -1875,6 +1951,7 @@ impl<'de> Deserialize<'de> for Task {
             skills: helper.skills,
             inputs: helper.inputs,
             deliverables: helper.deliverables,
+            choices: helper.choices,
             artifacts: helper.artifacts,
             exec: helper.exec,
             timeout: helper.timeout,
