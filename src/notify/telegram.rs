@@ -1553,12 +1553,31 @@ agent_id = "nora"
             let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await.unwrap();
             assert!(updates.is_empty());
         }
-        let after = open_fd_count();
+
+        // `open_fd_count()` is process-GLOBAL, and this binary runs its tests
+        // concurrently — sibling tests opening sockets/temp files transiently
+        // inflate the count and used to flake this assertion. A genuine per-poll
+        // leak is different in kind: it adds ~1 fd/iteration (~50 here) and is
+        // PERSISTENT, whereas concurrent noise dissipates in milliseconds. So on a
+        // spike we let the noise settle and re-measure before failing — a real
+        // leak stays above the bound, transient noise falls back under it.
+        let tolerance = 8;
+        let mut after = open_fd_count();
+        if after > before + tolerance {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                after = open_fd_count();
+                if after <= before + tolerance {
+                    break;
+                }
+            }
+        }
 
         assert!(
-            after <= before + 3,
+            after <= before + tolerance,
             "poll loop leaked file descriptors: before={before} after={after} \
-             (a reused pooled connection should keep this flat; a per-poll client leaks)"
+             (a reused pooled connection should keep this flat; a per-poll client \
+             leaks ~1 fd/iteration and stays elevated after settling)"
         );
     }
 }

@@ -53,7 +53,7 @@ use crate::chat_sessions;
 use crate::config::Config;
 
 use super::NotificationChannel;
-use super::telegram::{TelegramChannel, TelegramConfig};
+use super::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
 use super::telegram_group::CONCIERGE_BOT;
 
 /// Which entry point produced a conversational message. Carried for logging so
@@ -445,14 +445,38 @@ impl BotReplySink {
     }
 }
 
+/// Resolve the `(id, config)` a reply must send with, keyed by the ELECTED
+/// `bot_id`. When the elected bot is present the reply goes out as that persona
+/// (the whole point — see BUG 3: a group-elected reply must render as the elected
+/// bot, not the default/concierge one). Only when the elected id is genuinely
+/// absent from the config do we fall back to the first bot so a reply still goes
+/// out — and we log that loudly, because a silent fallback is exactly what made
+/// bruno's group reply render as Otto. Never logs a token.
+fn resolve_reply_bot<'a>(
+    bots: &'a [(String, TelegramBotConfig)],
+    bot_id: &str,
+) -> Option<&'a (String, TelegramBotConfig)> {
+    if let Some(hit) = bots.iter().find(|(id, _)| id == bot_id) {
+        return Some(hit);
+    }
+    // Elected bot missing from the config — send *something* rather than drop the
+    // reply, but make the wrong-persona render diagnosable instead of silent.
+    if let Some(first) = bots.first() {
+        eprintln!(
+            "[convo] elected bot {bot_id:?} not in Telegram config — falling back to {:?}; \
+             the reply will render as the wrong persona until the bot is configured",
+            first.0,
+        );
+        return Some(first);
+    }
+    None
+}
+
 #[async_trait]
 impl ReplySink for BotReplySink {
     async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
         let bots = self.config.all_bots();
-        let (id, bot) = bots
-            .iter()
-            .find(|(id, _)| id == bot_id)
-            .or_else(|| bots.first())
+        let (id, bot) = resolve_reply_bot(&bots, bot_id)
             .ok_or_else(|| anyhow::anyhow!("no Telegram bots configured — cannot reply"))?;
         let channel = TelegramChannel::from_bot(id.clone(), bot.clone());
         let mid = channel.send_text(chat_id, text).await?;
@@ -461,10 +485,7 @@ impl ReplySink for BotReplySink {
 
     async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
         let bots = self.config.all_bots();
-        let (id, bot) = bots
-            .iter()
-            .find(|(id, _)| id == bot_id)
-            .or_else(|| bots.first())
+        let (id, bot) = resolve_reply_bot(&bots, bot_id)
             .ok_or_else(|| anyhow::anyhow!("no Telegram bots configured — cannot edit"))?;
         let channel = TelegramChannel::from_bot(id.clone(), bot.clone());
         // If the edit fails (e.g. message too old, or a non-numeric id), fall
@@ -1269,6 +1290,95 @@ mod tests {
         assert_eq!(bot, "bruno", "group election replies via the ELECTED bot");
         assert_eq!(chat_id, "-100777", "group reply lands in the GROUP");
         assert_eq!(text, "Dinner's at seven.");
+    }
+
+    #[tokio::test]
+    async fn composed_group_turn_replies_via_elected_bot_not_the_concierge() {
+        // BUG 3 (2026-07-12): a group-elected conversational reply rendered as
+        // Otto in the Telegram bubble even though the election target was bruno.
+        // The LIVE path is the COMPOSER (a one-shot claude spawn), not the legacy
+        // outbox poll — and it had no group-elected coverage. This proves every
+        // send the composed turn makes (ack + final answer) goes out with the
+        // ELECTED persona's bot id, never the default/concierge bot, exactly like
+        // the 1:1 path sends via the messaged bot.
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        // otto is first (the concierge / default reply bot); bruno is elected.
+        let cfg = cfg_with_bots(&[("otto", Some("otto")), ("bruno", Some("bruno"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "bruno", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        let plan =
+            plan_conversation(&wg, &cfg, "telegram:bruno", "-100777", "luca-1", Entry::GroupElected);
+        // Sanity: the plan itself routed to bruno.
+        assert_eq!(plan.route().bot_id, "bruno");
+
+        let sink = RecSink::default();
+        // A slow compose so the latency ack fires too — assert IT is bruno as well.
+        let composer = FakeComposer::ok_after("Dinner's at seven.", Duration::from_millis(150));
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "can you all weigh in on dinner?",
+            "req-grp",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Replied { acked: true }));
+        // EVERY send (the ack) went out via bruno, in the group — never otto.
+        for (bot, chat_id, _text) in sink.calls() {
+            assert_eq!(bot, "bruno", "composed group reply must send via the ELECTED bot");
+            assert_eq!(chat_id, "-100777", "composed group reply lands in the GROUP");
+        }
+        // The final answer edits the ack in place — also via bruno.
+        for (bot, chat_id, _mid, text) in sink.edits() {
+            assert_eq!(bot, "bruno", "the final answer edit must also use the ELECTED bot");
+            assert_eq!(chat_id, "-100777");
+            assert_eq!(text, "Dinner's at seven.");
+        }
+        // The elected bot's token is distinct from the concierge's, so a wrong-bot
+        // send would have surfaced a different token — pin the mapping explicitly.
+        let bruno_token = cfg.all_bots().into_iter().find(|(id, _)| id == "bruno").unwrap().1.bot_token;
+        assert_eq!(bruno_token, "token-bruno");
+        assert_ne!(
+            bruno_token,
+            cfg.all_bots().into_iter().find(|(id, _)| id == "otto").unwrap().1.bot_token,
+            "bruno and otto must carry distinct tokens for this test to be meaningful"
+        );
+    }
+
+    #[test]
+    fn resolve_mentioned_bot_needs_a_real_handle_no_false_positive_on_prose() {
+        // BUG 3 side-investigation: msg=70 logged rule=mention target=bruno for a
+        // message the screenshot shows had no @mention. The mention rule fires only
+        // from parsed @mention entities; resolve_mentioned_bot itself matches a
+        // bot by @username / bot_id / agent_id / compound handle segment — NOT by a
+        // bare persona word buried in prose. So plain sentences that merely say
+        // "bruno" as a word do not resolve here (the addressed-NAME rule handles
+        // vocatives separately); only an actual handle does.
+        use crate::notify::telegram_group::resolve_mentioned_bot;
+        let cfg = cfg_with_bots(&[("otto", Some("otto")), ("bruno", Some("bruno"))]);
+        // A real handle resolves.
+        assert_eq!(
+            resolve_mentioned_bot("bruno_bot", &cfg).map(|b| b.bot_id),
+            Some("bruno".to_string()),
+        );
+        assert_eq!(
+            resolve_mentioned_bot("@bruno", &cfg).map(|b| b.bot_id),
+            Some("bruno".to_string()),
+        );
+        // Prose words that are NOT a configured handle do not resolve.
+        for prose in ["dinner", "meeting", "brunobrunch", "the", "everyone"] {
+            assert!(
+                resolve_mentioned_bot(prose, &cfg).is_none(),
+                "plain word {prose:?} must not resolve to a bot"
+            );
+        }
     }
 
     #[tokio::test]

@@ -586,6 +586,41 @@ pub const BROAD_ADDRESS_TOKENS: &[&str] = &[
     "ragazzi", "ragazza", "tutti",
 ];
 
+/// Plural-you follower words: when one *immediately follows* "you"/"u" it turns
+/// the pronoun into a second-person-plural address to the whole family — "you
+/// guys", "you all", "you folks", "you both", "you two", "you lot". Distinct from
+/// a third-person "the guys"/"those guys" (no leading "you"), which stays
+/// concierge. Fuzzy-matched for 4+ chars. See [`is_plural_you_address`].
+pub const PLURAL_YOU_FOLLOWERS: &[&str] = &[
+    "guys", "all", "folks", "both", "two", "lot", "everyone", "everybody",
+    "team", "crew", "gang", "people", "ragazzi", "tutti", "yous",
+];
+
+/// Nouns that, following "the whole …", name the family as one body — "the whole
+/// team/family/crew". Fuzzy-matched for 4+ chars. See [`is_plural_you_address`].
+pub const WHOLE_GROUP_NOUNS: &[&str] = &[
+    "team", "family", "crew", "gang", "group", "household", "fam", "bunch", "lot",
+    "squad", "gruppo", "famiglia",
+];
+
+/// Opening gratitude tokens ("thanks", "thank", "thx", "grazie", "cheers"). A
+/// message that *opens* with one is thank-you small-talk the bots stay out of,
+/// even when it names the family ("thanks everyone", "thank you all"). Fuzzy for
+/// 4+ chars. See [`is_gratitude_opener`].
+pub const GRATITUDE_OPENERS: &[&str] = &[
+    "thanks", "thank", "thankyou", "thanx", "thx", "ty", "tysm", "grazie",
+    "cheers", "gracias", "merci",
+];
+
+/// Endearment verbs ("love you all", "miss you guys"). When one *opens* the
+/// message, or sits immediately before the second-person pronoun, the "you all"
+/// is the object of affection — small-talk the bots stay out of — not an address
+/// asking the family to weigh in. Fuzzy for 4+ chars. See [`is_plural_you_address`].
+pub const ENDEARMENT_VERBS: &[&str] = &[
+    "love", "loved", "loves", "loving", "miss", "missed", "adore", "adored",
+    "appreciate", "bless", "cherish", "hug", "hugs",
+];
+
 /// Interjections/verbs that, immediately before a family name, mark it as an
 /// *address* rather than narrative mention ("tell bruno", "hey nora"). Tunable.
 pub const ADDRESSING_CUES: &[&str] = &[
@@ -907,6 +942,13 @@ pub fn is_greeting_collective(text: &str) -> bool {
 /// group ("goodnight guys") counts via [`is_greeting_collective`] — both even
 /// with no trigger phrase at all.
 pub fn is_collective_address(text: &str) -> bool {
+    // Gratitude / endearment small-talk that names the family ("thanks everyone",
+    // "love you all") is NOT a broadcast summons — checked FIRST so a bare
+    // "everyone"/"guys" trigger word inside it doesn't fire. Bots stay out
+    // (rule f silence).
+    if is_gratitude_opener(text) || is_endearment_opener(text) {
+        return false;
+    }
     let tokens = word_list(text);
     for trig in COLLECTIVE_TRIGGERS {
         if trig.contains(' ') {
@@ -919,6 +961,122 @@ pub fn is_collective_address(text: &str) -> bool {
         }
     }
     is_greeting_shaped_summon(text) || is_greeting_collective(text)
+}
+
+/// True if `text` *opens with* a gratitude token ("thanks …", "thank you …",
+/// "grazie …"). Keyed on the FIRST word so a mid-sentence "…and thanks" doesn't
+/// count. Typo-tolerant for 4+-char tokens. Used to keep thank-you small-talk
+/// ("thanks everyone", "thank you all") out of the collective / plural-address
+/// broadcast rules — the family thanking each other is not a team summons.
+pub fn is_endearment_opener(text: &str) -> bool {
+    let tokens = word_list(text);
+    match tokens.first() {
+        Some(first) => ENDEARMENT_VERBS
+            .iter()
+            .any(|t| fuzzy_token_matches(first, t)),
+        None => false,
+    }
+}
+
+pub fn is_gratitude_opener(text: &str) -> bool {
+    let tokens = word_list(text);
+    match tokens.first() {
+        Some(first) => GRATITUDE_OPENERS
+            .iter()
+            .any(|t| fuzzy_token_matches(first, t)),
+        None => false,
+    }
+}
+
+/// True if `text` addresses the whole family in the **second person plural**
+/// *anywhere* in the sentence — "can you guys discuss this", "tell me what you
+/// all think", "what do all of you reckon?", "the whole team should weigh in".
+/// Unlike [`is_collective_address`] (greeting-shaped openers only) this fires
+/// mid-sentence, and unlike a plain team-directed ask it elects the WHOLE roster:
+/// a message that explicitly asks *everyone present* to weigh in wants every
+/// voice, not one concierge answer (this is the group-discussion prompt).
+///
+/// Recognised second-person-plural shapes (all typo-tolerant for 4+-char words):
+/// * "you guys" / "you all" / "you folks" / "you both" / "you two" / "you lot"
+///   — "you"/"u" immediately followed by a [`PLURAL_YOU_FOLLOWERS`] word;
+/// * "all of you" / "each of you" / "both of you" / "any of you" — a quantifier
+///   then "of you";
+/// * "the whole team/family/crew" — "whole" + a [`WHOLE_GROUP_NOUNS`] word.
+///
+/// Deliberately does NOT fire on third-person mentions ("tell the guys I said
+/// hi", "those guys were loud") — "guys"/"folks" only count when the preceding
+/// token is the second-person "you"/"u". Gratitude openers ("thank you all") are
+/// excluded so they fall through to silence. Bare "everyone"/"everybody" is left
+/// to [`is_collective_address`] (rule d, after the ask check) so a third-person
+/// "tell everyone dinner's ready" still routes to the concierge.
+pub fn is_plural_you_address(text: &str) -> bool {
+    // Gratitude ("thank you all") and endearment ("love you all so much") that
+    // name the family are affectionate small-talk, not a request for the roster
+    // to weigh in — bots stay out.
+    if is_gratitude_opener(text) || is_endearment_opener(text) {
+        return false;
+    }
+    let tokens = word_list(text);
+    for (i, w) in tokens.iter().enumerate() {
+        // "you guys" / "you all" / "you both" / …
+        if w == "you" || w == "u" {
+            // "…love you all", "…miss you guys", "…thank you all" — the pronoun is
+            // the object of affection/thanks, not an address. Skip when the word
+            // right before "you" is an endearment or gratitude verb.
+            let prev_is_endearment = i
+                .checked_sub(1)
+                .and_then(|j| tokens.get(j))
+                .map(|p| {
+                    ENDEARMENT_VERBS
+                        .iter()
+                        .chain(GRATITUDE_OPENERS.iter())
+                        .any(|e| fuzzy_token_matches(p, e))
+                })
+                .unwrap_or(false);
+            if prev_is_endearment {
+                continue;
+            }
+            if let Some(next) = tokens.get(i + 1) {
+                if PLURAL_YOU_FOLLOWERS
+                    .iter()
+                    .any(|t| fuzzy_token_matches(next, t))
+                {
+                    return true;
+                }
+            }
+        }
+        // "all of you" / "each of you" / "both of you" / "any of you"
+        if w == "of" {
+            let prev_quantifier = i
+                .checked_sub(1)
+                .and_then(|j| tokens.get(j))
+                .map(|p| {
+                    ["all", "each", "both", "any", "some", "many", "one"]
+                        .iter()
+                        .any(|q| *q == p.as_str())
+                })
+                .unwrap_or(false);
+            let next_you = tokens
+                .get(i + 1)
+                .map(|n| n == "you" || n == "u" || fuzzy_token_matches(n, "yous"))
+                .unwrap_or(false);
+            if prev_quantifier && next_you {
+                return true;
+            }
+        }
+        // "the whole team/family/crew"
+        if fuzzy_token_matches(w, "whole") {
+            if let Some(next) = tokens.get(i + 1) {
+                if WHOLE_GROUP_NOUNS
+                    .iter()
+                    .any(|t| fuzzy_token_matches(next, t))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Find the first family name in `text` that is used to *address* an agent
@@ -1108,6 +1266,23 @@ pub fn elect_responders(
                 addressed_by: AddressedBy::ReplyChain,
             };
         }
+    }
+
+    // d-plural. Explicit SECOND-PERSON-PLURAL address anywhere in the message —
+    // "can you guys discuss this", "tell me what you all think", "all of you",
+    // "the whole team" — elects the WHOLE roster, and does so BEFORE the ask
+    // check below. A message that explicitly asks *everyone present* to weigh in
+    // wants every voice, not one concierge answer (this is the group-discussion
+    // prompt Luca reported swallowed on 2026-07-12). Third-person mentions
+    // ("tell the guys …") and gratitude ("thanks everyone") do not match here —
+    // see [`is_plural_you_address`] — so they still fall through to the concierge
+    // / silence rules. Bare "everyone"/"everybody" stays with rule d (below) so
+    // the ask check keeps precedence for "tell everyone dinner's ready".
+    if is_plural_you_address(text) {
+        return Election::All {
+            reply_chat,
+            body: text.to_string(),
+        };
     }
 
     // e-before-d for ASKS (Fix #4a). Collective (rule d) is reserved for
@@ -2096,6 +2271,110 @@ mod tests {
                 matches!(elect(t, &[], None), Election::All { .. }),
                 "expected collective for {t:?}"
             );
+        }
+    }
+
+    // ---- d-plural. mid-sentence second-person-plural address -> ALL ------
+    // Regression for the 2026-07-12 live failure: plural addressing buried in a
+    // question/request ("can you guys discuss …", "what you all think") was
+    // swallowed to otto-concierge instead of electing the whole roster.
+
+    #[test]
+    fn elect_plural_you_address_elects_roster_even_mid_sentence() {
+        // (message, expected_collective) — the two live misses plus siblings.
+        let collective = [
+            "can you guys discuss this and find consensus", // live miss #1
+            "the meaning of life tell me what you all think", // live miss #2
+            "what do you all think?",
+            "hey guys", // greeting-shaped collective still fires (via rule d)
+            "so what do all of you reckon we should do?",
+            "each of you should weigh in on this",
+            "the whole team should decide together",
+            "can you guys help me plan the weekend?", // ask + plural-you -> roster
+        ];
+        for t in collective {
+            assert!(
+                matches!(elect(t, &[], None), Election::All { .. }),
+                "expected collective (whole roster) for {t:?}, got {:?}",
+                elect(t, &[], None)
+            );
+        }
+        // The live failure was in a SINGLE-human group, where an unaddressed
+        // message otherwise falls to the concierge (otto). The plural-address rule
+        // must beat that fallback too — the two live misses must elect the roster.
+        for t in [
+            "can you guys discuss this and find consensus",
+            "the meaning of life tell me what you all think",
+        ] {
+            assert!(
+                matches!(elect_solo(t, &[], None), Election::All { .. }),
+                "live miss {t:?} must elect the roster even in a single-human group, got {:?}",
+                elect_solo(t, &[], None)
+            );
+        }
+    }
+
+    #[test]
+    fn elect_third_person_and_gratitude_are_not_plural_collective() {
+        // Third-person "the guys" is NOT a second-person address — it stays a
+        // single concierge answer, never a four-way broadcast.
+        assert!(
+            !matches!(elect("tell the guys dinner is ready", &[], None), Election::All { .. }),
+            "third-person 'the guys' must not elect the roster"
+        );
+        assert!(
+            !matches!(
+                elect_solo("tell the guys dinner is ready", &[], None),
+                Election::All { .. }
+            ),
+            "third-person 'the guys' must not elect the roster (solo)"
+        );
+        // "tell the guys I said hi" — the task's canonical third-person case —
+        // is still the concierge's, not a broadcast.
+        assert_one(
+            &elect_solo("tell the guys I said hi", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
+        // Gratitude that names the family is thank-you small-talk -> silence.
+        assert_eq!(
+            elect("thanks everyone", &[], None),
+            Election::Silence(SilenceReason::SmallTalk),
+            "'thanks everyone' is gratitude small-talk, not a collective summons"
+        );
+        assert_eq!(
+            elect("thank you all so much", &[], None),
+            Election::Silence(SilenceReason::SmallTalk),
+            "'thank you all' is gratitude small-talk, not a collective summons"
+        );
+    }
+
+    #[test]
+    fn is_plural_you_address_unit_cases() {
+        // Second-person plural anywhere -> true.
+        for t in [
+            "can you guys discuss this and find consensus",
+            "the meaning of life tell me what you all think",
+            "what do you all think?",
+            "all of you should come",
+            "each of you has a say",
+            "the whole family needs to agree",
+            "you folks are the best team",
+            "hey u guys ready?",
+        ] {
+            assert!(is_plural_you_address(t), "expected plural-you for {t:?}");
+        }
+        // Third-person / gratitude / singular -> false.
+        for t in [
+            "tell the guys dinner is ready",
+            "those guys were loud",
+            "tell the guys I said hi",
+            "thanks everyone",
+            "thank you all so much",
+            "can you plan dinner?", // singular "you"
+            "what's for dinner tonight?",
+        ] {
+            assert!(!is_plural_you_address(t), "expected NOT plural-you for {t:?}");
         }
     }
 

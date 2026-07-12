@@ -172,7 +172,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         use worksgood::notify::telegram_pacing;
         let listener_start = chrono::Utc::now().timestamp();
         let mut backlog_notified = false;
-        let mut coalescer = telegram_pacing::BurstCoalescer::default();
+        // Shared so the OFF-LOOP conversation turn (spawned below) can mark its
+        // reply *sent* when it completes — that ends the pending turn so a genuine
+        // follow-up arriving after the answer is a NEW turn, never coalesced away
+        // (BUG 2, the 2026-07-12 swallowed "why they don't reply?"). Locked only
+        // for the trivial admit/mark calls, never across an `.await`.
+        let coalescer =
+            std::sync::Arc::new(std::sync::Mutex::new(telegram_pacing::BurstCoalescer::default()));
 
         while let Some(msg) = rx.recv().await {
             // Fix #0 — the bot-loop guard, FIRST (before dedupe, feed mirror,
@@ -403,6 +409,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 ),
             );
 
+            // If the concierge (auto-routed otto) case admits below, this holds
+            // the agent id so the spawned turn can mark its reply sent (BUG 2).
+            let mut coalesced_named_agent: Option<String> = None;
+
             let (route_channel, route_body) = match election {
                 Election::Silence(_) => {
                     // Small-talk / no-chat-id / no-voice — bots stay quiet. The
@@ -414,9 +424,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     ref body,
                 } => {
                     // Fix #2 — burst coalescing. Multiple collective elections
-                    // inside the burst window collapse to ONE roster reply, so a
-                    // rapid flurry of greetings doesn't fire four×N sends.
-                    if !coalescer.admit_collective(chrono::Utc::now().timestamp()) {
+                    // that arrive WHILE a roster reply is still composing collapse
+                    // to ONE reply; a follow-up after the reply was sent is a new
+                    // turn (BUG 2, pending-only coalescing).
+                    if !coalescer
+                        .lock()
+                        .unwrap()
+                        .admit_collective(chrono::Utc::now().timestamp())
+                    {
                         println!(
                             "[{}] collective coalesced (burst) — msg {}",
                             chrono::Utc::now().format("%H:%M:%S"),
@@ -444,6 +459,11 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     {
                         eprintln!("Failed to run collective reply: {e}");
                     }
+                    // The roster reply has gone out — end the pending turn so the
+                    // next collective message is a fresh turn, not coalesced away
+                    // (BUG 2). The collective send is awaited inline here, so it is
+                    // provably sent by this point.
+                    coalescer.lock().unwrap().mark_collective_sent();
                     continue;
                 }
                 Election::One {
@@ -455,12 +475,18 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     debug_assert_eq!(reply_chat, &reply_target);
                     // Fix #2 — burst coalescing for the AUTO-routed concierge
                     // case (an unaddressed team ask that lands on otto). Repeated
-                    // concierge elections in the window collapse to one reply.
+                    // concierge elections that arrive WHILE the turn is composing
+                    // collapse to one reply; a follow-up after the reply was sent
+                    // is a NEW turn (BUG 2 — the swallowed "why they don't reply?").
                     // Explicit @mentions / addressed names / reply-chains are
                     // deliberate and are ALWAYS answered — never coalesced.
                     if matches!(addressed_by, worksgood::notify::telegram_group::AddressedBy::Concierge) {
                         let agent = bot.agent_id.as_deref().unwrap_or(&bot.bot_id);
-                        if !coalescer.admit_named(agent, chrono::Utc::now().timestamp()) {
+                        if !coalescer
+                            .lock()
+                            .unwrap()
+                            .admit_named(agent, chrono::Utc::now().timestamp())
+                        {
                             println!(
                                 "[{}] concierge coalesced (burst) — msg {}",
                                 chrono::Utc::now().format("%H:%M:%S"),
@@ -468,6 +494,9 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             );
                             continue;
                         }
+                        // Remember the admitted agent so the spawned turn below can
+                        // mark its reply sent when it finishes composing (BUG 2).
+                        coalesced_named_agent = Some(agent.to_string());
                     }
                     (bot.channel_type.clone(), body.clone())
                 }
@@ -664,6 +693,11 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         let mirror_group = matches!(entry, convo::Entry::GroupElected);
                         let feed_path_owned = feed_path.clone();
                         let wg_config_owned = wg_config.clone();
+                        // Hand the coalescer + admitted agent into the spawn so it
+                        // marks the reply *sent* when it finishes — ending the
+                        // pending turn so the next follow-up is a new turn (BUG 2).
+                        let coalescer_spawn = coalescer.clone();
+                        let coalesced_agent_spawn = coalesced_named_agent.clone();
                         tokio::spawn(async move {
                             let base = convo::BotReplySink::new(cfg_owned.clone());
                             let sink: Box<dyn convo::ReplySink> = if mirror_group {
@@ -702,6 +736,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                     chrono::Utc::now().format("%H:%M:%S"),
                                     sender,
                                 ),
+                            }
+                            // The turn is done (reply sent, or failed fast into the
+                            // glitched follow-up) — end its pending window so a
+                            // genuine follow-up to the concierge is a NEW turn, not
+                            // coalesced away (BUG 2). Only set for the concierge
+                            // case; None for 1:1 / named turns that never coalesced.
+                            if let Some(agent) = coalesced_agent_spawn {
+                                coalescer_spawn.lock().unwrap().mark_named_sent(&agent);
                             }
                         });
                     }

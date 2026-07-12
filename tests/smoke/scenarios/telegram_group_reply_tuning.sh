@@ -115,4 +115,43 @@ echo "Fix #4a regression: a PURE greeting still elects the whole roster (collect
 out="$(elect 'hey everyone, how is it going?' --chat-type supergroup)"
 expect_grep   "pure greeting stays collective"         "$out" '"kind": "collective"'
 
-echo "PASS: sender resolution (id→human), bot-sender visibility, and the content-question-vs-collective boundary all hold through the real binary"
+# ---------------------------------------------------------------------------
+# group-chat-plural (2026-07-12): mid-sentence second-person-plural addressing
+# elects the WHOLE roster even when it carries a question/request — the live
+# misses "can you guys discuss…" and "…what you all think" were swallowed to
+# otto-concierge. Third-person "the guys" and gratitude stay OUT of the roster.
+# Runs at --humans 2 (the conservative small-talk context) so the plural-address
+# rule is shown to beat both the ask check and the small-talk silence.
+# ---------------------------------------------------------------------------
+echo "BUG 1: mid-sentence 'you guys/you all' elects the whole roster (even as an ask):"
+for msg in \
+    'can you guys discuss this and find consensus' \
+    'the meaning of life tell me what you all think' \
+    'what do you all think?'
+do
+    out="$(elect "$msg" --chat-type supergroup --humans 2)"
+    expect_grep   "plural-you '$msg' → collective"     "$out" '"kind": "collective"'
+done
+
+echo "BUG 1: third-person 'the guys' is NOT a roster broadcast:"
+out="$(elect 'tell the guys dinner is ready' --chat-type supergroup --humans 2)"
+expect_absent "third-person 'the guys' did NOT fan out" "$out" '"kind": "collective"'
+
+echo "BUG 1: gratitude that names the family stays silent small-talk (not a summons):"
+out="$(elect 'thanks everyone' --chat-type supergroup --humans 2)"
+expect_absent "gratitude 'thanks everyone' is not collective" "$out" '"kind": "collective"'
+expect_grep   "gratitude 'thanks everyone' is silence"        "$out" '"kind": "silence"'
+
+# ---------------------------------------------------------------------------
+# group-chat-plural BUG 3: a name-addressed group message elects that PERSONA
+# (bruno), not the default/concierge bot. The election is what the send helper
+# keys the reply bot off of; that the reply actually goes out via the ELECTED
+# bot's token is proven by the unit test
+# `composed_group_turn_replies_via_elected_bot_not_the_concierge`.
+# ---------------------------------------------------------------------------
+echo "BUG 3: an addressed name elects that persona (bruno), not otto:"
+out="$(elect 'bruno, what should we cook tonight?' --chat-type supergroup --humans 2)"
+expect_grep   "addressed name elects bruno"            "$out" '"who": "bruno"'
+expect_grep   "…by the addressed-name rule"            "$out" '"addressed_by": "name"'
+
+echo "PASS: sender resolution (id→human), bot-sender visibility, the content-question-vs-collective boundary, plural-address broadcast, and elected-persona routing all hold through the real binary"
