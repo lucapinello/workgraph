@@ -320,6 +320,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // @username. Falls back to the raw display label for unbound senders.
             let auth_sender = resolve_auth_sender(&workgraph_dir, &msg);
 
+            // Membership-aware silence: count the onboarded humans so a
+            // single-human group (Casa Pinello: one human, four bots) answers
+            // greetings instead of protecting non-existent human-to-human
+            // chatter. Recomputed per message so a newly-onboarded human flips
+            // the group back to the conservative silence rule without a restart.
+            let human_count = human_agent_id_set(&workgraph_dir).len();
+
             let election = elect_responders(
                 msg.chat_type.as_deref(),
                 msg.chat_id.as_deref(),
@@ -329,6 +336,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // Defense in depth behind the boundary guard above — a bot-sent
                 // message never reaches here, but the election refuses it too.
                 msg.sender_is_bot,
+                human_count,
                 &route_config,
             );
 
@@ -970,10 +978,12 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
 /// approximated from any `@handle` tokens (the live listener reads Telegram
 /// entities). See docs/09 §natural-group.
 pub fn run_elect(
+    workgraph_dir: &Path,
     message: &str,
     reply_to_bot: Option<&str>,
     chat_type: &str,
     chat_id: &str,
+    human_count_override: Option<usize>,
     json: bool,
 ) -> Result<()> {
     let config = load_telegram_config()?;
@@ -984,6 +994,13 @@ pub fn run_elect(
         .map(|t| t.trim_start_matches('@').to_ascii_lowercase())
         .collect();
 
+    // Membership-aware silence: default to the real onboarded-human count so the
+    // diagnostic mirrors the live listener, but let `--humans N` preview either
+    // side of the boundary (a single-human group answers greetings; 2+ humans
+    // keep the conservative silence).
+    let human_count =
+        human_count_override.unwrap_or_else(|| human_agent_id_set(workgraph_dir).len());
+
     let election = elect_responders(
         Some(chat_type),
         Some(chat_id),
@@ -993,6 +1010,7 @@ pub fn run_elect(
         // The `wg telegram elect` diagnostic is always run by a human operator,
         // never a bot — the bot-loop guard is exercised by the unit tests.
         false,
+        human_count,
         &config,
     );
 

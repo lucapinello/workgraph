@@ -89,18 +89,37 @@ expect_grep "fuzzy-summon/luca-typos" "$out" "collective address — the whole r
 out="$(elect "hi guyz where is everyone?")"
 expect_grep "fuzzy-summon/hi-guyz" "$out" "collective address — the whole roster answers in order: nora, bruno, mira, otto"
 # Counter-case: a greeting mentioned mid-sentence is narration, NOT a summon —
-# the silence preference for non-greeting-shaped chatter must hold.
-expect_grep "fuzzy-summon/narration-not-summon" "$(elect "he said hey to me yesterday?")" "silence (small-talk)"
+# the silence preference for non-greeting-shaped chatter must hold. Two humans
+# present (`--humans 2`) so the conservative silence rule is in force.
+expect_grep "fuzzy-summon/narration-not-summon" "$(elect "he said hey to me yesterday?" --humans 2)" "silence (small-talk)"
 
 echo "e. team-directed unaddressed ask → otto coordinates:"
 expect_grep "ask/someone" "$(elect "can someone plan Saturday dinner?")" "answered by otto (by concierge)"
 expect_grep "ask/domain-q" "$(elect "what's the plan for dinner tonight?")" "answered by otto (by concierge)"
 
-echo "f. pure small talk → SILENCE:"
-expect_grep "silence/laughter" "$(elect "haha that was so funny")" "silence (small-talk)"
-expect_grep "silence/human-q" "$(elect "did you have a good day?")" "silence (small-talk)"
+echo "f. pure small talk with 2+ humans → SILENCE (family chatter protected):"
+# `--humans 2` forces the conservative rule: with more than one human in the
+# group these are human-to-human lines the bots deliberately stay out of.
+expect_grep "silence/laughter" "$(elect "haha that was so funny" --humans 2)" "silence (small-talk)"
+expect_grep "silence/human-q" "$(elect "did you have a good day?" --humans 2)" "silence (small-talk)"
 # Tricky: a name talking ABOUT a human must not summon the bot (→ small talk).
-expect_grep "silence/name-about-human" "$(elect "nora from work said hi today")" "silence (small-talk)"
+expect_grep "silence/name-about-human" "$(elect "nora from work said hi today" --humans 2)" "silence (small-talk)"
+
+echo "g. membership-aware silence — a SINGLE-human group answers greetings:"
+# THE LIVE CASE (02:45): Luca posted a bare "hello" in a group with one human
+# and four bots. The small-talk rule protects human-to-human chatter, but there
+# is none to protect here — every message is for the team — so a bare greeting
+# now earns a brief warm roster greeting instead of silence.
+expect_grep "solo/bare-hello-collective" "$(elect "hello" --humans 1)" "collective address — the whole roster answers in order: nora, bruno, mira, otto"
+# The SAME "hello" with a second human present stays silent (chatter returns).
+expect_grep "two-human/bare-hello-silence" "$(elect "hello" --humans 2)" "silence (small-talk)"
+# A greeting that names the whole group ("goodnight guys") is a broadcast in
+# ANY membership — collective with one human AND with two.
+expect_grep "goodnight-guys/solo" "$(elect "goodnight guys" --humans 1)" "collective address — the whole roster answers in order: nora, bruno, mira, otto"
+expect_grep "goodnight-guys/two-human" "$(elect "goodnight guys" --humans 2)" "collective address — the whole roster answers in order: nora, bruno, mira, otto"
+# In a single-human group, non-greeting unaddressed text leans on otto rather
+# than falling silent — the human is never left talking to an empty room.
+expect_grep "solo/nongreeting-otto" "$(elect "just got home" --humans 1)" "answered by otto (by concierge)"
 
 echo "Private chat is a 1:1 passthrough (privacy preserved):"
 expect_grep "private" "$(elect "hey guys" --chat-type private)" "1:1 passthrough"

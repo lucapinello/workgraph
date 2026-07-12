@@ -3645,11 +3645,14 @@ fn main() -> Result<()> {
                 reply_to_bot,
                 chat_type,
                 chat_id,
+                humans,
             } => commands::telegram::run_elect(
+                &workgraph_dir,
                 &message,
                 reply_to_bot.as_deref(),
                 &chat_type,
                 &chat_id,
+                humans,
                 cli.json,
             ),
             TelegramCommands::ResolveSender { update } => {

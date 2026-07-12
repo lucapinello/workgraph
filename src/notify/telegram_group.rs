@@ -419,13 +419,22 @@ pub fn route_natural(
 //   c. reply to a bot's message      -> that agent        (conversation continuity)
 //   d. COLLECTIVE address            -> ALL FOUR respond   (roster order)
 //   e. team-directed unaddressed ask -> OTTO (coordinator)
-//   f. pure human-to-human small talk-> SILENCE
+//   f. pure human-to-human small talk-> SILENCE   (2+ humans in the group)
+//   f'. single-human group, unaddressed:
+//         greeting-shaped ("hello")  -> ALL respond briefly (warm greeting)
+//         anything else              -> OTTO (concierge)
 //
 // Precedence is most-explicit-first: a single named/mentioned/replied target
 // beats a collective trigger (addressing one person is more specific than "hey
 // guys"); the d/e/f boundary is heuristic and documented on each helper. When
 // unsure between e and f we prefer f (silence) — a missed summon is better than
 // a chatty bot.
+//
+// The f-vs-f' split is MEMBERSHIP-AWARE (`human_count`): rule f's silence exists
+// only to protect human-to-human chatter. A group with a single human (the Casa
+// Pinello case: one human, four bots) has none — every message is addressed to
+// the team — so a bare "hello" deserves a warm greeting, not silence. The
+// conservative silence returns unchanged the moment a second human joins.
 
 /// Collective-address triggers: phrases that address the whole family at once
 /// ("hey guys", "everyone", "ciao a tutti"). Case-insensitive. Multi-word
@@ -471,7 +480,32 @@ pub const COLLECTIVE_TRIGGERS: &[&str] = &[
 /// tokens of 4+ chars (so "helo"/"ciap" still open), exact for the short ones
 /// ("hey"/"hi"/"yo") to avoid firing on unrelated 2–3 letter words. Tunable.
 pub const GREETING_TOKENS: &[&str] = &[
-    "hey", "hi", "hello", "hiya", "yo", "ciao", "hola", "hallo",
+    "hey", "hi", "hello", "hiya", "heya", "yo", "sup", "howdy", "ciao", "hola",
+    "hallo",
+    // Time-of-day greetings, written as one word ("goodnight", "goodmorning").
+    // The two-word forms ("good night", "good morning") are handled by
+    // [`is_greeting_shaped`], which pairs a leading "good"/"g" with the
+    // time-of-day word so bare "morning"/"night" don't count as greetings.
+    "goodnight", "goodmorning", "goodevening", "goodafternoon",
+    // Italian
+    "buongiorno", "buonasera", "buonanotte", "salve",
+];
+
+/// Time-of-day words that turn a leading "good"/"g" into a greeting
+/// ("good morning", "g'night"). Fuzzy-matched for 4+ chars. Kept separate from
+/// [`GREETING_TOKENS`] so bare "morning"/"night" only read as a greeting when
+/// they follow "good" — "morning meeting moved?" is not a greeting.
+pub const TIME_OF_DAY_WORDS: &[&str] = &["morning", "evening", "afternoon", "night", "nite"];
+
+/// Broad plural-you address words that, when they accompany a greeting, address
+/// the whole family at once ("goodnight guys", "morning folks"). Fuzzy-matched
+/// for 4+ chars. Distinct from [`COLLECTIVE_TRIGGERS`], whose single-word entries
+/// are deliberately tight — this set only ever fires *together with* a greeting
+/// (see [`is_greeting_collective`]), so it can safely include the looser "guys"
+/// / "folks" / "all" that would over-fire on their own.
+pub const BROAD_ADDRESS_TOKENS: &[&str] = &[
+    "guys", "folks", "all", "y'all", "yall", "everyone", "everybody", "team",
+    "ragazzi", "ragazza", "tutti",
 ];
 
 /// Interjections/verbs that, immediately before a family name, mark it as an
@@ -734,15 +768,66 @@ pub fn is_greeting_shaped_summon(text: &str) -> bool {
     }
 }
 
+/// True if `text` *opens with a greeting* — the shape of "hello", "hey guys",
+/// "goodnight", "good morning everyone". Typo-tolerant (task fuzzy-summon): the
+/// leading word is fuzzy-matched against [`GREETING_TOKENS`], and a leading
+/// "good"/"g" followed by a [`TIME_OF_DAY_WORDS`] word ("good night") also
+/// counts. Unlike [`is_greeting_shaped_summon`] this needs no `?` — a bare
+/// "hello" qualifies. Keys on the FIRST word only, so narrative chatter that
+/// merely mentions a greeting mid-sentence ("he said hi to me") is not a
+/// greeting. This is the membership-aware silence rule's greeting test.
+pub fn is_greeting_shaped(text: &str) -> bool {
+    let tokens = word_list(text);
+    let first = match tokens.first() {
+        Some(f) => f.as_str(),
+        None => return false,
+    };
+    if GREETING_TOKENS.iter().any(|g| fuzzy_token_matches(first, g)) {
+        return true;
+    }
+    // "good <morning|night|…>" / "g'night" — a leading good-wish + time-of-day.
+    if (first == "good" || first == "g") || fuzzy_token_matches(first, "good") {
+        if let Some(second) = tokens.get(1) {
+            if TIME_OF_DAY_WORDS
+                .iter()
+                .any(|t| fuzzy_token_matches(second, t))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True if `text` is a greeting that *also* addresses the whole family —
+/// "goodnight guys", "morning folks", "hello all". This fires a collective
+/// (whole-roster) reply **regardless of how many humans are in the group**,
+/// because a greeting explicitly aimed at everyone is a broadcast in any
+/// membership. It is the greeting shape ([`is_greeting_shaped`]) AND a
+/// [`BROAD_ADDRESS_TOKENS`] word present (fuzzy-matched). Folded into
+/// [`is_collective_address`] so it participates in rule d.
+pub fn is_greeting_collective(text: &str) -> bool {
+    if !is_greeting_shaped(text) {
+        return false;
+    }
+    let tokens = word_list(text);
+    tokens.iter().any(|w| {
+        BROAD_ADDRESS_TOKENS
+            .iter()
+            .any(|b| fuzzy_token_matches(w, b))
+    })
+}
+
 /// True if `text` collectively addresses the family (see [`COLLECTIVE_TRIGGERS`]).
 ///
 /// Matching is typo-tolerant (task fuzzy-summon): multi-word triggers match as
 /// consecutive tokens each within edit distance 1 for 4+-char words (so "hey
 /// guyd" satisfies "hey guys"); single-word triggers still match only as an
 /// exact whole word, so "teamwork" / "everyones" (missing apostrophe) don't
-/// over-fire. Finally, a greeting-shaped question ("hey … ?") counts as a
-/// collective summon via [`is_greeting_shaped_summon`] even with no trigger
-/// phrase at all.
+/// over-fire. A greeting-shaped question ("hey … ?") counts as a collective
+/// summon via [`is_greeting_shaped_summon`], and a greeting that names the whole
+/// group ("goodnight guys") counts via [`is_greeting_collective`] — both even
+/// with no trigger phrase at all.
 pub fn is_collective_address(text: &str) -> bool {
     let tokens = word_list(text);
     for trig in COLLECTIVE_TRIGGERS {
@@ -755,7 +840,7 @@ pub fn is_collective_address(text: &str) -> bool {
             return true;
         }
     }
-    is_greeting_shaped_summon(text)
+    is_greeting_shaped_summon(text) || is_greeting_collective(text)
 }
 
 /// Find the first family name in `text` that is used to *address* an agent
@@ -874,6 +959,17 @@ pub fn is_team_directed_ask(text: &str) -> bool {
 /// See the section header above for the ordered table and the d/e/f boundary
 /// rationale. Non-group chats yield [`Election::Private`]; a group message with
 /// no chat id yields [`Election::Silence`]`(NoChatId)`.
+///
+/// `human_count` is how many **human** members the group has (onboarded humans
+/// present in the chat — see `human_agent_id_set`). It makes the silence-vs-
+/// respond boundary membership-aware: the conservative small-talk silence (rule
+/// f) exists to protect *human-to-human* chatter, but a group with a single
+/// human has none — every message is necessarily addressed to the team. So when
+/// `human_count <= 1`, a greeting-shaped message ("hello", "goodnight") earns a
+/// brief whole-roster greeting and any other unaddressed text leans on the
+/// concierge (otto) instead of falling silent. With 2+ humans the conservative
+/// silence returns unchanged (family chatter is protected the moment a second
+/// human joins).
 pub fn elect_responders(
     chat_type: Option<&str>,
     chat_id: Option<&str>,
@@ -881,6 +977,7 @@ pub fn elect_responders(
     mention_usernames: &[String],
     reply_to_bot: Option<&str>,
     sender_is_bot: bool,
+    human_count: usize,
     config: &TelegramConfig,
 ) -> Election {
     // Fix #0 — the bot-loop guard. UNCONDITIONAL and first: a message sent by a
@@ -964,7 +1061,33 @@ pub fn elect_responders(
         };
     }
 
-    // f. Pure human-to-human small talk — bots stay silent.
+    // Membership-aware silence boundary. Rule f's silence protects human-to-
+    // human chatter — but a group with a single human has no such chatter to
+    // protect: every message is addressed to the team. So when the group holds
+    // at most one human, an unaddressed message is answered rather than silenced:
+    //   * a greeting ("hello", "goodnight") → a brief whole-roster greeting;
+    //   * anything else → the concierge (otto), the group's coordinator voice.
+    // The moment a second human joins (`human_count >= 2`) the conservative
+    // silence below returns and family small-talk is protected again.
+    if human_count <= 1 {
+        if is_greeting_shaped(text) {
+            return Election::All {
+                reply_chat,
+                body: text.to_string(),
+            };
+        }
+        return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
+            Some(bot) => Election::One {
+                bot,
+                reply_chat,
+                body: text.to_string(),
+                addressed_by: AddressedBy::Concierge,
+            },
+            None => Election::Silence(SilenceReason::NoVoicesConfigured),
+        };
+    }
+
+    // f. Pure human-to-human small talk (2+ humans present) — bots stay silent.
     Election::Silence(SilenceReason::SmallTalk)
 }
 
@@ -1512,8 +1635,26 @@ mod tests {
     // =======================================================================
 
     /// Run the election in the Casa Pinello group with the given mentions /
-    /// reply-chain against the four-bot roster.
+    /// reply-chain against the four-bot roster, in a **two-human** group. Two
+    /// humans keep the conservative silence rule (rule f) in force, so the a–f
+    /// table's silence expectations hold; the single-human rule is exercised by
+    /// [`elect_solo`].
     fn elect(text: &str, mentions: &[&str], reply_to_bot: Option<&str>) -> Election {
+        elect_with_humans(text, mentions, reply_to_bot, 2)
+    }
+
+    /// Run the election in a **single-human** Casa Pinello group (one human,
+    /// four bots) — the live case that motivates the membership-aware rule.
+    fn elect_solo(text: &str, mentions: &[&str], reply_to_bot: Option<&str>) -> Election {
+        elect_with_humans(text, mentions, reply_to_bot, 1)
+    }
+
+    fn elect_with_humans(
+        text: &str,
+        mentions: &[&str],
+        reply_to_bot: Option<&str>,
+        human_count: usize,
+    ) -> Election {
         let mentions: Vec<String> = mentions.iter().map(|s| s.to_string()).collect();
         elect_responders(
             Some("supergroup"),
@@ -1522,6 +1663,7 @@ mod tests {
             &mentions,
             reply_to_bot,
             false, // human sender in the a–f election tests
+            human_count,
             &casa_config(),
         )
     }
@@ -1753,6 +1895,7 @@ mod tests {
             &[],
             None,
             false,
+            2,
             &casa_config(),
         );
         assert_eq!(e, Election::Private);
@@ -1760,7 +1903,8 @@ mod tests {
 
     #[test]
     fn elect_group_without_chat_id_is_silence_no_chat() {
-        let e = elect_responders(Some("group"), None, "hey guys", &[], None, false, &casa_config());
+        let e =
+            elect_responders(Some("group"), None, "hey guys", &[], None, false, 2, &casa_config());
         assert_eq!(e, Election::Silence(SilenceReason::NoChatId));
     }
 
@@ -1778,6 +1922,7 @@ mod tests {
             &[],
             None,
             false,
+            2,
             &cfg,
         );
         assert_eq!(e, Election::Silence(SilenceReason::NoVoicesConfigured));
@@ -1798,6 +1943,7 @@ mod tests {
             &[],
             None,
             true, // sender is a bot
+            2,
             &casa_config(),
         );
         assert_eq!(e, Election::Silence(SilenceReason::BotSender));
@@ -1815,6 +1961,7 @@ mod tests {
                 &["bruno_casapinello_bot".to_string()],
                 Some("mira_casapinello_bot"),
                 true,
+                2,
                 &casa_config(),
             ),
             Election::Silence(SilenceReason::BotSender)
@@ -1827,6 +1974,7 @@ mod tests {
                 &[],
                 None,
                 true,
+                2,
                 &casa_config(),
             ),
             Election::Silence(SilenceReason::BotSender)
@@ -1842,6 +1990,7 @@ mod tests {
             &[],
             None,
             true,
+            2,
             &casa_config(),
         );
         let line = election_decision_summary(Some("55"), Some("supergroup"), &e);
@@ -1944,6 +2093,149 @@ mod tests {
             elect("those guys were so loud last night", &[], None),
             Election::Silence(SilenceReason::SmallTalk)
         );
+    }
+
+    // ---- membership-aware silence (single-human vs 2+ humans) ------------
+
+    #[test]
+    fn elect_solo_bare_hello_is_brief_collective() {
+        // THE LIVE CASE (02:45): Luca posted a bare "hello" in a group that holds
+        // one human and four bots. With no human-to-human chatter to protect the
+        // greeting is necessarily for the team → a brief whole-roster greeting,
+        // NOT silence:small-talk.
+        assert_eq!(
+            elect_solo("hello", &[], None),
+            Election::All {
+                reply_chat: "-100999".to_string(),
+                body: "hello".to_string(),
+            },
+            "a bare greeting in a single-human group must warmly greet, not go silent"
+        );
+    }
+
+    #[test]
+    fn elect_two_humans_bare_hello_is_silence() {
+        // The moment a second human is present the conservative rule returns:
+        // "hello" is human-to-human small talk the bots stay out of.
+        assert_eq!(
+            elect("hello", &[], None),
+            Election::Silence(SilenceReason::SmallTalk),
+            "with 2+ humans a bare greeting is protected family chatter → silence"
+        );
+    }
+
+    #[test]
+    fn elect_goodnight_guys_is_collective_in_both_memberships() {
+        // "goodnight guys" carries a collective word ("guys") on a greeting, so it
+        // is a broadcast in ANY membership — the whole roster answers whether the
+        // group has one human or five.
+        let expected = Election::All {
+            reply_chat: "-100999".to_string(),
+            body: "goodnight guys".to_string(),
+        };
+        assert_eq!(elect_solo("goodnight guys", &[], None), expected, "solo");
+        assert_eq!(elect("goodnight guys", &[], None), expected, "two-human");
+    }
+
+    #[test]
+    fn elect_solo_greeting_variants_are_collective() {
+        // Every greeting shape earns a brief roster greeting in a single-human
+        // group, including typo'd and time-of-day forms.
+        for t in [
+            "hi", "hey", "helo", "hey there", "goodnight", "goodmorning",
+            "good morning", "good night", "buongiorno",
+        ] {
+            assert!(
+                matches!(elect_solo(t, &[], None), Election::All { .. }),
+                "expected brief collective for solo greeting {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn elect_solo_nongreeting_unaddressed_leans_otto_concierge() {
+        // Non-greeting chatter with no named target is NOT silenced in a
+        // single-human group — it leans on otto (the concierge) so the human is
+        // never left talking to an empty room.
+        for t in ["that movie was great", "ok cool", "just got home"] {
+            assert_one(&elect_solo(t, &[], None), "otto", AddressedBy::Concierge);
+        }
+        // And with 2+ humans the very same lines stay silent (family chatter).
+        for t in ["that movie was great", "ok cool", "just got home"] {
+            assert_eq!(
+                elect(t, &[], None),
+                Election::Silence(SilenceReason::SmallTalk),
+                "2+ humans: {t:?} is protected small talk"
+            );
+        }
+    }
+
+    #[test]
+    fn elect_solo_still_honours_named_mention_and_ask_precedence() {
+        // Membership only changes the d/e/f *fallback*. Explicit targets and
+        // team-directed asks still win exactly as before, even in a solo group.
+        assert_one(&elect_solo("nora, hi", &[], None), "nora", AddressedBy::Name);
+        assert_one(
+            &elect_solo("can someone plan dinner?", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
+        // A pure collective greeting is still a roster broadcast.
+        assert!(matches!(
+            elect_solo("hey everyone!", &[], None),
+            Election::All { .. }
+        ));
+    }
+
+    #[test]
+    fn elect_solo_unaddressed_without_otto_is_silence_not_crash() {
+        // Single-human, non-greeting, but no concierge configured → there is no
+        // voice to lean on, so it degrades to silence (NoVoicesConfigured) rather
+        // than an empty election.
+        let cfg = cfg_with_bots(&[
+            ("nora", "-100999", Some("nora"), Some("nora_bot")),
+            ("bruno", "-100999", Some("bruno"), Some("bruno_bot")),
+        ]);
+        let e = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "just got home",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+        );
+        assert_eq!(e, Election::Silence(SilenceReason::NoVoicesConfigured));
+    }
+
+    #[test]
+    fn is_greeting_shaped_covers_bare_and_time_of_day_greetings() {
+        assert!(is_greeting_shaped("hello"));
+        assert!(is_greeting_shaped("hey guys"));
+        assert!(is_greeting_shaped("goodnight"));
+        assert!(is_greeting_shaped("good morning everyone"));
+        assert!(is_greeting_shaped("helo")); // typo-tolerant
+        // Not greetings: mid-sentence greeting, or a bare time-of-day word.
+        assert!(!is_greeting_shaped("he said hi to me"));
+        assert!(!is_greeting_shaped("morning meeting moved to 3?"));
+        assert!(!is_greeting_shaped("what's for dinner?"));
+    }
+
+    #[test]
+    fn is_greeting_collective_needs_greeting_and_broad_address() {
+        assert!(is_greeting_collective("goodnight guys"));
+        assert!(is_greeting_collective("hey folks"));
+        assert!(is_greeting_collective("good morning everyone"));
+        assert!(is_greeting_collective("hello all"));
+        // A bare time-of-day word is not a recognized greeting on its own, so
+        // "morning folks" does not count (matches the tight bare-word policy).
+        assert!(!is_greeting_collective("morning folks"));
+        // A broad-address word without a greeting is not a greeting-collective.
+        assert!(!is_greeting_collective("those guys were loud"));
+        // A greeting with no broad-address word is not a greeting-collective
+        // (its membership handling happens in elect_responders instead).
+        assert!(!is_greeting_collective("hello"));
     }
 
     #[test]
@@ -2090,7 +2382,8 @@ mod tests {
 
     #[test]
     fn decision_line_for_silence_no_chat_id() {
-        let election = elect_responders(Some("group"), None, "hey guys", &[], None, false, &casa_config());
+        let election =
+            elect_responders(Some("group"), None, "hey guys", &[], None, false, 2, &casa_config());
         let line = election_decision_summary(None, Some("group"), &election);
         // No transport message id → "none"; reason surfaced in the rule.
         assert_eq!(
@@ -2112,6 +2405,7 @@ mod tests {
             &[],
             None,
             false,
+            2,
             &cfg,
         );
         let line = election_decision_summary(Some("7"), Some("supergroup"), &election);
@@ -2123,8 +2417,16 @@ mod tests {
 
     #[test]
     fn decision_line_for_private_passthrough() {
-        let election =
-            elect_responders(Some("private"), Some("111"), "nora, hi", &[], None, false, &casa_config());
+        let election = elect_responders(
+            Some("private"),
+            Some("111"),
+            "nora, hi",
+            &[],
+            None,
+            false,
+            2,
+            &casa_config(),
+        );
         let line = election_decision_summary(Some("9"), Some("private"), &election);
         assert_eq!(line, "msg=9 chat=private rule=private target=passthrough");
     }
@@ -2141,6 +2443,7 @@ mod tests {
             &[],
             None,
             false,
+            2,
             &cfg,
         );
         let line = election_decision_summary(Some("3"), Some("supergroup"), &election);

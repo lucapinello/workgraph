@@ -6487,6 +6487,15 @@ pub enum TelegramCommands {
         /// The group chat id the message arrived in (the reply target).
         #[arg(long, default_value = "-1000000000001")]
         chat_id: String,
+
+        /// Override the number of human members in the group. The membership-
+        /// aware silence rule answers greetings in a single-human group (1) but
+        /// stays silent on small talk once a second human joins (2+). Defaults
+        /// to the onboarded-human count read from the project's `agency/`, so
+        /// pass `--humans 2` to preview the conservative rule without a second
+        /// human actually onboarded.
+        #[arg(long)]
+        humans: Option<usize>,
     },
 
     /// Resolve the sender of a raw Telegram update against the binding map
