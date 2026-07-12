@@ -194,6 +194,29 @@ pub fn compose(cmd: &FamilyCommand, ctx: &CommandContext<'_>) -> String {
     (cmd.compose)(ctx)
 }
 
+/// Operator/coordinator vocabulary that must never appear in family-facing text
+/// — the WG claim/done reference and friends. Checked case-insensitively as
+/// whole-ish tokens so ordinary family words ("ready in ten minutes") don't trip
+/// it. See `fix-command-leaks`.
+const OPERATOR_VOCAB: &[&str] = &[
+    "claim ", "unclaim", "wg claim", "wg done", "workgraph", "task id", "task_id",
+    "coordinator", "`claim", "`done", "`status`",
+];
+
+/// Whether `text` is safe to render into a FAMILY chat: no markdown code
+/// backticks and none of the operator WG vocabulary. The listener gates every
+/// command reply bound for a family chat through this so coordinator content
+/// (the raw claim/done/status reference) can never leak into the group — the
+/// belt to the structural brace that already keeps the operator command path
+/// out of groups. `fix-command-leaks`.
+pub fn is_family_voice(text: &str) -> bool {
+    if text.contains('`') {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    !OPERATOR_VOCAB.iter().any(|v| lower.contains(v))
+}
+
 // ---------------------------------------------------------------------------
 // Compose functions — one per command, all pure and family-voice (docs/04).
 // ---------------------------------------------------------------------------
@@ -540,6 +563,31 @@ mod tests {
         assert!(match_command("what's for dinner tonight?").is_none());
         assert!(match_command("").is_none());
         assert!(match_command("/unknown").is_none());
+    }
+
+    #[test]
+    fn family_voice_gate_rejects_operator_reference_accepts_family_help() {
+        // The operator WG help — backticks + claim/done vocabulary — must FAIL
+        // the family-voice gate so it can never leak into a family chat.
+        let operator_help = "\u{1f4cb} *WG commands*\n\n\u{2022} `claim <task>` \\- Claim a task\n\u{2022} `done <task>` \\- Mark done";
+        assert!(
+            !is_family_voice(operator_help),
+            "operator claim/done reference must not pass the family-voice gate"
+        );
+
+        // Every family command reply — /help included — must PASS the gate.
+        let plans: Vec<PlanDoc> = Vec::new();
+        let humans = HashSet::new();
+        let cfg = casa_config();
+        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        for cmd in FAMILY_COMMANDS {
+            let out = compose(cmd, &c);
+            assert!(
+                is_family_voice(&out),
+                "{} reply is not family-voice: {out:?}",
+                cmd.keyword
+            );
+        }
     }
 
     #[test]

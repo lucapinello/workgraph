@@ -73,6 +73,52 @@ pub fn parse_mention_usernames(text: &str, entities: &serde_json::Value) -> Vec<
     out
 }
 
+/// True when the message carries a Telegram `bot_command` entity at **offset 0**
+/// — i.e. it opens with a genuine `/slash` command.
+///
+/// Telegram only tags an actual leading `/command` token with a `bot_command`
+/// entity; ordinary chatter, a bare `?`, or any other punctuation carries none.
+/// This is the single load-bearing signal the listener uses to decide "is this a
+/// command at all": a message is only ever treated as a command when this is
+/// true (see `fix-command-leaks` — a bare `?` was being parsed as an operator
+/// HELP command and leaked the WG claim/done reference into the family group).
+///
+/// `entities` is the raw JSON array from the update's `message.entities`
+/// (or `null`/absent, in which case the result is `false`).
+pub fn has_leading_bot_command(entities: &serde_json::Value) -> bool {
+    let arr = match entities.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    arr.iter().any(|ent| {
+        ent.get("type").and_then(|t| t.as_str()) == Some("bot_command")
+            && ent.get("offset").and_then(|o| o.as_u64()) == Some(0)
+    })
+}
+
+/// Extract `@handle` mention tokens from a plain text string, the way the
+/// `wg telegram elect` / `route` / `classify` diagnostics approximate the live
+/// listener (which reads them from Telegram `mention` entities via
+/// [`parse_mention_usernames`]).
+///
+/// Each whitespace token starting with `@` contributes its handle with the `@`
+/// removed, **trailing punctuation stripped**, and lower-cased. The trailing
+/// strip is load-bearing: without it `@bruno?` yields the token `bruno?`, which
+/// resolves to no bot, so an explicit mention silently degrades. Leading/inner
+/// `_` are preserved so real handles (`nora_casapinello_bot`) survive intact.
+/// Empty results (a bare `@`) are dropped.
+pub fn parse_at_mention_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|t| t.starts_with('@'))
+        .map(|t| {
+            t.trim_start_matches('@')
+                .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                .to_ascii_lowercase()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Extract the `@username` of the bot whose message an inbound Telegram
 /// `message` is a reply to, for reply-chain routing.
 ///
@@ -115,15 +161,35 @@ pub struct ResolvedBot {
 /// Map a mentioned @username to the configured bot that carries it.
 ///
 /// A bot matches when its declared `username` equals `username`
-/// (case-insensitively); as a fallback the `[telegram.bots.<id>]` key itself is
-/// matched, so a config that omits `username` still routes if the operator
-/// named the bot after its handle. Returns `None` when no bot claims the
-/// handle. Tokens are never read into the result.
+/// (case-insensitively); as a fallback the `[telegram.bots.<id>]` key **or** the
+/// fronted `agent_id` is matched, so a config that omits `username` still routes
+/// if the operator named the bot after its handle or agent.
+///
+/// **Resilience fallback (fix-mention-precedence).** The live config frequently
+/// omits the optional `username` field, yet an explicit `@mention` is the
+/// strongest possible address signal and must NEVER be dropped for a missing
+/// data field. Telegram bot usernames are, by BotFather rule, always of the form
+/// `<name>…bot` and end in `bot`; the family handles follow the
+/// `<agent>_casapinello_bot` convention. So when the handle *looks like a bot
+/// handle* (contains `_` and ends in `bot`) we also match its **leading
+/// underscore-segment** against the bot id / agent id — `@nora_casapinello_bot`
+/// resolves to the `nora` bot even with no `username` configured. The
+/// `ends_with("bot")` guard keeps this from ever matching ordinary prose tokens
+/// (`nora_from_work` does not end in `bot`, so it is not treated as a handle).
+///
+/// Returns `None` when no bot claims the handle. Tokens are never read into the
+/// result.
 pub fn resolve_mentioned_bot(username: &str, config: &TelegramConfig) -> Option<ResolvedBot> {
     let want = username.trim_start_matches('@').to_ascii_lowercase();
     if want.is_empty() {
         return None;
     }
+
+    // Leading underscore-segment of a compound Telegram bot handle
+    // ("nora_casapinello_bot" -> "nora"), used only when `want` looks like a bot
+    // handle (see the resilience fallback in the doc comment above).
+    let looks_like_bot_handle = want.contains('_') && want.ends_with("bot");
+    let handle_segment = want.split('_').next().unwrap_or(want.as_str());
 
     for (bot_id, bot) in config.all_bots() {
         let by_username = bot
@@ -132,7 +198,19 @@ pub fn resolve_mentioned_bot(username: &str, config: &TelegramConfig) -> Option<
             .map(|u| u.trim_start_matches('@').eq_ignore_ascii_case(&want))
             .unwrap_or(false);
         let by_bot_id = bot_id.eq_ignore_ascii_case(&want);
-        if by_username || by_bot_id {
+        let by_agent_id = bot
+            .agent_id
+            .as_deref()
+            .map(|a| a.eq_ignore_ascii_case(&want))
+            .unwrap_or(false);
+        let by_handle_segment = looks_like_bot_handle
+            && (bot_id.eq_ignore_ascii_case(handle_segment)
+                || bot
+                    .agent_id
+                    .as_deref()
+                    .map(|a| a.eq_ignore_ascii_case(handle_segment))
+                    .unwrap_or(false));
+        if by_username || by_bot_id || by_agent_id || by_handle_segment {
             let channel_type = if bot_id == "default" {
                 "telegram".to_string()
             } else {
@@ -1122,6 +1200,41 @@ mod tests {
     use crate::notify::telegram::TelegramBotConfig;
     use std::collections::HashMap;
 
+    // --- has_leading_bot_command (fix-command-leaks) ----------------------
+
+    #[test]
+    fn bot_command_at_offset_zero_is_a_command() {
+        // A genuine `/help` — Telegram tags it with a bot_command entity at 0.
+        let entities = serde_json::json!([{ "type": "bot_command", "offset": 0, "length": 5 }]);
+        assert!(has_leading_bot_command(&entities));
+    }
+
+    #[test]
+    fn bare_punctuation_is_not_a_command() {
+        // The reported leak: `?` (and any punctuation) carries NO entity, so it
+        // must never be treated as a command.
+        assert!(!has_leading_bot_command(&serde_json::Value::Null));
+        assert!(!has_leading_bot_command(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn a_mention_is_not_a_command() {
+        // `@nora_casapinello_bot ?` — a mention entity, but no bot_command.
+        let entities = serde_json::json!([{ "type": "mention", "offset": 0, "length": 21 }]);
+        assert!(!has_leading_bot_command(&entities));
+    }
+
+    #[test]
+    fn bot_command_after_a_mention_is_not_at_offset_zero() {
+        // `@otto /shopping` — the slash command sits after the mention, so it is
+        // NOT a leading command; by Fix (2) the @mention election owns it.
+        let entities = serde_json::json!([
+            { "type": "mention", "offset": 0, "length": 5 },
+            { "type": "bot_command", "offset": 6, "length": 9 },
+        ]);
+        assert!(!has_leading_bot_command(&entities));
+    }
+
     fn cfg_with_bots(bots: &[(&str, &str, Option<&str>, Option<&str>)]) -> TelegramConfig {
         // (bot_id, chat_id, agent_id, username)
         let mut map = HashMap::new();
@@ -1752,6 +1865,184 @@ mod tests {
             }
             other => panic!("expected One(bruno) by mention, got {other:?}"),
         }
+    }
+
+    // ---- b (regression). @mention MUST win even without a configured
+    //        `username`, and even when the rest of the text looks like small
+    //        talk. This mirrors the LIVE .wg/notify.toml, which omits the
+    //        optional `username` field — the exact config that produced
+    //        `elect "@nora_casapinello_bot what about you?" -> silence`.
+    //        (fix-mention-precedence)
+
+    /// The four-bot roster with NO `username` configured — a faithful copy of
+    /// the live deployment's config, where only `agent_id` and the bot-id key
+    /// identify each bot.
+    fn casa_config_no_usernames() -> TelegramConfig {
+        cfg_with_bots(&[
+            ("nora", "-100999", Some("nora"), None),
+            ("bruno", "-100999", Some("bruno"), None),
+            ("mira", "-100999", Some("mira"), None),
+            ("otto", "-100999", Some("otto"), None),
+        ])
+    }
+
+    #[test]
+    fn resolve_real_handle_without_configured_username() {
+        // The core defect: the real Telegram handle must resolve to its bot even
+        // though `username` is unset in the live config.
+        let cfg = casa_config_no_usernames();
+        for (handle, agent) in [
+            ("nora_casapinello_bot", "nora"),
+            ("BRUNO_casapinello_bot", "bruno"), // case-insensitive
+            ("mira_casapinello_bot", "mira"),
+            ("otto_casapinello_bot", "otto"),
+        ] {
+            let resolved = resolve_mentioned_bot(handle, &cfg)
+                .unwrap_or_else(|| panic!("{handle} must resolve without a configured username"));
+            assert_eq!(resolved.agent_id.as_deref(), Some(agent), "handle {handle:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_prose_token_is_not_mistaken_for_a_handle() {
+        // The `ends_with("bot")` guard: an ordinary underscore token that shares
+        // a leading segment with a bot id must NOT resolve — only real bot
+        // handles (…bot) get the segment fallback.
+        let cfg = casa_config_no_usernames();
+        assert!(resolve_mentioned_bot("nora_from_work", &cfg).is_none());
+        assert!(resolve_mentioned_bot("bruno_and_friends", &cfg).is_none());
+        // A bare exact bot-id / agent-id still resolves.
+        assert_eq!(
+            resolve_mentioned_bot("bruno", &cfg).and_then(|b| b.agent_id),
+            Some("bruno".to_string())
+        );
+    }
+
+    #[test]
+    fn elect_mention_wins_over_small_talk_without_configured_username() {
+        // THE regression under test. `@nora_casapinello_bot what about you?`
+        // used to elect `silence(small-talk)` on the live username-less config;
+        // an explicit @mention must ALWAYS route to that bot's agent.
+        let mentions = parse_at_mention_tokens("@nora_casapinello_bot what about you?");
+        let election = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "@nora_casapinello_bot what about you?",
+            &mentions,
+            None,
+            false,
+            &casa_config_no_usernames(),
+        );
+        match &election {
+            Election::One {
+                bot, addressed_by, ..
+            } => {
+                assert_eq!(bot.agent_id.as_deref(), Some("nora"));
+                assert_eq!(*addressed_by, AddressedBy::Mention);
+            }
+            other => panic!("expected One(nora) by mention, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_at_mention_tokens_strips_trailing_punctuation() {
+        // `@bruno?` must yield the clean handle `bruno` (not `bruno?`), so the
+        // mention resolves instead of silently degrading.
+        assert_eq!(parse_at_mention_tokens("@bruno?"), vec!["bruno".to_string()]);
+        assert_eq!(
+            parse_at_mention_tokens("@nora_casapinello_bot what about you?"),
+            vec!["nora_casapinello_bot".to_string()]
+        );
+        assert_eq!(
+            parse_at_mention_tokens("hey @Mira, @otto!"),
+            vec!["mira".to_string(), "otto".to_string()]
+        );
+        // A bare `@` contributes nothing.
+        assert!(parse_at_mention_tokens("email me @ home").is_empty());
+    }
+
+    #[test]
+    fn elect_bruno_question_mention_resolves_via_mention_path() {
+        // End-to-end for `@bruno?`: CLI-style extraction + election must land on
+        // bruno by @mention (the strongest signal), not the name fallback.
+        let mentions = parse_at_mention_tokens("@bruno?");
+        let election = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "@bruno?",
+            &mentions,
+            None,
+            false,
+            &casa_config_no_usernames(),
+        );
+        match &election {
+            Election::One {
+                bot, addressed_by, ..
+            } => {
+                assert_eq!(bot.agent_id.as_deref(), Some("bruno"));
+                assert_eq!(*addressed_by, AddressedBy::Mention);
+            }
+            other => panic!("expected One(bruno) by mention, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elect_full_precedence_ladder_on_live_username_less_config() {
+        // Every precedence level, exercised against the live config shape (no
+        // `username`), proving the whole a–f ladder holds in production, not just
+        // the mention rung. Order asserted: mention > name > reply > collective >
+        // ask(otto) > silence.
+        let cfg = casa_config_no_usernames();
+        let elect = |text: &str, mentions: &[&str], reply: Option<&str>| {
+            let m: Vec<String> = mentions.iter().map(|s| s.to_string()).collect();
+            elect_responders(
+                Some("supergroup"),
+                Some("-100999"),
+                text,
+                &m,
+                reply,
+                false,
+                &cfg,
+            )
+        };
+        let agent_of = |e: &Election| match e {
+            Election::One { bot, addressed_by, .. } => {
+                (bot.agent_id.clone(), Some(*addressed_by))
+            }
+            _ => (None, None),
+        };
+
+        // 1. @mention beats name-in-text (mention wins over "ask nora").
+        assert_eq!(
+            agent_of(&elect(
+                "nora can you ask @bruno_casapinello_bot?",
+                &["bruno_casapinello_bot"],
+                None
+            )),
+            (Some("bruno".to_string()), Some(AddressedBy::Mention))
+        );
+        // 2. name-in-text (no mention).
+        assert_eq!(
+            agent_of(&elect("tell mira the plan", &[], None)),
+            (Some("mira".to_string()), Some(AddressedBy::Name))
+        );
+        // 3. reply-chain — the replied-to handle resolves without a username too.
+        assert_eq!(
+            agent_of(&elect("yes that works", &[], Some("otto_casapinello_bot"))),
+            (Some("otto".to_string()), Some(AddressedBy::ReplyChain))
+        );
+        // 4. collective greeting → the whole roster.
+        assert!(matches!(elect("hey everyone!", &[], None), Election::All { .. }));
+        // 5. unaddressed team ask → the concierge (otto).
+        assert_eq!(
+            agent_of(&elect("can someone plan dinner?", &[], None)),
+            (Some("otto".to_string()), Some(AddressedBy::Concierge))
+        );
+        // 6. pure small talk → silence.
+        assert_eq!(
+            elect("haha yeah that was fun", &[], None),
+            Election::Silence(SilenceReason::SmallTalk)
+        );
     }
 
     // ---- c. reply-chain ---------------------------------------------------

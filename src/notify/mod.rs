@@ -145,6 +145,16 @@ pub struct IncomingMessage {
     /// bot's own group message lands on that bot's agent even with no name in
     /// the text. See `telegram_group::route_natural`.
     pub reply_to_bot: Option<String>,
+    /// Whether this message opens with a genuine Telegram slash command — a
+    /// `bot_command` entity at **offset 0**. This is the ONLY signal the
+    /// listener treats as "this is a command": a bare `?`, any punctuation, or
+    /// ordinary chatter carries no such entity and is conversation, never a
+    /// command. Without this gate a bare `?` was parsed as an operator HELP
+    /// command and leaked the WG claim/done reference into the family group,
+    /// racing the mention election (see `fix-command-leaks`). `false` for button
+    /// presses and transports that don't surface entities. See
+    /// `telegram_group::has_leading_bot_command`.
+    pub has_bot_command: bool,
 }
 
 /// Classification of notification events for routing.

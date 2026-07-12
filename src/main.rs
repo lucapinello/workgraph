@@ -3709,6 +3709,9 @@ fn main() -> Result<()> {
                 &message,
                 cli.json,
             ),
+            TelegramCommands::Decide { update } => {
+                commands::telegram::run_decide(&update, cli.json)
+            }
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),

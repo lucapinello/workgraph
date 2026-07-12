@@ -129,4 +129,60 @@ if elect "otto, status?" | grep -q "dummy-token"; then
     loud_fail "bot token leaked into election output"
 fi
 
-echo "PASS: responder election (name / mention-beats-name / reply-chain / collective→4 / ask→otto / small-talk→silence)"
+# g. REGRESSION (fix-mention-precedence): an explicit @mention must ALWAYS win
+#    over the small-talk/silence classifier, EVEN when the config omits the
+#    optional `username` field — which is exactly how the LIVE .wg/notify.toml
+#    was shaped when `elect "@nora_casapinello_bot what about you?"` wrongly
+#    returned `silence(small-talk)`. Here the fixture binds only agent_id + the
+#    bot-id key (no username), mirroring production; resolution must still route
+#    the real @handle to its agent by @mention.
+echo "g. @mention resolves & beats silence with NO username configured (live-config shape):"
+nou_scratch="$(make_scratch)"
+mkdir -p "$nou_scratch/.wg"
+cat >"$nou_scratch/.wg/notify.toml" <<'TOML'
+[telegram.bots.nora]
+bot_token = "0000000000:nora-dummy-token"
+chat_id   = "-1000000000001"
+agent_id  = "nora"
+
+[telegram.bots.bruno]
+bot_token = "0000000000:bruno-dummy-token"
+chat_id   = "-1000000000001"
+agent_id  = "bruno"
+
+[telegram.bots.mira]
+bot_token = "0000000000:mira-dummy-token"
+chat_id   = "-1000000000001"
+agent_id  = "mira"
+
+[telegram.bots.otto]
+bot_token = "0000000000:otto-dummy-token"
+chat_id   = "-1000000000001"
+agent_id  = "otto"
+TOML
+elect_nou() {
+    local msg="$1"
+    shift
+    (cd "$nou_scratch" && WG_DIR= wg telegram elect "$msg" "$@" 2>&1)
+}
+# The exact live failure: mention + small-talk-shaped tail → the mentioned agent.
+expect_grep "no-username/mention-beats-small-talk" \
+    "$(elect_nou "@nora_casapinello_bot what about you?")" \
+    "answered by nora (by @mention)"
+# Trailing punctuation on the handle must not defeat the mention path.
+expect_grep "no-username/bruno-question" \
+    "$(elect_nou "@bruno_casapinello_bot?")" \
+    "answered by bruno (by @mention)"
+# The rest of the ladder still holds without usernames (reply-chain resolves the
+# real handle too; a team ask still coordinates through otto; chatter is silent).
+expect_grep "no-username/reply-chain" \
+    "$(elect_nou "sounds good" --reply-to-bot mira_casapinello_bot)" \
+    "answered by mira (by reply-chain)"
+expect_grep "no-username/ask-otto" \
+    "$(elect_nou "can someone plan dinner?")" \
+    "answered by otto (by concierge)"
+expect_grep "no-username/small-talk-silent" \
+    "$(elect_nou "haha yeah that was fun")" \
+    "silence (small-talk)"
+
+echo "PASS: responder election (name / mention-beats-name / reply-chain / collective→4 / ask→otto / small-talk→silence / @mention-without-username→that-agent)"
