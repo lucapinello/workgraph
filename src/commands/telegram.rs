@@ -72,6 +72,59 @@ fn auth_confirm_url() -> String {
     std::env::var("CASA_AUTH_CONFIRM_URL").unwrap_or_else(|_| AUTH_CONFIRM_URL_DEFAULT.to_string())
 }
 
+/// The request header carrying the listener→gateway SHARED SECRET (task
+/// urgent-auth-phantom). The old "loopback-only" guard on the gateway's WRITE path
+/// (`/auth/confirm`, `/auth/found`, `/invite/redeem`) is meaningless on the kiosk
+/// deployment — every kitchen-tablet browser IS loopback, so an `/auth` page open
+/// on an already-signed-in browser could self-confirm each auto-refreshed nonce
+/// and mint a PHANTOM device (found live 2026-07-12). The real trust boundary is a
+/// secret only the LISTENER can read: the gateway mints it into a mode-600
+/// gitignored file at boot (`.casa/auth-confirm.secret`) and the listener attaches
+/// it here on every write; the gateway rejects (`403`) any write without it. A
+/// browser can never read that file, so a page can never forge the header.
+const CONFIRM_SECRET_HEADER: &str = "x-casa-auth-secret";
+
+/// Default location of the gateway-minted confirm secret, relative to the casa
+/// project root (the listener's CWD) — mirrors the gateway's
+/// `resolve(project.root, ".casa/auth-confirm.secret")`.
+const CONFIRM_SECRET_FILE_DEFAULT: &str = ".casa/auth-confirm.secret";
+
+/// Read the listener→gateway confirm secret. Prefers `CASA_AUTH_CONFIRM_SECRET`
+/// (a literal, for the live/scripted test stub) then the mode-600 secret file
+/// (`CASA_AUTH_CONFIRM_SECRET_FILE` or the `.casa/auth-confirm.secret` default).
+/// Read fresh on each write so a gateway that re-mints the secret on restart is
+/// picked up without a listener restart. Returns `None` when neither is present —
+/// the listener then posts WITHOUT the header, exactly as before, so an OLD
+/// gateway that predates the secret gate still works. The value is a bearer
+/// secret and is NEVER logged.
+fn confirm_secret() -> Option<String> {
+    if let Ok(v) = std::env::var("CASA_AUTH_CONFIRM_SECRET") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let path = std::env::var("CASA_AUTH_CONFIRM_SECRET_FILE")
+        .unwrap_or_else(|_| CONFIRM_SECRET_FILE_DEFAULT.to_string());
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let s = s.trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Attach the confirm secret header to a listener→gateway WRITE request when a
+/// secret is configured (see [`confirm_secret`]). A no-op when none is present, so
+/// the listener stays compatible with a gateway that predates the secret gate.
+fn with_confirm_secret(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match confirm_secret() {
+        Some(secret) => req.header(CONFIRM_SECRET_HEADER, secret),
+        None => req,
+    }
+}
+
 /// Loopback gateway endpoints for the onboarding-bootstrap flows (task
 /// onboarding-bootstrap-first). `/auth/found` founds the household from the very
 /// first scan of an EMPTY roster (after the owner answers YES); `/invite/redeem`
@@ -229,7 +282,9 @@ async fn confirm_web_login_outcome(
     telegram_id: &str,
 ) -> WebLoginOutcome {
     let body = serde_json::json!({ "nonce": nonce, "telegram_id": telegram_id });
-    let resp = client.post(auth_confirm_url()).json(&body).send().await;
+    let resp = with_confirm_secret(client.post(auth_confirm_url()).json(&body))
+        .send()
+        .await;
     let confirm = match resp {
         Ok(r) => r.json::<ConfirmResp>().await.ok(),
         Err(_) => None,
@@ -287,7 +342,9 @@ fn parse_join_nonce(body: &str) -> Option<&str> {
 /// the family-voice welcome (or a friendly error). NEVER logs the nonce.
 async fn redeem_invite(client: &reqwest::Client, nonce: &str, telegram_id: &str) -> String {
     let body = serde_json::json!({ "nonce": nonce, "telegram_id": telegram_id });
-    let resp = client.post(invite_redeem_url()).json(&body).send().await;
+    let resp = with_confirm_secret(client.post(invite_redeem_url()).json(&body))
+        .send()
+        .await;
     let redeemed = match resp {
         Ok(r) => r.json::<RedeemResp>().await.ok(),
         Err(_) => None,
@@ -319,7 +376,9 @@ async fn found_household(
     name: &str,
 ) -> String {
     let body = serde_json::json!({ "nonce": nonce, "telegram_id": telegram_id, "name": name });
-    let resp = client.post(auth_found_url()).json(&body).send().await;
+    let resp = with_confirm_secret(client.post(auth_found_url()).json(&body))
+        .send()
+        .await;
     let founded = match resp {
         Ok(r) => r.json::<RedeemResp>().await.ok(),
         Err(_) => None,
@@ -4602,6 +4661,120 @@ mod tests {
             }
         });
         (url, rx)
+    }
+
+    /// Like [`spawn_confirm_stub`] but sends the FULL raw request (headers + body)
+    /// over the channel, so a test can assert on the request HEADERS — used to
+    /// prove the listener attaches (or omits) the `x-casa-auth-secret` header
+    /// (task urgent-auth-phantom).
+    fn spawn_confirm_stub_raw(response_json: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{}/auth/confirm", port);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 512];
+                let header_end = loop {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break buf.len(),
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break buf.len(),
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let mut body = buf[header_end..].to_vec();
+                while body.len() < content_length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let mut raw = headers;
+                raw.push_str(&String::from_utf8_lossy(&body));
+                let _ = tx.send(raw);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_json.len(),
+                    response_json
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, rx)
+    }
+
+    /// SECURITY (task urgent-auth-phantom): when a confirm secret is configured,
+    /// the listener MUST attach it as the `x-casa-auth-secret` header so the
+    /// gateway's shared-secret gate accepts the write. Without this, a loopback
+    /// browser page could self-confirm nonces and mint phantom devices.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_write_attaches_secret_header_when_configured() {
+        let (url, rx) = spawn_confirm_stub_raw(r#"{"ok":true}"#);
+        unsafe {
+            std::env::set_var("CASA_AUTH_CONFIRM_URL", &url);
+            std::env::set_var("CASA_AUTH_CONFIRM_SECRET", "top-secret-token-abc");
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let _ = rt.block_on(confirm_web_login(&client, "nonce", "123456789"));
+        unsafe {
+            std::env::remove_var("CASA_AUTH_CONFIRM_URL");
+            std::env::remove_var("CASA_AUTH_CONFIRM_SECRET");
+        }
+
+        let raw = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let lower = raw.to_ascii_lowercase();
+        assert!(
+            lower.contains("x-casa-auth-secret: top-secret-token-abc"),
+            "confirm request must carry the secret header; got:\n{raw}"
+        );
+    }
+
+    /// BACKWARD COMPAT: with NO secret configured (no env, no file) the listener
+    /// omits the header entirely, so a gateway that predates the secret gate — and
+    /// the existing loopback-only path — keeps working unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_write_omits_secret_header_when_unconfigured() {
+        let (url, rx) = spawn_confirm_stub_raw(r#"{"ok":true}"#);
+        unsafe {
+            std::env::set_var("CASA_AUTH_CONFIRM_URL", &url);
+            std::env::remove_var("CASA_AUTH_CONFIRM_SECRET");
+            // Point the file lookup at a path that cannot exist so the default
+            // `.casa/auth-confirm.secret` (which may exist in a live CWD) is skipped.
+            std::env::set_var("CASA_AUTH_CONFIRM_SECRET_FILE", "/nonexistent/casa/auth-confirm.secret");
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let _ = rt.block_on(confirm_web_login(&client, "nonce", "123456789"));
+        unsafe {
+            std::env::remove_var("CASA_AUTH_CONFIRM_URL");
+            std::env::remove_var("CASA_AUTH_CONFIRM_SECRET_FILE");
+        }
+
+        let raw = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            !raw.to_ascii_lowercase().contains("x-casa-auth-secret"),
+            "no secret configured → no header; got:\n{raw}"
+        );
     }
 
     /// A bound household member's `/start login_<nonce>` POSTs exactly
