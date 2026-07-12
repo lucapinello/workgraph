@@ -11,6 +11,7 @@ pub mod dispatch;
 #[cfg(feature = "email")]
 pub mod email;
 pub mod family_plan;
+pub mod meal_feedback;
 #[cfg(feature = "matrix-lite")]
 pub mod matrix;
 pub mod push;

@@ -58,6 +58,7 @@ pub mod exec;
 pub mod exec_fed_cmd;
 pub mod fail;
 pub mod fed_node;
+pub mod feedback;
 pub mod forecast;
 pub mod func_apply;
 pub mod func_bootstrap;

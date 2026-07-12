@@ -2390,6 +2390,12 @@ pub enum Commands {
         command: TelegramCommands,
     },
 
+    /// Meal-feedback loop: ask how dinner was, record ratings, feed next week's plan
+    Feedback {
+        #[command(subcommand)]
+        command: FeedbackCommands,
+    },
+
     /// Manage LLM endpoints (add, remove, list, test)
     Endpoints {
         #[command(subcommand)]
@@ -6341,6 +6347,57 @@ pub enum MatrixCommands {
 }
 
 #[derive(Subcommand)]
+pub enum FeedbackCommands {
+    /// Compose the (rate-limited) evening "how was dinner?" ask for tonight's
+    /// dish and record that it went out. Prints the family-voice line to stdout.
+    Ask {
+        /// Override the dish (default: tonight's dinner from the plan).
+        #[arg(long)]
+        dish: Option<String>,
+
+        /// The date to reason about, YYYY-MM-DD (default: today, local).
+        #[arg(long)]
+        today: Option<String>,
+
+        /// Send even if the nag gate would suppress it (one-per-day / two-silent).
+        #[arg(long)]
+        force: bool,
+
+        /// Compose but do not record the ask (no state written).
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Route a family reply/reaction into a rating and append it to
+    /// `plans/feedback.jsonl`. A reply with no clear sentiment is not recorded.
+    Record {
+        /// Who reacted (the human's display handle).
+        #[arg(long)]
+        rater: String,
+
+        /// The reply text or emoji reaction (e.g. "👍", "loved it", "too bland").
+        #[arg(long)]
+        reply: String,
+
+        /// Override the dish this rates (default: tonight's dinner from the plan).
+        #[arg(long)]
+        dish: Option<String>,
+
+        /// The date to reason about, YYYY-MM-DD (default: today, local).
+        #[arg(long)]
+        today: Option<String>,
+    },
+
+    /// Print the ratings digest: the plan briefing by default, or the personas'
+    /// session one-liner with `--session`.
+    Summary {
+        /// Print the warm one-liner for session summaries instead of the briefing.
+        #[arg(long)]
+        session: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum TelegramCommands {
     /// Start the Telegram bot listener
     ///
@@ -6831,6 +6888,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         Commands::Matrix { .. } => "matrix",
         Commands::Telegram { .. } => "telegram",
+        Commands::Feedback { .. } => "feedback",
         Commands::Chat { .. } => "chat",
         Commands::Endpoints { .. } | Commands::Endpoint { .. } => "endpoints",
         Commands::Models { .. } => "models",
@@ -6867,6 +6925,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
     matches!(
         cmd,
         Commands::Ready
+            | Commands::Feedback { .. }
             | Commands::Discover { .. }
             | Commands::Blocked { .. }
             | Commands::WhyBlocked { .. }

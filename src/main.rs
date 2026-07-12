@@ -3598,6 +3598,38 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Feedback { command } => match command {
+            FeedbackCommands::Ask {
+                dish,
+                today,
+                force,
+                dry_run,
+            } => commands::feedback::run_ask(
+                &workgraph_dir,
+                dish.as_deref(),
+                today.as_deref(),
+                force,
+                dry_run,
+                cli.json,
+            ),
+            FeedbackCommands::Record {
+                rater,
+                reply,
+                dish,
+                today,
+            } => commands::feedback::run_record(
+                &workgraph_dir,
+                &rater,
+                &reply,
+                dish.as_deref(),
+                today.as_deref(),
+                cli.json,
+            ),
+            FeedbackCommands::Summary { session } => {
+                commands::feedback::run_summary(&workgraph_dir, session, cli.json)
+            }
+        },
+
         Commands::Telegram { command } => match command {
             TelegramCommands::Listen { chat_id } => {
                 commands::telegram::run_listen(&workgraph_dir, chat_id.as_deref())
