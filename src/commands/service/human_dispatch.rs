@@ -404,6 +404,15 @@ pub enum InboundReplyOutcome {
     /// The sender proved their confirmed binding, but the human they are bound
     /// to had no parked task awaiting a reply — nothing to record.
     NoWaitingTask,
+    /// The sender is a confirmed human, but the receiving bot fronts an AI
+    /// persona (not the human this sender is bound to). This is the ordinary
+    /// Casa case — a confirmed human simply chatting in a group an AI persona's
+    /// bot also listens on — so it is NOT a parked-task reply and is expected to
+    /// fall through to the conversation composer. It is benign, distinct from a
+    /// [`Rejected`](Self::Rejected) security event, so the listener can log it
+    /// neutrally instead of crying wolf on every normal message. Carries the
+    /// persona's DISPLAY NAME (never the raw agent id/hash).
+    NotParkedReply { persona: String },
     /// The reply was rejected before recording. The string is a log-only
     /// reason (unrecognized/unconfirmed sender, or a sender answering for a
     /// human they are not bound to).
@@ -491,9 +500,33 @@ pub fn route_inbound_reply(
     // bound to. (Shared/default bots front no specific agent and skip this.)
     if let Some(bound) = bound_agent_for_channel(dir, channel_type, &agents) {
         if bound != authorized_agent {
-            return InboundReplyOutcome::Rejected(format!(
-                "sender '{sender}' (bound to '{authorized_agent}') arrived on a bot fronting '{bound}'"
-            ));
+            // The receiving bot fronts an agent OTHER than the human this sender
+            // is bound to. Two very different situations land here:
+            //
+            //  - It fronts a DIFFERENT HUMAN: a genuine mis-route / spoof — a
+            //    confirmed sender for human A trying to answer through human B's
+            //    dedicated bot. That stays a clearly-logged security event.
+            //
+            //  - It fronts an AI PERSONA (the common Casa case): a confirmed
+            //    human simply chatting in a group an AI persona's bot also
+            //    listens on. This is NOT a parked-task reply and is expected to
+            //    fall through to the conversation composer. Reporting it as
+            //    `Rejected` cried wolf on every ordinary message, so it gets a
+            //    benign outcome carrying the persona's display name.
+            if human_ids.contains(bound.as_str()) {
+                return InboundReplyOutcome::Rejected(format!(
+                    "sender '{sender}' (bound to '{authorized_agent}') arrived on a bot fronting human '{bound}'"
+                ));
+            }
+            // `bound_agent_for_channel` only returns an id that matched a loaded
+            // agent, so the name lookup below resolves; fall back to the id only
+            // defensively (a concurrently-removed persona).
+            let persona = agents
+                .iter()
+                .find(|a| a.id == bound)
+                .map(|a| a.name.clone())
+                .unwrap_or(bound);
+            return InboundReplyOutcome::NotParkedReply { persona };
         }
     }
 
@@ -932,6 +965,110 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty()
         );
+    }
+
+    /// Write an AI persona agent (native executor ⇒ `is_human()` is false) that
+    /// a per-agent Telegram bot fronts (e.g. "otto"). `id` may be a hash-shaped
+    /// agent id; `name` is the persona display name.
+    fn write_persona_agent(dir: &Path, id: &str, name: &str) {
+        let agents_dir = dir.join("agency").join("cache/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let agent = Agent {
+            id: id.to_string(),
+            role_id: "concierge".to_string(),
+            tradeoff_id: "default".to_string(),
+            name: name.to_string(),
+            performance: PerformanceRecord::default(),
+            lineage: Default::default(),
+            capabilities: vec![],
+            rate: None,
+            capacity: None,
+            trust_level: Default::default(),
+            contact: None,
+            executor: "native".to_string(),
+            preferred_model: None,
+            preferred_provider: None,
+            deployment_history: vec![],
+            attractor_weight: 0.5,
+            staleness_flags: vec![],
+        };
+        agency::save_agent(&agent, &agents_dir).unwrap();
+    }
+
+    /// Write a `notify.toml` next to the graph with a single per-agent bot that
+    /// fronts `agent_id`, so `bound_agent_for_channel(dir, "telegram:<bot>", …)`
+    /// resolves to that agent.
+    fn write_persona_bot(dir: &Path, bot: &str, agent_id: &str) {
+        std::fs::write(
+            dir.join("notify.toml"),
+            format!(
+                "[telegram.bots.{bot}]\n\
+                 bot_token = \"111:AAA\"\n\
+                 chat_id = \"-100777\"\n\
+                 agent_id = \"{agent_id}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The misleading-noise fix. A confirmed human's ordinary group message that
+    /// arrives on a bot fronting an AI PERSONA (not a parked-task reply) must
+    /// resolve to the benign `NotParkedReply` carrying the persona DISPLAY NAME
+    /// — never a security `Rejected`, and never the raw agent id/hash. This is
+    /// the fall-through the listener logs neutrally instead of "Rejected reply".
+    #[test]
+    fn route_inbound_reply_persona_bot_is_benign_not_parked_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+        // A hash-shaped persona id proves the outcome carries the NAME, not id.
+        write_persona_agent(dir, "agent-a1b2c3d4", "Otto");
+        write_binding(dir, "luca-1", "human-luca", "Luca", true);
+        write_persona_bot(dir, "otto", "agent-a1b2c3d4");
+
+        // No parked task; persist an empty graph the router loads from disk.
+        worksgood::parser::save_graph(&WorkGraph::new(), crate::commands::graph_path(dir)).unwrap();
+
+        let routed = route_inbound_reply(dir, "telegram:otto", "luca-1", "morning everyone!");
+
+        match routed {
+            InboundReplyOutcome::NotParkedReply { persona } => {
+                assert_eq!(persona, "Otto", "carries the persona display name");
+                assert!(
+                    !persona.contains("agent-"),
+                    "must never surface the raw agent hash: {persona}"
+                );
+            }
+            other => panic!("persona-bot message must be benign NotParkedReply, got {other:?}"),
+        }
+    }
+
+    /// Do NOT weaken the genuine mis-route path: a confirmed sender for human A
+    /// arriving on a bot dedicated to a DIFFERENT HUMAN B is still a security
+    /// `Rejected`, logged clearly with both names.
+    #[test]
+    fn route_inbound_reply_wrong_human_bot_still_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_human_agent(dir, "human-luca", "Luca");
+        write_human_agent(dir, "human-nadin", "Nadin");
+        write_binding(dir, "luca-1", "human-luca", "Luca", true);
+        // A per-human bot dedicated to Nadin, not Luca.
+        write_persona_bot(dir, "nadin", "human-nadin");
+
+        worksgood::parser::save_graph(&WorkGraph::new(), crate::commands::graph_path(dir)).unwrap();
+
+        let routed = route_inbound_reply(dir, "telegram:nadin", "luca-1", "answer for nadin");
+
+        match routed {
+            InboundReplyOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("human-luca") && reason.contains("human-nadin"),
+                    "genuine mis-route names both humans clearly: {reason}"
+                );
+            }
+            other => panic!("a bot fronting a DIFFERENT human must stay Rejected, got {other:?}"),
+        }
     }
 
     #[test]
