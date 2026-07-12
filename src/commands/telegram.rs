@@ -72,15 +72,113 @@ fn auth_confirm_url() -> String {
     std::env::var("CASA_AUTH_CONFIRM_URL").unwrap_or_else(|_| AUTH_CONFIRM_URL_DEFAULT.to_string())
 }
 
+/// Loopback gateway endpoints for the onboarding-bootstrap flows (task
+/// onboarding-bootstrap-first). `/auth/found` founds the household from the very
+/// first scan of an EMPTY roster (after the owner answers YES); `/invite/redeem`
+/// completes a `join_<nonce>` invite. Both are loopback-only and derived from the
+/// same base as `/auth/confirm` so a single override points every path at a stub
+/// gateway in the live/scripted test. See docs/16-web-identity.md §The listener side.
+fn auth_found_url() -> String {
+    auth_confirm_url().replace("/auth/confirm", "/auth/found")
+}
+fn invite_redeem_url() -> String {
+    auth_confirm_url().replace("/auth/confirm", "/invite/redeem")
+}
+
 /// The gateway's reply to `POST /auth/confirm`. `ok:true` → the telegram id
 /// resolved to a household human and the browser session is now bound;
-/// `ok:false` with `reason:"unknown-user"` → the id is not in the roster.
+/// `ok:false` with `reason:"unknown-user"` → the id is not in the roster;
+/// `reason:"empty-roster"` → a FRESH deployment, so offer to found the household.
 #[derive(Debug, serde::Deserialize)]
 struct ConfirmResp {
     #[serde(default)]
     ok: bool,
     #[serde(default)]
     reason: Option<String>,
+}
+
+/// The gateway's reply to `POST /invite/redeem` (and `/auth/found`). `ok:true`
+/// carries the joined/founded person's display name so Otto can welcome them by
+/// name; `ok:false` carries a `reason` (`unknown-invite`/`expired`/`used`).
+#[derive(Debug, serde::Deserialize)]
+struct RedeemResp {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Outcome of a `/start login_<nonce>` confirm against the gateway. The founding
+/// window (item 1) needs to distinguish an EMPTY roster (offer ownership) from a
+/// genuinely unknown user (ask Otto to add you), so the handler branches on this
+/// rather than only receiving a pre-baked reply string.
+#[derive(Debug, PartialEq)]
+enum WebLoginOutcome {
+    /// The telegram id resolved to a household human; the browser is signed in.
+    SignedIn,
+    /// The roster is EMPTY (fresh deployment) — the handler runs the "are you
+    /// the owner?" founding handshake instead of rejecting.
+    EmptyRoster,
+    /// The id is not in a (non-empty) roster — ask Otto to add you.
+    UnknownUser,
+    /// Bad/expired nonce or the gateway was unreachable — tell them to retry.
+    NoSession,
+}
+
+impl WebLoginOutcome {
+    /// The family-voice reply for the outcomes that DON'T need the founding
+    /// handshake (EmptyRoster is handled specially by the caller).
+    fn reply(&self) -> String {
+        match self {
+            WebLoginOutcome::SignedIn => "You're signed in on the kitchen tablet ✋".to_string(),
+            WebLoginOutcome::UnknownUser => {
+                "I don't recognise you yet — ask Otto to add you to the household.".to_string()
+            }
+            WebLoginOutcome::EmptyRoster | WebLoginOutcome::NoSession => {
+                "That sign-in link expired — tap the tablet to get a fresh one.".to_string()
+            }
+        }
+    }
+}
+
+/// A pending founding handshake: the empty-roster scanner has been asked "are
+/// you the owner?" and we are holding the login nonce + their profile name until
+/// they answer YES/NO. Keyed by the sender's numeric telegram id in the listener
+/// loop; expires with the login nonce so a stale YES never founds a home.
+#[derive(Debug, Clone)]
+struct PendingFounding {
+    nonce: String,
+    name: String,
+    created: i64,
+}
+
+/// The founding handshake expires with the login nonce (5 minutes) — a YES that
+/// arrives after the window is ignored and the scanner just taps the tablet again.
+const FOUNDING_TTL_SECS: i64 = 5 * 60;
+
+/// Is an inbound body an explicit decline (`no`/`n`)? The mirror of
+/// [`worksgood::agency::human_binding::is_affirmative`] for the founding
+/// handshake's NO path. Anything that is neither yes nor no re-prompts.
+fn is_negative(body: &str) -> bool {
+    let n = body.trim().to_ascii_lowercase();
+    n == "no" || n == "n"
+}
+
+/// Derive an editable display name for a founding member from their Telegram
+/// display label (`@username` when present, else the numeric id). Strips a
+/// leading `@`; falls back to "Owner" when only a numeric id is available, so the
+/// household's first member never gets a bare number for a name (they can rename
+/// later — see docs/16). The listener never has the profile first-name, only the
+/// display label the transport surfaced.
+fn founding_display_name(sender: &str) -> String {
+    let s = sender.trim().trim_start_matches('@').trim();
+    if s.is_empty() || s.chars().all(|c| c.is_ascii_digit()) {
+        "Owner".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Extract the login nonce from a `/start` deep-link message body, or `None`
@@ -125,11 +223,11 @@ fn parse_login_nonce(body: &str) -> Option<&str> {
 ///
 /// NEVER logs the nonce or the confirm body — the confirm is token-free but the
 /// nonce is still a single-use secret (see docs/16-web-identity.md).
-async fn confirm_web_login(
+async fn confirm_web_login_outcome(
     client: &reqwest::Client,
     nonce: &str,
     telegram_id: &str,
-) -> String {
+) -> WebLoginOutcome {
     let body = serde_json::json!({ "nonce": nonce, "telegram_id": telegram_id });
     let resp = client.post(auth_confirm_url()).json(&body).send().await;
     let confirm = match resp {
@@ -137,11 +235,104 @@ async fn confirm_web_login(
         Err(_) => None,
     };
     match confirm {
-        Some(c) if c.ok => "You're signed in on the kitchen tablet ✋".to_string(),
-        Some(c) if c.reason.as_deref() == Some("unknown-user") => {
-            "I don't recognise you yet — ask Otto to add you to the household.".to_string()
+        Some(c) if c.ok => WebLoginOutcome::SignedIn,
+        Some(c) if c.reason.as_deref() == Some("empty-roster") => WebLoginOutcome::EmptyRoster,
+        Some(c) if c.reason.as_deref() == Some("unknown-user") => WebLoginOutcome::UnknownUser,
+        _ => WebLoginOutcome::NoSession,
+    }
+}
+
+/// Backward-compatible thin wrapper returning the family-voice reply string for
+/// the non-founding outcomes (used by the existing unit tests + the plain
+/// signed-in / unknown-user / no-session paths).
+async fn confirm_web_login(
+    client: &reqwest::Client,
+    nonce: &str,
+    telegram_id: &str,
+) -> String {
+    confirm_web_login_outcome(client, nonce, telegram_id)
+        .await
+        .reply()
+}
+
+/// Extract the invite nonce from a `/start join_<nonce>` deep-link body, or
+/// `None` when this is not a `join_` deep link. The mirror of
+/// [`parse_login_nonce`] for the INVITE family (onboarding-bootstrap item 2):
+/// the operator's Manage-household card mints `t.me/<bot>?start=join_<nonce>`,
+/// the invitee taps it, and Telegram delivers `/start join_<nonce>`. Same
+/// `@bot`-qualified handling and clean-termination rules as the login parser.
+fn parse_join_nonce(body: &str) -> Option<&str> {
+    let rest = body.trim_start().strip_prefix("/start")?;
+    let payload = match rest.chars().next() {
+        None => return None,
+        Some(c) if c.is_whitespace() => rest.trim_start(),
+        Some('@') => match rest[1..].split_once(char::is_whitespace) {
+            Some((_bot, tail)) => tail.trim_start(),
+            None => return None,
+        },
+        Some(_) => return None,
+    };
+    let nonce = payload
+        .strip_prefix("join_")?
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if nonce.is_empty() { None } else { Some(nonce) }
+}
+
+/// Redeem a `/start join_<nonce>` invite (onboarding-bootstrap item 2): POST the
+/// tapper's REAL telegram id + the nonce to the loopback gateway `/invite/redeem`,
+/// which resolves the nonce to the pending person's name, creates their binding
+/// under that name + this id, and confirms it (the tap IS the handshake). Returns
+/// the family-voice welcome (or a friendly error). NEVER logs the nonce.
+async fn redeem_invite(client: &reqwest::Client, nonce: &str, telegram_id: &str) -> String {
+    let body = serde_json::json!({ "nonce": nonce, "telegram_id": telegram_id });
+    let resp = client.post(invite_redeem_url()).json(&body).send().await;
+    let redeemed = match resp {
+        Ok(r) => r.json::<RedeemResp>().await.ok(),
+        Err(_) => None,
+    };
+    match redeemed {
+        Some(r) if r.ok => {
+            let who = r.name.as_deref().filter(|s| !s.is_empty()).unwrap_or("friend");
+            format!("Welcome to the household, {who}! You're all set — sign in on any device. \u{1f3e0}")
         }
-        _ => "That sign-in link expired — tap the tablet to get a fresh one.".to_string(),
+        Some(r) if r.reason.as_deref() == Some("used") => {
+            "That invite was already used — ask for a fresh one from Manage household.".to_string()
+        }
+        Some(r) if r.reason.as_deref() == Some("expired") => {
+            "That invite has expired — ask for a fresh one from Manage household.".to_string()
+        }
+        _ => "I couldn't find that invite — ask whoever invited you for a new link.".to_string(),
+    }
+}
+
+/// Found the household from an empty-roster scan (onboarding-bootstrap item 1)
+/// once the owner has answered YES: POST the login nonce + their telegram id +
+/// profile name to the loopback gateway `/auth/found`, which creates them as the
+/// first member (operator) and binds the browser session. Returns the family-voice
+/// welcome (or a friendly error). NEVER logs the nonce.
+async fn found_household(
+    client: &reqwest::Client,
+    nonce: &str,
+    telegram_id: &str,
+    name: &str,
+) -> String {
+    let body = serde_json::json!({ "nonce": nonce, "telegram_id": telegram_id, "name": name });
+    let resp = client.post(auth_found_url()).json(&body).send().await;
+    let founded = match resp {
+        Ok(r) => r.json::<RedeemResp>().await.ok(),
+        Err(_) => None,
+    };
+    match founded {
+        Some(r) if r.ok => {
+            let who = r.name.as_deref().filter(|s| !s.is_empty()).unwrap_or(name);
+            format!(
+                "This home is yours now, {who} — you're the first member. \u{2705} \
+                 You're signed in on the tablet; invite the rest of the family from Manage household."
+            )
+        }
+        _ => "I couldn't finish setting up — tap the tablet for a fresh link and try again.".to_string(),
     }
 }
 
@@ -273,6 +464,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+
+        // Founding handshakes in flight (onboarding-bootstrap item 1), keyed by
+        // the scanner's numeric telegram id: the empty-roster `/start login_`
+        // scan asked "are you the owner?" and we hold their login nonce + profile
+        // name here until they answer YES/NO. Stale entries expire with the login
+        // nonce (FOUNDING_TTL_SECS) so a late YES never founds a household.
+        let mut pending_founding: std::collections::HashMap<String, PendingFounding> =
+            std::collections::HashMap::new();
 
         while let Some(msg) = rx.recv().await {
             // Fix #0 — the bot-loop guard, FIRST (before dedupe, feed mirror,
@@ -426,31 +625,139 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             let is_private = matches!(msg.chat_type.as_deref(), Some("private") | None);
             if gate.operator && is_private {
                 if let Some(nonce) = parse_login_nonce(&msg.body) {
-                    let reply = match msg.sender_id.as_deref() {
+                    match msg.sender_id.as_deref() {
                         Some(telegram_id) => {
-                            confirm_web_login(&auth_client, nonce, telegram_id).await
+                            let outcome =
+                                confirm_web_login_outcome(&auth_client, nonce, telegram_id).await;
+                            if outcome == WebLoginOutcome::EmptyRoster {
+                                // FOUNDING WINDOW (item 1): a fresh deployment — do
+                                // NOT reject the very first scan. Ask the owner to
+                                // confirm, then hold the login nonce + their profile
+                                // name until they reply YES/NO. A stray scan never
+                                // silently founds a household.
+                                let name = founding_display_name(&msg.sender);
+                                pending_founding.insert(
+                                    telegram_id.to_string(),
+                                    PendingFounding {
+                                        nonce: nonce.to_string(),
+                                        name: name.clone(),
+                                        created: chrono::Utc::now().timestamp(),
+                                    },
+                                );
+                                println!(
+                                    "[{}] empty-roster founding offered to {} (awaiting YES/NO)",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    msg.sender,
+                                );
+                                let q = format!(
+                                    "You're setting up this home, {name} — are you the owner? \
+                                     Reply YES to make this your household, or NO to cancel."
+                                );
+                                if let Err(e) = channel.send_text(&reply_target, &q).await {
+                                    eprintln!("Failed to send founding prompt: {e}");
+                                }
+                            } else {
+                                let reply = outcome.reply();
+                                // Redacted breadcrumb — the outcome, never the nonce.
+                                println!(
+                                    "[{}] web sign-in confirm from {} -> {:?}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    msg.sender,
+                                    outcome,
+                                );
+                                if let Err(e) = channel.send_text(&reply_target, &reply).await {
+                                    eprintln!("Failed to send web sign-in reply: {e}");
+                                }
+                            }
                         }
                         // No numeric id to verify — cannot bind a session.
-                        None => "That sign-in link expired — tap the tablet to get a fresh one."
-                            .to_string(),
-                    };
-                    // Redacted breadcrumb — the outcome, never the nonce.
-                    println!(
-                        "[{}] web sign-in confirm from {} -> {}",
-                        chrono::Utc::now().format("%H:%M:%S"),
-                        msg.sender,
-                        if reply.starts_with("You're signed in") {
-                            "signed-in"
-                        } else if reply.starts_with("I don't recognise") {
-                            "unknown-user"
-                        } else {
-                            "no-session"
-                        },
-                    );
-                    if let Err(e) = channel.send_text(&reply_target, &reply).await {
-                        eprintln!("Failed to send web sign-in reply: {e}");
+                        None => {
+                            let reply = "That sign-in link expired — tap the tablet to get a fresh one.";
+                            if let Err(e) = channel.send_text(&reply_target, reply).await {
+                                eprintln!("Failed to send web sign-in reply: {e}");
+                            }
+                        }
                     }
                     continue;
+                }
+                // INVITE (item 2): a 1:1 `/start join_<nonce>` deep link. The
+                // invitee taps the QR/link the operator generated in Manage
+                // household; we POST their REAL telegram id + the nonce to the
+                // loopback gateway `/invite/redeem`, which creates their binding
+                // under the invite's name and confirms it (the tap is the
+                // handshake). One-directional, token-free. NEVER log the nonce.
+                if let Some(nonce) = parse_join_nonce(&msg.body) {
+                    let reply = match msg.sender_id.as_deref() {
+                        Some(telegram_id) => redeem_invite(&auth_client, nonce, telegram_id).await,
+                        None => {
+                            "That invite link needs your Telegram profile — open it from your own chat with the bot.".to_string()
+                        }
+                    };
+                    // Redacted breadcrumb — outcome only, never the nonce.
+                    println!(
+                        "[{}] invite redeem from {} -> {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        msg.sender,
+                        if reply.starts_with("Welcome") { "joined" } else { "rejected" },
+                    );
+                    if let Err(e) = channel.send_text(&reply_target, &reply).await {
+                        eprintln!("Failed to send invite reply: {e}");
+                    }
+                    continue;
+                }
+            }
+
+            // FOUNDING handshake reply (item 1): the empty-roster scanner answers
+            // YES/NO to Otto's "are you the owner?" prompt. This is a PLAIN message
+            // (no slash command), so we intercept it here — before family commands,
+            // confirmation routing, and the conversation composer — whenever the
+            // sender has a founding handshake in flight. On YES we found the
+            // household; on NO we cancel; anything else re-prompts. The window
+            // expires with the login nonce so a late reply is treated as a normal
+            // message. See docs/16-web-identity.md §The founding member.
+            if is_private {
+                if let Some(tid) = msg.sender_id.clone() {
+                    if let Some(pending) = pending_founding.get(&tid).cloned() {
+                        let now = chrono::Utc::now().timestamp();
+                        if now - pending.created > FOUNDING_TTL_SECS {
+                            // Expired — drop it and let the message fall through.
+                            pending_founding.remove(&tid);
+                        } else if worksgood::agency::human_binding::is_affirmative(&msg.body) {
+                            pending_founding.remove(&tid);
+                            let reply =
+                                found_household(&auth_client, &pending.nonce, &tid, &pending.name)
+                                    .await;
+                            println!(
+                                "[{}] FOUNDED household — first member {} ({})",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                pending.name,
+                                msg.sender,
+                            );
+                            if let Err(e) = channel.send_text(&reply_target, &reply).await {
+                                eprintln!("Failed to send founding welcome: {e}");
+                            }
+                            continue;
+                        } else if is_negative(&msg.body) {
+                            pending_founding.remove(&tid);
+                            println!(
+                                "[{}] founding declined by {}",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                msg.sender,
+                            );
+                            let reply = "No problem — nothing was set up. Tap the tablet again whenever you're ready.";
+                            if let Err(e) = channel.send_text(&reply_target, reply).await {
+                                eprintln!("Failed to send founding cancel: {e}");
+                            }
+                            continue;
+                        } else {
+                            // Ambiguous — re-prompt without consuming the window.
+                            let reply = "Just reply YES to set up this home as yours, or NO to cancel.";
+                            if let Err(e) = channel.send_text(&reply_target, reply).await {
+                                eprintln!("Failed to send founding re-prompt: {e}");
+                            }
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -3634,6 +3941,139 @@ mod tests {
 
         assert!(reply.contains("expired"), "reply: {reply}");
         assert!(!reply.starts_with("You're signed in"));
+    }
+
+    // ── onboarding-bootstrap: invite (join_) + founding gate ─────────────────
+
+    #[test]
+    fn parse_join_nonce_extracts_and_rejects() {
+        // Plain + @bot-qualified + whitespace-tolerant, mirroring parse_login_nonce.
+        assert_eq!(parse_join_nonce("/start join_abc123"), Some("abc123"));
+        assert_eq!(
+            parse_join_nonce("/start@otto_casapinello_bot join_deadbeef"),
+            Some("deadbeef")
+        );
+        assert_eq!(parse_join_nonce("  /start   join_xyz  "), Some("xyz"));
+        // A LOGIN payload is not a JOIN payload (the two families never collide).
+        assert_eq!(parse_join_nonce("/start login_abc"), None);
+        assert_eq!(parse_join_nonce("/start"), None);
+        assert_eq!(parse_join_nonce("/start join_"), None);
+        assert_eq!(parse_join_nonce("/started join_abc"), None);
+        assert_eq!(parse_join_nonce("hello"), None);
+        // And parse_login_nonce rejects a join payload (symmetry).
+        assert_eq!(parse_login_nonce("/start join_abc"), None);
+    }
+
+    #[test]
+    fn is_negative_matches_only_no_variants() {
+        assert!(is_negative("no"));
+        assert!(is_negative("NO"));
+        assert!(is_negative("  No  "));
+        assert!(is_negative("n"));
+        assert!(!is_negative("yes"));
+        assert!(!is_negative("nope, not me"));
+        assert!(!is_negative(""));
+    }
+
+    #[test]
+    fn founding_display_name_strips_handle_and_falls_back_for_numeric() {
+        assert_eq!(founding_display_name("@luca_pinello"), "luca_pinello");
+        assert_eq!(founding_display_name("Nadin"), "Nadin");
+        // A bare numeric id (no public @username) → the editable "Owner" default.
+        assert_eq!(founding_display_name("8905220378"), "Owner");
+        assert_eq!(founding_display_name(""), "Owner");
+        assert_eq!(founding_display_name("  @erik "), "erik");
+    }
+
+    #[test]
+    fn redeem_resp_deserializes_gateway_shapes() {
+        let ok: RedeemResp = serde_json::from_str(r#"{"ok":true,"name":"Erik"}"#).unwrap();
+        assert!(ok.ok);
+        assert_eq!(ok.name.as_deref(), Some("Erik"));
+        let used: RedeemResp = serde_json::from_str(r#"{"ok":false,"reason":"used"}"#).unwrap();
+        assert!(!used.ok);
+        assert_eq!(used.reason.as_deref(), Some("used"));
+    }
+
+    /// EMPTY roster: the confirm outcome is `EmptyRoster` so the handler offers
+    /// founding instead of rejecting the very first scan.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_web_login_outcome_detects_empty_roster() {
+        let (url, rx) = spawn_confirm_stub(r#"{"ok":false,"reason":"empty-roster"}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let outcome = rt.block_on(confirm_web_login_outcome(&client, "nonce", "55501234"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        let body = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["telegram_id"], "55501234");
+        assert_eq!(outcome, WebLoginOutcome::EmptyRoster);
+    }
+
+    /// A tapped invite (`/start join_<nonce>`) POSTs `{nonce, telegram_id}` and,
+    /// on success, welcomes the joined person by the invite's name.
+    #[test]
+    #[serial_test::serial]
+    fn redeem_invite_posts_and_welcomes_by_name() {
+        let (url, rx) = spawn_confirm_stub(r#"{"ok":true,"name":"Erik"}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let reply = rt.block_on(redeem_invite(&client, "inv-nonce", "77712345"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        let body = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["nonce"], "inv-nonce");
+        assert_eq!(parsed["telegram_id"], "77712345");
+        assert!(reply.starts_with("Welcome"), "reply: {reply}");
+        assert!(reply.contains("Erik"), "reply: {reply}");
+    }
+
+    /// A replayed / dead invite gets the friendly "ask for a fresh one" reply.
+    #[test]
+    #[serial_test::serial]
+    fn redeem_invite_used_link_is_rejected_kindly() {
+        let (url, _rx) = spawn_confirm_stub(r#"{"ok":false,"reason":"used"}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let reply = rt.block_on(redeem_invite(&client, "inv", "1"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        assert!(reply.contains("already used"), "reply: {reply}");
+        assert!(!reply.starts_with("Welcome"));
+    }
+
+    /// Founding (`/auth/found`) POSTs `{nonce, telegram_id, name}` and welcomes
+    /// the first member as the household owner.
+    #[test]
+    #[serial_test::serial]
+    fn found_household_posts_name_and_welcomes_owner() {
+        let (url, rx) = spawn_confirm_stub(r#"{"ok":true,"name":"Luca"}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let reply = rt.block_on(found_household(&client, "login-nonce", "55501234", "Luca"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        let body = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["nonce"], "login-nonce");
+        assert_eq!(parsed["telegram_id"], "55501234");
+        assert_eq!(parsed["name"], "Luca");
+        assert!(reply.contains("first member"), "reply: {reply}");
+        assert!(reply.contains("Luca"), "reply: {reply}");
+    }
+
+    #[test]
+    fn onboarding_urls_derive_from_confirm_base() {
+        // The two write paths share the confirm base so one override retargets all.
+        assert_eq!(auth_found_url(), "http://127.0.0.1:7788/auth/found");
+        assert_eq!(invite_redeem_url(), "http://127.0.0.1:7788/invite/redeem");
     }
 
     /// Record an unconfirmed binding exactly as `wg agency human add` would,
