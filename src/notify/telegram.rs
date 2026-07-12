@@ -495,12 +495,17 @@ impl TelegramChannel {
                     }
                     Err(e) => {
                         let action = backoff_state.on_failure();
+                        // A reqwest transport error's `Display` embeds the full
+                        // request URL — which contains the bot token
+                        // (`.../bot<token>/getUpdates`). Redact it before it
+                        // reaches the log file; keep the bot NAME (`bot_id`)
+                        // and the error chain otherwise intact.
                         eprintln!(
-                            "polling {} error (failure #{}, backing off {}s): {:#}",
+                            "polling {} error (failure #{}, backing off {}s): {}",
                             bot_id,
                             backoff_state.consecutive_failures,
                             action.backoff.as_secs(),
-                            e
+                            redact_bot_token(&format!("{e:#}"))
                         );
                         // After a sustained streak the connection pool itself
                         // may be wedged (half-dead sockets, a lost IPv6 path,
@@ -593,6 +598,31 @@ pub(crate) fn build_poll_client() -> reqwest::Client {
         // A builder failure is a TLS-backend init problem, not per-call — fall
         // back to the default client rather than taking the whole listener down.
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Strip Telegram bot tokens out of any string bound for a log line.
+///
+/// A reqwest transport error's `Display` includes the request URL, e.g.
+/// `error sending request for url (https://api.telegram.org/bot123456:AA-Ee/getUpdates): ...`.
+/// The `bot<id>:<secret>` segment IS the bot token — a credential that must
+/// NEVER land in a log file (`.wg/notify.toml` discipline: tokens never in
+/// git, graph, or logs, because logs get pasted into issues, monitors, and
+/// chats). This rewrites every `/bot<token>/` URL segment to
+/// `/bot<redacted>/`, leaving the rest of the message — including the bot NAME
+/// already present in the line — untouched. Token-free strings pass through
+/// unchanged. Route EVERY error string that can carry an API URL through here
+/// before logging (poll loop, send/edit paths, `getMe`, `setMyCommands`).
+pub(crate) fn redact_bot_token(s: &str) -> String {
+    // Telegram tokens are `<digits>:<35+ url-safe base64 chars>`; in an API URL
+    // they follow the literal `bot` path segment. Match that shape so a real
+    // token is redacted while the bot NAME (e.g. `telegram:otto`) — which has
+    // no leading `bot<digits>:` — is preserved.
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"bot\d+:[A-Za-z0-9_-]+")
+            .expect("bot-token redaction regex is a valid literal")
+    });
+    re.replace_all(s, "bot<redacted>").into_owned()
 }
 
 /// Perform ONE `getUpdates` long-poll round-trip against `api_base`, returning
@@ -883,6 +913,45 @@ mod tests {
             chat_id: chat.into(),
             bots: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn redact_bot_token_scrubs_reqwest_error_url() {
+        // Exactly the poll-failure line that leaked 24 full tokens on
+        // 2026-07-12: a reqwest transport error whose Display embeds the URL.
+        let leaked = "getUpdates request failed: error sending request for url \
+             (https://api.telegram.org/bot123456789:AAE-abc_DEF-gHIjkLmNoPqRstUvwx/getUpdates): \
+             operation timed out";
+        let redacted = redact_bot_token(leaked);
+        assert!(
+            !redacted.contains("123456789:AAE-abc_DEF-gHIjkLmNoPqRstUvwx"),
+            "token must not survive redaction: {redacted}"
+        );
+        assert!(
+            redacted.contains("/bot<redacted>/getUpdates"),
+            "URL shape should be preserved with the token replaced: {redacted}"
+        );
+        // Surrounding context (method name, error tail) stays readable.
+        assert!(redacted.contains("getUpdates request failed"));
+        assert!(redacted.contains("operation timed out"));
+    }
+
+    #[test]
+    fn redact_bot_token_leaves_token_free_strings_unchanged() {
+        let clean = "polling telegram:otto error (failure #3, backing off 4s): \
+             connection refused";
+        assert_eq!(redact_bot_token(clean), clean);
+        // The human-facing bot NAME (`telegram:otto`, `bot_id`) must be kept —
+        // it has no `bot<digits>:` shape so it is never touched.
+        assert!(redact_bot_token(clean).contains("telegram:otto"));
+    }
+
+    #[test]
+    fn redact_bot_token_scrubs_every_token_in_the_line() {
+        // A single log line can mention the same URL twice (send + retry).
+        let two = "bot111:AAAAAAAAAAAA and again bot222:BBBBBBBBBBBB";
+        let redacted = redact_bot_token(two);
+        assert_eq!(redacted, "bot<redacted> and again bot<redacted>");
     }
 
     #[test]

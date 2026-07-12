@@ -492,7 +492,13 @@ impl ReplySink for BotReplySink {
         // back to a fresh send so the human still gets the answer — never a
         // stranded hourglass.
         if let Err(e) = channel.edit_text(chat_id, message_id, text).await {
-            eprintln!("[convo] editMessageText failed ({e:#}) — sending fresh message instead");
+            // `{e:#}` prints the full error chain, which for a transport
+            // failure embeds the request URL (and thus the bot token) — redact
+            // before logging. See `telegram::redact_bot_token`.
+            eprintln!(
+                "[convo] editMessageText failed ({}) — sending fresh message instead",
+                super::telegram::redact_bot_token(&format!("{e:#}"))
+            );
             channel.send_text(chat_id, text).await?;
         }
         Ok(())
