@@ -1853,6 +1853,287 @@ impl worksgood::notify::telegram_conversation::ReplySink for FeedMirrorSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Web-origin inbound (kiosk conversation pane → first-class group turn)
+// ---------------------------------------------------------------------------
+
+/// Resolve a WEB session sender to a confirmed human's binding key.
+///
+/// A message typed in the kiosk pane carries a web identity — a `humanId` from
+/// `GET /auth/me` (e.g. `luca`) or, pre-`web-identity-sign`, the household
+/// default display name (`Luca`). The conversation composer downstream
+/// (`sender_is_confirmed` → `find_by_user`) matches the binding's stored
+/// `telegram_user` **verbatim** (a numeric Telegram id for Casa Pinello), so a
+/// bare `luca`/`Luca` would never resolve as a confirmed human and every voice
+/// would answer with the onboarding line instead of a grounded reply.
+///
+/// So we resolve here, mirroring `resolve_auth_sender`'s boundary role for the
+/// Telegram path: first the direct identity match (numeric id or `@handle`),
+/// then a web-friendly match on the binding's display `name` or its agency
+/// `agent_id` (`human-luca`). We return the binding's `telegram_user` so the
+/// verbatim downstream lookup recognizes the confirmed human. An unresolved
+/// sender falls back to its raw form (handled exactly as an unbound human —
+/// the onboarding line, never a crash).
+fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
+    use worksgood::agency::TelegramBindingMap;
+    let agency_dir = workgraph_dir.join("agency");
+    let map = match TelegramBindingMap::load(&agency_dir) {
+        Ok(m) => m,
+        Err(_) => return sender.to_string(),
+    };
+    // 1. Direct identity match — numeric Telegram id or @username.
+    if let Some(b) = map.find_by_identity(Some(sender), Some(sender)) {
+        return b.telegram_user.clone();
+    }
+    // 2. Web identity is a display name / humanId — match the binding's `name`
+    //    or its `human-`-prefixed agent id, then hand back the stored key.
+    let want = sender.trim().trim_start_matches("human-").to_ascii_lowercase();
+    if let Some(b) = map.bindings.iter().find(|b| {
+        b.name.eq_ignore_ascii_case(sender)
+            || b.agent_id
+                .trim_start_matches("human-")
+                .eq_ignore_ascii_case(&want)
+    }) {
+        return b.telegram_user.clone();
+    }
+    sender.to_string()
+}
+
+/// `wg telegram web-inbound --sender <humanId> --message <text>` — make a
+/// web-origin (kiosk conversation-pane) message a **first-class group turn**.
+///
+/// The live gap this closes: the kiosk send box only RELAYED a line into the
+/// family Telegram group via a bot, and Telegram bots never see other bots'
+/// messages — so the listener's election/conversation pipeline NEVER ran on a
+/// kiosk-typed message. It was posted (`💬 Luca (kiosk): …`) and never answered,
+/// while the same words typed on a phone got four replies.
+///
+/// This command runs the SAME pipeline the listener runs on a group message,
+/// without a live socket: it elects responder(s) with the exact
+/// [`elect_responders`] table (@mention / addressed name / collective / concierge
+/// / silence), then dispatches through the SAME senders + composer the listener
+/// uses — [`run_group_discussion`] / [`run_group_collective`] for a collective
+/// address, or the single-voice [`plan_conversation`] +
+/// [`run_conversation_turn`] path for a named/concierge ask. Every reply goes
+/// out to the group via the elected persona's OWN bot AND is mirrored into
+/// `.casa/group-feed.jsonl` (via [`FeedMirrorSink`]) so the kiosk pane shows it.
+///
+/// The gateway shells out to this after it mirrors the kiosk line into the group.
+///
+/// # Double-reply / dedupe
+/// The gateway ALSO mirrors the same human line into the Telegram group via the
+/// relay bot. That mirrored copy is **bot-authored**, so the listener's
+/// unconditional bot-loop guard ([`SilenceReason::BotSender`], Fix #0) drops it
+/// before election — it can never be re-answered. Every reply THIS command posts
+/// likewise goes out via a persona bot, so the listener drops those too. No
+/// cross-process dedupe set is required: **bot authorship is the fingerprint that
+/// covers the mirror**, exactly as it already does for every reply the listener
+/// itself sends into the group.
+///
+/// [`SilenceReason::BotSender`]: worksgood::notify::telegram_group::SilenceReason
+pub fn run_web_inbound(
+    workgraph_dir: &Path,
+    sender: &str,
+    message: &str,
+    chat_id_override: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::telegram_conversation as convo;
+    use worksgood::notify::telegram_standup as standup;
+
+    let config = load_telegram_config()?;
+
+    // Reply target: an explicit override wins, else the configured family group.
+    let target = chat_id_override
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| config.chat_id.clone());
+    if target.is_empty() {
+        anyhow::bail!("no chat id — pass --chat-id or configure telegram.chat_id in notify.toml");
+    }
+
+    // Resolve the web identity to a confirmed human's binding key so the composer
+    // treats them as a known human and answers grounded (see `resolve_web_sender`).
+    let auth_sender = resolve_web_sender(workgraph_dir, sender);
+
+    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
+    let human_count = human_agent_id_set(workgraph_dir).len();
+
+    // A web-origin message is first-class GROUP inbound — run the exact election
+    // the listener runs, as a supergroup message in the family chat. No
+    // reply-chain (the pane has none) and never bot-sent.
+    let election = elect_responders(
+        Some("supergroup"),
+        Some(&target),
+        message,
+        &mention_usernames,
+        None,
+        false,
+        human_count,
+        &config,
+    );
+
+    // Observability: one decision line, PII-safe (no tokens, no chat id text).
+    println!(
+        "[{}] web-inbound election from {} -> {}",
+        chrono::Utc::now().format("%H:%M:%S"),
+        sender,
+        election_decision_summary(None, Some("supergroup"), &election),
+    );
+
+    let feed_path = casa_feed::feed_path_for(&project_root(workgraph_dir));
+
+    let category = match &election {
+        Election::Silence(_) => "silence",
+        Election::Private => "private",
+        Election::All { body, .. } => {
+            if is_discussion_ask(body) {
+                "discussion-round"
+            } else {
+                "collective"
+            }
+        }
+        Election::One { .. } => "single-voice",
+    };
+
+    // Dry-run seam (credential-free, like `wg telegram elect`/`discuss`): run the
+    // real election + planning and report WHO would answer, but send nothing.
+    // This is the scripted-test entry point — the smoke scenario asserts the
+    // decision without a live bot or token.
+    if dry_run {
+        let who: Option<String> = match &election {
+            Election::All { .. } => Some(
+                standup::plan_roster(&config, standup::DEFAULT_ROSTER)
+                    .into_iter()
+                    .map(|m| m.bot_id)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            Election::One { bot, .. } => {
+                Some(bot.agent_id.clone().unwrap_or_else(|| bot.bot_id.clone()))
+            }
+            _ => None,
+        };
+        if json {
+            let out = serde_json::json!({
+                "dry_run": true,
+                "category": category,
+                "sender": sender,
+                "auth_sender": auth_sender,
+                "target": target,
+                "who": who,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            println!(
+                "web-inbound [{category}] from {sender} (dry-run) -> {}",
+                who.as_deref().unwrap_or("(no reply)"),
+            );
+        }
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    let outcome_label: String = rt.block_on(async {
+        match &election {
+            Election::Silence(reason) => {
+                // Small talk / no voice — the bots deliberately stay quiet, exactly
+                // as they would on the same words typed into Telegram.
+                Ok::<String, anyhow::Error>(format!("silence ({reason}) — no reply sent"))
+            }
+            Election::Private => {
+                // A supergroup election never resolves to Private; guard defensively
+                // rather than leak a 1:1 into the shared group feed.
+                Ok("private — no group reply".to_string())
+            }
+            Election::All { reply_chat, body } => {
+                if is_discussion_ask(body) {
+                    run_group_discussion(
+                        workgraph_dir,
+                        &config,
+                        reply_chat,
+                        &feed_path,
+                        body,
+                        &auth_sender,
+                    )
+                    .await?;
+                    Ok("discussion round posted".to_string())
+                } else {
+                    run_group_collective(
+                        workgraph_dir,
+                        &config,
+                        reply_chat,
+                        &feed_path,
+                        body,
+                        &auth_sender,
+                    )
+                    .await?;
+                    Ok("collective reply posted".to_string())
+                }
+            }
+            Election::One {
+                bot,
+                reply_chat,
+                body,
+                ..
+            } => {
+                // Single voice — the SAME path the listener's `Unmatched` branch
+                // runs for a named/@mention/concierge ask: plan the converse turn
+                // for the elected bot and compose+send it, mirroring the reply into
+                // the casa feed (this is a group-elected turn).
+                let plan = convo::plan_conversation(
+                    workgraph_dir,
+                    &config,
+                    &bot.channel_type,
+                    reply_chat,
+                    &auth_sender,
+                    convo::Entry::GroupElected,
+                );
+                let sink = FeedMirrorSink::new(
+                    convo::BotReplySink::new(config.clone()),
+                    feed_path.clone(),
+                    config.clone(),
+                );
+                let request_id = format!("web-{}-{}", reply_chat, bot.bot_id);
+                let timing = convo::AckTiming::from_env();
+                let wg_config = worksgood::config::Config::load_merged(workgraph_dir).ok();
+                let composer = wg_config.map(convo::OneshotComposer::from_config);
+                let composer_ref = composer.as_ref().map(|c| c as &dyn convo::ReplyComposer);
+                let out = convo::run_conversation_turn(
+                    workgraph_dir,
+                    &plan,
+                    body,
+                    &request_id,
+                    timing,
+                    composer_ref,
+                    &sink,
+                )
+                .await?;
+                Ok(format!(
+                    "single voice ({}) answered [{}]",
+                    bot.bot_id,
+                    out.label()
+                ))
+            }
+        }
+    })?;
+
+    if json {
+        let out = serde_json::json!({
+            "category": category,
+            "sender": sender,
+            "auth_sender": auth_sender,
+            "target": target,
+            "outcome": outcome_label,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("web-inbound [{category}] from {sender}: {outcome_label}");
+    }
+    Ok(())
+}
+
 /// Mirror one synthetic line to the casa conversation-pane feed (diagnostic).
 ///
 /// Drives the EXACT `casa_feed` writer the listener uses, so a smoke test can

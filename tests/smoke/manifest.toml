@@ -2116,6 +2116,15 @@ description = "Pins task group-chat-discussion: a confirmed-human group message 
 timeout_seconds = 30
 
 [[scenario]]
+name = "telegram_web_inbound"
+script = "scenarios/telegram_web_inbound.sh"
+owners = [
+    "web-chat-first",
+]
+description = "Pins task web-chat-first: a message typed in the casa kiosk conversation pane is a FIRST-CLASS group turn, not just a bot-relayed line the family never sees. The live gap (Luca, 'the constellation chat may not work'): the kiosk send box only RELAYED the message into the family Telegram group via a bot, and Telegram bots never see other bots' messages, so the listener's election/conversation pipeline NEVER ran on it — it was posted ('💬 Luca (kiosk): …') and never answered, while the SAME words typed on a phone got four replies. The fix is `wg telegram web-inbound`, which runs the EXACT `elect_responders` table the live listener runs and dispatches through the SAME senders + composer (run_group_collective / run_group_discussion / single-voice plan_conversation+run_conversation_turn), posting each elected persona's reply to the group via its OWN bot AND into .casa/group-feed.jsonl so the kiosk pane shows it; the gateway shells out to it on POST /conversation/send. Drives the real binary via `wg telegram web-inbound --dry-run --json` (the credential-free seam that runs the real election + planning and reports WHO would answer without sending) and asserts a web-origin message routes IDENTICALLY to a Telegram message: a collective ask ('hey all, are you around?') elects the whole roster (nora/bruno/mira/otto); a discussion ask runs a `discussion-round`; a named ask ('nora, …') is `single-voice` nora; and a web humanId ('luca') resolves to the confirmed human's binding key (auth_sender=8905220378) so the composer answers grounded, not the onboarding line. Double-reply is prevented by bot-authorship: the gateway's own Telegram mirror of the kiosk line is bot-sent, so the listener's bot-loop guard drops it before election. Credential-free: the subcommand only reads local config/bindings; nothing is sent."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_group_reply_tuning"
 script = "scenarios/telegram_group_reply_tuning.sh"
 owners = [

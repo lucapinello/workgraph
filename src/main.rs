@@ -3715,6 +3715,19 @@ fn main() -> Result<()> {
             TelegramCommands::Decide { update } => {
                 commands::telegram::run_decide(&workgraph_dir, &update, cli.json)
             }
+            TelegramCommands::WebInbound {
+                sender,
+                message,
+                chat_id,
+                dry_run,
+            } => commands::telegram::run_web_inbound(
+                &workgraph_dir,
+                &sender,
+                &message,
+                chat_id.as_deref(),
+                dry_run,
+                cli.json,
+            ),
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),

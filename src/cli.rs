@@ -6673,6 +6673,44 @@ pub enum TelegramCommands {
         /// The raw update JSON, inline or `@path/to/update.json` to read a file.
         update: String,
     },
+
+    /// Make a web-origin (kiosk pane) message a first-class group turn
+    ///
+    /// The kiosk conversation pane only RELAYED a line into the family Telegram
+    /// group via a bot — and Telegram bots never see other bots' messages, so
+    /// the listener's election/conversation pipeline NEVER ran on a kiosk-typed
+    /// message (it was posted and never answered). This runs the SAME pipeline
+    /// the `wg telegram listen` listener runs on a group message — election
+    /// (@mention / addressed name / collective / concierge / silence) then the
+    /// conversation composer against the elected persona's bound session —
+    /// WITHOUT a live socket. Replies go out to the group via each elected
+    /// persona's OWN bot AND are mirrored into `.casa/group-feed.jsonl` so the
+    /// kiosk pane shows them. The gateway shells out to this on
+    /// `POST /conversation/send`. Bot-authored replies are dropped by the
+    /// listener's bot-loop guard, so the group mirror is never double-answered.
+    WebInbound {
+        /// The web session's human identity — a `humanId` from `GET /auth/me`
+        /// (e.g. `luca`), or the household default display name (`Luca`) while
+        /// `web-identity-sign` is unmerged. Resolved to the confirmed human's
+        /// binding so the composer answers grounded.
+        #[arg(long)]
+        sender: String,
+
+        /// The message the human typed in the kiosk conversation pane.
+        #[arg(long)]
+        message: String,
+
+        /// The group chat id to reply in. Defaults to the configured
+        /// `telegram.chat_id` (the family group).
+        #[arg(long)]
+        chat_id: Option<String>,
+
+        /// Run the real election + planning and report who WOULD answer, but
+        /// send nothing (credential-free scripted-test seam, like
+        /// `wg telegram elect` / `discuss`).
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking
