@@ -6418,10 +6418,21 @@ pub enum TelegramCommands {
         #[arg(long)]
         chat_id: Option<String>,
 
+        /// Send AS this composing persona (bot id or agent_id, e.g. `otto`).
+        /// The message leaves via that persona's bot; if the persona has no
+        /// configured bot the send HARD-FAILS instead of silently falling back
+        /// to another bot. Every non-conversation outbound (review digest,
+        /// reminders, standup, plan announcements) that is signed as a voice
+        /// MUST name that voice here so it never delivers under the wrong
+        /// identity (task `review-digest-sent`).
+        #[arg(long, visible_alias = "as")]
+        persona: Option<String>,
+
         /// Resolve and print the target bot + chat + API URL (token redacted)
         /// WITHOUT sending. Credential-free way to verify send resolution —
         /// notably that a bots-map-only config picks a real token instead of
-        /// the empty-token `bot//sendMessage` 404.
+        /// the empty-token `bot//sendMessage` 404, and that `--persona` binds
+        /// to the right bot.
         #[arg(long = "dry-run")]
         dry_run: bool,
     },

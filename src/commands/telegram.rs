@@ -1668,15 +1668,28 @@ fn classify_inbound_message(
 }
 
 /// Send a message to the configured Telegram chat.
-pub fn run_send(chat_id: Option<&str>, message: &str, dry_run: bool) -> Result<()> {
+///
+/// `persona` names the composing voice (e.g. `otto` for the Sunday review
+/// digest). When set, the message is bound to that persona's bot and a
+/// misconfigured persona is a hard error — see [`resolve_send_bot`]. When
+/// `None`, the plain default-bot resolution applies.
+pub fn run_send(
+    chat_id: Option<&str>,
+    message: &str,
+    dry_run: bool,
+    persona: Option<&str>,
+) -> Result<()> {
     let config = load_telegram_config()?;
-    let (bot_id, bot, effective_chat_id) = resolve_send_bot(&config, chat_id)?;
+    let (bot_id, bot, effective_chat_id) = resolve_send_bot(&config, chat_id, persona)?;
 
     if dry_run {
         // Resolution-only path: prove which bot + chat + URL a real send would
         // use, with the token redacted. The URL host segment MUST be
         // `bot<digits>:...` — an empty token (the old bots-map-only 404 bug)
         // would render `bot/sendMessage`.
+        if let Some(p) = persona {
+            println!("[dry-run] composing persona: {}", p);
+        }
         println!("[dry-run] would send via bot '{}'", bot_id);
         println!("[dry-run] target chat: {}", effective_chat_id);
         println!("[dry-run] api url: {}", redacted_send_url(&bot.bot_token));
@@ -1707,28 +1720,70 @@ fn redacted_send_url(bot_token: &str) -> String {
 
 /// Resolve which bot + chat `wg telegram send` should use.
 ///
-/// Prefers the legacy top-level `[telegram]` bot, falling back to the first
-/// `[telegram.bots.*]` entry. Previously `run_send` always built the channel
-/// from the top-level `bot_token`, which is EMPTY in a bots-map-only config —
-/// producing the URL `https://api.telegram.org/bot/sendMessage` and a bare 404
-/// (task `listener-reconnect`). `all_bots()` lists the legacy bot first when
-/// present, so `.next()` picks the correct default either way. The effective
-/// chat id defaults to the resolved bot's own chat when the caller passes none.
+/// When `persona` is `Some`, the caller is naming the COMPOSING voice (e.g. the
+/// Sunday review digest is signed "— Otto", so it must leave via Otto's bot).
+/// The message is then bound to the bot whose id OR `agent_id` matches that
+/// persona, and if none is configured this HARD ERRORS rather than silently
+/// falling back to another bot. Silent wrong-identity delivery — "Otto's words
+/// via Bruno's face" (task `review-digest-sent`) — is worse than a failed send,
+/// so a persona-named send never resolves to a different persona's bot.
+///
+/// When `persona` is `None` (the plain `wg telegram send` default), this
+/// prefers the legacy top-level `[telegram]` bot, falling back to the
+/// lexicographically-first `[telegram.bots.*]` entry. Previously `run_send`
+/// always built the channel from the top-level `bot_token`, which is EMPTY in a
+/// bots-map-only config — producing the URL `https://api.telegram.org/bot/sendMessage`
+/// and a bare 404 (task `listener-reconnect`). `all_bots()` lists the legacy
+/// bot first when present, so it picks the correct default either way. The `bots`
+/// map is a HashMap, so the fallback pins the lexicographically-first id rather
+/// than a random one, keeping the default send stable. The effective chat id
+/// defaults to the resolved bot's own chat when the caller passes none.
 fn resolve_send_bot(
     config: &TelegramConfig,
     chat_id: Option<&str>,
+    persona: Option<&str>,
 ) -> Result<(String, TelegramBotConfig, String)> {
     let mut bots = config.all_bots();
-    // The legacy top-level bot (always id "default") is listed first by
-    // `all_bots` and wins when present. Otherwise pick the lexicographically-
-    // first named bot: the `bots` map is a HashMap, so a bare `.next()` would
-    // target a RANDOM bot each run — this keeps `wg telegram send` stable.
-    let (bot_id, bot) = if bots.first().map(|(id, _)| id == "default").unwrap_or(false) {
-        bots.remove(0)
-    } else {
-        bots.into_iter().min_by(|a, b| a.0.cmp(&b.0)).context(
+    if bots.is_empty() {
+        anyhow::bail!(
             "No Telegram bots configured — set [telegram] bot_token/chat_id or a [telegram.bots.*] entry",
-        )?
+        );
+    }
+
+    let (bot_id, bot) = match persona {
+        Some(p) => {
+            // Bind to the named voice's bot (by bot id OR agent_id binding).
+            // Refuse to fall back — the caller asked for THIS persona.
+            match bots
+                .iter()
+                .find(|(id, bot)| id == p || bot.agent_id.as_deref() == Some(p))
+            {
+                Some((id, bot)) => (id.clone(), bot.clone()),
+                None => anyhow::bail!(
+                    "Telegram send requested as persona '{p}', but no bot is configured for it \
+                     (neither a [telegram.bots.{p}] id nor an agent_id binding). Refusing to \
+                     fall back to another persona's bot — a review/reminder/announcement signed \
+                     as '{p}' must leave via {p}'s bot, not deliver under the wrong identity. \
+                     Configured bots: {}",
+                    bots.iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            }
+        }
+        None => {
+            // The legacy top-level bot (always id "default") is listed first by
+            // `all_bots` and wins when present. Otherwise pick the
+            // lexicographically-first named bot for a stable default.
+            if bots.first().map(|(id, _)| id == "default").unwrap_or(false) {
+                bots.remove(0)
+            } else {
+                bots.into_iter()
+                    .min_by(|a, b| a.0.cmp(&b.0))
+                    .expect("bots is non-empty (checked above)")
+            }
+        }
     };
     let effective_chat_id = chat_id
         .map(|s| s.to_string())
@@ -5116,7 +5171,7 @@ mod tests {
             bots,
         };
 
-        let (bot_id, bot, chat) = resolve_send_bot(&config, None).unwrap();
+        let (bot_id, bot, chat) = resolve_send_bot(&config, None, None).unwrap();
         assert_eq!(bot_id, "nora");
         assert_eq!(bot.bot_token, "111:AAA", "must not slice an empty token");
         assert!(!bot.bot_token.is_empty(), "empty token would yield a 404 URL");
@@ -5155,7 +5210,7 @@ mod tests {
 
         // Resolve several times — the pick must never change.
         for _ in 0..8 {
-            let (bot_id, bot, _chat) = resolve_send_bot(&config, None).unwrap();
+            let (bot_id, bot, _chat) = resolve_send_bot(&config, None, None).unwrap();
             assert_eq!(bot_id, "bruno", "must pick the lexicographically-first bot");
             assert_eq!(bot.bot_token, "1234567:BRUNO");
         }
@@ -5181,7 +5236,7 @@ mod tests {
             bots,
         };
 
-        let (bot_id, bot, chat) = resolve_send_bot(&config, Some("777")).unwrap();
+        let (bot_id, bot, chat) = resolve_send_bot(&config, Some("777"), None).unwrap();
         assert_eq!(bot_id, "default");
         assert_eq!(bot.bot_token, "999:LEGACY");
         assert_eq!(chat, "777", "explicit chat id overrides the default");
@@ -5194,8 +5249,134 @@ mod tests {
             chat_id: String::new(),
             bots: HashMap::new(),
         };
-        let err = resolve_send_bot(&config, None).unwrap_err().to_string();
+        let err = resolve_send_bot(&config, None, None).unwrap_err().to_string();
         assert!(err.contains("No Telegram bots configured"), "got: {err}");
+    }
+
+    /// The bug that motivated `review-digest-sent`: the Sunday review digest is
+    /// composed and signed "— Otto", but the plain default send resolved to the
+    /// lexicographically-first bot (bruno < otto), delivering Otto's words under
+    /// Bruno's face. A persona-named send must resolve OTTO's token, never the
+    /// alphabetical default.
+    #[test]
+    fn review_digest_send_as_otto_resolves_ottos_token_not_bruno() {
+        let mut bots = HashMap::new();
+        bots.insert(
+            "bruno".to_string(),
+            TelegramBotConfig {
+                bot_token: "1000000:BRUNO".to_string(),
+                chat_id: "10".to_string(),
+                agent_id: Some("bruno".to_string()),
+                username: None,
+            },
+        );
+        bots.insert(
+            "otto".to_string(),
+            TelegramBotConfig {
+                bot_token: "2000000:OTTO".to_string(),
+                chat_id: "20".to_string(),
+                agent_id: Some("otto".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        // Without a persona the default fallback would pick "bruno" (< "otto")
+        // — that is exactly the wrong-identity trap.
+        let (default_id, _, _) = resolve_send_bot(&config, None, None).unwrap();
+        assert_eq!(
+            default_id, "bruno",
+            "sanity: the silent default lands on bruno — the very trap we are fixing"
+        );
+
+        // Naming the composing persona resolves Otto's own bot + token + chat.
+        let (bot_id, bot, chat) = resolve_send_bot(&config, None, Some("otto")).unwrap();
+        assert_eq!(bot_id, "otto");
+        assert_eq!(bot.bot_token, "2000000:OTTO", "must send with Otto's token");
+        assert_eq!(chat, "20", "defaults to Otto's own chat");
+    }
+
+    /// A persona can be named by the bot's `agent_id` binding even when the bot
+    /// id (the `[telegram.bots.<id>]` key) differs — the composing voice is the
+    /// agent, not the arbitrary map key.
+    #[test]
+    fn send_as_persona_matches_agent_id_binding() {
+        let mut bots = HashMap::new();
+        bots.insert(
+            "otto_concierge_bot".to_string(),
+            TelegramBotConfig {
+                bot_token: "3000000:OTTO".to_string(),
+                chat_id: "30".to_string(),
+                agent_id: Some("otto".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        let (bot_id, bot, _chat) = resolve_send_bot(&config, None, Some("otto")).unwrap();
+        assert_eq!(bot_id, "otto_concierge_bot");
+        assert_eq!(bot.bot_token, "3000000:OTTO");
+    }
+
+    /// The core safety property: a persona-named send NEVER falls back silently.
+    /// If the named voice has no configured bot, resolution is a hard error —
+    /// delivering under another persona's identity is worse than a failed send.
+    #[test]
+    fn send_as_persona_never_falls_back_silently() {
+        // Only bruno is configured; a review signed as Otto must NOT go out via
+        // bruno's bot.
+        let mut bots = HashMap::new();
+        bots.insert(
+            "bruno".to_string(),
+            TelegramBotConfig {
+                bot_token: "1000000:BRUNO".to_string(),
+                chat_id: "10".to_string(),
+                agent_id: Some("bruno".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        let result = resolve_send_bot(&config, None, Some("otto"));
+        assert!(
+            result.is_err(),
+            "a persona-named send with no matching bot must hard-fail, not fall back to bruno"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("otto"), "error must name the missing persona: {err}");
+        assert!(
+            !err.contains("BRUNO"),
+            "error must never leak/return bruno's token as a fallback: {err}"
+        );
+    }
+
+    /// Even the legacy top-level `[telegram]` bot (id "default") does not satisfy
+    /// a persona-named send — the default bot fronts no specific voice, so a
+    /// request "as otto" against a default-only config still hard-fails rather
+    /// than sending anonymously as the group bot.
+    #[test]
+    fn send_as_persona_does_not_match_legacy_default_bot() {
+        let config = TelegramConfig {
+            bot_token: "999:LEGACY".to_string(),
+            chat_id: "500".to_string(),
+            bots: HashMap::new(),
+        };
+        let err = resolve_send_bot(&config, None, Some("otto"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("otto"), "got: {err}");
     }
 
     #[test]

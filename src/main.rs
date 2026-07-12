@@ -3637,8 +3637,14 @@ fn main() -> Result<()> {
             TelegramCommands::Send {
                 message,
                 chat_id,
+                persona,
                 dry_run,
-            } => commands::telegram::run_send(chat_id.as_deref(), &message, dry_run),
+            } => commands::telegram::run_send(
+                chat_id.as_deref(),
+                &message,
+                dry_run,
+                persona.as_deref(),
+            ),
             TelegramCommands::Status => commands::telegram::run_status(cli.json),
             TelegramCommands::Poll { timeout, chat_id } => {
                 commands::telegram::run_poll(chat_id.as_deref(), timeout)
