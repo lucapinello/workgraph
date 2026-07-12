@@ -19,7 +19,7 @@ use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::telegram_group::{
     CONCIERGE_BOT, Election, NaturalRoute, elect_responders, election_decision_summary,
-    route_natural,
+    parse_at_mention_tokens, route_natural,
 };
 
 /// Run the Telegram listener.
@@ -855,11 +855,7 @@ pub fn run_route(
     let config = load_telegram_config()?;
 
     // Approximate the listener's mention extraction: any @handle token.
-    let mention_usernames: Vec<String> = message
-        .split_whitespace()
-        .filter(|t| t.starts_with('@'))
-        .map(|t| t.trim_start_matches('@').to_ascii_lowercase())
-        .collect();
+    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
 
     let route = route_natural(
         Some(chat_type),
@@ -978,11 +974,7 @@ pub fn run_elect(
 ) -> Result<()> {
     let config = load_telegram_config()?;
 
-    let mention_usernames: Vec<String> = message
-        .split_whitespace()
-        .filter(|t| t.starts_with('@'))
-        .map(|t| t.trim_start_matches('@').to_ascii_lowercase())
-        .collect();
+    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
 
     let election = elect_responders(
         Some(chat_type),
