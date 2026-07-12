@@ -1143,7 +1143,7 @@ pub fn run_elect(
 /// the election routes it to. This is the `fix-command-leaks` proof: a bare `?`
 /// or `@mention ?` must decide `conversation` with ZERO commands and never
 /// touch the operator claim/done path.
-pub fn run_decide(update: &str, json: bool) -> Result<()> {
+pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> {
     let raw = if let Some(path) = update.strip_prefix('@') {
         std::fs::read_to_string(path)
             .with_context(|| format!("failed to read update fixture {path}"))?
@@ -1206,6 +1206,9 @@ pub fn run_decide(update: &str, json: bool) -> Result<()> {
     // would, so the diagnostic proves an addressed `@mention ?` routes to the
     // agent (converses) rather than firing a command.
     let config = load_telegram_config()?;
+    // Membership-aware silence: mirror the listener by counting onboarded humans
+    // so the diagnostic's election matches the live decision.
+    let human_count = human_agent_id_set(workgraph_dir).len();
     let election = elect_responders(
         msg.chat_type.as_deref(),
         msg.chat_id.as_deref(),
@@ -1213,6 +1216,7 @@ pub fn run_decide(update: &str, json: bool) -> Result<()> {
         &msg.mention_usernames,
         msg.reply_to_bot.as_deref(),
         msg.sender_is_bot,
+        human_count,
         &config,
     );
     let (elected, addressed_by): (Option<String>, Option<String>) = match &election {

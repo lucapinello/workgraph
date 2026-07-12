@@ -1931,6 +1931,7 @@ mod tests {
             &mentions,
             None,
             false,
+            2,
             &casa_config_no_usernames(),
         );
         match &election {
@@ -1973,6 +1974,7 @@ mod tests {
             &mentions,
             None,
             false,
+            2,
             &casa_config_no_usernames(),
         );
         match &election {
@@ -2002,6 +2004,7 @@ mod tests {
                 &m,
                 reply,
                 false,
+                2,
                 &cfg,
             )
         };

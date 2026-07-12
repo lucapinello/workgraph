@@ -129,14 +129,14 @@ if elect "otto, status?" | grep -q "dummy-token"; then
     loud_fail "bot token leaked into election output"
 fi
 
-# g. REGRESSION (fix-mention-precedence): an explicit @mention must ALWAYS win
+# h. REGRESSION (fix-mention-precedence): an explicit @mention must ALWAYS win
 #    over the small-talk/silence classifier, EVEN when the config omits the
 #    optional `username` field — which is exactly how the LIVE .wg/notify.toml
 #    was shaped when `elect "@nora_casapinello_bot what about you?"` wrongly
 #    returned `silence(small-talk)`. Here the fixture binds only agent_id + the
 #    bot-id key (no username), mirroring production; resolution must still route
 #    the real @handle to its agent by @mention.
-echo "g. @mention resolves & beats silence with NO username configured (live-config shape):"
+echo "h. @mention resolves & beats silence with NO username configured (live-config shape):"
 nou_scratch="$(make_scratch)"
 mkdir -p "$nou_scratch/.wg"
 cat >"$nou_scratch/.wg/notify.toml" <<'TOML'
@@ -181,8 +181,10 @@ expect_grep "no-username/reply-chain" \
 expect_grep "no-username/ask-otto" \
     "$(elect_nou "can someone plan dinner?")" \
     "answered by otto (by concierge)"
+# Two humans present so the conservative silence rule holds (this fixture has no
+# agency/, i.e. zero onboarded humans, which would otherwise answer greetings).
 expect_grep "no-username/small-talk-silent" \
-    "$(elect_nou "haha yeah that was fun")" \
+    "$(elect_nou "haha yeah that was fun" --humans 2)" \
     "silence (small-talk)"
 
 echo "PASS: responder election (name / mention-beats-name / reply-chain / collective→4 / ask→otto / small-talk→silence / @mention-without-username→that-agent)"
