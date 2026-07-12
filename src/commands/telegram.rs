@@ -793,6 +793,16 @@ enum InboundOutcome {
 ///
 /// This is the pure, filesystem-only core of the listener's inbound branch (no
 /// network), so it is unit-testable without a live bot.
+/// The neutral listener log line for a benign fall-through: a confirmed human's
+/// ordinary message reached an AI persona's bot, so it is not a parked-task
+/// reply and continues on to the conversation composer. Uses the persona's
+/// display name (never the raw agent hash) and reads as "continuing", not a
+/// refusal — so tailing the listener log does not cry wolf on every normal group
+/// message (the misleading "Rejected reply from …" noise this replaces).
+fn fallthrough_log_line(persona: &str) -> String {
+    format!("not a parked-task reply (bot fronts {persona}) — continuing to conversation")
+}
+
 fn classify_inbound_message(
     workgraph_dir: &Path,
     channel_type: &str,
@@ -816,6 +826,20 @@ fn classify_inbound_message(
     ) {
         InboundReplyOutcome::Recorded(task_id) => Some(task_id),
         InboundReplyOutcome::NoWaitingTask => None,
+        InboundReplyOutcome::NotParkedReply { persona } => {
+            // Benign, NOT a failure: a confirmed human's ordinary message reached
+            // an AI persona's bot, so it is not a parked-task answer and falls
+            // through to the conversation composer below. Log a neutral one-liner
+            // (persona NAME, never the raw agent hash) — the old "Rejected reply"
+            // wording read as a refusal and tripped the operator problems monitor
+            // on every normal group message.
+            eprintln!(
+                "[{}] {}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                fallthrough_log_line(&persona)
+            );
+            None
+        }
         InboundReplyOutcome::Rejected(reason) => {
             eprintln!(
                 "[{}] Rejected reply from {}: {}",
@@ -3176,11 +3200,12 @@ mod tests {
     /// reply onto an awaiting-human TASK; it must never gate ordinary
     /// conversation.
     ///
-    /// The rejection is produced the realistic Casa way: the human speaks
+    /// The decline is produced the realistic Casa way: the human speaks
     /// through an AI-persona bot ("otto"), so pr51's defense-in-depth check
     /// ("a per-agent bot must front the same human the sender is bound to")
-    /// rejects it — bound to `human-luca`, arriving on a bot fronting `otto`.
-    /// Whatever the rejection reason, the listener must converse, not swallow.
+    /// declines to record it — bound to `human-luca`, arriving on a bot fronting
+    /// the persona `otto`. That decline is the benign `NotParkedReply` outcome
+    /// (NOT a security `Rejected`), and the listener must converse, not swallow.
     #[test]
     fn hardened_auth_rejection_falls_through_to_conversation() {
         use crate::commands::service::human_dispatch::{InboundReplyOutcome, route_inbound_reply};
@@ -3209,11 +3234,25 @@ mod tests {
         )
         .unwrap();
 
-        // Precondition: the hardened router DOES reject this confirmed human's
-        // turn (the sender is bound to human-luca but arrives on otto's bot).
+        // Precondition: the hardened router declines to record this confirmed
+        // human's turn (bound to human-luca but arriving on otto's bot). It is a
+        // benign NotParkedReply — NOT a security Rejected — carrying the persona
+        // DISPLAY NAME ("Otto"), never the raw agent id/hash. That name is what
+        // the listener logs, so tailing the log never reads as a refusal.
         match route_inbound_reply(dir, "telegram:otto", "luca-1", "otto, are you there?") {
-            InboundReplyOutcome::Rejected(_) => {}
-            other => panic!("expected hardened Rejected precondition, got {other:?}"),
+            InboundReplyOutcome::NotParkedReply { persona } => {
+                assert_eq!(persona, "Otto", "logs the persona display name, not a hash");
+                let line = fallthrough_log_line(&persona);
+                assert!(
+                    !line.to_lowercase().contains("reject"),
+                    "fall-through log must not read as a rejection: {line}"
+                );
+                assert!(
+                    line.contains("Otto") && line.contains("continuing to conversation"),
+                    "neutral one-liner names the persona and says it continues: {line}"
+                );
+            }
+            other => panic!("expected benign NotParkedReply precondition, got {other:?}"),
         }
 
         // The listener MUST fall through to conversation, not swallow.
