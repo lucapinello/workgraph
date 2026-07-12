@@ -666,6 +666,64 @@ pub const REQUEST_LEADS: &[&str] = &[
     "could someone", "could somebody", "can anyone", "does anyone", "is anyone",
 ];
 
+/// Multi-word discussion/opinion phrases. A COLLECTIVELY-elected message that
+/// contains one of these reads as an *invitation to deliberate* — the family
+/// should talk it through, not fire four independent one-liners. Matched as an
+/// ordered fuzzy phrase ([`contains_fuzzy_phrase`], so "what do you all thinl"
+/// still fires). See [`is_discussion_ask`]. Tunable.
+pub const DISCUSSION_TRIGGERS: &[&[&str]] = &[
+    &["what", "do", "you", "think"],
+    &["what", "do", "you", "all", "think"],
+    &["what", "do", "you", "guys", "think"],
+    &["what", "do", "we", "think"],
+    &["what", "do", "you", "reckon"],
+    &["what", "are", "your", "thoughts"],
+    &["your", "thoughts"],
+    &["any", "thoughts"],
+    &["lets", "discuss"],
+    &["weigh", "in"],
+    &["hash", "it", "out"],
+    &["hash", "this", "out"],
+    &["talk", "it", "through"],
+    &["find", "consensus"],
+    &["reach", "consensus"],
+    &["come", "to", "a", "consensus"],
+    &["come", "to", "an", "agreement"],
+    &["tell", "me", "what", "you", "think"],
+    &["tell", "me", "what", "you", "all", "think"],
+    &["let", "me", "know", "what", "you", "think"],
+];
+
+/// Single discussion/opinion words. A COLLECTIVELY-elected message carrying one
+/// of these is an opinion ask — run a discussion round rather than four parallel
+/// replies. Fuzzy-matched for 4+ chars (typo-tolerant like the greeting set).
+/// Kept to words that a plain group *greeting* never contains, so gating a round
+/// on them can never turn "hey guys" into a deliberation. See [`is_discussion_ask`].
+pub const DISCUSSION_WORDS: &[&str] = &[
+    "discuss", "discussion", "debate", "consensus", "deliberate", "brainstorm",
+    "thoughts", "opinions", "opinion", "reckon", "disagree",
+    // Italian
+    "discutere", "consenso", "opinione", "opinioni",
+];
+
+/// Discussion *verbs* — the imperative/hortative core of a "let's talk this
+/// through" ask ("discuss this", "let's debate", "can you guys deliberate"). A
+/// message opening with one, or carrying one right after a request/hortative cue
+/// ([`DISCUSSION_VERB_CUES`]), reads as a deliberation invitation even without a
+/// question mark. Fuzzy-matched for 4+ chars. See [`is_discussion_ask`].
+pub const DISCUSSION_VERBS: &[&str] = &[
+    "discuss", "debate", "deliberate", "brainstorm", "discutere", "dibattere",
+];
+
+/// Request/hortative cues that, immediately before a [`DISCUSSION_VERBS`] verb,
+/// mark it as an *ask to the group* ("let's **discuss**", "can you guys
+/// **debate**", "we should **brainstorm**"). Fuzzy-matched for 4+ chars.
+pub const DISCUSSION_VERB_CUES: &[&str] = &[
+    "let's", "lets", "let", "please", "pls", "plz", "can", "could", "would",
+    "will", "should", "you", "u", "guys", "we", "everyone", "all", "y'all",
+    "yall", "someone", "anyone", "gonna", "wanna",
+];
+
 /// Who should respond to a de-duplicated inbound group message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Election {
@@ -1079,6 +1137,80 @@ pub fn is_plural_you_address(text: &str) -> bool {
     false
 }
 
+/// True if `text` reads as an *opinion / discussion ask* — an invitation for the
+/// family to deliberate and land on a view ("can you guys discuss this and find
+/// consensus", "what do you all think?", "thoughts?", "let's debate the plan"),
+/// as opposed to a plain collective greeting ("hey guys are you around?") or an
+/// idle statement that merely mentions a discussion word ("I had some thoughts
+/// today").
+///
+/// It elects the WHOLE roster (see [`elect_responders`], rule d-discussion) and
+/// then drives a **discussion round** — sequenced, reacting takes plus an Otto
+/// wrap-up (see [`telegram_discussion`]). Because that fans four bots out, this
+/// deliberately requires an *ask shape*, not just a keyword:
+/// * any multi-word discussion phrase in [`DISCUSSION_TRIGGERS`] ("what do you
+///   all think", "find consensus", "weigh in") — these are inherently asks; or
+/// * a `?`-question that also carries a [`DISCUSSION_WORDS`] word ("thoughts?",
+///   "consensus on this?"); or
+/// * an imperative/hortative [`DISCUSSION_VERBS`] verb — one that opens the
+///   message or follows a [`DISCUSSION_VERB_CUES`] cue ("let's discuss",
+///   "can you guys debate").
+///
+/// A bare discussion word in a plain statement ("I had some thoughts today")
+/// matches none of these, so it never fans out the roster. All matching is
+/// typo-tolerant for 4+-char tokens.
+///
+/// [`telegram_discussion`]: crate::notify::telegram_discussion
+pub fn is_discussion_ask(text: &str) -> bool {
+    let tokens = word_list(text);
+    if tokens.is_empty() {
+        return false;
+    }
+    // 1. Multi-word discussion phrases are inherently asks.
+    if DISCUSSION_TRIGGERS
+        .iter()
+        .any(|phrase| contains_fuzzy_phrase(&tokens, phrase))
+    {
+        return true;
+    }
+    // 2. An interrogative sentence carrying a discussion word.
+    let is_question = text.trim_end().ends_with('?');
+    if is_question
+        && tokens
+            .iter()
+            .any(|w| DISCUSSION_WORDS.iter().any(|d| fuzzy_token_matches(w, d)))
+    {
+        return true;
+    }
+    // 3. An imperative/hortative discussion verb.
+    has_imperative_discussion_verb(&tokens)
+}
+
+/// True if `tokens` contain a [`DISCUSSION_VERBS`] verb used imperatively — it
+/// opens the message ("discuss this") or sits immediately after a
+/// [`DISCUSSION_VERB_CUES`] cue ("let's debate", "can you guys deliberate"). A
+/// discussion verb buried elsewhere ("we had a long discussion yesterday" — note
+/// "discussion" is a noun, not in [`DISCUSSION_VERBS`]) does not qualify.
+fn has_imperative_discussion_verb(tokens: &[String]) -> bool {
+    for (i, w) in tokens.iter().enumerate() {
+        if !DISCUSSION_VERBS.iter().any(|v| fuzzy_token_matches(w, v)) {
+            continue;
+        }
+        if i == 0 {
+            return true;
+        }
+        if let Some(prev) = tokens.get(i - 1) {
+            if DISCUSSION_VERB_CUES
+                .iter()
+                .any(|c| fuzzy_token_matches(prev, c))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Find the first family name in `text` that is used to *address* an agent
 /// (not merely mentioned in passing) and resolve it to a configured bot.
 ///
@@ -1279,6 +1411,26 @@ pub fn elect_responders(
     // / silence rules. Bare "everyone"/"everybody" stays with rule d (below) so
     // the ask check keeps precedence for "tell everyone dinner's ready".
     if is_plural_you_address(text) {
+        return Election::All {
+            reply_chat,
+            body: text.to_string(),
+        };
+    }
+
+    // d-discussion. An opinion / DISCUSSION ask — "let's discuss this and find
+    // consensus", "what do you all think?", "thoughts?" — elects the WHOLE
+    // roster, BEFORE the team-directed-ask rule below. Luca asked the group to
+    // "discuss this and find consensus" and wanted every voice + a wrap-up, not
+    // one concierge answer; a discussion ask that also happens to name a
+    // household topic ("let's discuss the weekend plan") must therefore NOT be
+    // swallowed to otto here. `is_discussion_ask` requires an ask *shape* (a
+    // discussion phrase, a `?`-question with a discussion word, or an imperative
+    // discuss/debate verb), so an idle statement mentioning a discussion word
+    // ("I had some thoughts today") does not fan out the roster. The
+    // `Election::All` handler then runs the discussion ROUND (sequenced in-voice
+    // takes + an Otto synthesis) rather than four independent replies — see
+    // [`is_discussion_ask`] and `telegram_discussion`.
+    if is_discussion_ask(text) {
         return Election::All {
             reply_chat,
             body: text.to_string(),
@@ -2375,6 +2527,91 @@ mod tests {
             "what's for dinner tonight?",
         ] {
             assert!(!is_plural_you_address(t), "expected NOT plural-you for {t:?}");
+        }
+    }
+
+    #[test]
+    fn is_discussion_ask_unit_cases() {
+        // Opinion / discussion asks -> true.
+        for t in [
+            "can you guys discuss this and find consensus",
+            "tell me what you all think",
+            "what do you all think?",
+            "what do you think about pizza friday?",
+            "let's debate the holiday plan",
+            "thoughts?",
+            "any thoughts on the new schedule",
+            "your thoughts on the budget?",
+            "can we reach consensus on dinner",
+            "let's discuss the weekend",
+            "everyone weigh in on this please",
+            // typo tolerance (4+ char fuzzy, edit distance ≤1)
+            "what are your thoughs",
+            "lets discus the plan",
+        ] {
+            assert!(is_discussion_ask(t), "expected discussion ask for {t:?}");
+        }
+        // Plain greetings / non-deliberative collective asks -> false.
+        for t in [
+            "hey guys are you around?",
+            "hi everyone!",
+            "goodnight all",
+            "hey guys ready for dinner?",
+            "morning team",
+            "you guys up yet?",
+            "hey folks what's for dinner tonight?", // a plain ask, not a debate
+            "",
+        ] {
+            assert!(!is_discussion_ask(t), "expected NOT discussion ask for {t:?}");
+        }
+    }
+
+    /// The classification table that gates a discussion ROUND: it fires ONLY when
+    /// the message is elected COLLECTIVE (`Election::All`) AND reads as a
+    /// discussion ask. Greetings stay collective-but-not-a-round; concierge asks
+    /// stay a single voice; small talk stays silent. Mirrors the live
+    /// `Election::All` handler's `is_discussion_ask` branch.
+    #[test]
+    fn discussion_round_gating_table() {
+        // (message, elected collective?, discussion ask?) — a round runs iff both.
+        // A discussion ask ALWAYS elects collective (rule d-discussion promotes it
+        // over the concierge/team-directed rule), so want_discussion ⇒
+        // want_collective.
+        let cases: &[(&str, bool, bool)] = &[
+            // Discussion asks that ARE collectively elected → ROUND.
+            ("can you guys discuss this and find consensus", true, true),
+            ("tell me what you all think", true, true),
+            ("what do you all think?", true, true),
+            // A discussion ask with NO second-person-plural address is promoted to
+            // collective too (would otherwise be swallowed to the concierge).
+            ("let's discuss the weekend plan and find consensus", true, true),
+            ("thoughts on the holiday plan everyone?", true, true),
+            // Collective greeting → collective, but NOT a round.
+            ("hey guys are you around?", true, false),
+            ("hi everyone!", true, false),
+            // Plain concierge / single-voice ask → not collective (so no round).
+            ("what's for dinner tonight?", false, false),
+            // Named address → not collective.
+            ("nora, can you help?", false, false),
+        ];
+        for (msg, want_collective, want_discussion) in cases {
+            let is_collective = matches!(elect_solo(msg, &[], None), Election::All { .. });
+            assert_eq!(
+                is_collective, *want_collective,
+                "collective election mismatch for {msg:?}",
+            );
+            assert_eq!(
+                is_discussion_ask(msg),
+                *want_discussion,
+                "discussion-ask mismatch for {msg:?}",
+            );
+            // A round runs exactly when both hold.
+            let runs_round = is_collective && is_discussion_ask(msg);
+            assert_eq!(
+                runs_round,
+                *want_collective && *want_discussion,
+                "round-gating mismatch for {msg:?}",
+            );
         }
     }
 

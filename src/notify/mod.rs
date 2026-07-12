@@ -19,6 +19,7 @@ pub mod sms;
 pub mod telegram;
 pub mod telegram_conversation;
 pub mod telegram_dedupe;
+pub mod telegram_discussion;
 pub mod telegram_family_commands;
 pub mod telegram_group;
 pub mod telegram_pacing;

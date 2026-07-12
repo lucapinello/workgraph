@@ -19,7 +19,7 @@ use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::telegram_group::{
     CONCIERGE_BOT, Election, NaturalRoute, elect_responders, election_decision_summary,
-    parse_at_mention_tokens, route_natural,
+    is_discussion_ask, parse_at_mention_tokens, route_natural,
 };
 
 /// Whether an inbound listener message may fire a FAMILY command and/or the
@@ -439,24 +439,47 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         );
                         continue;
                     }
-                    // Collective address — the whole roster answers, briefly and
-                    // in-voice, in roster order. The single listener orchestrates
-                    // the sequential sends so no bot double-posts. Fix #4b: each
-                    // voice answers the MESSAGE CONTENT through the SAME
-                    // persistent-session composer the 1:1 path uses (grounded
-                    // reply), falling back to a task-grounded in-voice line only
-                    // when that voice has no bound session. The composed turn
-                    // logs its own compose-start + per-voice sent message_id.
-                    if let Err(e) = run_group_collective(
-                        &workgraph_dir,
-                        &route_config,
-                        reply_chat,
-                        &feed_path,
-                        body,
-                        &auth_sender,
-                    )
-                    .await
-                    {
+                    // A collective election splits two ways. An opinion /
+                    // discussion ask ("can you guys discuss this and find
+                    // consensus", "what do you all think?") runs a DISCUSSION
+                    // ROUND — sequenced, reacting in-voice takes plus an Otto
+                    // wrap-up (`run_group_discussion`). Everything else (plain
+                    // collective greetings, "hey guys are you around?") keeps
+                    // today's behavior: four brief independent replies, in roster
+                    // order (`run_group_collective`). The burst coalescer above
+                    // already guarantees a second discussion ask arriving WHILE a
+                    // round is composing does not start a second round.
+                    let run = if is_discussion_ask(body) {
+                        run_group_discussion(
+                            &workgraph_dir,
+                            &route_config,
+                            reply_chat,
+                            &feed_path,
+                            body,
+                            &auth_sender,
+                        )
+                        .await
+                    } else {
+                        // Collective address — the whole roster answers, briefly
+                        // and in-voice, in roster order. The single listener
+                        // orchestrates the sequential sends so no bot double-posts.
+                        // Fix #4b: each voice answers the MESSAGE CONTENT through
+                        // the SAME persistent-session composer the 1:1 path uses
+                        // (grounded reply), falling back to a task-grounded in-voice
+                        // line only when that voice has no bound session. The
+                        // composed turn logs its own compose-start + per-voice sent
+                        // message_id.
+                        run_group_collective(
+                            &workgraph_dir,
+                            &route_config,
+                            reply_chat,
+                            &feed_path,
+                            body,
+                            &auth_sender,
+                        )
+                        .await
+                    };
+                    if let Err(e) = run {
                         eprintln!("Failed to run collective reply: {e}");
                     }
                     // The roster reply has gone out — end the pending turn so the
@@ -1175,6 +1198,99 @@ pub fn run_elect(
     Ok(())
 }
 
+/// `wg telegram discuss --dry-run` — show whether a group message would run a
+/// DISCUSSION ROUND, and the planned round, without sending anything.
+///
+/// Runs the exact [`elect_responders`] decision the listener uses, then applies
+/// the same [`is_discussion_ask`] gate the live `Election::All` handler uses to
+/// split a collective election into a discussion round vs today's four
+/// independent hellos. Prints the category and, for a round, the voices in
+/// contribution order plus the synthesizer (Otto). This is the scripted-test
+/// seam (sibling of `wg telegram elect`): a discussion ask → `discussion-round`;
+/// a plain collective greeting → `collective-greeting`; a named/concierge ask →
+/// `single-voice`; small talk → `silence`. Nothing is sent.
+pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()> {
+    use worksgood::notify::telegram_discussion as discussion;
+    use worksgood::notify::telegram_standup as standup;
+
+    let config = load_telegram_config()?;
+    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
+    let human_count = human_agent_id_set(workgraph_dir).len();
+
+    let election = elect_responders(
+        Some("supergroup"),
+        Some("-1000000000001"),
+        message,
+        &mention_usernames,
+        None,
+        // The diagnostic is always run by a human operator, never a bot.
+        false,
+        human_count,
+        &config,
+    );
+
+    let is_discussion = is_discussion_ask(message);
+    let roster_ids: Vec<String> = standup::plan_roster(&config, standup::DEFAULT_ROSTER)
+        .into_iter()
+        .map(|m| m.bot_id)
+        .collect();
+
+    // (category, plan) — plan is Some only for a discussion round.
+    let (category, plan): (&str, Option<discussion::DiscussionPlan>) = match &election {
+        Election::Private => ("private", None),
+        Election::Silence(_) => ("silence", None),
+        Election::One { .. } => ("single-voice", None),
+        Election::All { .. } => {
+            if is_discussion {
+                ("discussion-round", Some(discussion::plan_round(&roster_ids)))
+            } else {
+                ("collective-greeting", None)
+            }
+        }
+    };
+
+    if json {
+        let out = serde_json::json!({
+            "category": category,
+            "is_discussion_ask": is_discussion,
+            "voices": plan.as_ref().map(|p| p.take_voices.clone()),
+            "synthesizer": plan.as_ref().and_then(|p| p.synthesizer.clone()),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    match category {
+        "discussion-round" => {
+            let plan = plan.unwrap();
+            println!(
+                "discussion round — each voice gives a short take, in order: {}",
+                if plan.take_voices.is_empty() {
+                    "(none configured)".to_string()
+                } else {
+                    plan.take_voices.join(" → ")
+                },
+            );
+            match plan.synthesizer {
+                Some(s) => println!(
+                    "then {s} closes with a synthesis (only if ≥2 other voices weigh in)"
+                ),
+                None => println!("no synthesizer configured — no closing wrap-up"),
+            }
+        }
+        "collective-greeting" => println!(
+            "collective greeting — the whole roster answers with brief independent hellos \
+             (no discussion round)"
+        ),
+        "single-voice" => {
+            println!("single voice — one bot answers (named/mention/reply/concierge); no round")
+        }
+        "silence" => println!("silence — no one responds; no round"),
+        _ => println!("private chat — 1:1 passthrough; no round"),
+    }
+    Ok(())
+}
+
 /// `wg telegram decide` — run the listener's command-vs-election decision on a
 /// raw Telegram update, without sending anything.
 ///
@@ -1530,6 +1646,138 @@ pub async fn run_group_collective(
             Err(e) => eprintln!("collective: {} failed to reply: {e}", post.bot_id),
         }
     }
+    Ok(())
+}
+
+/// Orchestrate a **discussion round** (collective election + an opinion /
+/// discussion ask). Instead of four independent replies the family talks it
+/// through: each bound-session persona contributes one short in-voice take, in
+/// roster order and *reacting* to the takes so far, then Otto closes with a
+/// synthesis when at least two other voices weighed in.
+///
+/// This is the deliberative sibling of [`run_group_collective`]: same sole
+/// orchestrator (the single listener), same per-voice bot, same
+/// persistent-session composer ([`convo::OneshotComposer`]) and casa-feed mirror
+/// ([`FeedMirrorSink`]). It differs in that the takes are *sequenced with
+/// context* and a voice whose session errors or does not answer in time is
+/// skipped SILENTLY — no glitch line, no jargon in the family group. The
+/// round-runner itself lives in [`telegram_discussion`] and is unit-tested there;
+/// this function only resolves the live roster/composer/sink and hands off.
+///
+/// [`telegram_discussion`]: worksgood::notify::telegram_discussion
+pub async fn run_group_discussion(
+    workgraph_dir: &Path,
+    config: &TelegramConfig,
+    target: &str,
+    feed_path: &Path,
+    human_message: &str,
+    sender: &str,
+) -> Result<()> {
+    use worksgood::notify::telegram_conversation as convo;
+    use worksgood::notify::telegram_discussion as discussion;
+    use worksgood::notify::telegram_standup as standup;
+
+    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    if roster.is_empty() {
+        eprintln!("No named bots configured — discussion round has no voices.");
+        return Ok(());
+    }
+
+    // Only bound-session voices can contribute a grounded, in-character take. A
+    // voice with no bound session (or an unconfirmed sender) is left out of the
+    // round rather than posting a canned status line into a discussion.
+    let mut voices: Vec<discussion::DiscussionVoice> = Vec::new();
+    for member in &roster {
+        let plan = convo::plan_conversation(
+            workgraph_dir,
+            config,
+            &member.channel_type(),
+            target,
+            sender,
+            convo::Entry::GroupElected,
+        );
+        if let convo::ConversationPlan::Converse {
+            session_ref,
+            agent_id,
+            ..
+        } = plan
+        {
+            voices.push(discussion::DiscussionVoice {
+                bot_id: member.bot_id.clone(),
+                agent_id,
+                session_ref,
+            });
+        }
+    }
+
+    if voices.is_empty() {
+        // Nobody can speak in character (no bound sessions / unconfirmed sender) —
+        // fall back to today's collective reply so the family still hears back.
+        return run_group_collective(
+            workgraph_dir,
+            config,
+            target,
+            feed_path,
+            human_message,
+            sender,
+        )
+        .await;
+    }
+
+    let timing = discussion::DiscussionTiming::from_env();
+    println!(
+        "[{}] discussion round -> {} ({} voice(s), synthesizer {})",
+        chrono::Utc::now().format("%H:%M:%S"),
+        target,
+        voices.len(),
+        CONCIERGE_BOT,
+    );
+
+    // Same composer + feed-mirroring sink as the collective path: each take is
+    // composed by that persona's bound session and mirrored into the casa
+    // conversation pane as an `agent` line.
+    let wg_config = worksgood::config::Config::load_merged(workgraph_dir).ok();
+    let composer = wg_config.map(convo::OneshotComposer::from_config);
+    let composer_ref = match composer.as_ref() {
+        Some(c) => c as &dyn convo::ReplyComposer,
+        None => {
+            eprintln!("No composer available — discussion round falls back to collective reply.");
+            return run_group_collective(
+                workgraph_dir,
+                config,
+                target,
+                feed_path,
+                human_message,
+                sender,
+            )
+            .await;
+        }
+    };
+    let sink = FeedMirrorSink::new(
+        convo::BotReplySink::new(config.clone()),
+        feed_path.to_path_buf(),
+        config.clone(),
+    );
+
+    let outcome = discussion::run_discussion_round(
+        workgraph_dir,
+        human_message,
+        &voices,
+        CONCIERGE_BOT,
+        composer_ref,
+        &sink,
+        target,
+        timing,
+    )
+    .await?;
+
+    println!(
+        "[{}] discussion round done: {} take(s), synthesis={}, skipped=[{}]",
+        chrono::Utc::now().format("%H:%M:%S"),
+        outcome.takes.len(),
+        outcome.synthesis.is_some(),
+        outcome.skipped.join(","),
+    );
     Ok(())
 }
 

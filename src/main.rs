@@ -3709,6 +3709,9 @@ fn main() -> Result<()> {
                 &message,
                 cli.json,
             ),
+            TelegramCommands::Discuss { message } => {
+                commands::telegram::run_discuss(&workgraph_dir, &message, cli.json)
+            }
             TelegramCommands::Decide { update } => {
                 commands::telegram::run_decide(&workgraph_dir, &update, cli.json)
             }

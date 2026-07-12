@@ -2107,6 +2107,15 @@ description = "Pins the pr51-auth conversational SWALLOW regression Luca hit liv
 timeout_seconds = 30
 
 [[scenario]]
+name = "telegram_discussion_round"
+script = "scenarios/telegram_discussion_round.sh"
+owners = [
+    "group-chat-discussion",
+]
+description = "Pins task group-chat-discussion: a confirmed-human group message elected COLLECTIVE that ALSO reads as an opinion/discussion ask ('can you guys discuss this and find consensus', 'tell me what you all think', 'what do you all think?', 'thoughts?') runs a DISCUSSION ROUND — each persona a short in-voice take in roster order (nora→bruno→mira→otto), then Otto synthesizes — rather than four independent replies. Drives the real binary via `wg telegram discuss --json` (the exact `elect_responders` + `is_discussion_ask` gate the live `Election::All` handler branches on) and asserts: a discussion ask classifies `discussion-round` with is_discussion_ask=true, synthesizer=otto, and the whole roster as voices; a PLAIN collective greeting ('hey guys are you around?', 'hi everyone!', 'goodnight all') classifies `collective-greeting` (today's brief independent hellos, is_discussion_ask=false) and does NOT start a round; and a concierge/named single-voice ask ('what is on the menu tomorrow?', 'nora, can you help?') classifies `single-voice`, never a round. The round runner itself (sequenced reacting takes, dead-session skip, synthesis-only-when-≥2 threshold) is unit-tested in notify::telegram_discussion. Credential-free: the subcommand only reads local config/bindings; nothing is sent."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_group_reply_tuning"
 script = "scenarios/telegram_group_reply_tuning.sh"
 owners = [

@@ -6643,6 +6643,21 @@ pub enum TelegramCommands {
         message: String,
     },
 
+    /// Show whether a group message runs a DISCUSSION ROUND (diagnostic)
+    ///
+    /// Runs the exact `elect_responders` decision plus the `is_discussion_ask`
+    /// gate the `wg telegram listen` listener uses to split a collective election
+    /// into a multi-voice discussion round (sequenced in-voice takes + an Otto
+    /// synthesis) vs today's four independent hellos. Prints the category —
+    /// `discussion-round`, `collective-greeting`, `single-voice`, or `silence` —
+    /// and, for a round, the voices in contribution order plus the synthesizer,
+    /// WITHOUT sending anything. Reads bots from the current project's
+    /// `notify.toml`.
+    Discuss {
+        /// The group message text (e.g. "can you guys discuss dinner and find consensus?")
+        message: String,
+    },
+
     /// Decide command-vs-election for a raw Telegram update, as the listener would
     ///
     /// Feeds a raw `getUpdates` element through the SAME boundary the
