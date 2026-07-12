@@ -22,6 +22,43 @@ use worksgood::notify::telegram_group::{
     parse_at_mention_tokens, route_natural,
 };
 
+/// Whether an inbound listener message may fire a FAMILY command and/or the
+/// OPERATOR command reference.
+///
+/// This is the single gate that closed `fix-command-leaks`: a bare `?` in the
+/// group was parsed as an operator HELP command and dumped the raw WG
+/// claim/done reference into the family chat, racing the mention election. The
+/// three rules it encodes:
+///
+/// 1. A message is a command **only** when it opens with a genuine Telegram
+///    slash command (`has_bot_command` — a `bot_command` entity at offset 0).
+///    Punctuation, a bare `?`, or ordinary chatter is conversation, never a
+///    command — so it can never race the election.
+/// 2. Because the gate keys off the slash entity (not the text), an addressed
+///    conversational turn like `@nora ?` carries no command entity → the
+///    election owns it and the agent converses.
+/// 3. The OPERATOR reference (claim/done/status/help) is coordinator content
+///    that must NEVER surface in a family group — it runs only in a 1:1
+///    operator DM, and only for a real slash command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandGate {
+    /// A family-voice command (`/dinner`, `/help`, …) may run in this chat.
+    pub family: bool,
+    /// The operator WG command reference may run in this chat.
+    pub operator: bool,
+}
+
+/// Decide the [`CommandGate`] for an inbound message. Pure and unit-testable
+/// against real `decode_update` output.
+pub fn command_gate(msg: &worksgood::notify::IncomingMessage) -> CommandGate {
+    let is_group = matches!(msg.chat_type.as_deref(), Some("group") | Some("supergroup"));
+    let is_command = msg.has_bot_command;
+    CommandGate {
+        family: is_command,
+        operator: is_command && !is_group,
+    }
+}
+
 /// Run the Telegram listener.
 ///
 /// Starts a long-running process that polls for incoming messages via the
@@ -268,6 +305,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 continue;
             }
 
+            // Command gate: a message is a command ONLY when it opens with a
+            // genuine Telegram slash command (a `bot_command` entity at offset
+            // 0). A bare `?`, punctuation, or ordinary chatter carries no such
+            // entity and is conversation — it flows to the election below and is
+            // never parsed as a command. See `fix-command-leaks`.
+            let gate = command_gate(&msg);
+
             // Family command set (/dinner /shopping /week /reminders /standup
             // /help). Commands ride ABOVE the election table: the surviving
             // (deduped) copy is exactly-once, and a bare slash command must
@@ -276,31 +320,34 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // /dinner) regardless of which bot's queue delivered the surviving
             // copy; in a 1:1 the bot you messaged answers. `/standup` fans out
             // to the whole roster. See `notify::telegram_family_commands`.
-            if let Some(cmd) = worksgood::notify::telegram_family_commands::match_command(&msg.body)
-            {
-                let is_group =
-                    matches!(msg.chat_type.as_deref(), Some("group") | Some("supergroup"));
-                println!(
-                    "[{}] Command {} from {} -> {} ({})",
-                    chrono::Utc::now().format("%H:%M:%S"),
-                    cmd.keyword,
-                    msg.sender,
-                    reply_target,
-                    if is_group { "group" } else { "direct" },
-                );
-                if let Err(e) = run_family_command(
-                    &workgraph_dir,
-                    &route_config,
-                    cmd,
-                    &reply_target,
-                    is_group,
-                    &msg.channel,
-                )
-                .await
+            if gate.family {
+                if let Some(cmd) =
+                    worksgood::notify::telegram_family_commands::match_command(&msg.body)
                 {
-                    eprintln!("Failed to run command {}: {e}", cmd.keyword);
+                    let is_group =
+                        matches!(msg.chat_type.as_deref(), Some("group") | Some("supergroup"));
+                    println!(
+                        "[{}] Command {} from {} -> {} ({})",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        cmd.keyword,
+                        msg.sender,
+                        reply_target,
+                        if is_group { "group" } else { "direct" },
+                    );
+                    if let Err(e) = run_family_command(
+                        &workgraph_dir,
+                        &route_config,
+                        cmd,
+                        &reply_target,
+                        is_group,
+                        &msg.channel,
+                    )
+                    .await
+                    {
+                        eprintln!("Failed to run command {}: {e}", cmd.keyword);
+                    }
+                    continue;
                 }
-                continue;
             }
 
             // All-bots-privacy-off responder election (layered on R17's
@@ -420,40 +467,52 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             };
 
             // Family command with a leading @mention (e.g. "@otto /shopping").
-            // The bare and `@bot`-suffixed forms were already handled before
-            // election; this catches the case where election stripped a leading
-            // mention off the front. `/standup` is one such command (whole-team
-            // check-in — one post per voice in roster order); it and the rest of
-            // the family set now flow through the SAME table. See
-            // `notify::telegram_family_commands`. Only groups reach here (a
-            // private command was resolved pre-election), so the owner answers.
-            if let Some(cmd) =
-                worksgood::notify::telegram_family_commands::match_command(&route_body)
-            {
-                println!(
-                    "[{}] Command {} from {} (post-mention) -> {}",
-                    chrono::Utc::now().format("%H:%M:%S"),
-                    cmd.keyword,
-                    msg.sender,
-                    reply_target,
-                );
-                if let Err(e) = run_family_command(
-                    &workgraph_dir,
-                    &route_config,
-                    cmd,
-                    &reply_target,
-                    true,
-                    &msg.channel,
-                )
-                .await
+            // Reached only when election stripped a leading mention off the
+            // front — and by Fix (2) an @mention/name election OWNS the message:
+            // it addresses an agent, so the agent converses rather than a command
+            // racing the election. `gate.family` is keyed off the offset-0 slash
+            // entity of the ORIGINAL message, so a mention-prefixed body never
+            // qualifies here; a bare `/shopping` was already handled pre-election.
+            if gate.family {
+                if let Some(cmd) =
+                    worksgood::notify::telegram_family_commands::match_command(&route_body)
                 {
-                    eprintln!("Failed to run command {}: {e}", cmd.keyword);
+                    println!(
+                        "[{}] Command {} from {} (post-mention) -> {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        cmd.keyword,
+                        msg.sender,
+                        reply_target,
+                    );
+                    if let Err(e) = run_family_command(
+                        &workgraph_dir,
+                        &route_config,
+                        cmd,
+                        &reply_target,
+                        true,
+                        &msg.channel,
+                    )
+                    .await
+                    {
+                        eprintln!("Failed to run command {}: {e}", cmd.keyword);
+                    }
+                    continue;
                 }
-                continue;
             }
 
-            // Try to parse as a command
-            if let Some(cmd) = worksgood::telegram_commands::parse(&route_body) {
+            // Operator WG command reference (claim/done/fail/status/ready/help).
+            // This is COORDINATOR content — backticks and wg vocabulary — and it
+            // must NEVER surface in a family group (`fix-command-leaks`: a bare
+            // `?` fired the operator HELP and dumped the claim/done reference into
+            // the family chat). `gate.operator` runs it ONLY in a 1:1 operator DM
+            // and ONLY for a genuine slash command. In a group the election above
+            // owns the message and the conversational composer answers.
+            let operator_cmd = if gate.operator {
+                worksgood::telegram_commands::parse(&route_body)
+            } else {
+                None
+            };
+            if let Some(cmd) = operator_cmd {
                 println!(
                     "[{}] Command from {}: {}",
                     chrono::Utc::now().format("%H:%M:%S"),
@@ -1056,6 +1115,120 @@ pub fn run_elect(
     Ok(())
 }
 
+/// `wg telegram decide` — run the listener's command-vs-election decision on a
+/// raw Telegram update, without sending anything.
+///
+/// Feeds the raw `getUpdates` element through the SAME boundary the live
+/// listener uses: [`decode_update`] (which reads the Telegram entities so a
+/// bare `?` is distinguished from a real `/help`), then [`command_gate`] and
+/// [`elect_responders`]. Prints the decision — is it a command, and if not, who
+/// the election routes it to. This is the `fix-command-leaks` proof: a bare `?`
+/// or `@mention ?` must decide `conversation` with ZERO commands and never
+/// touch the operator claim/done path.
+pub fn run_decide(update: &str, json: bool) -> Result<()> {
+    let raw = if let Some(path) = update.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read update fixture {path}"))?
+    } else {
+        update.to_string()
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).context("update is not valid JSON")?;
+
+    let msg = match worksgood::notify::telegram::decode_update(&value, "telegram") {
+        Some(m) => m,
+        None => {
+            if json {
+                println!("{}", serde_json::json!({ "decision": "ignored" }));
+            } else {
+                println!("ignored — not a text message or button press");
+            }
+            return Ok(());
+        }
+    };
+
+    let gate = command_gate(&msg);
+
+    // If the message is a genuine slash command, that's the decision — report
+    // which command path (family vs operator) and, for a family command, which
+    // one it matches. Otherwise fall through to the election.
+    if gate.family || gate.operator {
+        let family = family_commands::match_command(&msg.body);
+        let (kind, name) = if let Some(cmd) = family {
+            ("family_command", Some(cmd.keyword.to_string()))
+        } else if gate.operator {
+            match worksgood::telegram_commands::parse(&msg.body) {
+                Some(cmd) => ("operator_command", Some(cmd.description())),
+                None => ("conversation", None),
+            }
+        } else {
+            ("conversation", None)
+        };
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "decision": kind,
+                    "command": name,
+                    "has_bot_command": msg.has_bot_command,
+                })
+            );
+        } else {
+            println!(
+                "{} ({}) — has_bot_command={}",
+                kind,
+                name.as_deref().unwrap_or("-"),
+                msg.has_bot_command,
+            );
+        }
+        return Ok(());
+    }
+
+    // Not a command — this is conversation. Run the exact election the listener
+    // would, so the diagnostic proves an addressed `@mention ?` routes to the
+    // agent (converses) rather than firing a command.
+    let config = load_telegram_config()?;
+    let election = elect_responders(
+        msg.chat_type.as_deref(),
+        msg.chat_id.as_deref(),
+        &msg.body,
+        &msg.mention_usernames,
+        msg.reply_to_bot.as_deref(),
+        msg.sender_is_bot,
+        &config,
+    );
+    let (elected, addressed_by): (Option<String>, Option<String>) = match &election {
+        Election::One { bot, addressed_by, .. } => (
+            bot.agent_id.clone().or_else(|| Some(bot.bot_id.clone())),
+            Some(addressed_by.to_string()),
+        ),
+        Election::All { .. } => (Some("roster".to_string()), None),
+        Election::Private => (None, None),
+        Election::Silence(reason) => (None, Some(reason.to_string())),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "decision": "conversation",
+                "command": serde_json::Value::Null,
+                "has_bot_command": msg.has_bot_command,
+                "elected": elected,
+                "addressed_by": addressed_by,
+            })
+        );
+    } else {
+        println!(
+            "conversation — no command; elected={} (by {}), has_bot_command={}",
+            elected.as_deref().unwrap_or("(silence/1:1)"),
+            addressed_by.as_deref().unwrap_or("-"),
+            msg.has_bot_command,
+        );
+    }
+    Ok(())
+}
+
 /// `wg telegram classify` — show how the listener would CLASSIFY an inbound
 /// (non-command, non-button) message once it has survived dedupe + election,
 /// without sending anything.
@@ -1461,6 +1634,25 @@ pub async fn run_family_command(
     }
 
     let text = compose_family_reply(workgraph_dir, config, cmd);
+
+    // Family-voice gate: a command reply bound for a family chat must never
+    // carry coordinator content (markdown backticks or the WG claim/done
+    // vocabulary). The compose fns are already family-voice; this is the
+    // defensive brace that makes a regression loud instead of silent. See
+    // `fix-command-leaks`.
+    if !family_commands::is_family_voice(&text) {
+        eprintln!(
+            "[{}] REFUSING to send non-family-voice {} reply (contains operator vocabulary/backticks)",
+            chrono::Utc::now().format("%H:%M:%S"),
+            cmd.keyword,
+        );
+        debug_assert!(
+            family_commands::is_family_voice(&text),
+            "{} composed a non-family-voice reply: {text:?}",
+            cmd.keyword,
+        );
+        return Ok(());
+    }
 
     // Which bot sends: in a group, the command's owner; in a 1:1, the bot the
     // user actually messaged (mapped from its channel_type). Fall back to the
@@ -2305,6 +2497,7 @@ async fn poll_once(
                     chat_type: None,
                     mention_usernames: Vec::new(),
                     reply_to_bot: None,
+                    has_bot_command: false,
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -2352,6 +2545,9 @@ async fn poll_once(
                 );
                 let reply_to_bot =
                     worksgood::notify::telegram_group::reply_to_bot_username(message);
+                let has_bot_command = worksgood::notify::telegram_group::has_leading_bot_command(
+                    message.get("entities").unwrap_or(&serde_json::Value::Null),
+                );
 
                 let msg = worksgood::notify::IncomingMessage {
                     channel: "telegram".to_string(),
@@ -2367,6 +2563,7 @@ async fn poll_once(
                     chat_type,
                     mention_usernames,
                     reply_to_bot,
+                    has_bot_command,
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -2478,6 +2675,53 @@ mod tests {
 
     fn ts() -> chrono::DateTime<chrono::Utc> {
         "2026-07-10T12:00:00Z".parse().unwrap()
+    }
+
+    // --- command_gate (fix-command-leaks) ---------------------------------
+
+    fn gate_msg(chat_type: &str, has_bot_command: bool) -> worksgood::notify::IncomingMessage {
+        worksgood::notify::IncomingMessage {
+            channel: "telegram".to_string(),
+            sender: "luca".to_string(),
+            sender_id: Some("8905220378".to_string()),
+            sender_is_bot: false,
+            sent_at: None,
+            body: "?".to_string(),
+            action_id: None,
+            reply_to: None,
+            message_id: Some("1".to_string()),
+            chat_id: Some("-100".to_string()),
+            chat_type: Some(chat_type.to_string()),
+            mention_usernames: Vec::new(),
+            reply_to_bot: None,
+            has_bot_command,
+        }
+    }
+
+    #[test]
+    fn command_gate_blocks_non_slash_everywhere() {
+        // Punctuation / chatter (no bot_command) is never a command — the leak.
+        let g = command_gate(&gate_msg("supergroup", false));
+        assert!(!g.family && !g.operator, "no slash entity → no command");
+        let g = command_gate(&gate_msg("private", false));
+        assert!(!g.family && !g.operator, "no slash entity → no command in DM either");
+    }
+
+    #[test]
+    fn command_gate_operator_reference_never_in_a_group() {
+        // Even a genuine slash command in a family GROUP must NOT open the
+        // operator claim/done path — that content is coordinator-only.
+        let g = command_gate(&gate_msg("supergroup", true));
+        assert!(g.family, "a real /command still runs the family set in a group");
+        assert!(!g.operator, "the operator WG reference must never surface in a group");
+    }
+
+    #[test]
+    fn command_gate_operator_only_in_private_slash() {
+        // A 1:1 operator DM with a real slash command is the only place the
+        // operator reference may run.
+        let g = command_gate(&gate_msg("private", true));
+        assert!(g.operator, "operator reference is allowed in a 1:1 slash command");
     }
 
     /// Record an unconfirmed binding exactly as `wg agency human add` would,

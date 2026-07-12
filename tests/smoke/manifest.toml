@@ -2051,6 +2051,15 @@ description = "Pins the family command set from docs/09 §commands: each command
 timeout_seconds = 30
 
 [[scenario]]
+name = "telegram_command_leaks"
+script = "scenarios/telegram_command_leaks.sh"
+owners = [
+    "fix-command-leaks",
+]
+description = "Pins the command-vs-conversation boundary that Luca hit live (screenshot + listener log 02:28:15): he sent '@nora_casapinello_bot ?' in the group and the bare '?' was parsed as an operator HELP command, dumping the RAW WG claim/done/status reference (coordinator content) into the family chat and OVERRIDING the mention election that had already targeted nora. Drives the real binary via `wg telegram decide` — the same decode_update (reads Telegram entities) + command_gate + elect_responders decision the live `wg telegram listen` listener makes on a raw getUpdates element — and proves: (1) '@nora ?' → conversation elected to nora with ZERO commands (the reported bug), (2) a bare '?' → conversation, no command (punctuation is never a command), (3) the bareword 'help' → conversation, no command (every non-slash operator trigger is killed), (4) a genuine '/help' (bot_command entity at offset 0) → the FAMILY command, never the operator reference, and (5) '@otto /shopping' → conversation elected to otto (the mention election owns a message; a slash command after a mention is not a leading command). Also pinned by the notify::telegram_group has_leading_bot_command tests, the notify::telegram decode_update entity tests, the commands::telegram command_gate tests, and the notify::telegram_family_commands family-voice gate test. Credential-free: `decide` is a pure decision, nothing is sent, no live group or real tokens needed."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_conversation"
 script = "scenarios/telegram_conversation.sh"
 owners = [

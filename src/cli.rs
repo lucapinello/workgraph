@@ -6633,6 +6633,22 @@ pub enum TelegramCommands {
         #[arg(long)]
         message: String,
     },
+
+    /// Decide command-vs-election for a raw Telegram update, as the listener would
+    ///
+    /// Feeds a raw `getUpdates` element through the SAME boundary the
+    /// `wg telegram listen` listener uses — `decode_update` (which reads the
+    /// Telegram entities), then the `command_gate` (is this a genuine slash
+    /// command?) and `elect_responders` (who answers) — and prints the decision
+    /// WITHOUT sending anything. This is the `fix-command-leaks` diagnostic: a
+    /// bare `?` or an `@mention ?` must decide `conversation` with ZERO commands
+    /// and never leak the operator claim/done reference; a real `/help` must
+    /// decide the family command. Reads bots from the current project's
+    /// `notify.toml`.
+    Decide {
+        /// The raw update JSON, inline or `@path/to/update.json` to read a file.
+        update: String,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

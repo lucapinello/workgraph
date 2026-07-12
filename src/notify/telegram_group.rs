@@ -73,6 +73,29 @@ pub fn parse_mention_usernames(text: &str, entities: &serde_json::Value) -> Vec<
     out
 }
 
+/// True when the message carries a Telegram `bot_command` entity at **offset 0**
+/// — i.e. it opens with a genuine `/slash` command.
+///
+/// Telegram only tags an actual leading `/command` token with a `bot_command`
+/// entity; ordinary chatter, a bare `?`, or any other punctuation carries none.
+/// This is the single load-bearing signal the listener uses to decide "is this a
+/// command at all": a message is only ever treated as a command when this is
+/// true (see `fix-command-leaks` — a bare `?` was being parsed as an operator
+/// HELP command and leaked the WG claim/done reference into the family group).
+///
+/// `entities` is the raw JSON array from the update's `message.entities`
+/// (or `null`/absent, in which case the result is `false`).
+pub fn has_leading_bot_command(entities: &serde_json::Value) -> bool {
+    let arr = match entities.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    arr.iter().any(|ent| {
+        ent.get("type").and_then(|t| t.as_str()) == Some("bot_command")
+            && ent.get("offset").and_then(|o| o.as_u64()) == Some(0)
+    })
+}
+
 /// Extract `@handle` mention tokens from a plain text string, the way the
 /// `wg telegram elect` / `route` / `classify` diagnostics approximate the live
 /// listener (which reads them from Telegram `mention` entities via
@@ -1053,6 +1076,41 @@ mod tests {
     use super::*;
     use crate::notify::telegram::TelegramBotConfig;
     use std::collections::HashMap;
+
+    // --- has_leading_bot_command (fix-command-leaks) ----------------------
+
+    #[test]
+    fn bot_command_at_offset_zero_is_a_command() {
+        // A genuine `/help` — Telegram tags it with a bot_command entity at 0.
+        let entities = serde_json::json!([{ "type": "bot_command", "offset": 0, "length": 5 }]);
+        assert!(has_leading_bot_command(&entities));
+    }
+
+    #[test]
+    fn bare_punctuation_is_not_a_command() {
+        // The reported leak: `?` (and any punctuation) carries NO entity, so it
+        // must never be treated as a command.
+        assert!(!has_leading_bot_command(&serde_json::Value::Null));
+        assert!(!has_leading_bot_command(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn a_mention_is_not_a_command() {
+        // `@nora_casapinello_bot ?` — a mention entity, but no bot_command.
+        let entities = serde_json::json!([{ "type": "mention", "offset": 0, "length": 21 }]);
+        assert!(!has_leading_bot_command(&entities));
+    }
+
+    #[test]
+    fn bot_command_after_a_mention_is_not_at_offset_zero() {
+        // `@otto /shopping` — the slash command sits after the mention, so it is
+        // NOT a leading command; by Fix (2) the @mention election owns it.
+        let entities = serde_json::json!([
+            { "type": "mention", "offset": 0, "length": 5 },
+            { "type": "bot_command", "offset": 6, "length": 9 },
+        ]);
+        assert!(!has_leading_bot_command(&entities));
+    }
 
     fn cfg_with_bots(bots: &[(&str, &str, Option<&str>, Option<&str>)]) -> TelegramConfig {
         // (bot_id, chat_id, agent_id, username)

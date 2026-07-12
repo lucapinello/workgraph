@@ -695,8 +695,9 @@ impl PollBackoffState {
 ///
 /// Extracted from the poll loop so the single-bot and multi-bot pollers share
 /// exactly one decoder — the two must never diverge in how they parse a
-/// button press vs. a group @mention.
-fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<IncomingMessage> {
+/// button press vs. a group @mention. Public so the `wg telegram decide`
+/// diagnostic can run the SAME parse the live listener uses on a raw update.
+pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<IncomingMessage> {
     // Handle callback queries (button presses)
     if let Some(cb) = update.get("callback_query") {
         // Sender identity (id + username + is_bot), read once at the boundary so
@@ -751,6 +752,8 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
             chat_type,
             mention_usernames: Vec::new(),
             reply_to_bot: None,
+            // A button press is an action, not a slash command.
+            has_bot_command: false,
         });
     }
 
@@ -800,6 +803,12 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
             message.get("text").and_then(|t| t.as_str()).unwrap_or(""),
             message.get("entities").unwrap_or(&serde_json::Value::Null),
         );
+        // A genuine leading `/slash` command carries a `bot_command` entity at
+        // offset 0 — the ONLY signal we treat as "this is a command". A bare `?`
+        // or ordinary chatter has none. See `fix-command-leaks`.
+        let has_bot_command = super::telegram_group::has_leading_bot_command(
+            message.get("entities").unwrap_or(&serde_json::Value::Null),
+        );
         // Reply-chain: if this replies to a bot's own message,
         // name that bot so the reply routes to its agent.
         let reply_to_bot = super::telegram_group::reply_to_bot_username(message);
@@ -818,6 +827,7 @@ fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<Incomi
             chat_type,
             mention_usernames,
             reply_to_bot,
+            has_bot_command,
         });
     }
 
@@ -1159,6 +1169,46 @@ agent_id = "nora"
 
         let as_mira = decode_update(&update, "telegram:mira").unwrap();
         assert_eq!(as_mira.channel, "telegram:mira");
+        // A plain @mention is NOT a slash command — `fix-command-leaks`.
+        assert!(!as_bruno.has_bot_command);
+    }
+
+    #[test]
+    fn decode_update_flags_leading_slash_command() {
+        // A genuine `/help` carries a bot_command entity at offset 0 → the ONLY
+        // signal the listener treats as a command (fix-command-leaks).
+        let update = serde_json::json!({
+            "update_id": 101,
+            "message": {
+                "message_id": 8,
+                "from": { "id": 8905220378_i64, "username": "luca" },
+                "chat": { "id": -1001, "type": "supergroup" },
+                "text": "/help",
+                "entities": [ { "type": "bot_command", "offset": 0, "length": 5 } ]
+            }
+        });
+        let msg = decode_update(&update, "telegram:otto").unwrap();
+        assert!(msg.has_bot_command, "/help is a leading slash command");
+    }
+
+    #[test]
+    fn decode_update_bare_question_mark_is_not_a_command() {
+        // The exact reported leak: `@nora_casapinello_bot ?` — a mention entity,
+        // NO bot_command — must NOT be flagged as a command, so it can never fire
+        // the operator HELP path and leak the WG claim/done reference.
+        let update = serde_json::json!({
+            "update_id": 102,
+            "message": {
+                "message_id": 9,
+                "from": { "id": 8905220378_i64, "username": "luca" },
+                "chat": { "id": -1001, "type": "supergroup" },
+                "text": "@nora_casapinello_bot ?",
+                "entities": [ { "type": "mention", "offset": 0, "length": 21 } ]
+            }
+        });
+        let msg = decode_update(&update, "telegram:nora").unwrap();
+        assert!(!msg.has_bot_command, "a bare `?` after a mention is conversation");
+        assert_eq!(msg.mention_usernames, vec!["nora_casapinello_bot".to_string()]);
     }
 
     #[test]
