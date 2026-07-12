@@ -3717,6 +3717,21 @@ fn main() -> Result<()> {
                 compose_error,
                 cli.json,
             ),
+            TelegramCommands::Remind {
+                list,
+                dry_run,
+                add,
+                recipient,
+                now,
+            } => commands::telegram::run_remind(
+                &workgraph_dir,
+                list,
+                dry_run,
+                add.as_deref(),
+                recipient.as_deref(),
+                now.as_deref(),
+                cli.json,
+            ),
             TelegramCommands::FeedWrite {
                 root,
                 kind,

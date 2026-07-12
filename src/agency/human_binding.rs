@@ -133,6 +133,15 @@ impl TelegramBindingMap {
         self.bindings.iter().find(|b| b.agent_id == agent_id)
     }
 
+    /// Find a binding by human display `name`, case-insensitively — how the
+    /// reminder engine resolves a plan row's recipient ("Luca") to the chat/bot
+    /// that reaches them.
+    pub fn find_by_name_ci(&self, name: &str) -> Option<&TelegramBinding> {
+        self.bindings
+            .iter()
+            .find(|b| b.name.eq_ignore_ascii_case(name))
+    }
+
     /// Resolve an inbound sender to its binding by trying, in order of
     /// reliability: the numeric Telegram **user id**, then the **@username**
     /// (both the bare handle and the `@`-prefixed form the operator may have

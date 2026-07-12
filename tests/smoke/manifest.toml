@@ -2142,3 +2142,12 @@ owners = [
 ]
 description = "Pins the bot→agent roster binding (task dedupe-key-fix): the group election logged `target=otto(unbound)` because the live notify.toml set no per-bot `agent_id`, so `TelegramBotConfig.agent_id` defaulted to None and the election decision summary rendered every bot as `<bot_id>(unbound)` (routing still worked via the bot_id fallback — the symptom was a misleading diagnostic, and the separate per-persona chat SESSION bindings were intact). Drives the real binary via `wg telegram list-bots` (the same config load the listener performs): with `agent_id` set, every bot reports its bound agent and the concierge election resolves the bound voice; with `agent_id` absent, the bot is honestly reported as shared/unbound so a future regression that stops reading `agent_id` is caught. No token body ever leaks. Credential-free: config load + election are pure decisions; nothing is sent."
 timeout_seconds = 30
+
+[[scenario]]
+name = "reminders_engine_fire_exactly_once"
+script = "scenarios/reminders_engine_fire_exactly_once.sh"
+owners = [
+    "reminders-that-reach",
+]
+description = "Pins the reminder engine (task reminders-that-reach): the weekly plan's `## 3. Calendar` reminder rows (`⏰ Reminder: Luca PT check-in`) and ad-hoc 'remind me Thursday to …' asks become scheduled DMs that fire EXACTLY once, restart-safe, with a `(late)` honesty window. Drives the real binary via `wg telegram remind` (the credential-free scheduler seam, same pattern as `wg telegram elect`/`feed-write`): a plan row lists as one pending reminder; at its due minute it WOULD SEND on time, 40 min late it fires with the honest `(late)` tag, and over 2h late it is DROPPED rather than firing a stale nag; an ad-hoc request registers to `.casa/reminders-adhoc.json` and confirms in one line ('Will do — Thursday morning ✓'); a real fire records durable state in `.casa/reminders-state.json` BEFORE sending so a restart never re-fires (exactly once). Complements the notify::reminder unit tests (parse/fire/exactly-once/restart/late). Credential-free: no notify.toml, so nothing is sent — state files prove intent."
+timeout_seconds = 30

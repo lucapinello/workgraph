@@ -52,6 +52,29 @@ pub struct ShoppingSection {
     pub items: Vec<String>,
 }
 
+/// One row of the `## 3. Calendar` projection table.
+///
+/// The calendar merges cook slots, sessions, and standing events — and, crucially
+/// for the reminder engine, any **reminder rows** the family drafts, e.g.
+/// `| Tue 07-14 | 19:30 | ⏰ Reminder: Luca PT check-in (if unanswered) | Otto |`.
+/// The engine ([`crate::notify::reminder`]) reads these rows and fires the ones
+/// shaped like reminders at their `date`+`time`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarEvent {
+    /// Three-letter weekday as written, e.g. `"Tue"`.
+    pub weekday: String,
+    /// Concrete date resolved from the `MM-DD` day cell against the plan year.
+    /// `None` when the cell could not be parsed.
+    pub date: Option<NaiveDate>,
+    /// Clock time as written in the Time column, e.g. `"19:30"` (may be empty).
+    pub time: String,
+    /// The Event column text, emoji kept, markdown stripped, e.g.
+    /// `"⏰ Reminder: Luca PT check-in (if unanswered)"`.
+    pub event: String,
+    /// The Source column, e.g. `"Otto"` — which voice owns the row.
+    pub source: String,
+}
+
 /// One workout session from a person's workout table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkoutDay {
@@ -81,6 +104,8 @@ pub struct PlanDoc {
     pub shopping: Vec<ShoppingSection>,
     /// Workout sessions, in document order.
     pub workouts: Vec<WorkoutDay>,
+    /// Calendar projection rows, in document order (source of reminder rows).
+    pub calendar: Vec<CalendarEvent>,
 }
 
 /// Which `## N.` section the scanner is currently inside.
@@ -90,6 +115,7 @@ enum Section {
     Meals,
     Shopping,
     Workouts,
+    Calendar,
     Other,
 }
 
@@ -139,6 +165,8 @@ impl PlanDoc {
                     Section::Shopping
                 } else if low.contains("workout") {
                     Section::Workouts
+                } else if low.contains("calendar") {
+                    Section::Calendar
                 } else {
                     Section::Other
                 };
@@ -191,6 +219,25 @@ impl PlanDoc {
                     if let Some(item) = line.strip_prefix("- ") {
                         if let Some(sec) = doc.shopping.last_mut() {
                             sec.items.push(strip_md(item.trim()));
+                        }
+                    }
+                }
+                Section::Calendar => {
+                    if let Some(cells) = table_row(line) {
+                        // Columns: Day | Time | Event | Source
+                        if cells.len() >= 3 && !is_header_or_rule(&cells) {
+                            let (weekday, date) = parse_day_cell(&cells[0], year);
+                            if !weekday.is_empty() {
+                                doc.calendar.push(CalendarEvent {
+                                    weekday,
+                                    date,
+                                    time: strip_md(&cells[1]),
+                                    event: strip_md(&cells[2]),
+                                    source: strip_md(
+                                        cells.get(3).map(|s| s.as_str()).unwrap_or(""),
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -489,6 +536,25 @@ mod tests {
             .find(|w| w.person == "Luca" && w.weekday == "Mon")
             .expect("luca monday");
         assert!(luca_mon.session.contains("Lower"));
+    }
+
+    #[test]
+    fn parses_calendar_events_including_reminder_row() {
+        let doc = PlanDoc::parse("2026-W29", W29);
+        assert!(doc.calendar.len() >= 10, "calendar rows parsed");
+        // The reminder row is present with its time, event text, and source.
+        let rem = doc
+            .calendar
+            .iter()
+            .find(|e| e.event.contains("Reminder"))
+            .expect("the ⏰ Reminder row");
+        assert_eq!(rem.weekday, "Tue");
+        assert_eq!(rem.date, Some(date(2026, 7, 14)));
+        assert_eq!(rem.time, "19:30");
+        assert!(rem.event.contains("Luca PT check-in"), "got {}", rem.event);
+        assert_eq!(rem.source, "Otto");
+        // A plain cook row is a calendar event too, but not a reminder.
+        assert!(doc.calendar.iter().any(|e| e.event.contains("Cook:")));
     }
 
     #[test]

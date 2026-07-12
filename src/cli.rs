@@ -6643,6 +6643,40 @@ pub enum TelegramCommands {
         compose_error: bool,
     },
 
+    /// Drive the reminder engine: list, dry-run, register, or fire scheduled nudges
+    ///
+    /// Reads reminder-shaped rows from the current weekly plan's `## 3. Calendar`
+    /// table (`⏰ Reminder: …`) plus the ad-hoc store, and decides what to send at
+    /// `--now`. `--list` prints every known reminder with its fired/unfired state;
+    /// `--dry-run` prints what WOULD fire now without sending or recording (the
+    /// credential-free scripted-test seam); `--add "<remind me … >"` registers an
+    /// ad-hoc reminder and prints the one-line confirmation. With no flag it fires
+    /// due reminders for real — DMing each recipient via their bound bot, recording
+    /// each in `.casa/reminders-state.json` first so it fires exactly once.
+    Remind {
+        /// List all known reminders (plan + ad-hoc) with fired state, then exit.
+        #[arg(long)]
+        list: bool,
+
+        /// Show what WOULD fire at `--now` without sending or recording state.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Register an ad-hoc reminder from a natural request and print the
+        /// confirmation, e.g. `--add "remind me Thursday to defrost the trout"`.
+        #[arg(long)]
+        add: Option<String>,
+
+        /// Recipient display name for `--add` (defaults to the household default).
+        #[arg(long)]
+        recipient: Option<String>,
+
+        /// Override "now" as `YYYY-MM-DDTHH:MM` (local wall clock) for
+        /// deterministic tests; defaults to the system clock.
+        #[arg(long)]
+        now: Option<String>,
+    },
+
     /// Mirror one line to the casa conversation-pane feed (diagnostic)
     ///
     /// Appends a single line to `<root>/.casa/group-feed.jsonl` through the

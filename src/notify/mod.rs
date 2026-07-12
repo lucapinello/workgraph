@@ -15,6 +15,7 @@ pub mod meal_feedback;
 #[cfg(feature = "matrix-lite")]
 pub mod matrix;
 pub mod push;
+pub mod reminder;
 pub mod slack;
 pub mod sms;
 pub mod telegram;
