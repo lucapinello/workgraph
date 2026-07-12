@@ -3775,6 +3775,17 @@ fn main() -> Result<()> {
                 dry_run,
                 cli.json,
             ),
+            TelegramCommands::PhotoPlan {
+                update,
+                reply,
+                list,
+            } => commands::telegram::run_photo_plan(
+                &workgraph_dir,
+                &update,
+                reply.as_deref(),
+                list.as_deref(),
+                cli.json,
+            ),
         },
         Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),

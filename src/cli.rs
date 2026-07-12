@@ -6802,6 +6802,35 @@ pub enum TelegramCommands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Diagnose the PHOTO → shopping-list vision pipeline WITHOUT a network
+    ///
+    /// The credential-free scripted-test seam for task `photo-to-shopping`
+    /// (sibling of `wg telegram decide` / `elect`). Feeds a raw `getUpdates`
+    /// element — or a JSON ARRAY of them (an album) — through the SAME boundary
+    /// the listener uses: `decode_update` (photo `file_id`, caption, media
+    /// group), `coalesce_album` (one turn per album), then `elect_responders`
+    /// (who a captioned photo routes to). With `--reply` + `--list` it also
+    /// parses the model's `SHOPPING_UPDATE:` tail and prints the exact list
+    /// mutations that WOULD be applied through the gateway endpoints — proving
+    /// the vision→toggle/add mapping deterministically, without a bot or a
+    /// gateway. Nothing is downloaded and nothing is sent.
+    PhotoPlan {
+        /// The raw update JSON — a single object, or a JSON array (an album).
+        /// Inline, or `@path/to/update.json` to read a file.
+        update: String,
+
+        /// A fixture vision REPLY (the model's text, including the trailing
+        /// `SHOPPING_UPDATE: have=[…]; need=[…]` directive) to parse and plan.
+        /// When omitted, only routing + album coalescing are reported.
+        #[arg(long)]
+        reply: Option<String>,
+
+        /// The current shopping list as `GET /shopping.json` JSON (`{groups:[…]}`),
+        /// inline or `@path`. Defaults to an empty list.
+        #[arg(long)]
+        list: Option<String>,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking

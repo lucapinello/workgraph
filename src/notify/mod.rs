@@ -25,6 +25,7 @@ pub mod telegram_discussion;
 pub mod telegram_family_commands;
 pub mod telegram_group;
 pub mod telegram_pacing;
+pub mod telegram_photo;
 pub mod telegram_sender;
 pub mod telegram_standup;
 pub mod voice;
@@ -158,6 +159,19 @@ pub struct IncomingMessage {
     /// presses and transports that don't surface entities. See
     /// `telegram_group::has_leading_bot_command`.
     pub has_bot_command: bool,
+    /// If this message carried a **photo**, the Telegram `file_id` of the
+    /// largest rendered size (the last element of the `photo` size array). This
+    /// is the handle the listener passes to `getFile` to download the image for
+    /// a vision turn (see `telegram_photo`). `None` for text-only messages and
+    /// transports that don't surface photos. The `file_id` is opaque and safe to
+    /// log; the download URL (which embeds the bot token) is NEVER logged.
+    pub photo_file_id: Option<String>,
+    /// Telegram `media_group_id` when this message is one frame of an **album**
+    /// (several photos sent together share one id, arriving as separate
+    /// updates). The listener coalesces every frame of a group into a SINGLE
+    /// vision turn rather than answering each photo — see
+    /// `telegram_photo::coalesce_album`. `None` for a lone photo or text.
+    pub media_group_id: Option<String>,
 }
 
 /// Classification of notification events for routing.

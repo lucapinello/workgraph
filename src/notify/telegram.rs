@@ -341,6 +341,70 @@ impl TelegramChannel {
             .unwrap_or(0);
         MessageId(mid.to_string())
     }
+
+    /// Download a photo this bot received (`getFile` → GET the file URL) to
+    /// `dest`, enforcing a `max_file_size` byte cap BEFORE spending bandwidth.
+    /// The `file_id` is bot-specific, so this MUST be called on the channel of
+    /// the bot that received the photo. Both URLs embed the bot token, so any
+    /// transport error is scrubbed through [`redact_bot_token`] before it can be
+    /// returned/logged — the token never leaks.
+    pub async fn download_photo_to(
+        &self,
+        file_id: &str,
+        dest: &std::path::Path,
+        max_file_size: u64,
+    ) -> Result<()> {
+        // 1. Resolve the on-server file path (and its declared size).
+        let resp = self
+            .api_call("getFile", &serde_json::json!({ "file_id": file_id }))
+            .await?;
+        let result = resp.get("result").context("getFile: no result")?;
+        if let Some(size) = result.get("file_size").and_then(|s| s.as_u64()) {
+            if size > max_file_size {
+                anyhow::bail!("photo {size} bytes exceeds max file size {max_file_size}");
+            }
+        }
+        let file_path = result
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .context("getFile: result missing file_path")?;
+
+        // 2. Download the bytes (scrub the token from any transport error).
+        let file_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot.bot_token, file_path
+        );
+        let bytes = self
+            .client
+            .get(&file_url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(redact_bot_token(&format!("{e:#}"))))?
+            .bytes()
+            .await
+            .map_err(|e| anyhow::anyhow!(redact_bot_token(&format!("{e:#}"))))?;
+
+        if bytes.len() as u64 > max_file_size {
+            anyhow::bail!(
+                "downloaded photo {} bytes exceeds max file size {max_file_size}",
+                bytes.len()
+            );
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(dest, &bytes)
+            .with_context(|| format!("failed to write photo to {}", dest.display()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl super::telegram_photo::PhotoDownloader for TelegramChannel {
+    async fn download(&self, file_id: &str, dest: &std::path::Path) -> Result<()> {
+        let max = super::telegram_photo::PhotoLimits::default().max_file_size;
+        self.download_photo_to(file_id, dest, max).await
+    }
 }
 
 #[async_trait]
@@ -612,7 +676,7 @@ pub(crate) fn build_poll_client() -> reqwest::Client {
 /// already present in the line — untouched. Token-free strings pass through
 /// unchanged. Route EVERY error string that can carry an API URL through here
 /// before logging (poll loop, send/edit paths, `getMe`, `setMyCommands`).
-pub(crate) fn redact_bot_token(s: &str) -> String {
+pub fn redact_bot_token(s: &str) -> String {
     // Telegram tokens are `<digits>:<35+ url-safe base64 chars>`; in an API URL
     // they follow the literal `bot` path segment. Match that shape so a real
     // token is redacted while the bot NAME (e.g. `telegram:otto`) — which has
@@ -784,6 +848,9 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             reply_to_bot: None,
             // A button press is an action, not a slash command.
             has_bot_command: false,
+            // A button press carries no photo.
+            photo_file_id: None,
+            media_group_id: None,
         });
     }
 
@@ -796,11 +863,27 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
         let identity = super::telegram_sender::identity_from_message(message);
         let sender = identity.display();
 
+        // A photo message carries no `text`; its human-typed words (if any) ride
+        // in `caption`. Treat the caption as the body so a captioned photo routes
+        // exactly like text — `bruno what do we still need?` on a fridge photo
+        // elects Bruno by the same name/mention rules. Prefer `text` when present
+        // (a message is never both), else fall back to `caption`.
         let body = message
             .get("text")
             .and_then(|t| t.as_str())
+            .or_else(|| message.get("caption").and_then(|c| c.as_str()))
             .unwrap_or("")
             .to_string();
+
+        // Photo intake: Telegram sends an array of rendered sizes, smallest
+        // first. The last element is the largest; its `file_id` is the download
+        // handle. A message without a `photo` array is text/other. See
+        // `super::telegram_photo`.
+        let photo_file_id = super::telegram_photo::largest_photo_file_id(message);
+        let media_group_id = message
+            .get("media_group_id")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string());
 
         let reply_to = message
             .get("reply_to_message")
@@ -829,16 +912,19 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             .and_then(|c| c.get("type"))
             .and_then(|t| t.as_str())
             .map(|s| s.to_string());
-        let mention_usernames = super::telegram_group::parse_mention_usernames(
-            message.get("text").and_then(|t| t.as_str()).unwrap_or(""),
-            message.get("entities").unwrap_or(&serde_json::Value::Null),
-        );
+        // A photo carries its words + entities under `caption`/`caption_entities`
+        // instead of `text`/`entities`; fall back to those so a captioned photo's
+        // @mention and leading-command signals parse identically to text.
+        let entities = message
+            .get("entities")
+            .or_else(|| message.get("caption_entities"))
+            .unwrap_or(&serde_json::Value::Null);
+        let mention_usernames =
+            super::telegram_group::parse_mention_usernames(&body, entities);
         // A genuine leading `/slash` command carries a `bot_command` entity at
         // offset 0 — the ONLY signal we treat as "this is a command". A bare `?`
         // or ordinary chatter has none. See `fix-command-leaks`.
-        let has_bot_command = super::telegram_group::has_leading_bot_command(
-            message.get("entities").unwrap_or(&serde_json::Value::Null),
-        );
+        let has_bot_command = super::telegram_group::has_leading_bot_command(entities);
         // Reply-chain: if this replies to a bot's own message,
         // name that bot so the reply routes to its agent.
         let reply_to_bot = super::telegram_group::reply_to_bot_username(message);
@@ -858,6 +944,8 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             mention_usernames,
             reply_to_bot,
             has_bot_command,
+            photo_file_id,
+            media_group_id,
         });
     }
 
@@ -1298,6 +1386,58 @@ agent_id = "nora"
         assert_eq!(msg.action_id.as_deref(), Some("approve:my-task"));
         assert_eq!(msg.body, "approve:my-task");
         assert_eq!(msg.chat_id.as_deref(), Some("555"));
+    }
+
+    #[test]
+    fn decode_update_photo_populates_file_id_caption_and_group() {
+        // A captioned photo (task photo-to-shopping): the caption becomes the
+        // body so it routes like text, the largest size's file_id is captured,
+        // and the media_group_id + caption @mention/command parse from the
+        // caption fields (not the text/entities fields, which a photo lacks).
+        let update = serde_json::json!({
+            "update_id": 400,
+            "message": {
+                "message_id": 58,
+                "from": { "id": 8905220378_i64, "username": "luca" },
+                "chat": { "id": -1001, "type": "supergroup" },
+                "media_group_id": "AG9",
+                "caption": "@bruno_casapinello_bot what do we still need?",
+                "caption_entities": [ { "type": "mention", "offset": 0, "length": 22 } ],
+                "photo": [
+                    { "file_id": "thumb", "width": 90, "height": 60, "file_size": 900 },
+                    { "file_id": "biggest", "width": 1280, "height": 720, "file_size": 90000 }
+                ]
+            }
+        });
+        let msg = decode_update(&update, "telegram:bruno").unwrap();
+        assert_eq!(msg.photo_file_id.as_deref(), Some("biggest"), "largest size chosen");
+        assert_eq!(msg.media_group_id.as_deref(), Some("AG9"));
+        assert_eq!(msg.body, "@bruno_casapinello_bot what do we still need?", "caption is the body");
+        assert_eq!(
+            msg.mention_usernames,
+            vec!["bruno_casapinello_bot".to_string()],
+            "caption @mention parsed from caption_entities"
+        );
+        assert!(!msg.has_bot_command, "a captioned photo is conversation, not a command");
+    }
+
+    #[test]
+    fn decode_update_text_message_has_no_photo() {
+        // A plain text message carries no photo fields — the photo branch must
+        // never fabricate one.
+        let update = serde_json::json!({
+            "update_id": 401,
+            "message": {
+                "message_id": 7,
+                "from": { "id": 1_i64, "username": "luca" },
+                "chat": { "id": -1001, "type": "supergroup" },
+                "text": "hey bruno"
+            }
+        });
+        let msg = decode_update(&update, "telegram:bruno").unwrap();
+        assert!(msg.photo_file_id.is_none());
+        assert!(msg.media_group_id.is_none());
+        assert_eq!(msg.body, "hey bruno");
     }
 
     #[test]

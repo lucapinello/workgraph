@@ -2125,6 +2125,15 @@ description = "Pins task web-chat-first: a message typed in the casa kiosk conve
 timeout_seconds = 30
 
 [[scenario]]
+name = "telegram_photo_shopping"
+script = "scenarios/telegram_photo_shopping.sh"
+owners = [
+    "photo-to-shopping",
+]
+description = "Pins task photo-to-shopping (snap the fridge, Bruno adjusts the pickup list): a PHOTO sent to a persona is a vision turn that updates the shared shopping list. Drives the real binary via `wg telegram photo-plan` (the credential-free, network-free scripted-test seam, sibling of `wg telegram decide`/`elect`) which decodes a raw getUpdates element through the SAME `decode_update` boundary the listener uses (largest photo file_id, caption-as-body, media_group_id), coalesces album frames via `coalesce_album` (one vision turn per album — no loops), runs the real `elect_responders` decision on the caption, and — with a fixture `--reply` + `--list` — parses the model's `SHOPPING_UPDATE: have=[…]; need=[…]` structured tail and prints the exact gateway mutations that WOULD apply. Asserts: (1) a captioned fridge photo ('bruno what do we still need?') decodes as a photo, picks the largest frame, and elects Bruno by name; (2) three frames sharing a media_group_id collapse to ONE turn carrying all frames + the album caption; (3) the vision tail maps deterministically to endpoint calls — cross off what we already have (Chickpeas → POST /shopping/toggle checked=true), add what's missing (chard → POST /shopping/add), leave an already-listed uncrossed item alone (Lemons), restore a crossed-off needed item (Milk → toggle checked=false) — and the machine marker is stripped from the family-facing reply; (4) a non-photo update yields no photo turn and an uncaptioned/unaddressed photo falls to the concierge (Otto) under the same election rules, never name-routed to Bruno. The fixture image (fixtures/fridge_photo.png) is asserted to be a real PNG — the payload a live vision turn download-and-attaches. Credential-free: nothing is downloaded and nothing is sent; the download/vision/HTTP seams (`PhotoDownloader`/`VisionComposer`/`ShoppingGateway`) are proven by the notify::telegram_photo unit tests with fakes."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_group_reply_tuning"
 script = "scenarios/telegram_group_reply_tuning.sh"
 owners = [

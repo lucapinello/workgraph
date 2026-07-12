@@ -473,6 +473,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         let mut pending_founding: std::collections::HashMap<String, PendingFounding> =
             std::collections::HashMap::new();
 
+        // Album coalescing for photo → shopping (task photo-to-shopping): the
+        // FIRST frame of a Telegram album (all frames share a `media_group_id`)
+        // fires ONE vision turn; every later frame of the same group is dropped
+        // here so six fridge photos never fire six turns/replies. A lone photo
+        // carries no group id and is never suppressed.
+        let mut answered_media_groups: HashSet<String> = HashSet::new();
+
         while let Some(msg) = rx.recv().await {
             // Fix #0 — the bot-loop guard, FIRST (before dedupe, feed mirror,
             // commands, and election). The family bots run as group admins, so
@@ -1180,6 +1187,59 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             plan.route().bot_id,
                             plan.kind_label(),
                         );
+
+                        // PHOTO → SHOPPING (task photo-to-shopping). An inbound
+                        // PHOTO that has elected to a persona is a VISION turn, not
+                        // a text compose: Bruno (or whoever was named) looks at the
+                        // fridge and adjusts the pickup list. Two hard limits:
+                        //  · images only from CONFIRMED humans — a stranger's photo
+                        //    is never downloaded or fed to the model;
+                        //  · one turn per album — the first frame of a media group
+                        //    fires; later frames are dropped (no loops on albums).
+                        if msg.photo_file_id.is_some() {
+                            if !sender_is_confirmed_human(&workgraph_dir, &msg) {
+                                println!(
+                                    "[{}] photo from unconfirmed sender {} — ignored",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    msg.sender,
+                                );
+                                continue;
+                            }
+                            if let Some(gid) = msg.media_group_id.as_deref() {
+                                if !answered_media_groups.insert(gid.to_string()) {
+                                    println!(
+                                        "[{}] album frame (group {}) — already answering, dropped",
+                                        chrono::Utc::now().format("%H:%M:%S"),
+                                        gid,
+                                    );
+                                    continue;
+                                }
+                            }
+                            match handle_photo_shopping_turn(
+                                &workgraph_dir,
+                                &msg,
+                                &plan,
+                                &channels,
+                                &route_config,
+                                wg_config.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(()) => println!(
+                                    "[{}] photo-to-shopping turn from {} handled",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    msg.sender,
+                                ),
+                                Err(e) => eprintln!(
+                                    "[{}] photo-to-shopping turn from {} failed: {}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    msg.sender,
+                                    worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                                ),
+                            }
+                            continue;
+                        }
+
                         // Run the turn off the poll loop so waiting on one agent's
                         // session reply never blocks the next inbound message.
                         let dir_owned = workgraph_dir.clone();
@@ -1355,6 +1415,104 @@ fn resolve_auth_sender(workgraph_dir: &Path, msg: &worksgood::notify::IncomingMe
             .unwrap_or_else(|| msg.sender.clone()),
         Err(_) => msg.sender.clone(),
     }
+}
+
+/// Whether `msg`'s sender is a **confirmed** onboarded human (a binding that
+/// completed the YES handshake). The photo-to-shopping vision turn only ever
+/// runs for confirmed humans — a stranger's image is never downloaded or fed to
+/// the model. Matches on the numeric id first (Fix #5), then the @username.
+fn sender_is_confirmed_human(
+    workgraph_dir: &Path,
+    msg: &worksgood::notify::IncomingMessage,
+) -> bool {
+    use worksgood::agency::TelegramBindingMap;
+    let agency_dir = workgraph_dir.join("agency");
+    match TelegramBindingMap::load(&agency_dir) {
+        Ok(map) => map
+            .find_by_identity(msg.sender_id.as_deref(), Some(&msg.sender))
+            .map(|b| b.confirmed)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Run one photo → shopping-list vision turn end-to-end for an inbound photo
+/// that has ELECTED to a persona (task `photo-to-shopping`). Downloads the image
+/// with the RECEIVING bot's token (the `file_id` is bot-specific), reads the
+/// current shopping list from the gateway, runs the vision compose turn grounded
+/// in the elected persona's voice, applies the implied list changes through the
+/// SAME gateway endpoints the kiosk taps, and replies in-persona. Awaited inline
+/// (photos are infrequent; correctness over throughput) — it fails fast into the
+/// gentle note on any error so the family never sees a hang.
+async fn handle_photo_shopping_turn(
+    workgraph_dir: &Path,
+    msg: &worksgood::notify::IncomingMessage,
+    plan: &worksgood::notify::telegram_conversation::ConversationPlan,
+    channels: &[TelegramChannel],
+    route_config: &TelegramConfig,
+    wg_config: Option<&worksgood::config::Config>,
+) -> Result<()> {
+    use worksgood::notify::telegram_conversation as convo;
+    use worksgood::notify::telegram_conversation::ReplySink as _;
+    use worksgood::notify::telegram_photo as photo;
+
+    // The photo `file_id` is only valid for the bot that received it, so we must
+    // download via THAT bot's channel.
+    let receiving = channels
+        .iter()
+        .find(|c| c.channel_type() == msg.channel)
+        .with_context(|| format!("no channel matches receiving bot {:?}", msg.channel))?;
+
+    let turn = match photo::coalesce_album(std::slice::from_ref(msg)).into_iter().next() {
+        Some(t) => t,
+        None => return Ok(()), // not a photo (shouldn't happen — caller gated)
+    };
+
+    let route = plan.route();
+    let sink = convo::BotReplySink::new(route_config.clone());
+
+    // No model config → we can't run vision. Acknowledge gracefully rather than
+    // going silent, and invite the human to say what they need in words.
+    let Some(cfg) = wg_config else {
+        sink.send(
+            &route.bot_id,
+            &route.chat_id,
+            "Got your photo! I can't read pictures right now — tell me what you need and I'll update the list.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let composer = convo::OneshotComposer::from_config(cfg.clone());
+    let persona_summary = plan
+        .session_ref()
+        .and_then(|s| convo::read_session_summary(workgraph_dir, s));
+    let gateway = photo::HttpShoppingGateway::from_env();
+
+    // A per-message scratch dir for the temp image(s); removed after the turn.
+    let scratch = std::env::temp_dir().join(format!(
+        "casa-photo-{}-{}",
+        msg.message_id.as_deref().unwrap_or("na"),
+        msg.sender_id.as_deref().unwrap_or("na"),
+    ));
+    std::fs::create_dir_all(&scratch).ok();
+
+    let outcome = photo::run_photo_shopping_turn(
+        &turn,
+        persona_summary.as_deref(),
+        &photo::PhotoLimits::default(),
+        receiving,
+        &composer,
+        &gateway,
+        &scratch,
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    let result = outcome?;
+    sink.send(&route.bot_id, &route.chat_id, &result.reply_text)
+        .await?;
+    Ok(())
 }
 
 /// Classification of an inbound (non-command, non-button) Telegram message.
@@ -1957,6 +2115,173 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
             addressed_by.as_deref().unwrap_or("-"),
             msg.has_bot_command,
         );
+    }
+    Ok(())
+}
+
+/// `wg telegram photo-plan` — diagnose the photo → shopping-list vision
+/// pipeline WITHOUT a network (task `photo-to-shopping`).
+///
+/// Decodes the raw update(s) through the SAME `decode_update` boundary the
+/// listener uses (photo `file_id`, caption, media group), coalesces album
+/// frames into per-turn units, runs the real `elect_responders` decision on the
+/// first turn's caption (who a captioned photo routes to), and — when a fixture
+/// `--reply` + `--list` are given — parses the model's `SHOPPING_UPDATE:` tail
+/// and prints the exact mutations that WOULD be applied through the gateway
+/// endpoints. Nothing is downloaded and nothing is sent.
+pub fn run_photo_plan(
+    workgraph_dir: &Path,
+    update: &str,
+    reply: Option<&str>,
+    list: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::telegram as tg;
+    use worksgood::notify::telegram_photo as photo;
+
+    // --- 1. Decode update(s) → messages. Accept a single object or an array. ---
+    let read_arg = |arg: &str| -> Result<String> {
+        if let Some(path) = arg.strip_prefix('@') {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read fixture {path}"))
+        } else {
+            Ok(arg.to_string())
+        }
+    };
+    let raw = read_arg(update)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).context("update is not valid JSON")?;
+    let elements: Vec<serde_json::Value> = match value {
+        serde_json::Value::Array(a) => a,
+        other => vec![other],
+    };
+    let messages: Vec<worksgood::notify::IncomingMessage> = elements
+        .iter()
+        .filter_map(|u| tg::decode_update(u, "telegram"))
+        .collect();
+
+    // --- 2. Coalesce albums → per-turn units. ---
+    let turns = photo::coalesce_album(&messages);
+
+    // --- 3. Election on the first turn's caption (who answers a captioned photo). ---
+    let config = load_telegram_config()?;
+    let first = turns.first();
+    let (elected, is_photo): (Option<String>, bool) = match first {
+        Some(turn) => {
+            let mention_usernames = parse_at_mention_tokens(&turn.caption);
+            let human_count = human_agent_id_set(workgraph_dir).len();
+            let election = elect_responders(
+                turn.chat_type.as_deref(),
+                turn.chat_id.as_deref(),
+                &turn.caption,
+                &mention_usernames,
+                None,
+                false,
+                human_count,
+                &config,
+            );
+            let who = match &election {
+                Election::One { bot, .. } => {
+                    bot.agent_id.clone().or_else(|| Some(bot.bot_id.clone()))
+                }
+                Election::All { .. } => Some("roster".to_string()),
+                Election::Private => Some("(1:1 passthrough)".to_string()),
+                Election::Silence(_) => None,
+            };
+            (who, true)
+        }
+        None => (None, false),
+    };
+
+    // --- 4. Optional: parse the reply tail + plan the mutations. ---
+    let (verdict, actions): (Option<photo::VisionVerdict>, Vec<photo::ShoppingAction>) =
+        if let Some(reply) = reply {
+            let items = match list {
+                Some(l) => {
+                    let raw = read_arg(l)?;
+                    let json: serde_json::Value =
+                        serde_json::from_str(&raw).context("list is not valid JSON")?;
+                    photo::parse_shopping_json(&json)
+                }
+                None => Vec::new(),
+            };
+            let v = photo::parse_vision_verdict(reply);
+            let a = photo::plan_shopping_actions(&v, &items);
+            (Some(v), a)
+        } else {
+            (None, Vec::new())
+        };
+
+    // --- 5. Report. ---
+    if json {
+        let actions_json: Vec<serde_json::Value> = actions
+            .iter()
+            .map(|a| match a {
+                photo::ShoppingAction::CrossOff { key, text } => {
+                    serde_json::json!({ "op": "cross_off", "key": key, "text": text })
+                }
+                photo::ShoppingAction::Restore { key, text } => {
+                    serde_json::json!({ "op": "restore", "key": key, "text": text })
+                }
+                photo::ShoppingAction::Add { text } => {
+                    serde_json::json!({ "op": "add", "text": text })
+                }
+            })
+            .collect();
+        let out = serde_json::json!({
+            "is_photo": is_photo,
+            "turns": turns.len(),
+            "file_ids": turns.iter().flat_map(|t| t.file_ids.clone()).collect::<Vec<_>>(),
+            "caption": first.map(|t| t.caption.clone()),
+            "media_group_id": first.and_then(|t| t.media_group_id.clone()),
+            "elected": elected,
+            "have": verdict.as_ref().map(|v| v.have.clone()),
+            "need": verdict.as_ref().map(|v| v.need.clone()),
+            "actions": actions_json,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if !is_photo {
+        println!("not a photo — no photo turn");
+        return Ok(());
+    }
+    let turn = first.unwrap();
+    println!(
+        "photo — {} turn(s), {} image(s){}",
+        turns.len(),
+        turn.file_ids.len(),
+        turn.media_group_id
+            .as_deref()
+            .map(|g| format!(", album group {g}"))
+            .unwrap_or_default(),
+    );
+    println!("  caption: {}", if turn.caption.is_empty() { "(none)" } else { &turn.caption });
+    println!(
+        "  routes to: {}",
+        elected.as_deref().unwrap_or("(silence — no one answers)")
+    );
+    if let Some(v) = &verdict {
+        println!("  reply: {}", v.reply_text);
+        println!("  have: {:?}", v.have);
+        println!("  need: {:?}", v.need);
+        if actions.is_empty() {
+            println!("  actions: (none — list already matches)");
+        }
+        for a in &actions {
+            match a {
+                photo::ShoppingAction::CrossOff { text, .. } => {
+                    println!("  action: cross off '{text}' (POST /shopping/toggle checked=true)")
+                }
+                photo::ShoppingAction::Restore { text, .. } => {
+                    println!("  action: restore '{text}' (POST /shopping/toggle checked=false)")
+                }
+                photo::ShoppingAction::Add { text } => {
+                    println!("  action: add '{text}' (POST /shopping/add)")
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -3934,6 +4259,8 @@ async fn poll_once(
                     mention_usernames: Vec::new(),
                     reply_to_bot: None,
                     has_bot_command: false,
+                    photo_file_id: None,
+                    media_group_id: None,
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -3956,6 +4283,7 @@ async fn poll_once(
                 let body = message
                     .get("text")
                     .and_then(|t| t.as_str())
+                    .or_else(|| message.get("caption").and_then(|c| c.as_str()))
                     .unwrap_or("")
                     .to_string();
 
@@ -4000,6 +4328,13 @@ async fn poll_once(
                     mention_usernames,
                     reply_to_bot,
                     has_bot_command,
+                    photo_file_id: worksgood::notify::telegram_photo::largest_photo_file_id(
+                        message,
+                    ),
+                    media_group_id: message
+                        .get("media_group_id")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string()),
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -4131,6 +4466,8 @@ mod tests {
             mention_usernames: Vec::new(),
             reply_to_bot: None,
             has_bot_command,
+            photo_file_id: None,
+            media_group_id: None,
         }
     }
 

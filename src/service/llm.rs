@@ -382,6 +382,54 @@ pub fn run_model_oneshot(
     }
 }
 
+/// One-shot LLM call that ATTACHES one or more local images — the vision path
+/// for `photo-to-shopping`. The `claude` CLI reads image files referenced with
+/// an `@<path>` mention in the prompt (the same mechanism an interactive user
+/// uses to drag a file in), so vision is only supported on the Claude handler;
+/// other backends are rejected rather than silently dropping the image. With no
+/// images this is exactly [`run_model_oneshot`].
+///
+/// The `image_paths` are appended to `prompt` as `@<abs-path>` mentions here so
+/// the caller doesn't have to know the CLI's attachment convention — it just
+/// passes real files. Paths are NOT logged.
+pub fn run_model_oneshot_with_images(
+    config: &Config,
+    model_spec: &str,
+    prompt: &str,
+    image_paths: &[std::path::PathBuf],
+    timeout_secs: u64,
+) -> Result<LlmCallResult> {
+    if image_paths.is_empty() {
+        return run_model_oneshot(config, model_spec, prompt, timeout_secs);
+    }
+    let dispatch = agency_dispatch_for_spec(model_spec);
+    match dispatch.handler {
+        ExecutorKind::Claude => {
+            let full = build_image_prompt(prompt, image_paths);
+            call_claude_cli(&dispatch.model_id, &full, timeout_secs)
+        }
+        other => anyhow::bail!(
+            "vision (image) one-shot needs the Claude CLI, but model spec {model_spec:?} \
+             resolves to handler {other:?}; set WG_TELEGRAM_COMPOSE_MODEL to a claude model"
+        ),
+    }
+}
+
+/// Append `@<abs-path>` image mentions to a prompt so the `claude` CLI attaches
+/// them. Each path is emitted on its own line under a clear header; already
+/// referenced paths inside `prompt` are harmless duplicates the CLI dedupes.
+fn build_image_prompt(prompt: &str, image_paths: &[std::path::PathBuf]) -> String {
+    let mut out = String::with_capacity(prompt.len() + 64 * image_paths.len());
+    out.push_str(prompt);
+    out.push_str("\n\nImages to look at:\n");
+    for p in image_paths {
+        // Absolute path so the CLI resolves it regardless of its cwd.
+        let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        out.push_str(&format!("@{}\n", abs.display()));
+    }
+    out
+}
+
 /// Make a native-HTTP one-shot call resolving the provider directly from a model
 /// **spec** (not a role). Used by the reviewer strong-tier path, where the model is
 /// the premium tier rather than the cascade-resolved role model.

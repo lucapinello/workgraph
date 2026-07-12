@@ -124,6 +124,16 @@ impl ConversationPlan {
         }
     }
 
+    /// The bound session ref this plan converses against, when it is a
+    /// [`ConversationPlan::Converse`]. Used by the photo-to-shopping vision turn
+    /// to ground the reply in the elected persona's voice.
+    pub fn session_ref(&self) -> Option<&str> {
+        match self {
+            ConversationPlan::Converse { session_ref, .. } => Some(session_ref.as_str()),
+            _ => None,
+        }
+    }
+
     /// Short kind label for the route-decision log line.
     pub fn kind_label(&self) -> &'static str {
         match self {
@@ -581,11 +591,7 @@ fn build_compose_prompt(
     agent_id: &str,
     human_message: &str,
 ) -> String {
-    let chat_dir = chat::chat_dir_for_ref(workgraph_dir, session_ref);
-    let summary = std::fs::read_to_string(chat_dir.join("session-summary.md"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let summary = read_session_summary(workgraph_dir, session_ref);
 
     // A few recent turns for continuity (best-effort; empty on a fresh session).
     let mut history: Vec<String> = Vec::new();
@@ -629,6 +635,17 @@ fn build_compose_prompt(
     prompt
 }
 
+/// Read a bound persona's `session-summary.md` (its voice + role), trimmed;
+/// `None` when absent or empty. Public so the photo-to-shopping vision turn can
+/// ground its reply in the same persona summary the text composer uses.
+pub fn read_session_summary(workgraph_dir: &Path, session_ref: &str) -> Option<String> {
+    let chat_dir = chat::chat_dir_for_ref(workgraph_dir, session_ref);
+    std::fs::read_to_string(chat_dir.join("session-summary.md"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[async_trait]
 impl ReplyComposer for OneshotComposer {
     async fn compose(
@@ -653,6 +670,38 @@ impl ReplyComposer for OneshotComposer {
         let text = result.text.trim().to_string();
         if text.is_empty() {
             anyhow::bail!("compose model returned an empty reply");
+        }
+        Ok(text)
+    }
+}
+
+/// The same one-shot spawn, but with attached images — the `photo-to-shopping`
+/// vision turn. Reuses this composer's model/timeout (so the vision model is
+/// tunable via `WG_TELEGRAM_COMPOSE_MODEL`, which must resolve to a Claude CLI
+/// model for images to attach). The prompt is built by the caller
+/// ([`super::telegram_photo::build_vision_prompt`]); we only spawn the model.
+#[async_trait]
+impl super::telegram_photo::VisionComposer for OneshotComposer {
+    async fn compose_vision(
+        &self,
+        prompt: &str,
+        image_paths: &[std::path::PathBuf],
+    ) -> Result<String> {
+        let config = self.config.clone();
+        let model = self.model_spec.clone();
+        let timeout = self.timeout_secs;
+        let prompt = prompt.to_string();
+        let images = image_paths.to_vec();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::service::llm::run_model_oneshot_with_images(
+                &config, &model, &prompt, &images, timeout,
+            )
+        })
+        .await
+        .context("vision compose task panicked")??;
+        let text = result.text.trim().to_string();
+        if text.is_empty() {
+            anyhow::bail!("vision compose model returned an empty reply");
         }
         Ok(text)
     }
