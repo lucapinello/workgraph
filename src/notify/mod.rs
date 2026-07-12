@@ -6,6 +6,7 @@
 
 pub mod casa_feed;
 pub mod config;
+pub mod daily_digest;
 pub mod discord;
 pub mod dispatch;
 #[cfg(feature = "email")]
