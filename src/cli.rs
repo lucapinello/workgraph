@@ -6750,6 +6750,37 @@ pub enum TelegramCommands {
         dry_run: bool,
     },
 
+    /// The single-owner routing test seam: who owns a conversational ask?
+    ///
+    /// Runs the exact pure classifier the conversational turn uses
+    /// ([`worksgood::notify::ownership`]) over `<ask>` and prints the resolved
+    /// household [`Domain`](worksgood::notify::ownership::Domain) and the single
+    /// persona that OWNS it (from `--root`'s `household.toml`, else the shipped
+    /// Casa default). With `--persona` it also prints the routing decision —
+    /// whether that voice creates the task (it is the owner) or DEFERS to the
+    /// owner (off-domain guard). Credential-free and side-effect-free: nothing is
+    /// sent and no task is created. This is how "why did Mira take on a cooking
+    /// task?" is answerable without a live group.
+    Owner {
+        /// The human ask to classify and route.
+        ask: String,
+
+        /// The composing persona id (e.g. `mira`). When given, the decision
+        /// (owner vs defer) for THIS voice is printed too.
+        #[arg(long)]
+        persona: Option<String>,
+
+        /// Project root holding `household.toml`; when omitted (or the file is
+        /// absent) the shipped Casa owner map is used.
+        #[arg(long)]
+        root: Option<PathBuf>,
+
+        /// Accepted for symmetry with the other seams; this command never has
+        /// side effects, so it is always effectively a dry run.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
     /// Mirror one line to the casa conversation-pane feed (diagnostic)
     ///
     /// Appends a single line to `<root>/.casa/group-feed.jsonl` through the

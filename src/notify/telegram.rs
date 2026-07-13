@@ -1770,10 +1770,15 @@ agent_id = "nora"
         // PERSISTENT, whereas concurrent noise dissipates in milliseconds. So on a
         // spike we let the noise settle and re-measure before failing — a real
         // leak stays above the bound, transient noise falls back under it.
+        // Settle for up to ~2s: the suite's file-heavy conversational tests
+        // (collective single-owner routing, parity) churn fds concurrently for
+        // several hundred ms, so a short window could sample before the noise
+        // clears. A genuine per-poll leak is PERSISTENT and stays elevated no
+        // matter how long we wait, so a longer settle only removes false spikes.
         let tolerance = 8;
         let mut after = open_fd_count();
         if after > before + tolerance {
-            for _ in 0..10 {
+            for _ in 0..80 {
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 after = open_fd_count();
                 if after <= before + tolerance {

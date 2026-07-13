@@ -3803,6 +3803,68 @@ pub fn run_parity(
     Ok(())
 }
 
+/// The single-owner routing test seam — the `wg telegram owner` command (see
+/// [`crate::cli::TelegramCommands::Owner`]).
+///
+/// Runs the exact pure classifier the live conversational turn uses and prints
+/// the ask's household domain, the single persona that owns it, and — with
+/// `--persona` — whether that voice would create the task or defer to the owner.
+/// No side effects: nothing is sent, no task created.
+pub fn run_owner(
+    ask: &str,
+    persona: Option<&str>,
+    root: Option<&Path>,
+    _dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::ownership::{self, OwnerDecision, OwnerMap};
+
+    let domain = ownership::classify_domain(ask);
+    let map = match root {
+        Some(r) => OwnerMap::load(r),
+        None => OwnerMap::casa_default(),
+    };
+    let owner = map.owner_for_ask(ask).map(str::to_string);
+    let decision = persona.map(|p| map.decide_owner(p, ask));
+
+    if json {
+        let (decision_slug, defer_to) = match &decision {
+            Some(OwnerDecision::Owner) => ("owner", None),
+            Some(OwnerDecision::Defer { owner }) => ("defer", Some(owner.clone())),
+            None => ("n/a", None),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ask": ask,
+                "domain": domain.slug(),
+                "owner": owner,
+                "persona": persona,
+                "decision": decision_slug,
+                "deferTo": defer_to,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("ask:     \"{ask}\"");
+    println!("domain:  {}", domain.slug());
+    match &owner {
+        Some(o) => println!("owner:   {o}"),
+        None => println!("owner:   (unresolved — no persona lists this domain)"),
+    }
+    match (persona, &decision) {
+        (Some(p), Some(OwnerDecision::Owner)) => {
+            println!("verdict: {p} OWNS this ask → it creates the task");
+        }
+        (Some(p), Some(OwnerDecision::Defer { owner })) => {
+            println!("verdict: {p} is OFF-DOMAIN → defers to {owner} (re-routed, never its own copy)");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Report conversational tasks' progress back to the chats they came from — the
 /// `wg telegram lifecycle` seam (see [`crate::cli::TelegramCommands::Lifecycle`]).
 ///

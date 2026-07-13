@@ -52,6 +52,7 @@ use crate::chat;
 use crate::chat_sessions;
 use crate::config::Config;
 use crate::notify::lifecycle;
+use crate::notify::ownership;
 use crate::notify::parity;
 
 use super::NotificationChannel;
@@ -1094,48 +1095,96 @@ async fn finalize_composed_reply(
     let audit = parity::audit_promise(&reply_text);
     let mut created: Option<String> = None;
 
-    if let Some(title) = directive.title.as_deref() {
-        // The composer emitted the artifact directive — stamp it with this ask's
-        // origin so the lifecycle loop can report back here later.
-        created = try_create_origin_task(workgraph_dir, title, origin);
-    } else if audit.kind == parity::PromiseKind::Preference {
-        // A standing rule: write it where every future weekly draft can read it.
-        record_standing_preference(workgraph_dir, &reply_text, origin);
-    } else if audit.commits_action() {
-        // MISMATCH: the reply promised a one-off action but left no artifact.
-        // Retry the turn ONCE, explicitly instructing the persona to emit the
-        // directive this time.
-        let retry_msg = parity::retry_message(human_message, &reply_text);
-        match composer
-            .compose(workgraph_dir, session_ref, agent_id, &retry_msg)
-            .await
-        {
-            Ok(retry_raw) => {
-                let retry_dir = lifecycle::extract_task_directive(retry_raw.trim());
-                if let Some(title) = retry_dir.title.as_deref() {
-                    created = try_create_origin_task(workgraph_dir, title, origin);
-                    // Prefer the retry's fresh confirmation when it created the task.
-                    if created.is_some() && !retry_dir.reply.is_empty() {
-                        reply_text = retry_dir.reply;
-                    }
+    // SINGLE-OWNER RULE. Before any creation, resolve who OWNS this ask's domain
+    // (from `household.toml`, else the Casa default). Exactly one persona — the
+    // owner — mints the task; every other voice in a collective turn defers. This
+    // is the fix for Luca's tofu bug: one group ask electing the whole roster no
+    // longer mints one task per persona (with Coach Mira taking on a cooking task).
+    let decision = {
+        let root = project_root_of(workgraph_dir);
+        ownership::OwnerMap::load(&root).decide_owner(&origin.persona, human_message)
+    };
+
+    match decision {
+        ownership::OwnerDecision::Defer { owner } => {
+            // OFF-DOMAIN GUARD. This voice does not own the ask, so it must NOT
+            // create its own copy. If the turn nonetheless promised an action (a
+            // directive tail or an action-committing reply), log a loud warning
+            // and RE-ROUTE the ask to the owner: create it ONCE, stamped as the
+            // owner, guarded by the intent ledger so a collective never multiplies
+            // it. Then defer out loud so the ask visibly lands with its owner.
+            let wants_task = directive.title.is_some() || audit.commits_action();
+            if wants_task {
+                let domain = ownership::classify_domain(human_message);
+                eprintln!(
+                    "[{}] off-domain guard: {} would create a {} task it does not own — re-routing to {}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    origin.persona,
+                    domain.slug(),
+                    owner,
+                );
+                let title = directive
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| parity::fallback_task_title(human_message, &reply_text));
+                let owner_origin = origin_as_persona(origin, &owner);
+                created =
+                    try_create_origin_task(workgraph_dir, human_message, &title, &owner_origin);
+                let line = ownership::defer_line(&owner, domain);
+                if reply_text.is_empty() {
+                    reply_text = line;
+                } else {
+                    reply_text.push_str("\n\n");
+                    reply_text.push_str(&line);
                 }
             }
-            Err(e) => eprintln!(
-                "[{}] parity retry compose failed for {agent_id}: {e:#}",
-                chrono::Utc::now().format("%H:%M:%S"),
-            ),
         }
-        if created.is_none() {
-            // The persona still would not create it — never lose the ask. Build a
-            // fallback task from the promise text and correct the record honestly.
-            let title = parity::fallback_task_title(human_message, &reply_text);
-            created = try_create_origin_task(workgraph_dir, &title, origin);
-            let correction = parity::correction_line();
-            if reply_text.is_empty() {
-                reply_text = correction;
-            } else {
-                reply_text.push_str("\n\n");
-                reply_text.push_str(&correction);
+        ownership::OwnerDecision::Owner => {
+            if let Some(title) = directive.title.as_deref() {
+                // The composer emitted the artifact directive — stamp it with this
+                // ask's origin so the lifecycle loop can report back here later.
+                created = try_create_origin_task(workgraph_dir, human_message, title, origin);
+            } else if audit.kind == parity::PromiseKind::Preference {
+                // A standing rule: write it where every future weekly draft can read it.
+                record_standing_preference(workgraph_dir, &reply_text, origin);
+            } else if audit.commits_action() {
+                // MISMATCH: the reply promised a one-off action but left no artifact.
+                // Retry the turn ONCE, explicitly instructing the persona to emit the
+                // directive this time.
+                let retry_msg = parity::retry_message(human_message, &reply_text);
+                match composer
+                    .compose(workgraph_dir, session_ref, agent_id, &retry_msg)
+                    .await
+                {
+                    Ok(retry_raw) => {
+                        let retry_dir = lifecycle::extract_task_directive(retry_raw.trim());
+                        if let Some(title) = retry_dir.title.as_deref() {
+                            created =
+                                try_create_origin_task(workgraph_dir, human_message, title, origin);
+                            // Prefer the retry's fresh confirmation when it created the task.
+                            if created.is_some() && !retry_dir.reply.is_empty() {
+                                reply_text = retry_dir.reply;
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[{}] parity retry compose failed for {agent_id}: {e:#}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                    ),
+                }
+                if created.is_none() {
+                    // The persona still would not create it — never lose the ask. Build a
+                    // fallback task from the promise text and correct the record honestly.
+                    let title = parity::fallback_task_title(human_message, &reply_text);
+                    created = try_create_origin_task(workgraph_dir, human_message, &title, origin);
+                    let correction = parity::correction_line();
+                    if reply_text.is_empty() {
+                        reply_text = correction;
+                    } else {
+                        reply_text.push_str("\n\n");
+                        reply_text.push_str(&correction);
+                    }
+                }
             }
         }
     }
@@ -1171,13 +1220,36 @@ async fn finalize_composed_reply(
     Ok(TurnOutcome::Replied { acked })
 }
 
-/// Create an origin-stamped task, logging success/failure; returns the new id on
-/// success. Thin wrapper so the parity flow reads cleanly.
+/// Create an origin-stamped task, logging success/failure; returns the id the
+/// ask now lives under. Thin wrapper so the parity flow reads cleanly, with the
+/// **intent-dedupe safety net** in front of every creation path: a second
+/// creation matching the ask's fingerprint (normalized `human_message` + origin
+/// chat, within the dedupe window) is REFUSED — logged as `duplicate intent,
+/// task X already exists` — and reuses the existing task, no matter which
+/// persona tries. This backstops the single-owner rule for races and for
+/// households where the owner cannot be resolved.
 fn try_create_origin_task(
     workgraph_dir: &Path,
+    human_message: &str,
     title: &str,
     origin: &crate::graph::TaskOrigin,
 ) -> Option<String> {
+    let root = project_root_of(workgraph_dir);
+    let fp = ownership::fingerprint(human_message, &origin.chat_id);
+    let now = chrono::Utc::now().timestamp();
+    let window = ownership::IntentLedger::window_secs();
+    if let Some(existing) = ownership::IntentLedger::find_recent(&root, &fp, now, window) {
+        // The safety net fired: this exact ask already became a task inside the
+        // window. Refuse the duplicate and reuse it — regardless of persona.
+        println!(
+            "[{}] duplicate intent, task {} already exists (persona {} chat {})",
+            chrono::Utc::now().format("%H:%M:%S"),
+            existing,
+            origin.persona,
+            origin.chat_id,
+        );
+        return Some(existing);
+    }
     match create_origin_task(workgraph_dir, title, origin) {
         Ok(id) => {
             println!(
@@ -1187,6 +1259,16 @@ fn try_create_origin_task(
                 origin.channel.label(),
                 origin.chat_id,
             );
+            // Record the intent so any sibling turn (a later collective voice, a
+            // restart-replayed message) dedupes against it.
+            if let Err(e) =
+                ownership::IntentLedger::record(&root, &fp, &id, &origin.persona, now)
+            {
+                eprintln!(
+                    "[{}] failed to record task intent for dedupe: {e}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                );
+            }
             Some(id)
         }
         Err(e) => {
@@ -1197,6 +1279,19 @@ fn try_create_origin_task(
             None
         }
     }
+}
+
+/// A copy of `origin` re-stamped to a DIFFERENT persona — used by the off-domain
+/// guard to create a re-routed task under the domain owner while keeping the
+/// chat/requester the ask arrived with, so the lifecycle loop still reports back
+/// to the right conversation.
+fn origin_as_persona(
+    origin: &crate::graph::TaskOrigin,
+    persona: &str,
+) -> crate::graph::TaskOrigin {
+    let mut owned = origin.clone();
+    owned.persona = persona.trim().to_string();
+    owned
 }
 
 /// Persist a standing preference to the durable store under the project's
@@ -1769,12 +1864,14 @@ mod tests {
         use crate::graph::OriginChannel;
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
-        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        // A meals ask is owned by Nora (meals & nutrition); the origin-stamp
+        // machinery is identical on the owner path, so drive it as her.
+        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "otto", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "otto");
+        bind_agent(&wg, "nora", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "nora");
 
-        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
         let sink = RecSink::default();
         let composer = FakeComposer::ok(
             "On it — I'll get the week tweaked.\nTASK_CREATE: tweak this week's meals",
@@ -1809,8 +1906,8 @@ mod tests {
         assert_eq!(o.channel, OriginChannel::TelegramDirect);
         assert_eq!(o.chat_id, "555");
         assert_eq!(o.requester, "Luca");
-        assert_eq!(o.persona, "otto");
-        assert_eq!(o.bot_id.as_deref(), Some("otto"));
+        assert_eq!(o.persona, "nora");
+        assert_eq!(o.bot_id.as_deref(), Some("nora"));
     }
 
     /// PARITY, retry path: the salad regression. The composer's FIRST reply
@@ -1822,12 +1919,13 @@ mod tests {
     async fn promise_without_artifact_retries_then_creates_task() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
-        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        // Meals → Nora owns it; the parity retry runs on the owner path.
+        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "otto", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "otto");
+        bind_agent(&wg, "nora", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "nora");
 
-        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
         let sink = RecSink::default();
         // 1st: a bare promise. 2nd (forced retry): the same promise WITH the tail.
         let composer = SequenceComposer::new(&[
@@ -1878,12 +1976,13 @@ mod tests {
     async fn promise_survives_stubborn_composer_via_fallback_task_and_correction() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
-        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        // Meals → Nora owns it; the fallback path runs on the owner path.
+        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "otto", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "otto");
+        bind_agent(&wg, "nora", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "nora");
 
-        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
         let sink = RecSink::default();
         // Both replies promise but NEVER emit the tail.
         let composer = SequenceComposer::new(&[
@@ -1961,6 +2060,150 @@ mod tests {
         assert!(!any_task, "no task should be created for small talk");
     }
 
+    /// Bind a persona's bot + session and (idempotently) confirm the human, so a
+    /// `GroupElected` plan for that voice resolves to `Converse`. Returns the
+    /// four-bot config the collective tests share.
+    fn setup_collective(wg: &Path) -> TelegramConfig {
+        let cfg = cfg_with_bots(&[
+            ("nora", Some("nora")),
+            ("bruno", Some("bruno")),
+            ("mira", Some("mira")),
+            ("otto", Some("otto")),
+        ]);
+        for persona in ["nora", "bruno", "mira", "otto"] {
+            let uuid = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, persona, &uuid).unwrap();
+        }
+        confirm_human(wg, "luca-1", "human-luca", "otto");
+        cfg
+    }
+
+    /// Run one collective voice's turn: it emits a reply with a `TASK_CREATE`
+    /// tail (each voice, as in the live bug, *would* create its own copy).
+    async fn run_voice(
+        wg: &Path,
+        cfg: &TelegramConfig,
+        persona: &str,
+        chat: &str,
+        ask: &str,
+        reply_with_tail: &str,
+        sink: &RecSink,
+    ) {
+        let plan = plan_conversation(
+            wg,
+            cfg,
+            &format!("telegram:{persona}"),
+            chat,
+            "luca-1",
+            Entry::GroupElected,
+        );
+        let composer = FakeComposer::ok(reply_with_tail);
+        run_conversation_turn(
+            wg,
+            &plan,
+            ask,
+            &format!("req-collective-{persona}"),
+            fast_timing(),
+            Some(&composer),
+            sink,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// THE REGRESSION FIXTURE (Luca, 2026-07-13). A single collective ask ("swap
+    /// Thursday dinner to grilled tofu") elects the WHOLE roster; each voice
+    /// composes a reply that would create its own task — exactly the path that
+    /// minted FOUR duplicates, one per persona, including Coach Mira (workouts)
+    /// taking on a cooking task. With the single-owner rule + intent dedupe,
+    /// exactly ONE task survives, owned by Nora (the dietitian — her domain), and
+    /// the off-domain voices defer out loud.
+    #[tokio::test]
+    async fn collective_tofu_ask_creates_exactly_one_task_owned_by_nora() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = setup_collective(&wg);
+        let chat = "-100999";
+        let ask = "swap Thursday dinner to grilled tofu";
+
+        // Roster order: nora (owner) runs first, then three off-domain voices —
+        // each with a DIFFERENT title to prove dedupe keys on the ASK, not the
+        // title. Mira's would have been the impossible "add grilled tofu" card.
+        let nora_sink = RecSink::default();
+        run_voice(&wg, &cfg, "nora", chat, ask,
+            "Grilled tofu Thursday it is 🥗\nTASK_CREATE: swap Thursday dinner to grilled tofu",
+            &nora_sink).await;
+        let bruno_sink = RecSink::default();
+        run_voice(&wg, &cfg, "bruno", chat, ask,
+            "Sounds tasty!\nTASK_CREATE: prep grilled tofu for Thursday", &bruno_sink).await;
+        let mira_sink = RecSink::default();
+        run_voice(&wg, &cfg, "mira", chat, ask,
+            "Nice protein swap.\nTASK_CREATE: add grilled tofu", &mira_sink).await;
+        let otto_sink = RecSink::default();
+        run_voice(&wg, &cfg, "otto", chat, ask,
+            "Noted!\nTASK_CREATE: put tofu on the Thursday plan", &otto_sink).await;
+
+        // Exactly ONE task exists, and it is Nora's.
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
+        assert_eq!(
+            stamped.len(),
+            1,
+            "one ask, one task — got {}: {:?}",
+            stamped.len(),
+            stamped.iter().map(|t| &t.title).collect::<Vec<_>>()
+        );
+        let owner = stamped[0].origin.as_ref().unwrap();
+        assert_eq!(owner.persona, "nora", "the meal-plan owner (dietitian) owns it");
+        assert_eq!(stamped[0].title, "swap Thursday dinner to grilled tofu");
+
+        // Coach Mira never owns a cooking task — the impossible card is impossible.
+        assert!(
+            !graph.tasks().any(|t| t.origin.as_ref().map(|o| o.persona.as_str()) == Some("mira")),
+            "Coach Mira must never own a meals/cooking task"
+        );
+
+        // The off-domain voices defer out loud so the ask visibly lands with Nora.
+        let mira_last = mira_sink.calls().last().map(|c| c.2.clone()).unwrap_or_default();
+        assert!(
+            mira_last.contains("Nora"),
+            "an off-domain voice should defer to the owner by name, got: {mira_last:?}"
+        );
+    }
+
+    /// The off-domain re-route creates the task under the OWNER even when the
+    /// owner is not first in roster order: a collective workout ask ("can we all
+    /// move my gym session to Friday?") has owner Mira, who runs third. Nora
+    /// (first, off-domain) re-routes and creates it stamped as Mira; the later
+    /// voices — Mira included — dedupe against it. Net: one task, owned by Mira.
+    #[tokio::test]
+    async fn collective_off_domain_reroutes_to_owner_run_last() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = setup_collective(&wg);
+        let chat = "-100888";
+        let ask = "can we all move my gym session to Friday?";
+
+        for (persona, reply) in [
+            ("nora", "I'll flag it.\nTASK_CREATE: move the gym session to Friday"),
+            ("bruno", "Sure.\nTASK_CREATE: shift gym to Friday"),
+            ("mira", "On it — Friday works 💪\nTASK_CREATE: reschedule gym session to Friday"),
+            ("otto", "Noted.\nTASK_CREATE: gym Friday"),
+        ] {
+            let sink = RecSink::default();
+            run_voice(&wg, &cfg, persona, chat, ask, reply, &sink).await;
+        }
+
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
+        assert_eq!(stamped.len(), 1, "one workout ask, one task");
+        assert_eq!(
+            stamped[0].origin.as_ref().unwrap().persona,
+            "mira",
+            "the workout owner owns it, even created by an earlier off-domain voice"
+        );
+    }
+
     /// PARITY, standing preference: "remember we work Mon–Fri" writes to the
     /// durable preference store (not a one-off task) so the weekly draft can
     /// read it every week.
@@ -1969,12 +2212,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let wg = dir.path().join(".wg");
         std::fs::create_dir_all(&wg).unwrap();
-        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        // A meal-planning standing rule is Nora's domain; it is recorded once, by
+        // the owner, rather than duplicated across a collective.
+        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "otto", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "otto");
+        bind_agent(&wg, "nora", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "nora");
 
-        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
         let sink = RecSink::default();
         let composer =
             SequenceComposer::new(&["Got it — from now on, no weekday lunches. We work Mon-Fri."]);
@@ -1997,7 +2242,7 @@ mod tests {
         assert_eq!(prefs.len(), 1, "one preference recorded");
         assert!(prefs[0].text.to_lowercase().contains("no weekday lunches"));
         assert_eq!(prefs[0].requester, "Luca");
-        assert_eq!(prefs[0].persona, "otto");
+        assert_eq!(prefs[0].persona, "nora");
 
         // A preference is NOT a one-off task.
         let graph = crate::parser::load_graph(wg.join("graph.jsonl")).ok();

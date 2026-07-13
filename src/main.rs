@@ -3842,6 +3842,18 @@ fn main() -> Result<()> {
                 dry_run,
                 cli.json,
             ),
+            TelegramCommands::Owner {
+                ask,
+                persona,
+                root,
+                dry_run,
+            } => commands::telegram::run_owner(
+                &ask,
+                persona.as_deref(),
+                root.as_deref(),
+                dry_run,
+                cli.json,
+            ),
             TelegramCommands::FeedWrite {
                 root,
                 kind,
