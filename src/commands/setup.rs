@@ -1521,7 +1521,37 @@ fn run_route(args: &SetupArgs) -> Result<()> {
         let auth_env = args.api_key_env.as_deref().or(Some(OPENROUTER_ENV_VAR));
         finalize_openrouter_onboarding(auth_env, args.api_key_file.as_deref(), scope)?;
     }
+    if route == SetupRoute::ClaudeCli {
+        print_claude_headless_next_step();
+    }
     Ok(())
+}
+
+/// Credential guidance for the claude-cli route. `claude login` is fine for a
+/// laptop, but a headless / always-on server (systemd, launchd) has no
+/// interactive session and — on macOS — no Keychain unlock, so a login
+/// credential can be unreadable and every spawn 401s. Point the family at the
+/// `setup-token` → `[auth] *_file` path (credential option C1, docs/22).
+fn print_claude_headless_next_step() {
+    // Skip the nudge when auth is already wired via env or an [auth] file.
+    if std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        return;
+    }
+    println!();
+    println!("Claude auth:");
+    println!("  Laptop:  run `claude login` once (opens a browser).");
+    println!("  Headless / always-on server (recommended): mint a long-lived token so a");
+    println!("  boot daemon authenticates without a login session or the macOS Keychain:");
+    println!("    claude setup-token > ~/.config/casa/claude-oauth-token");
+    println!("    chmod 600 ~/.config/casa/claude-oauth-token");
+    println!("  then in .wg/config.toml:");
+    println!("    [auth]");
+    println!("    claude_code_oauth_token_file = \"~/.config/casa/claude-oauth-token\"");
+    println!("  Verify with `wg doctor` (checks the file exists + is not group-readable).");
 }
 
 /// Return the file paths that should be written for a given scope.
