@@ -326,6 +326,7 @@ pub fn run(
                 next_cron_fire: None,
                 cron_template: false,
                 cron_instance_of: None,
+                origin: None,
             };
 
             graph.add_node(Node::Task(task));

@@ -93,6 +93,7 @@ fn test_cron_task_serialization() {
         next_cron_fire: Some("2026-04-13T02:00:00Z".to_string()),
         cron_template: false,
         cron_instance_of: None,
+        origin: None,
     };
 
     // Test serialization

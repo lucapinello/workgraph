@@ -657,6 +657,7 @@ pub fn run(
         next_cron_fire,
         cron_template: false,
         cron_instance_of: None,
+        origin: None,
     };
 
     // Add task to graph
@@ -1141,6 +1142,7 @@ fn add_task_directly(
             next_cron_fire,
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
         };
 
         graph.add_node(Node::Task(task));

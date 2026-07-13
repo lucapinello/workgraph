@@ -175,6 +175,7 @@ pub(crate) fn defer_self_mutation(
         next_cron_fire: None,
         cron_template: false,
         cron_instance_of: None,
+        origin: None,
     };
 
     let mut already_exists = false;

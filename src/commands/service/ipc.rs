@@ -1318,6 +1318,7 @@ fn handle_add_task(
         next_cron_fire,
         cron_template: false,
         cron_instance_of: None,
+        origin: None,
     };
 
     // Save atomically via modify_graph

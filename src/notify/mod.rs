@@ -13,6 +13,7 @@ pub mod dispatch;
 pub mod email;
 pub mod errand;
 pub mod family_plan;
+pub mod lifecycle;
 pub mod meal_feedback;
 #[cfg(feature = "matrix-lite")]
 pub mod matrix;

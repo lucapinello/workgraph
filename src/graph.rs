@@ -802,6 +802,85 @@ pub struct Task {
     /// coordinator to avoid minting a duplicate instance for the same period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron_instance_of: Option<String>,
+    /// Where this task came from when a **conversational** turn created it (a
+    /// 1:1 DM, a family-group ask, or the kiosk chat pane). Stamped by the
+    /// composer's task-creation path ([`TaskOrigin`]) so the lifecycle loop can
+    /// report progress — "on it", "done", "sorry, snag" — back to the *exact*
+    /// chat the ask arrived in, in the composing persona's voice, via their bot.
+    /// `None` for tasks created by any other path (coordinator, cron, CLI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TaskOrigin>,
+}
+
+/// Which surface a conversational ask arrived on. Decides how the lifecycle
+/// notification is routed back (a 1:1 DM, the family group, or the web pane) and
+/// is recorded on the [`TaskOrigin`] so an audit can see where a task was born.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OriginChannel {
+    /// A 1:1 Telegram DM the human sent straight to a persona's bot.
+    #[serde(rename = "telegram-1:1", alias = "telegram-direct")]
+    TelegramDirect,
+    /// A name/mention/reply-elected message in the family Telegram group.
+    TelegramGroup,
+    /// The kiosk / web chat pane (`/conversation/send`).
+    Web,
+}
+
+impl OriginChannel {
+    /// Stable label for logs, the `--dry-run` seam, and origin stamping.
+    pub fn label(self) -> &'static str {
+        match self {
+            OriginChannel::TelegramDirect => "telegram-1:1",
+            OriginChannel::TelegramGroup => "telegram-group",
+            OriginChannel::Web => "web",
+        }
+    }
+}
+
+/// The origin of a conversationally-created task: enough to close the loop back
+/// to the human who asked, in the voice that answered. Everything the lifecycle
+/// notifier needs — which chat, which bot, which persona, and who asked — lives
+/// here, stamped once at `wg add` time by the composer's task-creation path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskOrigin {
+    /// The surface the ask arrived on.
+    pub channel: OriginChannel,
+    /// The chat to reply in — a Telegram chat id (1:1 or group), or a web
+    /// session id. The lifecycle notification is delivered *here*.
+    pub chat_id: String,
+    /// Display name of the human who asked, e.g. `"Luca"`. Used to answer their
+    /// "are they done yet?" and to address the payoff line. Empty when unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requester: String,
+    /// The composing persona's roster name / agent id, e.g. `"otto"`. The
+    /// lifecycle notification is signed and *sent as* this voice.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub persona: String,
+    /// The bot id the persona speaks through (e.g. `"otto"`), when known — so the
+    /// reply leaves via the same bot the human addressed, never a wrong face.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_id: Option<String>,
+}
+
+impl TaskOrigin {
+    /// Build an origin from the raw pieces the composer knows at task-creation
+    /// time. `requester`/`persona` are trimmed; an empty `bot_id` becomes `None`.
+    pub fn new(
+        channel: OriginChannel,
+        chat_id: impl Into<String>,
+        requester: impl Into<String>,
+        persona: impl Into<String>,
+        bot_id: Option<String>,
+    ) -> Self {
+        Self {
+            channel,
+            chat_id: chat_id.into(),
+            requester: requester.into().trim().to_string(),
+            persona: persona.into().trim().to_string(),
+            bot_id: bot_id.filter(|b| !b.trim().is_empty()),
+        }
+    }
 }
 
 impl Default for Task {
@@ -894,6 +973,7 @@ impl Default for Task {
             next_cron_fire: None,
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
         }
     }
 }
@@ -1977,6 +2057,9 @@ struct TaskHelper {
     /// Template id a minted cron instance was produced from.
     #[serde(default)]
     cron_instance_of: Option<String>,
+    /// Conversational origin stamp (see [`TaskOrigin`]).
+    #[serde(default)]
+    origin: Option<TaskOrigin>,
 }
 
 impl<'de> Deserialize<'de> for Task {
@@ -2089,6 +2172,7 @@ impl<'de> Deserialize<'de> for Task {
             next_cron_fire: helper.next_cron_fire,
             cron_template: helper.cron_template,
             cron_instance_of: helper.cron_instance_of,
+            origin: helper.origin,
         })
     }
 }

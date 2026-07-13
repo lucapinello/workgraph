@@ -408,6 +408,7 @@ mod tests {
             next_cron_fire: None,
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
         }
     }
 

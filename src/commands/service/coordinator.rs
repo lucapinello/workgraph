@@ -2046,6 +2046,7 @@ fn build_auto_assign_tasks(
                     next_cron_fire: None,
                     cron_template: false,
                     cron_instance_of: None,
+                    origin: None,
                 };
 
                 graph.add_node(Node::Task(create_task));
@@ -2448,6 +2449,7 @@ fn build_flip_verification_tasks(
             next_cron_fire: None,
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
         };
 
         graph.add_node(Node::Task(verify_task));
@@ -2725,6 +2727,7 @@ fn build_separate_verify_tasks(
             next_cron_fire: None,
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
         };
 
         graph.add_node(Node::Task(verify_task));
@@ -2934,6 +2937,7 @@ fn build_auto_evolve_task(
         next_cron_fire: None,
         cron_template: false,
         cron_instance_of: None,
+        origin: None,
     };
 
     graph.add_node(Node::Task(evolve_task));
@@ -3146,6 +3150,7 @@ fn build_auto_create_task(
         next_cron_fire: None,
         cron_template: false,
         cron_instance_of: None,
+        origin: None,
     };
 
     graph.add_node(Node::Task(create_task));

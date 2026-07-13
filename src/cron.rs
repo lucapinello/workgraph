@@ -902,6 +902,7 @@ mod tests {
             next_cron_fire: Some(past_fire.to_rfc3339()),
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
             ..Default::default()
         };
 
@@ -1036,6 +1037,7 @@ mod tests {
             next_cron_fire: Some(future_fire.to_rfc3339()),
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
             ..Default::default()
         };
 
@@ -1169,6 +1171,7 @@ mod tests {
             next_cron_fire: None,
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
             last_cron_fire: None,
             ..Default::default()
         };
@@ -1216,6 +1219,7 @@ mod tests {
             next_cron_fire: Some(past_fire.to_rfc3339()),
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
             ..Default::default()
         };
 
@@ -1418,6 +1422,7 @@ mod tests {
             next_cron_fire: Some(future),
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
             ..Default::default()
         };
         assert!(overdue_secs(&task, Utc::now()).is_none());
@@ -1433,6 +1438,7 @@ mod tests {
             next_cron_fire: Some(past),
             cron_template: false,
             cron_instance_of: None,
+            origin: None,
             ..Default::default()
         };
         let overdue = overdue_secs(&task, Utc::now()).expect("past due");

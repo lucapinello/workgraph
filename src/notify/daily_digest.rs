@@ -83,6 +83,12 @@ pub enum NudgeKind {
     FeedbackAsk,
     /// An errand nudge ("market run at 9 — list attached").
     ErrandNudge,
+    /// A conversational-task lifecycle notification — "on it", "done", or an
+    /// honest "snag" — reporting back on a task the human *asked for* in chat
+    /// (see [`crate::notify::lifecycle`]). Unlike the others these are direct
+    /// replies to an ask, not proactive pings, so they fire time-critically but
+    /// stay capped so a burst of asks can't flood the chat.
+    Lifecycle,
     /// Any other future proactive DM. New senders route through here by default.
     Proactive,
 }
