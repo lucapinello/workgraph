@@ -6726,6 +6726,30 @@ pub enum TelegramCommands {
         now: Option<String>,
     },
 
+    /// Audit whether a composed reply's PROMISE would leave an artifact
+    ///
+    /// The promise-action parity test seam: runs the exact pattern-based
+    /// classifier the conversational turn uses ([`worksgood::notify::parity`])
+    /// over `<reply-text>` and prints whether the reply commits to an action or
+    /// a standing preference, whether it already carries a `TASK_CREATE:` tail,
+    /// and — the whole point — whether there is a MISMATCH (a promise with no
+    /// artifact) that would trigger the retry-then-fallback path. Credential-free
+    /// and side-effect-free; nothing is sent and no task is created. `--human`
+    /// supplies the original ask so the fallback task title can be previewed.
+    Parity {
+        /// The composed reply text to audit.
+        reply_text: String,
+
+        /// The original human ask, used only to preview the fallback task title.
+        #[arg(long)]
+        human: Option<String>,
+
+        /// Accepted for symmetry with the other seams; this command never has
+        /// side effects, so it is always effectively a dry run.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
     /// Mirror one line to the casa conversation-pane feed (diagnostic)
     ///
     /// Appends a single line to `<root>/.casa/group-feed.jsonl` through the

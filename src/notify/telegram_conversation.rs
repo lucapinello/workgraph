@@ -41,7 +41,7 @@
 //! - **No tokens or secrets** are ever logged; the bot token lives only on the
 //!   send channel.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -52,6 +52,7 @@ use crate::chat;
 use crate::chat_sessions;
 use crate::config::Config;
 use crate::notify::lifecycle;
+use crate::notify::parity;
 
 use super::NotificationChannel;
 use super::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
@@ -1002,46 +1003,26 @@ async fn run_composed_turn(
             res = &mut compose => {
                 match res {
                     Ok(text) => {
-                        // Split the composed reply from any `TASK_CREATE:` tail: if
-                        // the turn asked to create a task, stamp it with this ask's
-                        // origin so the lifecycle loop can report back here later.
-                        let directive = lifecycle::extract_task_directive(text.trim());
-                        if let Some(title) = directive.title.as_deref() {
-                            match create_origin_task(workgraph_dir, title, origin) {
-                                Ok(id) => println!(
-                                    "[{}] conversation created task {} (origin {} chat {})",
-                                    chrono::Utc::now().format("%H:%M:%S"),
-                                    id,
-                                    origin.channel.label(),
-                                    origin.chat_id,
-                                ),
-                                Err(e) => eprintln!(
-                                    "[{}] failed to create conversational task: {e:#}",
-                                    chrono::Utc::now().format("%H:%M:%S"),
-                                ),
-                            }
-                        }
-                        // Honor an explicit "let me know when…": acknowledge it out
-                        // loud (the payoff itself arrives via the Done notification).
-                        let mut text = directive.reply;
-                        if lifecycle::is_follow_request(human_message) {
-                            if text.is_empty() {
-                                text = lifecycle::FOLLOW_ACK.to_string();
-                            } else {
-                                text.push_str("\n\n");
-                                text.push_str(lifecycle::FOLLOW_ACK);
-                            }
-                        }
-                        if text.is_empty() {
-                            // The whole reply was a bare directive — never send an
-                            // empty message; give a minimal in-voice confirmation.
-                            text = "On it 👍".to_string();
-                        }
-                        let _ = chat::append_outbox_ref(
-                            workgraph_dir, session_ref, &text, request_id,
-                        );
-                        deliver_reply(sink, route, ack_mid.as_deref(), &text).await?;
-                        return Ok(TurnOutcome::Replied { acked });
+                        // Post-turn parity audit + delivery: create the task the
+                        // reply promised (via the composer's directive, a forced
+                        // retry, or a fallback), record a standing preference, or
+                        // just relay a non-committal reply — always leaving the
+                        // promised artifact or an honest correction.
+                        return finalize_composed_reply(
+                            workgraph_dir,
+                            session_ref,
+                            agent_id,
+                            human_message,
+                            request_id,
+                            route,
+                            sink,
+                            composer,
+                            origin,
+                            ack_mid.as_deref(),
+                            acked,
+                            text,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         // Fail fast — surface the child's error (never a token)
@@ -1072,6 +1053,182 @@ async fn run_composed_turn(
                 }
             }
         }
+    }
+}
+
+/// Turn a composed reply into a delivered message with **promise-action
+/// parity** enforced: when the reply commits to doing something, the system
+/// proves it happened.
+///
+/// The decision tree over one composed `first_text`:
+/// * The composer emitted a `TASK_CREATE:` tail → create that task (the happy
+///   path that already worked for the carbonara ask).
+/// * The reply is a standing preference ("no weekday lunches") → record it in
+///   the durable [`parity::PreferenceStore`], not a one-off task.
+/// * The reply commits to a one-off action but produced NO tail (the salad
+///   regression) → retry the compose ONCE, forcing the tail; if it still
+///   produces nothing, create a fallback task from the promise text AND append
+///   an honest correction to the reply so the ask is never silently dropped.
+/// * A non-committal reply → relay as-is.
+///
+/// Every turn logs `promised=<kind> created=<task-id|none>` so the parity of
+/// promises-vs-artifacts is observable.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_composed_reply(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    agent_id: &str,
+    human_message: &str,
+    request_id: &str,
+    route: &ReplyRoute,
+    sink: &dyn ReplySink,
+    composer: &dyn ReplyComposer,
+    origin: &crate::graph::TaskOrigin,
+    ack_mid: Option<&str>,
+    acked: bool,
+    first_text: String,
+) -> Result<TurnOutcome> {
+    let directive = lifecycle::extract_task_directive(first_text.trim());
+    let mut reply_text = directive.reply.clone();
+    // Audit the human-facing reply (with the machine tail already stripped).
+    let audit = parity::audit_promise(&reply_text);
+    let mut created: Option<String> = None;
+
+    if let Some(title) = directive.title.as_deref() {
+        // The composer emitted the artifact directive — stamp it with this ask's
+        // origin so the lifecycle loop can report back here later.
+        created = try_create_origin_task(workgraph_dir, title, origin);
+    } else if audit.kind == parity::PromiseKind::Preference {
+        // A standing rule: write it where every future weekly draft can read it.
+        record_standing_preference(workgraph_dir, &reply_text, origin);
+    } else if audit.commits_action() {
+        // MISMATCH: the reply promised a one-off action but left no artifact.
+        // Retry the turn ONCE, explicitly instructing the persona to emit the
+        // directive this time.
+        let retry_msg = parity::retry_message(human_message, &reply_text);
+        match composer
+            .compose(workgraph_dir, session_ref, agent_id, &retry_msg)
+            .await
+        {
+            Ok(retry_raw) => {
+                let retry_dir = lifecycle::extract_task_directive(retry_raw.trim());
+                if let Some(title) = retry_dir.title.as_deref() {
+                    created = try_create_origin_task(workgraph_dir, title, origin);
+                    // Prefer the retry's fresh confirmation when it created the task.
+                    if created.is_some() && !retry_dir.reply.is_empty() {
+                        reply_text = retry_dir.reply;
+                    }
+                }
+            }
+            Err(e) => eprintln!(
+                "[{}] parity retry compose failed for {agent_id}: {e:#}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            ),
+        }
+        if created.is_none() {
+            // The persona still would not create it — never lose the ask. Build a
+            // fallback task from the promise text and correct the record honestly.
+            let title = parity::fallback_task_title(human_message, &reply_text);
+            created = try_create_origin_task(workgraph_dir, &title, origin);
+            let correction = parity::correction_line();
+            if reply_text.is_empty() {
+                reply_text = correction;
+            } else {
+                reply_text.push_str("\n\n");
+                reply_text.push_str(&correction);
+            }
+        }
+    }
+
+    // Metrics: every turn records promised-vs-created (task id), so a promise
+    // that leaves no artifact is loud, not silent.
+    println!(
+        "[{}] parity: promised={} created={} agent={} chat={}",
+        chrono::Utc::now().format("%H:%M:%S"),
+        audit.kind.slug(),
+        created.as_deref().unwrap_or("none"),
+        agent_id,
+        origin.chat_id,
+    );
+
+    // Honor an explicit "let me know when…": acknowledge it out loud (the payoff
+    // itself arrives later via the Done notification).
+    if lifecycle::is_follow_request(human_message) {
+        if reply_text.is_empty() {
+            reply_text = lifecycle::FOLLOW_ACK.to_string();
+        } else {
+            reply_text.push_str("\n\n");
+            reply_text.push_str(lifecycle::FOLLOW_ACK);
+        }
+    }
+    if reply_text.is_empty() {
+        // The whole reply was a bare directive — never send an empty message.
+        reply_text = "On it 👍".to_string();
+    }
+
+    let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &reply_text, request_id);
+    deliver_reply(sink, route, ack_mid, &reply_text).await?;
+    Ok(TurnOutcome::Replied { acked })
+}
+
+/// Create an origin-stamped task, logging success/failure; returns the new id on
+/// success. Thin wrapper so the parity flow reads cleanly.
+fn try_create_origin_task(
+    workgraph_dir: &Path,
+    title: &str,
+    origin: &crate::graph::TaskOrigin,
+) -> Option<String> {
+    match create_origin_task(workgraph_dir, title, origin) {
+        Ok(id) => {
+            println!(
+                "[{}] conversation created task {} (origin {} chat {})",
+                chrono::Utc::now().format("%H:%M:%S"),
+                id,
+                origin.channel.label(),
+                origin.chat_id,
+            );
+            Some(id)
+        }
+        Err(e) => {
+            eprintln!(
+                "[{}] failed to create conversational task: {e:#}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+            None
+        }
+    }
+}
+
+/// Persist a standing preference to the durable store under the project's
+/// `.casa/`, best-effort (a write failure must never block the reply).
+fn record_standing_preference(
+    workgraph_dir: &Path,
+    text: &str,
+    origin: &crate::graph::TaskOrigin,
+) {
+    let root = project_root_of(workgraph_dir);
+    match parity::PreferenceStore::record(&root, text, &origin.requester, &origin.persona) {
+        Ok(_) => println!(
+            "[{}] conversation recorded standing preference (chat {})",
+            chrono::Utc::now().format("%H:%M:%S"),
+            origin.chat_id,
+        ),
+        Err(e) => eprintln!(
+            "[{}] failed to record standing preference: {e}",
+            chrono::Utc::now().format("%H:%M:%S"),
+        ),
+    }
+}
+
+/// The project root that owns `.casa/`: the parent of a `.wg`/`.workgraph`
+/// state dir, else the dir itself. Mirrors `commands::telegram::project_root`.
+fn project_root_of(workgraph_dir: &Path) -> PathBuf {
+    match workgraph_dir.file_name().and_then(|n| n.to_str()) {
+        Some(".wg") | Some(".workgraph") => workgraph_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| workgraph_dir.to_path_buf()),
+        _ => workgraph_dir.to_path_buf(),
     }
 }
 
@@ -1206,6 +1363,40 @@ mod tests {
                 Ok(t) => Ok(t.clone()),
                 Err(e) => anyhow::bail!("{e}"),
             }
+        }
+    }
+
+    /// A composer that returns a different reply on each successive call, so the
+    /// parity retry path (first turn promises, second turn is forced to create
+    /// the task — or stubbornly refuses again) is provable. The last reply is
+    /// reused if called more times than it has entries.
+    struct SequenceComposer {
+        replies: Vec<String>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl SequenceComposer {
+        fn new(replies: &[&str]) -> Self {
+            Self {
+                replies: replies.iter().map(|s| s.to_string()).collect(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    #[async_trait]
+    impl ReplyComposer for SequenceComposer {
+        async fn compose(
+            &self,
+            _workgraph_dir: &Path,
+            _session_ref: &str,
+            _agent_id: &str,
+            _human_message: &str,
+        ) -> Result<String> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let idx = n.min(self.replies.len().saturating_sub(1));
+            Ok(self.replies[idx].clone())
         }
     }
 
@@ -1620,6 +1811,198 @@ mod tests {
         assert_eq!(o.requester, "Luca");
         assert_eq!(o.persona, "otto");
         assert_eq!(o.bot_id.as_deref(), Some("otto"));
+    }
+
+    /// PARITY, retry path: the salad regression. The composer's FIRST reply
+    /// promises action ("I'll add the salad…") but emits NO `TASK_CREATE:` tail,
+    /// so nothing would be created. The post-turn audit catches the mismatch,
+    /// retries ONCE, and the second reply carries the directive → a real task
+    /// now exists and the human sees the confirming reply (never the directive).
+    #[tokio::test]
+    async fn promise_without_artifact_retries_then_creates_task() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        // 1st: a bare promise. 2nd (forced retry): the same promise WITH the tail.
+        let composer = SequenceComposer::new(&[
+            "Sure! I'll add the salad to the list I'm sending Nora and Bruno.",
+            "On it — adding it now.\nTASK_CREATE: add a green salad to Monday dinner",
+        ]);
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "add a green salad to Monday dinner and pass it to Nora and Bruno",
+            "req-parity-1",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        // The composer was retried exactly once (2 calls total).
+        assert_eq!(composer.call_count(), 2, "expected one retry");
+
+        // A real, origin-stamped task now exists — parity restored.
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let created = graph
+            .tasks()
+            .find(|t| t.origin.is_some())
+            .expect("the retry created a stamped task");
+        assert_eq!(created.title, "add a green salad to Monday dinner");
+
+        // The human sees the confirming reply, never the machine directive.
+        let (_bot, _chat, text) = sink.calls().last().cloned().unwrap_or_default();
+        // Delivery may edit the ack in place; check both channels for the reply.
+        let last = sink
+            .edits()
+            .last()
+            .map(|e| e.3.clone())
+            .unwrap_or(text);
+        assert!(!last.contains("TASK_CREATE"), "directive leaked: {last}");
+        assert!(!last.to_lowercase().contains("snag"), "no correction expected: {last}");
+    }
+
+    /// PARITY, fallback path: a stubborn composer promises action on BOTH the
+    /// first turn and the forced retry, never emitting the directive. The ask
+    /// must still not be lost: the system creates a fallback task from the
+    /// promise text AND appends an honest correction to the SAME chat.
+    #[tokio::test]
+    async fn promise_survives_stubborn_composer_via_fallback_task_and_correction() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        // Both replies promise but NEVER emit the tail.
+        let composer = SequenceComposer::new(&[
+            "Absolutely, I'll add the salad to the list.",
+            "Yep, adding it right now!",
+        ]);
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "add a green salad to Monday dinner",
+            "req-parity-2",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(composer.call_count(), 2, "expected exactly one retry");
+
+        // A fallback task carrying the ask now exists — the ask was not lost.
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let created = graph
+            .tasks()
+            .find(|t| t.origin.is_some())
+            .expect("a fallback task was created");
+        assert!(
+            created.title.contains("add a green salad to Monday dinner"),
+            "fallback title should carry the ask: {}",
+            created.title
+        );
+
+        // The human got an honest correction in the same chat.
+        let last = sink
+            .edits()
+            .last()
+            .map(|e| e.3.clone())
+            .or_else(|| sink.calls().last().map(|c| c.2.clone()))
+            .unwrap();
+        assert!(last.to_lowercase().contains("snag"), "expected correction: {last}");
+    }
+
+    /// PARITY, no false positive: a purely non-committal reply (no promise)
+    /// creates NO task — the audit must not manufacture work from small talk.
+    #[tokio::test]
+    async fn non_committal_reply_creates_no_task() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer = SequenceComposer::new(&["Dinner's at seven, see you there!"]);
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "what time is dinner?",
+            "req-parity-3",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        // No retry, no task.
+        assert_eq!(composer.call_count(), 1, "no retry for a non-committal reply");
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).ok();
+        let any_task = graph.map(|g| g.tasks().next().is_some()).unwrap_or(false);
+        assert!(!any_task, "no task should be created for small talk");
+    }
+
+    /// PARITY, standing preference: "remember we work Mon–Fri" writes to the
+    /// durable preference store (not a one-off task) so the weekly draft can
+    /// read it every week.
+    #[tokio::test]
+    async fn standing_preference_is_recorded_durably() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer =
+            SequenceComposer::new(&["Got it — from now on, no weekday lunches. We work Mon-Fri."]);
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "remember we work Monday to Friday — no weekday lunches",
+            "req-parity-4",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        // The preference is durably recorded under the project's .casa/.
+        let root = dir.path();
+        let prefs = parity::PreferenceStore::all(root);
+        assert_eq!(prefs.len(), 1, "one preference recorded");
+        assert!(prefs[0].text.to_lowercase().contains("no weekday lunches"));
+        assert_eq!(prefs[0].requester, "Luca");
+        assert_eq!(prefs[0].persona, "otto");
+
+        // A preference is NOT a one-off task.
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).ok();
+        let any_task = graph.map(|g| g.tasks().next().is_some()).unwrap_or(false);
+        assert!(!any_task, "a standing preference must not create a task");
     }
 
     /// "Are they done yet?" is answered from LIVE graph state — the in-progress

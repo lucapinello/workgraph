@@ -3832,6 +3832,16 @@ fn main() -> Result<()> {
                 now.as_deref(),
                 cli.json,
             ),
+            TelegramCommands::Parity {
+                reply_text,
+                human,
+                dry_run,
+            } => commands::telegram::run_parity(
+                &reply_text,
+                human.as_deref(),
+                dry_run,
+                cli.json,
+            ),
             TelegramCommands::FeedWrite {
                 root,
                 kind,

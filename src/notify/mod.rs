@@ -15,6 +15,7 @@ pub mod errand;
 pub mod family_plan;
 pub mod lifecycle;
 pub mod meal_feedback;
+pub mod parity;
 #[cfg(feature = "matrix-lite")]
 pub mod matrix;
 pub mod push;

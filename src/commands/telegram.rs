@@ -3727,6 +3727,82 @@ fn resolve_reminder_target(
     resolve_dm_target(config, bindings, &rem.recipient, &rem.bot)
 }
 
+/// Audit a composed reply for promise-action parity — the `wg telegram parity`
+/// seam (see [`crate::cli::TelegramCommands::Parity`]).
+///
+/// Runs the exact pattern-based classifier the live conversational turn uses and
+/// prints: the promise kind (`action` / `preference` / `none`), whether the
+/// reply already carries a `TASK_CREATE:` tail, and whether there is a MISMATCH
+/// a live turn would repair (a one-off action promised with no artifact). No
+/// side effects — nothing is sent, no task is created.
+pub fn run_parity(
+    reply_text: &str,
+    human: Option<&str>,
+    _dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::lifecycle;
+    use worksgood::notify::parity::{self, PromiseKind};
+
+    // The audit runs over the human-facing reply, with any machine tail stripped
+    // — exactly as the live turn sees it.
+    let directive = lifecycle::extract_task_directive(reply_text.trim());
+    let audit = parity::audit_promise(&directive.reply);
+    let has_artifact = directive.title.is_some();
+    // A mismatch is the parity gap: a one-off action promised, no artifact.
+    let mismatch = audit.commits_action() && !has_artifact;
+    let fallback_title = if mismatch {
+        Some(parity::fallback_task_title(
+            human.unwrap_or(""),
+            &directive.reply,
+        ))
+    } else {
+        None
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "promised": audit.kind.slug(),
+                "commits": audit.commits(),
+                "hasArtifact": has_artifact,
+                "artifactTitle": directive.title,
+                "mismatch": mismatch,
+                "matched": audit.matched,
+                "fallbackTitle": fallback_title,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("promised: {}", audit.kind.slug());
+    if let Some(m) = &audit.matched {
+        println!("matched:  \"{m}\"");
+    }
+    match directive.title {
+        Some(t) => println!("artifact: TASK_CREATE present → \"{t}\""),
+        None => println!("artifact: none"),
+    }
+    match audit.kind {
+        PromiseKind::Preference => {
+            println!("verdict:  standing preference → would be written to the durable store");
+        }
+        PromiseKind::Action if mismatch => {
+            println!("verdict:  MISMATCH → promised an action but no artifact");
+            println!("          a live turn would retry once, then fall back to task:");
+            println!("          \"{}\"", fallback_title.unwrap_or_default());
+        }
+        PromiseKind::Action => {
+            println!("verdict:  action promised AND artifact present → parity OK");
+        }
+        PromiseKind::None => {
+            println!("verdict:  no commitment → nothing owed");
+        }
+    }
+    Ok(())
+}
+
 /// Report conversational tasks' progress back to the chats they came from — the
 /// `wg telegram lifecycle` seam (see [`crate::cli::TelegramCommands::Lifecycle`]).
 ///
