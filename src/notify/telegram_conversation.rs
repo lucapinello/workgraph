@@ -51,6 +51,7 @@ use crate::agency::TelegramBindingMap;
 use crate::chat;
 use crate::chat_sessions;
 use crate::config::Config;
+use crate::notify::lifecycle;
 
 use super::NotificationChannel;
 use super::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
@@ -95,6 +96,13 @@ pub enum ConversationPlan {
         agent_id: String,
         route: ReplyRoute,
         entry: Entry,
+        /// Display name of the human who addressed the persona (from the binding
+        /// map), so a task this turn creates can be stamped with its origin and a
+        /// "are they done yet?" can be answered for the right person. Empty when
+        /// the sender resolves to no known display name.
+        requester: String,
+        /// Which surface the ask arrived on — stamped onto any task created here.
+        channel: crate::graph::OriginChannel,
     },
     /// Confirmed human, but the elected agent has no bound session yet. We still
     /// answer — never silence — with a lightweight in-voice line.
@@ -316,6 +324,21 @@ fn sender_is_confirmed(workgraph_dir: &Path, sender: &str) -> bool {
     }
 }
 
+/// The human's display name for this Telegram `sender`, from the binding map
+/// (e.g. `"Luca"`), or empty when the sender resolves to no known name. Used to
+/// stamp a conversationally-created task's origin and to answer that person's
+/// "are they done yet?".
+fn requester_display_name(workgraph_dir: &Path, sender: &str) -> String {
+    let agency_dir = workgraph_dir.join("agency");
+    match TelegramBindingMap::load(&agency_dir) {
+        Ok(map) => map
+            .find_by_user(sender)
+            .map(|b| b.name.clone())
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
 /// Decide what to do with a plain message that routed to a single agent.
 ///
 /// Pure and filesystem-only (binding map + session registry) — no network — so
@@ -353,12 +376,19 @@ pub fn plan_conversation(
     // binds under the canonical agency id — canonicalise before the lookup so we
     // find the session that was actually bound (see `canonical_agent_id`).
     let session_key = canonical_agent_id(workgraph_dir, &agent_id);
+    let requester = requester_display_name(workgraph_dir, sender);
+    let channel = match entry {
+        Entry::Direct => crate::graph::OriginChannel::TelegramDirect,
+        Entry::GroupElected => crate::graph::OriginChannel::TelegramGroup,
+    };
     match chat_sessions::session_for_agent(workgraph_dir, &session_key) {
         Some(session_ref) => ConversationPlan::Converse {
             session_ref,
             agent_id,
             route,
             entry,
+            requester,
+            channel,
         },
         None => ConversationPlan::Sessionless {
             agent_id,
@@ -631,6 +661,14 @@ fn build_compose_prompt(
          conversational. Talk like a person texting family — no jargon, no task ids, no \
          status dumps, no markdown headings. Just answer.\n\n",
     );
+    prompt.push_str(
+        "If the message is asking the family to actually DO something (change the week, \
+         plan a meal, run an errand, book something), reply warmly that you're on it, then \
+         on a FINAL separate line emit exactly one machine directive of the form \
+         `TASK_CREATE: <short imperative describing the work>`. It is stripped before the \
+         human sees your reply, so never mention it. Do NOT emit it for small talk, \
+         questions, or things you can answer directly.\n\n",
+    );
     prompt.push_str(&format!("Message: {}\n\nYour reply:", human_message.trim()));
     prompt
 }
@@ -768,6 +806,8 @@ pub async fn run_conversation_turn(
             session_ref,
             route,
             agent_id,
+            requester,
+            channel,
             ..
         } => match composer {
             // The real path: directly drive a bounded compose turn (a one-shot
@@ -775,6 +815,15 @@ pub async fn run_conversation_turn(
             // fails fast into the graceful "glitched" follow-up — never the
             // open-loop 120s hang that this task fixes.
             Some(composer) => {
+                // Everything the lifecycle loop needs to stamp a task this turn
+                // creates and to report back here later, in this persona's voice.
+                let origin = crate::graph::TaskOrigin::new(
+                    *channel,
+                    route.chat_id.clone(),
+                    requester.clone(),
+                    agent_id.clone(),
+                    Some(route.bot_id.clone()),
+                );
                 run_composed_turn(
                     workgraph_dir,
                     session_ref,
@@ -785,6 +834,7 @@ pub async fn run_conversation_turn(
                     route,
                     sink,
                     composer,
+                    &origin,
                 )
                 .await
             }
@@ -829,6 +879,70 @@ async fn deliver_reply(
     }
 }
 
+/// Answer a requester's "are they done yet?" from their origin-stamped tasks'
+/// live state. Loads the graph, keeps the tasks stamped as theirs, and renders
+/// a family-voice status line ([`lifecycle::answer_status`]). `None` when they
+/// have no such tasks — the caller then falls back to an ordinary chat turn.
+fn answer_status_from_graph(workgraph_dir: &Path, requester: &str) -> Option<String> {
+    let graph = crate::parser::load_graph(workgraph_dir.join("graph.jsonl")).ok()?;
+    let states: Vec<lifecycle::TaskState> = graph
+        .tasks()
+        .filter(|t| {
+            t.origin
+                .as_ref()
+                .map(|o| o.requester.eq_ignore_ascii_case(requester))
+                .unwrap_or(false)
+        })
+        .map(lifecycle::TaskState::from_task)
+        .collect();
+    lifecycle::answer_status(&states)
+}
+
+/// Create an origin-stamped task from a conversational `TASK_CREATE:` title and
+/// persist it to the graph, returning its id. The task lands `Open` (the
+/// coordinator dispatches it from there) and carries `origin`, so the lifecycle
+/// loop can report "on it" / "done" back to the chat the ask arrived in.
+fn create_origin_task(
+    workgraph_dir: &Path,
+    title: &str,
+    origin: &crate::graph::TaskOrigin,
+) -> Result<String> {
+    use crate::graph::{Node, Status, Task, WorkGraph};
+    let path = workgraph_dir.join("graph.jsonl");
+    // A missing/empty graph (first-ever task) is not an error — start fresh.
+    let mut graph = if path.exists() {
+        crate::parser::load_graph(&path).map_err(|e| anyhow::anyhow!("load graph: {e}"))?
+    } else {
+        WorkGraph::new()
+    };
+    let id = lifecycle::derive_task_id(title, |cand| graph.get_node(cand).is_some());
+    let now = chrono::Local::now()
+        .naive_local()
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    let who = if origin.requester.is_empty() {
+        "a family member"
+    } else {
+        &origin.requester
+    };
+    let task = Task {
+        id: id.clone(),
+        title: title.to_string(),
+        description: Some(format!(
+            "Created from a {} chat request by {who}.",
+            origin.channel.label(),
+        )),
+        status: Status::Open,
+        created_at: Some(now.clone()),
+        last_interaction_at: Some(now),
+        origin: Some(origin.clone()),
+        ..Default::default()
+    };
+    graph.add_node(Node::Task(task));
+    crate::parser::save_graph(&graph, &path).map_err(|e| anyhow::anyhow!("save graph: {e}"))?;
+    Ok(id)
+}
+
 /// Drive a bounded compose turn: race the composer against the ack/timeout
 /// clock. Emits the latency ack once past `ack_after`; on success relays the
 /// answer (editing the ack in place); on failure OR at `reply_timeout` sends the
@@ -846,7 +960,21 @@ async fn run_composed_turn(
     route: &ReplyRoute,
     sink: &dyn ReplySink,
     composer: &dyn ReplyComposer,
+    origin: &crate::graph::TaskOrigin,
 ) -> Result<TurnOutcome> {
+    // "Are they done yet?" — a status question from someone with recent
+    // origin-stamped tasks is answered from LIVE graph state, not a generic chat
+    // turn. This is the honest report-back: what's in progress / done, in the
+    // persona's voice, without spinning up the model.
+    if !origin.requester.trim().is_empty() && lifecycle::is_status_question(human_message) {
+        if let Some(answer) = answer_status_from_graph(workgraph_dir, &origin.requester) {
+            let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+            let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &answer, request_id);
+            deliver_reply(sink, route, None, &answer).await?;
+            return Ok(TurnOutcome::Replied { acked: false });
+        }
+    }
+
     // Persist the human turn so a live nex session and the TUI stay consistent
     // with the answer we compose here (best-effort — a write failure must not
     // block the reply).
@@ -874,7 +1002,41 @@ async fn run_composed_turn(
             res = &mut compose => {
                 match res {
                     Ok(text) => {
-                        let text = text.trim().to_string();
+                        // Split the composed reply from any `TASK_CREATE:` tail: if
+                        // the turn asked to create a task, stamp it with this ask's
+                        // origin so the lifecycle loop can report back here later.
+                        let directive = lifecycle::extract_task_directive(text.trim());
+                        if let Some(title) = directive.title.as_deref() {
+                            match create_origin_task(workgraph_dir, title, origin) {
+                                Ok(id) => println!(
+                                    "[{}] conversation created task {} (origin {} chat {})",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    id,
+                                    origin.channel.label(),
+                                    origin.chat_id,
+                                ),
+                                Err(e) => eprintln!(
+                                    "[{}] failed to create conversational task: {e:#}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                ),
+                            }
+                        }
+                        // Honor an explicit "let me know when…": acknowledge it out
+                        // loud (the payoff itself arrives via the Done notification).
+                        let mut text = directive.reply;
+                        if lifecycle::is_follow_request(human_message) {
+                            if text.is_empty() {
+                                text = lifecycle::FOLLOW_ACK.to_string();
+                            } else {
+                                text.push_str("\n\n");
+                                text.push_str(lifecycle::FOLLOW_ACK);
+                            }
+                        }
+                        if text.is_empty() {
+                            // The whole reply was a bare directive — never send an
+                            // empty message; give a minimal in-voice confirmation.
+                            text = "On it 👍".to_string();
+                        }
                         let _ = chat::append_outbox_ref(
                             workgraph_dir, session_ref, &text, request_id,
                         );
@@ -1405,6 +1567,143 @@ mod tests {
             cfg.all_bots().into_iter().find(|(id, _)| id == "otto").unwrap().1.bot_token,
             "bruno and otto must carry distinct tokens for this test to be meaningful"
         );
+    }
+
+    /// A 1:1 ask that the persona turns into work stamps the created task with
+    /// its ORIGIN (channel, chat, requester, persona) and never leaks the
+    /// `TASK_CREATE:` directive into the reply the human sees. This is the birth
+    /// of the loop: without the stamp there is no way to report back.
+    #[tokio::test]
+    async fn lifecycle_task_create_stamps_origin_and_strips_the_tail() {
+        use crate::graph::OriginChannel;
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok(
+            "On it — I'll get the week tweaked.\nTASK_CREATE: tweak this week's meals",
+        );
+
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "carbonara Wednesday, eggs Tuesday, fish Saturday lunch please",
+            "req-tc",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, TurnOutcome::Replied { .. }));
+
+        // The human sees the warm reply, never the machine directive.
+        let (_bot, _chat, text) = sink.calls().last().unwrap().clone();
+        assert_eq!(text, "On it — I'll get the week tweaked.");
+        assert!(!text.contains("TASK_CREATE"));
+
+        // A real, origin-stamped task now exists in the graph.
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let created = graph
+            .tasks()
+            .find(|t| t.origin.is_some())
+            .expect("a stamped task was created");
+        assert_eq!(created.title, "tweak this week's meals");
+        let o = created.origin.as_ref().unwrap();
+        assert_eq!(o.channel, OriginChannel::TelegramDirect);
+        assert_eq!(o.chat_id, "555");
+        assert_eq!(o.requester, "Luca");
+        assert_eq!(o.persona, "otto");
+        assert_eq!(o.bot_id.as_deref(), Some("otto"));
+    }
+
+    /// "Are they done yet?" is answered from LIVE graph state — the in-progress
+    /// task's status — not by spinning up the model. The FakeComposer here would
+    /// return a wrong answer if it were called, so a correct status line proves
+    /// the short-circuit.
+    #[tokio::test]
+    async fn lifecycle_status_question_answers_from_graph_not_the_model() {
+        use crate::graph::{Node, OriginChannel, Status, Task, TaskOrigin, WorkGraph};
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        // Seed an in-progress task Luca asked for.
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(Task {
+            id: "tweak-w29-meals".into(),
+            title: "tweak this week's meals".into(),
+            status: Status::InProgress,
+            origin: Some(TaskOrigin::new(
+                OriginChannel::TelegramDirect,
+                "555",
+                "Luca",
+                "otto",
+                Some("otto".into()),
+            )),
+            ..Default::default()
+        }));
+        crate::parser::save_graph(&graph, wg.join("graph.jsonl")).unwrap();
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok("WRONG — the model should not be consulted here.");
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "hey are they done yet?",
+            "req-st",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let (_bot, _chat, text) = sink.calls().last().unwrap().clone();
+        assert!(text.contains("on it now"), "status answer, got: {text}");
+        assert!(!text.contains("WRONG"), "must not use the model: {text}");
+    }
+
+    /// An explicit "let me know when…" is acknowledged out loud, appended to the
+    /// composed reply (the payoff itself arrives later via the Done notification).
+    #[tokio::test]
+    async fn lifecycle_follow_request_appends_the_ack() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok("Sure — I'll get it sorted.");
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "tweak the week, and let me know when they are done",
+            "req-fl",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let (_bot, _chat, text) = sink.calls().last().unwrap().clone();
+        assert!(text.starts_with("Sure — I'll get it sorted."), "{text}");
+        assert!(text.contains(lifecycle::FOLLOW_ACK), "follow ack appended: {text}");
     }
 
     #[test]

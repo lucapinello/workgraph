@@ -144,6 +144,36 @@ pub fn extract_task_directive(reply: &str) -> TaskDirective {
     }
 }
 
+/// Derive a stable, readable task id from a `TASK_CREATE:` title — a slug of up
+/// to five words — de-duplicated against the graph via `exists` (append `-2`,
+/// `-3`, … until free). Mirrors the shape `wg add` produces so a
+/// conversationally-created task reads like any other.
+pub fn derive_task_id(title: &str, exists: impl Fn(&str) -> bool) -> String {
+    let slug: String = title
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join("-");
+    let base = if slug.is_empty() {
+        "chat-task".to_string()
+    } else {
+        slug
+    };
+    if !exists(&base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !exists(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rendering the family-voice lines
 // ---------------------------------------------------------------------------
@@ -870,6 +900,20 @@ mod tests {
 
         let stamped_open = task_with("t", Status::Open); // no event yet
         assert!(LifecycleInput::from_task(&stamped_open, vec![]).is_none());
+    }
+
+    #[test]
+    fn lifecycle_derive_task_id_slugs_and_dedupes() {
+        // Slug of the first words, dashed and lowercased.
+        assert_eq!(
+            derive_task_id("Tweak this week's meals — carbonara Wed", |_| false),
+            "tweak-this-week-s-meals"
+        );
+        // Empty/punctuation-only title falls back to a stable base.
+        assert_eq!(derive_task_id("!!!", |_| false), "chat-task");
+        // Collisions get a numeric suffix until free.
+        let taken = |id: &str| id == "make-dinner" || id == "make-dinner-2";
+        assert_eq!(derive_task_id("Make dinner", taken), "make-dinner-3");
     }
 
     #[test]

@@ -6702,6 +6702,30 @@ pub enum TelegramCommands {
         now: Option<String>,
     },
 
+    /// Report a conversational task's progress back to the chat it came from
+    ///
+    /// Closes the back-and-forth loop: when a persona created a task from a chat
+    /// ask (a 1:1 DM, the family group, or the kiosk pane), this sends the
+    /// "on it" / "done, here's what changed" / honest-snag line back to that
+    /// exact chat, in the composing persona's voice via their bot — paced
+    /// through the daily-digest choke point (time-critical but capped) and fired
+    /// exactly once per (task, event). With a `<task-id>` it reports on that one
+    /// task; with none it scans every origin-stamped task. `--dry-run` prints
+    /// what would be sent where (credential-free), sending nothing.
+    Lifecycle {
+        /// Task id to report on; omit to scan every origin-stamped task.
+        task_id: Option<String>,
+
+        /// Print what would be sent where, without sending or recording state.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Override "now" as `YYYY-MM-DDTHH:MM` (local wall clock) for
+        /// deterministic tests; defaults to the system clock.
+        #[arg(long)]
+        now: Option<String>,
+    },
+
     /// Mirror one line to the casa conversation-pane feed (diagnostic)
     ///
     /// Appends a single line to `<root>/.casa/group-feed.jsonl` through the

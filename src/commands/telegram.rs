@@ -3727,6 +3727,188 @@ fn resolve_reminder_target(
     resolve_dm_target(config, bindings, &rem.recipient, &rem.bot)
 }
 
+/// Report conversational tasks' progress back to the chats they came from — the
+/// `wg telegram lifecycle` seam (see [`crate::cli::TelegramCommands::Lifecycle`]).
+///
+/// Scans origin-stamped tasks (or the single `task_id`), derives each one's
+/// start/done/fail event from live status, renders the family-voice line in the
+/// composing persona's voice, and fires it exactly once — paced through the
+/// daily-digest choke point (time-critical but capped) and delivered to the
+/// origin chat via the origin persona's bot. `--dry-run` prints what would be
+/// sent where and touches no state; the real path persists the FiredLog +
+/// pacing store FIRST (restart-safe), then sends.
+pub fn run_lifecycle(
+    workgraph_dir: &Path,
+    task_id: Option<&str>,
+    dry_run: bool,
+    now_override: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::daily_digest::{DigestPolicy, DigestStore};
+    use worksgood::notify::lifecycle::{self, LifecycleInput};
+    use worksgood::notify::reminder::FiredLog;
+
+    let root = project_root(workgraph_dir);
+    let now = match now_override {
+        Some(s) => parse_naive_now(s)
+            .with_context(|| format!("invalid --now '{s}', expected YYYY-MM-DDTHH:MM"))?,
+        None => chrono::Local::now().naive_local(),
+    };
+
+    // Live graph: gather origin-stamped tasks that owe a notification. A missing
+    // graph is not an error — there is simply nothing to report yet.
+    let graph_path = crate::commands::graph_path(workgraph_dir);
+    let graph = if graph_path.exists() {
+        worksgood::parser::load_graph(&graph_path).context("failed to load the task graph")?
+    } else {
+        worksgood::WorkGraph::new()
+    };
+    let mut inputs: Vec<LifecycleInput> = Vec::new();
+    for task in graph.tasks() {
+        if let Some(want) = task_id {
+            if task.id != want {
+                continue;
+            }
+        }
+        // Workers doing the work, for the "Nora and Bruno are on it" line: the
+        // assignee display name when it reads as a name, else the origin persona.
+        let workers = lifecycle_workers(task);
+        if let Some(input) = LifecycleInput::from_task(task, workers) {
+            inputs.push(input);
+        }
+    }
+
+    let log_path = FiredLog::path(&root);
+    let store_path = DigestStore::path(&root);
+    let mut log = FiredLog::load(&log_path);
+    let mut store = DigestStore::load(&store_path);
+    let policy = DigestPolicy::default();
+
+    if dry_run {
+        // Compute against throwaway copies so a dry run records nothing.
+        let mut dry_log = log.clone();
+        let mut dry_store = store.clone();
+        let result =
+            lifecycle::lifecycle_tick(&inputs, &mut dry_log, &mut dry_store, now, &policy);
+        if json {
+            let rows: Vec<_> = result
+                .fired
+                .iter()
+                .chain(result.capped.iter())
+                .map(|f| {
+                    serde_json::json!({
+                        "task": f.task_id,
+                        "event": f.event.slug(),
+                        "chat": f.origin.chat_id,
+                        "persona": f.origin.persona,
+                        "bot": f.origin.bot_id,
+                        "text": f.text,
+                        "capped": result.capped.iter().any(|c| c.task_id == f.task_id && c.event == f.event),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        } else if result.fired.is_empty() && result.capped.is_empty() {
+            println!("Nothing to report at {}.", now.format("%Y-%m-%d %H:%M"));
+        } else {
+            for f in &result.fired {
+                println!("{}", lifecycle::dry_run_line(f));
+            }
+            for f in &result.capped {
+                println!("[dry-run] (capped → folds into digest) {}", lifecycle::dry_run_line(f));
+            }
+        }
+        return Ok(());
+    }
+
+    // Real firing: persist exactly-once + pacing state FIRST, then deliver.
+    let result = lifecycle::lifecycle_tick(&inputs, &mut log, &mut store, now, &policy);
+    log.save(&log_path)
+        .with_context(|| format!("failed to persist lifecycle state to {}", log_path.display()))?;
+    store
+        .save(&store_path)
+        .with_context(|| format!("failed to persist pacing state to {}", store_path.display()))?;
+
+    let config = load_telegram_config().unwrap_or_default();
+    let mut sent = 0usize;
+    if !result.fired.is_empty() {
+        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+        rt.block_on(async {
+            for f in &result.fired {
+                // Reply in the ORIGIN chat, as the ORIGIN persona's bot. A
+                // misconfigured persona hard-fails resolution rather than
+                // delivering under the wrong face (same rule as `send --persona`).
+                let persona = f.origin.bot_id.as_deref().unwrap_or(&f.origin.persona);
+                match resolve_send_bot(&config, Some(&f.origin.chat_id), Some(persona)) {
+                    Ok((bot_id, bot, chat)) => {
+                        let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
+                        match channel.send_text(&chat, &f.text).await {
+                            Ok(_) => {
+                                sent += 1;
+                                println!(
+                                    "[{}] lifecycle {} for {} → chat {} via {}: {}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    f.event.slug(),
+                                    f.task_id,
+                                    chat,
+                                    bot_id,
+                                    f.text,
+                                );
+                            }
+                            Err(e) => eprintln!(
+                                "[{}] failed to deliver lifecycle {} for {}: {}",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                f.event.slug(),
+                                f.task_id,
+                                worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                            ),
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[{}] no bot for lifecycle persona '{}' on task {} — skipping: {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        persona,
+                        f.task_id,
+                        e,
+                    ),
+                }
+            }
+        });
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "fired": result.fired.len(),
+                "sent": sent,
+                "capped": result.capped.len(),
+            })
+        );
+    } else if result.fired.is_empty() && result.capped.is_empty() {
+        println!("Nothing to report at {}.", now.format("%Y-%m-%d %H:%M"));
+    }
+    Ok(())
+}
+
+/// The persona name(s) doing a task's work, for the "on it" line: the task's
+/// assignee display name when it reads like a plain roster name (not an agent
+/// content-hash), else the origin persona so the line still names a voice.
+fn lifecycle_workers(task: &worksgood::graph::Task) -> Vec<String> {
+    let looks_like_name = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 24
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && s.chars().any(|c| c.is_ascii_alphabetic())
+            // an agency content-hash is long lowercase hex; a roster name is short
+            && !(s.len() >= 16 && s.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    if let Some(a) = task.assigned.as_deref().filter(|a| looks_like_name(a)) {
+        return vec![a.to_string()];
+    }
+    Vec::new()
+}
+
 /// Resolve the DM target (chat + bot) for a proactive nudge to `recipient`, sent
 /// in the voice `bot`: prefer the recipient's own bound bot + chat, else a bot
 /// whose `agent_id` matches the owning voice, else any configured bot. Shared by

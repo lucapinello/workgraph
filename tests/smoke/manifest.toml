@@ -2169,3 +2169,12 @@ owners = [
 ]
 description = "Pins the reminder engine (task reminders-that-reach): the weekly plan's `## 3. Calendar` reminder rows (`⏰ Reminder: Luca PT check-in`) and ad-hoc 'remind me Thursday to …' asks become scheduled DMs that fire EXACTLY once, restart-safe, with a `(late)` honesty window. Drives the real binary via `wg telegram remind` (the credential-free scheduler seam, same pattern as `wg telegram elect`/`feed-write`): a plan row lists as one pending reminder; at its due minute it WOULD SEND on time, 40 min late it fires with the honest `(late)` tag, and over 2h late it is DROPPED rather than firing a stale nag; an ad-hoc request registers to `.casa/reminders-adhoc.json` and confirms in one line ('Will do — Thursday morning ✓'); a real fire records durable state in `.casa/reminders-state.json` BEFORE sending so a restart never re-fires (exactly once). Complements the notify::reminder unit tests (parse/fire/exactly-once/restart/late). Credential-free: no notify.toml, so nothing is sent — state files prove intent."
 timeout_seconds = 30
+
+[[scenario]]
+name = "lifecycle_report_back"
+script = "scenarios/lifecycle_report_back.sh"
+owners = [
+    "close-the-conversational",
+]
+description = "Pins the conversational feedback loop (task close-the-conversational): Luca's north-star back-and-forth — he asks a persona in chat to change the week, the family works, and he HEARS about it (start + done, in the persona's voice via their bot). Before this the work happened invisibly (a task got created but no start/done ever came back), so it looked like a bug. Drives the real binary via `wg telegram lifecycle` (the credential-free tick seam, same pattern as `wg telegram remind`/`elect`): an in-progress origin-stamped task WOULD send an 'on it' line naming the worker to the ORIGIN chat via the ORIGIN persona's bot; a done task WOULD send the payoff carrying WHAT CHANGED (the family-voice LIFECYCLE_SUMMARY line); an un-origin-stamped internal chore is NEVER reported on; and a real fire records durable state in `.casa/reminders-state.json` BEFORE sending so a restart never re-reports (exactly once — the loop is not a nag). Complements the notify::lifecycle unit tests (events/render/status-answer/follow-ack/pacing-cap/exactly-once) and the notify::telegram_conversation composer tests (TASK_CREATE origin stamping, status short-circuit, follow ack). Credential-free: dry-run resolves and prints only; nothing is sent."
+timeout_seconds = 30

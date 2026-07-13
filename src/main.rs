@@ -3821,6 +3821,17 @@ fn main() -> Result<()> {
                 now.as_deref(),
                 cli.json,
             ),
+            TelegramCommands::Lifecycle {
+                task_id,
+                dry_run,
+                now,
+            } => commands::telegram::run_lifecycle(
+                &workgraph_dir,
+                task_id.as_deref(),
+                dry_run,
+                now.as_deref(),
+                cli.json,
+            ),
             TelegramCommands::FeedWrite {
                 root,
                 kind,
