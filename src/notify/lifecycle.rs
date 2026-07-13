@@ -239,6 +239,7 @@ pub fn render_line(
         }
         LifecycleEvent::Done => match summary.map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => {
+                let s = cap_summary(s);
                 let s = s.trim_end_matches(['.', ' ']);
                 format!("Done! {s} ✅")
             }
@@ -306,10 +307,11 @@ impl TaskState {
     /// Derive a status snapshot from a live task: its human-facing ask, its
     /// lifecycle stage, and any recorded change summary.
     pub fn from_task(task: &Task) -> Self {
+        let event = event_for_task(task);
         Self {
             what: task_what(task),
-            event: event_for_task(task),
-            summary: summary_for_task(task),
+            event,
+            summary: event.and_then(|e| summary_with_fallback(task, e)),
         }
     }
 }
@@ -418,6 +420,66 @@ pub const FOLLOW_ACK: &str = "Will do — I'll ping you here when it's done.";
 /// Kept out of band from the technical breadcrumbs so the payoff stays warm.
 pub const SUMMARY_LOG_PREFIX: &str = "LIFECYCLE_SUMMARY:";
 
+/// Strict upper bound (characters) on the "what changed" payoff line. A composed
+/// or worker-recorded summary can run long; the Done ping is a one-liner, so both
+/// the recorded summary and the title-derived fallback are capped to this before
+/// they land in the message. Keeps a chatty summary from ballooning the reply.
+pub const SUMMARY_MAX_CHARS: usize = 160;
+
+/// Trim a "what changed" summary to [`SUMMARY_MAX_CHARS`], cutting on a word
+/// boundary and appending an ellipsis when it overflows. A single over-long word
+/// is hard-cut. Short summaries pass through untouched.
+fn cap_summary(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= SUMMARY_MAX_CHARS {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for word in s.split_whitespace() {
+        // Reserve one char for the trailing ellipsis, one for the joining space.
+        if out.chars().count() + word.chars().count() + 2 > SUMMARY_MAX_CHARS {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.is_empty() {
+        // A single very long word with no boundary to cut on — hard-truncate.
+        out = s.chars().take(SUMMARY_MAX_CHARS - 1).collect();
+    }
+    format!("{}…", out.trim_end_matches([',', ' ', '—', '-']))
+}
+
+/// A last-resort "what changed" line derived from the task title, for when the
+/// worker recorded no `LIFECYCLE_SUMMARY:`. Not as polished as a one-shot-composed
+/// line, but a specific echo of the request ("Add Thursday dinner: grilled tofu")
+/// beats the bare generic "that's sorted" — which is exactly the gap the first
+/// live report-back exposed. Humanizes the id-ish title and enforces the cap.
+pub fn fallback_summary_from_title(title: &str) -> Option<String> {
+    let human = title.trim().replace('-', " ");
+    let human = human.trim();
+    if human.is_empty() {
+        return None;
+    }
+    Some(cap_summary(&cap_first(human)))
+}
+
+/// The "what changed" summary to attach to a Done payoff: a worker-recorded
+/// `LIFECYCLE_SUMMARY:` when present (the composed, warmest line), else a
+/// title-derived fallback so the Done message is never the bare generic. Only
+/// Done events get the fallback — a Started/Failed line never quotes the title.
+fn summary_with_fallback(task: &Task, event: LifecycleEvent) -> Option<String> {
+    if let Some(recorded) = summary_for_task(task) {
+        return Some(recorded);
+    }
+    if event == LifecycleEvent::Done {
+        return fallback_summary_from_title(&task.title);
+    }
+    None
+}
+
 /// Extract the family-voice change summary a worker recorded via a
 /// `LIFECYCLE_SUMMARY:` log line, if any (the most recent one wins).
 pub fn summary_for_task(task: &Task) -> Option<String> {
@@ -452,6 +514,58 @@ pub fn task_what(task: &Task) -> String {
 /// `seen` set fire it at most once.
 pub fn notification_id(task_id: &str, event: LifecycleEvent) -> String {
     format!("lifecycle:{task_id}:{}", event.slug())
+}
+
+/// A task whose current lifecycle event still owes a report-back — the unit the
+/// coordinator's transition trigger works in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFire {
+    pub task_id: String,
+    pub event: LifecycleEvent,
+    /// The exactly-once id ([`notification_id`]) this fire would record.
+    pub notification_id: String,
+}
+
+/// Scan `tasks` for origin-stamped ones whose *current* lifecycle event has not
+/// yet been fired and which have someone to report back to. This is the cheap,
+/// in-tick gate the coordinator runs on every poll: a report-back is only fired
+/// when this returns something, so
+///
+/// * **non-origin tasks → silence** (no `origin` stamp → skipped),
+/// * **unaddressed origins → silence** (empty `requester` → skipped, matching
+///   [`lifecycle_tick`], so a task with no one to reach can't spin the trigger),
+/// * **already-reported events → silence** (`already_fired(id)` true → skipped),
+///
+/// and the trigger stays idle until a genuine start/done/fail transition lands.
+/// `already_fired` is the caller's view of the [`FiredLog`]
+/// (`|id| log.contains(id)`), so this predicts exactly what [`lifecycle_tick`]
+/// would fire without touching any state.
+pub fn pending_fires<'a>(
+    tasks: impl Iterator<Item = &'a Task>,
+    already_fired: impl Fn(&str) -> bool,
+) -> Vec<PendingFire> {
+    let mut out = Vec::new();
+    for task in tasks {
+        let Some(origin) = task.origin.as_ref() else {
+            continue; // not conversational — nothing to report back
+        };
+        if origin.requester.trim().is_empty() {
+            continue; // no one to reach
+        }
+        let Some(event) = event_for_task(task) else {
+            continue; // still queued — owes nothing yet
+        };
+        let id = notification_id(&task.id, event);
+        if already_fired(&id) {
+            continue; // this (task, event) already went out
+        }
+        out.push(PendingFire {
+            task_id: task.id.clone(),
+            event,
+            notification_id: id,
+        });
+    }
+    out
 }
 
 /// Build the pacing [`Nudge`] for a rendered lifecycle notification: time-critical
@@ -501,7 +615,7 @@ impl LifecycleInput {
             origin,
             event,
             workers,
-            summary: summary_for_task(task),
+            summary: summary_with_fallback(task, event),
         })
     }
 
@@ -914,6 +1028,109 @@ mod tests {
         // Collisions get a numeric suffix until free.
         let taken = |id: &str| id == "make-dinner" || id == "make-dinner-2";
         assert_eq!(derive_task_id("Make dinner", taken), "make-dinner-3");
+    }
+
+    // -- payoff content: title fallback + strict length cap ------------------
+
+    #[test]
+    fn lifecycle_done_falls_back_to_the_title_when_no_summary_recorded() {
+        // A Done task with no LIFECYCLE_SUMMARY log line must NOT ship the bare
+        // generic — it echoes what changed from the title (the first-live-test gap).
+        let mut t = task_with("replace-friday-dinner-chicken-with-trout", Status::Done);
+        t.title = "replace friday dinner chicken with trout".into();
+        let input = LifecycleInput::from_task(&t, vec![]).unwrap();
+        let line = input.render();
+        assert!(line.starts_with("Done!"), "{line}");
+        assert!(line.contains("trout"), "must say what changed: {line}");
+        assert_ne!(line, "All done — that's sorted ✅");
+    }
+
+    #[test]
+    fn lifecycle_recorded_summary_beats_the_title_fallback() {
+        let mut t = task_with("replace-friday-dinner", Status::Done);
+        t.title = "replace friday dinner chicken with trout".into();
+        t.log.push(LogEntry {
+            timestamp: "2026-07-13T12:00:00".into(),
+            actor: None,
+            user: None,
+            message: "LIFECYCLE_SUMMARY: Friday's dinner is now roast trout & potatoes".into(),
+        });
+        let line = LifecycleInput::from_task(&t, vec![]).unwrap().render();
+        assert_eq!(line, "Done! Friday's dinner is now roast trout & potatoes ✅");
+    }
+
+    #[test]
+    fn lifecycle_started_and_failed_never_quote_the_title() {
+        // The fallback is Done-only: a Started/Failed line stays voice-generic.
+        let running = task_with("swap-the-meals", Status::InProgress);
+        assert_eq!(
+            LifecycleInput::from_task(&running, vec![]).unwrap().summary,
+            None
+        );
+        let failed = task_with("swap-the-meals", Status::Failed);
+        let line = LifecycleInput::from_task(&failed, vec![]).unwrap().render();
+        assert!(line.to_lowercase().contains("snag"), "{line}");
+        assert!(!line.contains("swap"), "failed line must not quote the title: {line}");
+    }
+
+    #[test]
+    fn lifecycle_summary_is_capped_to_a_one_liner() {
+        let long = "a ".repeat(200); // ~400 chars, well over the cap
+        let line = render_line(&origin(), LifecycleEvent::Done, &[], Some(&long));
+        // "Done! " + capped body + " ✅" — body must respect SUMMARY_MAX_CHARS.
+        assert!(line.ends_with('✅'));
+        assert!(line.contains('…'), "over-long summary is elided: {line}");
+        let body = line
+            .trim_start_matches("Done! ")
+            .trim_end_matches(" ✅");
+        assert!(
+            body.chars().count() <= SUMMARY_MAX_CHARS,
+            "capped body is {} chars: {body}",
+            body.chars().count()
+        );
+    }
+
+    // -- the coordinator's transition trigger gate ----------------------------
+
+    #[test]
+    fn lifecycle_pending_fires_only_for_unreported_origin_transitions() {
+        let never = |_: &str| false;
+
+        // Origin-stamped + running + not-yet-fired → one pending fire.
+        let running = task_with("t1", Status::InProgress);
+        let p = pending_fires([running.clone()].iter(), never);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].event, LifecycleEvent::Started);
+        assert_eq!(p[0].notification_id, notification_id("t1", LifecycleEvent::Started));
+
+        // Already fired → silence (dedupe on retries).
+        let fired_id = p[0].notification_id.clone();
+        let already = |id: &str| id == fired_id;
+        assert!(pending_fires([running.clone()].iter(), already).is_empty());
+
+        // Non-origin task → silence.
+        let mut unstamped = task_with("t2", Status::InProgress);
+        unstamped.origin = None;
+        assert!(pending_fires([unstamped].iter(), never).is_empty());
+
+        // Origin but nobody to reach → silence (can't spin the trigger).
+        let mut unaddressed = task_with("t3", Status::Done);
+        unaddressed.origin.as_mut().unwrap().requester = String::new();
+        assert!(pending_fires([unaddressed].iter(), never).is_empty());
+
+        // Still queued (Open) → owes nothing yet.
+        let open = task_with("t4", Status::Open);
+        assert!(pending_fires([open].iter(), never).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_pending_fires_tracks_the_event_as_status_advances() {
+        let never = |_: &str| false;
+        // The SAME task at Done is a distinct pending fire from its Started one.
+        let done = task_with("t1", Status::Done);
+        let p = pending_fires([done].iter(), never);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].event, LifecycleEvent::Done);
     }
 
     #[test]

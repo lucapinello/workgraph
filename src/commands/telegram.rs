@@ -3166,7 +3166,7 @@ pub fn run_feed_write(
 /// The project root that holds `plans/`. The graph dir is `<root>/.wg`, so when
 /// `workgraph_dir` is a `.wg`/`.workgraph` subdir we step up to its parent;
 /// otherwise we treat it as the root itself.
-fn project_root(workgraph_dir: &Path) -> PathBuf {
+pub(crate) fn project_root(workgraph_dir: &Path) -> PathBuf {
     match workgraph_dir.file_name().and_then(|n| n.to_str()) {
         Some(".wg") | Some(".workgraph") => workgraph_dir
             .parent()

@@ -4635,6 +4635,12 @@ pub fn coordinator_tick(
     // below (max agents, no ready tasks) would skip chat processing otherwise.
     process_chat_inbox(dir);
 
+    // Conversational report-backs, BEFORE any capacity early-return. A task
+    // finishing is exactly when the daemon is often at max agents or idle, so
+    // this must not sit behind the "max agents" / "no ready tasks" returns below.
+    // Fire-and-forget: a network-bound Telegram send never blocks the tick.
+    fire_lifecycle_reports(dir);
+
     // Phase 1: Clean up dead agents and count alive ones
     let alive_count = match cleanup_and_count_alive(dir, &graph_path, max_agents)? {
         Ok(count) => count,
@@ -4953,6 +4959,68 @@ pub fn coordinator_tick(
         tasks_ready: ready_count,
         agents_spawned: spawned,
     })
+}
+
+/// Conversational report-backs: fire the lifecycle report for any origin-stamped
+/// task whose start/done/fail transition the coordinator now sees but hasn't yet
+/// reported. This is the trigger the first live test was missing — the CLI
+/// (`wg telegram lifecycle`) had to be run by hand. The coordinator sees every
+/// transition, so it fires the *same* code path automatically.
+///
+/// Cheap and safe to call on every tick:
+/// * a pure [`lifecycle::pending_fires`] gate reads the graph + [`FiredLog`] and
+///   returns nothing for non-origin tasks, unaddressed origins, and
+///   already-reported events → we don't even spawn a thread in the common case;
+/// * when something *is* pending, the actual (network-bound) send runs on a
+///   detached background thread so it NEVER blocks the tick — exactly-once and
+///   pacing are enforced inside `run_lifecycle` via the persisted `FiredLog`, so
+///   a redundant run is a no-op;
+/// * a short throttle marker keeps overlapping runs from double-sending while one
+///   is still in flight.
+fn fire_lifecycle_reports(dir: &Path) {
+    use worksgood::notify::lifecycle;
+    use worksgood::notify::reminder::FiredLog;
+
+    let graph_path = graph_path(dir);
+    if !graph_path.exists() {
+        return;
+    }
+    let graph = match load_graph(&graph_path) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let root = crate::commands::telegram::project_root(dir);
+    let fired = FiredLog::load(&FiredLog::path(&root));
+    let pending = lifecycle::pending_fires(graph.tasks(), |id| fired.contains(id));
+    if pending.is_empty() {
+        return; // nothing changed — silence
+    }
+
+    // Throttle: if a report run was launched very recently it is probably still
+    // mid-flight (it persists the FiredLog before sending). Skip so two runs
+    // can't both load an empty log and double-send. The marker's mtime is the
+    // last-launch clock.
+    let marker = dir.join(".lifecycle-trigger");
+    if let Ok(elapsed) = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+        && elapsed < std::time::Duration::from_secs(15)
+    {
+        return;
+    }
+    let _ = std::fs::write(&marker, b"lifecycle report-back launch marker\n");
+
+    eprintln!(
+        "[dispatcher] Lifecycle report-back: {} pending transition(s), firing",
+        pending.len()
+    );
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        // Same code path as `wg telegram lifecycle` (all tasks, real send).
+        if let Err(e) = crate::commands::telegram::run_lifecycle(&dir, None, false, None, false) {
+            eprintln!("[dispatcher] Lifecycle report-back failed: {e:#}");
+        }
+    });
 }
 
 /// Process pending chat inbox messages and write responses to the outbox.
