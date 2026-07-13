@@ -1950,6 +1950,15 @@ description = "Pins weekly-cron wakeup + missed-trigger catch-up (repro-weekly-w
 timeout_seconds = 90
 
 [[scenario]]
+name = "cron_template_reregistration_no_reblock"
+script = "scenarios/cron_template_reregistration_no_reblock.sh"
+owners = [
+    "cron-re-registration",
+]
+description = "Regression for the cron-re-registration deadlock: a `--cron-template` task is never dispatched itself (is_time_ready→cron_template gate); each due firing mints a DISTINCT instance task id (`<template>-<period>`, mint_due_cron_instances) instead of re-registering the template id; and a child created `--after <instance-1>` and left Open is NOT re-blocked when the next firing mints instance-2 — because the after-edge binds to the finished run, not the recurring definition. This is the exact tonight plan-pipeline stall (agents 2285/2286) where finished child work stranded on `blocked by weekly-plan-sunday: Open`. Credential-free: a real daemon with max-agents=0 mints via the coordinator; python3 rewrites next_cron_fire to drive two distinct-week firings."
+timeout_seconds = 90
+
+[[scenario]]
 name = "cron_paused_state_skips_dispatch"
 script = "scenarios/cron_paused_state_skips_dispatch.sh"
 owners = [

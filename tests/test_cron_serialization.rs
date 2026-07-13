@@ -91,6 +91,8 @@ fn test_cron_task_serialization() {
         cron_enabled: true,
         last_cron_fire: Some("2026-04-12T02:00:00Z".to_string()),
         next_cron_fire: Some("2026-04-13T02:00:00Z".to_string()),
+        cron_template: false,
+        cron_instance_of: None,
     };
 
     // Test serialization

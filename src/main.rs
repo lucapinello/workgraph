@@ -1043,6 +1043,7 @@ fn main() -> Result<()> {
             no_tier_escalation,
             priority,
             cron,
+            cron_template,
             subtask,
             spawned_by,
             scope,
@@ -1103,6 +1104,13 @@ fn main() -> Result<()> {
                 // Draft by default for interactive use
                 true
             };
+            // --cron-template only makes sense for a local cron task.
+            if cron_template && cron.is_none() {
+                anyhow::bail!("--cron-template requires --cron <expr>");
+            }
+            if cron_template && repo.is_some() {
+                anyhow::bail!("--cron-template is not supported for remote (--repo) adds");
+            }
             if let Some(ref peer_ref) = repo {
                 commands::add::run_remote(
                     &workgraph_dir,
@@ -1120,6 +1128,72 @@ fn main() -> Result<()> {
                     verify_timeout.as_deref(),
                     cron.as_deref(),
                 )
+            } else if cron_template {
+                // Capture the id of the newly-created cron task (which may be
+                // auto-generated) by diffing the graph before/after, then flip
+                // it to template mode.
+                let ids_before: std::collections::HashSet<String> =
+                    commands::load_workgraph(&workgraph_dir)
+                        .map(|(g, _)| g.tasks().map(|t| t.id.clone()).collect())
+                        .unwrap_or_default();
+                commands::add::run(
+                    &workgraph_dir,
+                    &title,
+                    id.as_deref(),
+                    description.as_deref(),
+                    &after,
+                    assign.as_deref(),
+                    hours,
+                    cost,
+                    &tag,
+                    &skill,
+                    &input,
+                    &deliverable,
+                    &choices,
+                    max_retries,
+                    model.as_deref(),
+                    provider.as_deref(),
+                    verify.as_deref(),
+                    verify_timeout.as_deref(),
+                    validation.as_deref(),
+                    validator_agent.as_deref(),
+                    validator_model.as_deref(),
+                    max_iterations,
+                    cycle_guard.as_deref(),
+                    cycle_delay.as_deref(),
+                    no_converge,
+                    no_restart_on_failure,
+                    max_failure_restarts,
+                    &visibility,
+                    context_scope.as_deref(),
+                    exec.as_deref(),
+                    timeout.as_deref(),
+                    exec_mode.as_deref(),
+                    effective_paused,
+                    effective_no_place,
+                    &place_near,
+                    &place_before,
+                    delay.as_deref(),
+                    not_before.as_deref(),
+                    allow_phantom,
+                    independent,
+                    no_tier_escalation,
+                    parse_iteration_config(propagation.as_deref(), retry_strategy.as_deref()),
+                    priority.as_deref(),
+                    cron.as_deref(),
+                    subtask,
+                )?;
+                let (graph_after, _) = commands::load_workgraph(&workgraph_dir)?;
+                let new_id = graph_after
+                    .tasks()
+                    .map(|t| t.id.clone())
+                    .find(|tid| !ids_before.contains(tid));
+                match new_id {
+                    Some(new_id) => {
+                        commands::cron_cmd::set_cron_template(&workgraph_dir, &new_id, true)
+                    }
+                    None => Ok(()),
+                }
             } else {
                 commands::add::run(
                     &workgraph_dir,
@@ -1195,41 +1269,50 @@ fn main() -> Result<()> {
             not_before,
             verify,
             cron,
+            cron_template,
             timeout,
             verify_timeout,
             allow_phantom,
             allow_cycle,
-        } => commands::edit::run(
-            &workgraph_dir,
-            &id,
-            title.as_deref(),
-            description.as_deref(),
-            &add_after,
-            &remove_after,
-            &add_tag,
-            &remove_tag,
-            model.as_deref(),
-            provider.as_deref(),
-            &add_skill,
-            &remove_skill,
-            max_iterations,
-            cycle_guard.as_deref(),
-            cycle_delay.as_deref(),
-            no_converge,
-            no_restart_on_failure,
-            max_failure_restarts,
-            visibility.as_deref(),
-            context_scope.as_deref(),
-            exec_mode.as_deref(),
-            delay.as_deref(),
-            not_before.as_deref(),
-            verify.as_deref(),
-            cron.as_deref(),
-            timeout.as_deref(),
-            verify_timeout.as_deref(),
-            allow_phantom,
-            allow_cycle,
-        ),
+        } => {
+            commands::edit::run(
+                &workgraph_dir,
+                &id,
+                title.as_deref(),
+                description.as_deref(),
+                &add_after,
+                &remove_after,
+                &add_tag,
+                &remove_tag,
+                model.as_deref(),
+                provider.as_deref(),
+                &add_skill,
+                &remove_skill,
+                max_iterations,
+                cycle_guard.as_deref(),
+                cycle_delay.as_deref(),
+                no_converge,
+                no_restart_on_failure,
+                max_failure_restarts,
+                visibility.as_deref(),
+                context_scope.as_deref(),
+                exec_mode.as_deref(),
+                delay.as_deref(),
+                not_before.as_deref(),
+                verify.as_deref(),
+                cron.as_deref(),
+                timeout.as_deref(),
+                verify_timeout.as_deref(),
+                allow_phantom,
+                allow_cycle,
+            )?;
+            // --cron-template: convert this cron task to template mode so each
+            // firing mints a distinct instance instead of re-registering the id.
+            if cron_template {
+                commands::cron_cmd::set_cron_template(&workgraph_dir, &id, true)?;
+            }
+            Ok(())
+        }
         Commands::Reprioritize { id, priority } => {
             commands::reprioritize::run(&workgraph_dir, &id, &priority)
         }

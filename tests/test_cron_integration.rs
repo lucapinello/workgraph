@@ -158,6 +158,8 @@ fn test_cron_task_serialization() {
         cron_enabled: true,
         last_cron_fire: Some("2026-04-12T02:00:00Z".to_string()),
         next_cron_fire: Some("2026-04-13T02:00:00Z".to_string()),
+        cron_template: false,
+        cron_instance_of: None,
         ..create_test_task()
     };
 
@@ -220,6 +222,8 @@ fn test_cron_workflow_end_to_end() {
         cron_schedule: Some("0 0 2 * * *".to_string()), // Daily at 2 AM
         last_cron_fire: None,
         next_cron_fire: None,
+        cron_template: false,
+        cron_instance_of: None,
         ..create_test_task()
     };
 
@@ -333,5 +337,7 @@ fn create_test_task() -> Task {
         cron_enabled: false,
         last_cron_fire: None,
         next_cron_fire: None,
+        cron_template: false,
+        cron_instance_of: None,
     }
 }

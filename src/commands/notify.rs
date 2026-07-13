@@ -406,6 +406,8 @@ mod tests {
             cron_enabled: false,
             last_cron_fire: None,
             next_cron_fire: None,
+            cron_template: false,
+            cron_instance_of: None,
         }
     }
 

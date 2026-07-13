@@ -69,6 +69,15 @@ struct CronRow {
     /// Human-readable current blocking state, e.g. `"paused"`, `"overdue"`,
     /// `"waiting"`, or `""` (ready / not due).
     blocking_state: String,
+    /// True when this cron task is a TEMPLATE that mints a distinct instance
+    /// task per firing (see `cron::mint_cron_instance`). Templates are never
+    /// dispatched directly.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cron_template: bool,
+    /// Ids of the most recent instances minted from this template (newest
+    /// first, capped). Empty for legacy (non-template) crons.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    instances: Vec<String>,
 }
 
 fn row_for(task: &Task, now: chrono::DateTime<Utc>) -> Option<CronRow> {
@@ -117,6 +126,8 @@ fn row_for(task: &Task, now: chrono::DateTime<Utc>) -> Option<CronRow> {
         missed_fires: missed,
         paused: task.paused,
         blocking_state,
+        cron_template: task.cron_template,
+        instances: Vec::new(),
     })
 }
 
@@ -130,6 +141,22 @@ pub fn run(dir: &Path, json: bool) -> Result<()> {
         .filter(|t| t.cron_enabled)
         .filter_map(|t| row_for(t, now))
         .collect();
+
+    // Attach recently-minted instances to each template row so `wg cron` shows
+    // the template alongside its last runs (cron-re-registration display).
+    for row in &mut rows {
+        if !row.cron_template {
+            continue;
+        }
+        let mut insts: Vec<(String, String)> = graph
+            .tasks()
+            .filter(|t| t.cron_instance_of.as_deref() == Some(row.id.as_str()))
+            .map(|t| (t.created_at.clone().unwrap_or_default(), t.id.clone()))
+            .collect();
+        // Newest first by created_at (id as tiebreaker), capped at 5.
+        insts.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        row.instances = insts.into_iter().take(5).map(|(_, id)| id).collect();
+    }
 
     // Sort: due/overdue first, then by next_cron_fire (soonest first), then id.
     rows.sort_by(|a, b| {
@@ -181,12 +208,20 @@ pub fn run(dir: &Path, json: bool) -> Result<()> {
             Some(s) => format!(" \x1b[31m[overdue: {}s]\x1b[0m", s),
             None => String::new(),
         };
+        let template_tag = if row.cron_template {
+            "  \x1b[35m[template]\x1b[0m"
+        } else {
+            ""
+        };
         println!(
-            "  \x1b[1m{}\x1b[0m — {}  [\x1b[36m{}\x1b[0m]  {}{}{}",
-            row.id, row.title, status_tag, next_tag, missed_tag, overdue_tag
+            "  \x1b[1m{}\x1b[0m — {}  [\x1b[36m{}\x1b[0m]{}  {}{}{}",
+            row.id, row.title, status_tag, template_tag, next_tag, missed_tag, overdue_tag
         );
         println!("    {}", row.summary);
         println!("    {}  {}", last_tag, row.status);
+        if !row.instances.is_empty() {
+            println!("    instances: {}", row.instances.join(", "));
+        }
     }
 
     // Surface the non-standard dow mapping as a single grouped hint (no per-row
@@ -199,6 +234,49 @@ pub fn run(dir: &Path, json: bool) -> Result<()> {
              7=Saturday (NOT standard cron's 0=Sunday, 1=Monday). Each cron summary above names \
              the actual weekday it will fire on — verify you are not scheduling the wrong day."
         );
+    }
+    Ok(())
+}
+
+/// Mark (or unmark) a cron task as a TEMPLATE (cron-re-registration).
+///
+/// This is the migration path for existing crons and the wiring behind
+/// `wg add --cron-template` / `wg edit --cron-template`: it flips the
+/// `cron_template` flag on an existing cron-enabled task so that, from the next
+/// firing on, the coordinator mints a distinct instance per run instead of
+/// re-registering this id (which re-blocks `--after` children). Errors if the
+/// task is missing or is not cron-enabled.
+pub fn set_cron_template(dir: &Path, id: &str, enable: bool) -> Result<()> {
+    let path = super::graph_path(dir);
+    let mut err: Option<anyhow::Error> = None;
+    worksgood::parser::modify_graph(&path, |graph| {
+        let Some(task) = graph.get_task_mut(id) else {
+            err = Some(anyhow::anyhow!("Task '{}' not found", id));
+            return false;
+        };
+        if !task.cron_enabled {
+            err = Some(anyhow::anyhow!(
+                "Task '{}' is not a cron task — set a schedule with --cron first",
+                id
+            ));
+            return false;
+        }
+        if task.cron_template == enable {
+            return false; // no change
+        }
+        task.cron_template = enable;
+        true
+    })?;
+    if let Some(e) = err {
+        return Err(e);
+    }
+    if enable {
+        println!(
+            "Task '{}' is now a cron template — each firing mints a distinct instance task.",
+            id
+        );
+    } else {
+        println!("Task '{}' is no longer a cron template.", id);
     }
     Ok(())
 }

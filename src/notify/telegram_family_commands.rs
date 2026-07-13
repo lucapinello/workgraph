@@ -702,6 +702,8 @@ mod tests {
             cron_enabled: true,
             cron_schedule: Some("0 0 18 * * SUN".to_string()),
             next_cron_fire: Some("2026-07-19T18:00:00Z".to_string()),
+            cron_template: false,
+            cron_instance_of: None,
             ..Default::default()
         }));
         let humans = HashSet::new();

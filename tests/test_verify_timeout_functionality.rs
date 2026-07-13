@@ -112,6 +112,8 @@ fn create_task_with_timeout(id: &str, verify_timeout: Option<String>) -> Task {
         cron_enabled: false,
         last_cron_fire: None,
         next_cron_fire: None,
+        cron_template: false,
+        cron_instance_of: None,
     }
 }
 

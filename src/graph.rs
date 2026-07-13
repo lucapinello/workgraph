@@ -786,6 +786,22 @@ pub struct Task {
     /// Timestamp of next scheduled cron trigger (ISO 8601 / RFC 3339)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cron_fire: Option<String>,
+    /// When true, this cron task is a *template*: it is never dispatched
+    /// directly. Instead, each time it is due the coordinator mints a fresh,
+    /// distinct instance task (e.g. `weekly-plan-sunday-2026-W29`) with this
+    /// task's definition, and only the instance is worked. Children created
+    /// `--after <instance-id>` therefore bind to the RUN, not the recurring
+    /// definition, so the next firing never re-blocks already-finished work.
+    /// Legacy cron tasks (`cron_template=false`) keep the in-place reset
+    /// behavior for backward compatibility. See `cron::mint_cron_instance`.
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    pub cron_template: bool,
+    /// Set on a minted cron *instance* to the id of the `cron_template` task it
+    /// was minted from. `None` on templates and ordinary tasks. Used by the
+    /// `wg cron` display to group instances under their template and by the
+    /// coordinator to avoid minting a duplicate instance for the same period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_instance_of: Option<String>,
 }
 
 impl Default for Task {
@@ -876,6 +892,8 @@ impl Default for Task {
             cron_enabled: false,
             last_cron_fire: None,
             next_cron_fire: None,
+            cron_template: false,
+            cron_instance_of: None,
         }
     }
 }
@@ -1953,6 +1971,12 @@ struct TaskHelper {
     /// Timestamp of next scheduled cron trigger (ISO 8601 / RFC 3339)
     #[serde(default)]
     next_cron_fire: Option<String>,
+    /// Whether this cron task is a template that mints per-fire instances.
+    #[serde(default)]
+    cron_template: bool,
+    /// Template id a minted cron instance was produced from.
+    #[serde(default)]
+    cron_instance_of: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Task {
@@ -2063,6 +2087,8 @@ impl<'de> Deserialize<'de> for Task {
             cron_enabled: helper.cron_enabled,
             last_cron_fire: helper.last_cron_fire,
             next_cron_fire: helper.next_cron_fire,
+            cron_template: helper.cron_template,
+            cron_instance_of: helper.cron_instance_of,
         })
     }
 }

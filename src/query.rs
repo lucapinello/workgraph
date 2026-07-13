@@ -27,7 +27,16 @@ pub fn is_time_ready(task: &Task) -> bool {
     }
     // Invalid timestamp = treat as ready (don't block)
 
-    // Cron gate: if cron-enabled, only ready when due
+    // Cron template gate: a template is never dispatched directly — the
+    // coordinator mints a distinct instance task per fire
+    // (cron::mint_due_cron_instances) and only the minted instance is ever
+    // ready. This is what keeps `--after <instance>` child edges bound to the
+    // finished RUN instead of a re-registered template id.
+    if task.cron_template {
+        return false;
+    }
+
+    // Cron gate: if cron-enabled (legacy, non-template), only ready when due
     if task.cron_enabled && !crate::cron::is_cron_due(task, now) {
         return false;
     }

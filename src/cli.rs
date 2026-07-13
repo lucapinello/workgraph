@@ -389,6 +389,13 @@ pub enum Commands {
         #[arg(long)]
         cron: Option<String>,
 
+        /// Make the cron task a TEMPLATE: it is never dispatched itself; each
+        /// firing mints a distinct instance task (`<id>-<period>`) so children
+        /// created `--after <instance>` bind to the RUN, not the recurring
+        /// definition, and the next firing never re-blocks them. Implies --cron.
+        #[arg(long)]
+        cron_template: bool,
+
         /// Create as a blocking subtask: child is created, parent waits for child to complete
         #[arg(long)]
         subtask: bool,
@@ -511,6 +518,13 @@ pub enum Commands {
         /// Set or clear cron schedule (empty string "" clears; 6-field: "sec min hour day month dow")
         #[arg(long)]
         cron: Option<String>,
+
+        /// Convert this cron task to TEMPLATE mode (migration path for existing
+        /// crons): each firing mints a distinct instance task instead of
+        /// re-registering this id, so `--after` child edges never re-block.
+        /// See `wg add --cron-template`.
+        #[arg(long)]
+        cron_template: bool,
 
         /// Set or clear the per-task worker hard timeout (e.g., `30m`, `4h`, `1d`).
         /// Takes priority over executor/coordinator timeout at spawn time. An

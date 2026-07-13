@@ -1,4 +1,4 @@
-use crate::graph::{LogEntry, Task};
+use crate::graph::{LogEntry, Node, Task, WorkGraph};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use cron::Schedule;
 use std::collections::hash_map::DefaultHasher;
@@ -222,6 +222,207 @@ pub fn reset_cron_task(task: &mut Task) -> bool {
     task.completed_at = None;
 
     true
+}
+
+// ── Cron template → instance model (cron-re-registration) ────────────────
+//
+// The recurring-cron deadlock this fixes: the old model re-registered a
+// *completed* cron run by flipping the SAME task id from Done back to Open
+// (`reset_cron_task`). Any child created `--after <cron-id>` then re-blocked
+// on the next (future) firing — the child's work was finished but `wg done`
+// refused ("blocked by <cron-id>: Open"), stranding it. See the coordinator
+// Phase 2.94/2.95 and the `tonight_*` regression tests.
+//
+// The fix: a cron task can be a *template* (`cron_template = true`). A template
+// is never dispatched itself; each time it is due the coordinator mints a
+// fresh, distinct instance task (`<template-id>-<period-suffix>`, e.g.
+// `weekly-plan-sunday-2026-W29`) carrying the template's definition. Children
+// bind `--after <instance-id>` to that RUN, so the NEXT firing (a new id)
+// cannot re-block them. Legacy crons (`cron_template = false`) keep the
+// in-place reset behavior for backward compatibility.
+
+/// Produce a stable, human-readable period suffix for a cron fire at `fire`,
+/// used to build a distinct instance id per firing. The granularity adapts to
+/// how often the schedule fires so the id stays both unique-per-run and
+/// readable:
+/// - fires at most weekly (min gap ≳ 6 days)   → ISO year-week  `2026-W29`
+/// - fires at most daily  (min gap ≳ 23 hours) → date           `2026-07-12`
+/// - finer                                       → date + time    `2026-07-12-0230`
+pub fn cron_period_suffix(schedule: &Schedule, fire: DateTime<Utc>) -> String {
+    // Estimate the cadence from the gap to the following scheduled fire.
+    let gap = calculate_next_fire(schedule, fire)
+        .map(|next| next - fire)
+        .unwrap_or_else(|| Duration::days(1));
+    if gap >= Duration::days(6) {
+        let iso = fire.iso_week();
+        format!("{}-W{:02}", iso.year(), iso.week())
+    } else if gap >= Duration::hours(23) {
+        fire.format("%Y-%m-%d").to_string()
+    } else {
+        fire.format("%Y-%m-%d-%H%M").to_string()
+    }
+}
+
+/// Mint a fresh, distinct instance task from a cron *template* for the fire at
+/// `fire`. The instance carries the template's definition (title, description,
+/// spawn/exec config, tags, skills, validation, …) but is an ordinary Open
+/// task: it has NO cron scheduling of its own, NO inherited dependency edges,
+/// and a distinct id of the form `<template-id>-<period-suffix>`. Children
+/// created `--after <instance-id>` therefore bind to this run only, so a later
+/// firing (a new instance id) never re-blocks them.
+///
+/// Returns `None` if the template has no parseable cron schedule.
+pub fn mint_cron_instance(template: &Task, fire: DateTime<Utc>) -> Option<Task> {
+    let expr = template.cron_schedule.as_ref()?;
+    let schedule = parse_cron_expression(expr).ok()?;
+    let suffix = cron_period_suffix(&schedule, fire);
+    let now = Utc::now();
+
+    // Start from the template so every spawn-relevant field (prompt/model/
+    // exec_mode/context_scope/priority/tags/skills/validation/…) is carried
+    // over, then override everything that must differ for a standalone run.
+    let mut inst = template.clone();
+    inst.id = format!("{}-{}", template.id, suffix);
+    inst.status = crate::graph::Status::Open;
+    inst.assigned = None;
+    inst.agent = None;
+
+    // A run stands alone: it inherits none of the template's dependency edges,
+    // and it is NOT itself a cron task.
+    inst.before.clear();
+    inst.after.clear();
+    inst.requires.clear();
+    inst.cron_enabled = false;
+    inst.cron_schedule = None;
+    inst.cron_template = false;
+    inst.last_cron_fire = None;
+    inst.next_cron_fire = None;
+    inst.cron_instance_of = Some(template.id.clone());
+
+    // Fresh run bookkeeping — none of the template's accumulated run state
+    // should leak into a new instance.
+    inst.created_at = Some(now.to_rfc3339());
+    inst.started_at = None;
+    inst.completed_at = None;
+    inst.last_interaction_at = Some(now.to_rfc3339());
+    inst.dispatch_count = 0;
+    inst.retry_count = 0;
+    inst.triage_count = 0;
+    inst.resurrection_count = 0;
+    inst.last_resurrected_at = None;
+    inst.gate_attempts = 0;
+    inst.rejection_count = 0;
+    inst.verify_failures = 0;
+    inst.rescue_count = 0;
+    inst.rescued = false;
+    inst.meta_eval_attempts = 0;
+    inst.spawn_failures = 0;
+    inst.tried_models.clear();
+    inst.token_usage = None;
+    inst.session_id = None;
+    inst.loop_iteration = 0;
+    inst.last_iteration_completed_at = None;
+    inst.failure_reason = None;
+    inst.failure_class = None;
+    inst.log = vec![LogEntry {
+        timestamp: now.to_rfc3339(),
+        actor: Some("cron".to_string()),
+        user: None,
+        message: format!(
+            "cron_instance_minted: distinct run minted from template '{}' for \
+             scheduled fire {}. Children created `--after {}` bind to THIS run, \
+             not the recurring template, so the next firing cannot re-block them.",
+            template.id,
+            fire.to_rfc3339(),
+            inst.id,
+        ),
+    }];
+
+    Some(inst)
+}
+
+/// Advance a cron *template* after it has fired: record the fire time and
+/// compute the next scheduled fire (with jitter). The template itself stays
+/// Open and dormant — it is never dispatched (see `query::is_time_ready`); it
+/// only mints instances. Returns false if the task is not a cron task with a
+/// parseable schedule.
+pub fn advance_cron_template(template: &mut Task, now: DateTime<Utc>) -> bool {
+    if !template.cron_enabled || template.cron_schedule.is_none() {
+        return false;
+    }
+    let expr = template.cron_schedule.as_ref().unwrap();
+    let schedule = match parse_cron_expression(expr) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    template.last_cron_fire = Some(now.to_rfc3339());
+    template.next_cron_fire =
+        calculate_next_fire_with_jitter(&template.id, &schedule, now).map(|dt| dt.to_rfc3339());
+    // A template is never itself dispatched; keep it Open and unassigned so it
+    // stays a dormant recurring definition.
+    template.status = crate::graph::Status::Open;
+    template.assigned = None;
+    template.completed_at = None;
+    true
+}
+
+/// Fire all due cron *templates* in `graph`: for each template whose next fire
+/// is due at `now`, mint a distinct instance (idempotent per period — an
+/// instance whose id already exists is not re-minted) and advance the template
+/// to its next fire. Returns the ids of newly minted instances.
+///
+/// This is the coordinator's cron firing step for template-mode crons. Because
+/// each firing produces a NEW task id, `--after <instance-id>` edges from child
+/// work bind to the finished run and are never re-blocked by the next firing —
+/// the deadlock this fixes (see the `tonight_*` regression tests).
+pub fn mint_due_cron_instances(graph: &mut WorkGraph, now: DateTime<Utc>) -> Vec<String> {
+    // Collect due template ids first (immutable borrow), then mutate.
+    let due_templates: Vec<String> = graph
+        .tasks()
+        .filter(|t| t.cron_enabled && t.cron_template && is_cron_due(t, now))
+        .map(|t| t.id.clone())
+        .collect();
+
+    let mut minted = Vec::new();
+    for tid in due_templates {
+        // Build the instance while borrowing the template immutably.
+        let instance = {
+            let Some(template) = graph.get_task(&tid) else {
+                continue;
+            };
+            // The instant this firing represents: the scheduled fire (so the
+            // period suffix reflects the schedule slot, not clock skew),
+            // falling back to `now` when unset.
+            let fire = template
+                .next_cron_fire
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now);
+            match mint_cron_instance(template, fire) {
+                Some(inst) => inst,
+                None => continue,
+            }
+        };
+
+        // Idempotent per period: if this period's instance already exists,
+        // don't duplicate it — but still advance the template so we don't spin
+        // on the same due slot.
+        if graph.get_task(&instance.id).is_some() {
+            if let Some(template) = graph.get_task_mut(&tid) {
+                advance_cron_template(template, now);
+            }
+            continue;
+        }
+
+        let instance_id = instance.id.clone();
+        graph.add_node(Node::Task(instance));
+        if let Some(template) = graph.get_task_mut(&tid) {
+            advance_cron_template(template, now);
+        }
+        minted.push(instance_id);
+    }
+    minted
 }
 
 /// Check if a task with cron scheduling is due to run based on current time
@@ -699,6 +900,8 @@ mod tests {
             cron_enabled: true,
             cron_schedule: Some("0 0 2 * * *".to_string()),
             next_cron_fire: Some(past_fire.to_rfc3339()),
+            cron_template: false,
+            cron_instance_of: None,
             ..Default::default()
         };
 
@@ -831,6 +1034,8 @@ mod tests {
             cron_enabled: true,
             cron_schedule: Some("0 0 2 * * *".to_string()),
             next_cron_fire: Some(future_fire.to_rfc3339()),
+            cron_template: false,
+            cron_instance_of: None,
             ..Default::default()
         };
 
@@ -962,6 +1167,8 @@ mod tests {
             cron_schedule: Some("0 0 9 * * 2".to_string()),
             // No next_cron_fire → schedule-based check via `schedule.includes(now)`
             next_cron_fire: None,
+            cron_template: false,
+            cron_instance_of: None,
             last_cron_fire: None,
             ..Default::default()
         };
@@ -1007,6 +1214,8 @@ mod tests {
             cron_enabled: true,
             cron_schedule: Some("0 0 9 * * 1".to_string()),
             next_cron_fire: Some(past_fire.to_rfc3339()),
+            cron_template: false,
+            cron_instance_of: None,
             ..Default::default()
         };
 
@@ -1207,6 +1416,8 @@ mod tests {
             cron_enabled: true,
             cron_schedule: Some("0 0 9 * * *".to_string()),
             next_cron_fire: Some(future),
+            cron_template: false,
+            cron_instance_of: None,
             ..Default::default()
         };
         assert!(overdue_secs(&task, Utc::now()).is_none());
@@ -1220,6 +1431,8 @@ mod tests {
             cron_enabled: true,
             cron_schedule: Some("0 0 9 * * *".to_string()),
             next_cron_fire: Some(past),
+            cron_template: false,
+            cron_instance_of: None,
             ..Default::default()
         };
         let overdue = overdue_secs(&task, Utc::now()).expect("past due");
@@ -1241,5 +1454,231 @@ mod tests {
         assert!(p.starts_with("ago "), "past countdown: {}", p);
         // Invalid timestamp → empty string (no noisy spam).
         assert_eq!(format_countdown("not-a-ts", now), "");
+    }
+
+    // ── Cron template → instance model (cron-re-registration) ────────────
+
+    // `Node` and `WorkGraph` are already in scope via `use super::*`; only
+    // `Status` needs importing (cron.rs refers to it fully-qualified).
+    use crate::graph::Status;
+
+    /// Build a weekly (Sunday 20:30 UTC) cron *template* whose next fire is in
+    /// the past (i.e. currently due), mirroring `weekly-plan-sunday`.
+    fn due_weekly_template(id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            title: "Weekly plan".to_string(),
+            status: Status::Open,
+            cron_enabled: true,
+            cron_template: true,
+            cron_schedule: Some("0 30 20 * * 1".to_string()), // dow 1 = Sunday
+            next_cron_fire: Some((Utc::now() - Duration::minutes(5)).to_rfc3339()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cron_period_suffix_weekly_is_iso_week() {
+        let schedule = parse_cron_expression("0 30 20 * * 1").unwrap();
+        // 2026-07-12 is a Sunday in ISO week 28.
+        let fire = Utc.with_ymd_and_hms(2026, 7, 12, 20, 30, 0).unwrap();
+        let suffix = cron_period_suffix(&schedule, fire);
+        assert_eq!(suffix, "2026-W28", "weekly cron → ISO year-week suffix");
+    }
+
+    #[test]
+    fn cron_period_suffix_daily_is_date() {
+        let schedule = parse_cron_expression("0 0 2 * * *").unwrap();
+        let fire = Utc.with_ymd_and_hms(2026, 7, 12, 2, 0, 0).unwrap();
+        assert_eq!(cron_period_suffix(&schedule, fire), "2026-07-12");
+    }
+
+    #[test]
+    fn cron_period_suffix_subdaily_includes_time() {
+        let schedule = parse_cron_expression("0 */5 * * * *").unwrap(); // every 5 min
+        let fire = Utc.with_ymd_and_hms(2026, 7, 12, 2, 30, 0).unwrap();
+        assert_eq!(cron_period_suffix(&schedule, fire), "2026-07-12-0230");
+    }
+
+    #[test]
+    fn cron_mint_instance_is_distinct_open_non_cron_task() {
+        let template = due_weekly_template("weekly-plan-sunday");
+        let fire = Utc.with_ymd_and_hms(2026, 7, 12, 20, 30, 0).unwrap();
+        let inst = mint_cron_instance(&template, fire).expect("should mint");
+
+        // Distinct, readable id bound to the run.
+        assert_eq!(inst.id, "weekly-plan-sunday-2026-W28");
+        assert_ne!(inst.id, template.id, "instance id must differ from template");
+        // A plain, dispatchable Open task — NOT itself a cron.
+        assert_eq!(inst.status, Status::Open);
+        assert!(!inst.cron_enabled, "instance is not cron-enabled");
+        assert!(!inst.cron_template, "instance is not a template");
+        assert!(inst.cron_schedule.is_none());
+        assert!(inst.next_cron_fire.is_none());
+        assert_eq!(inst.cron_instance_of.as_deref(), Some("weekly-plan-sunday"));
+        // Stands alone: no inherited edges, fresh assignment/bookkeeping.
+        assert!(inst.after.is_empty() && inst.before.is_empty());
+        assert!(inst.assigned.is_none());
+        assert_eq!(inst.dispatch_count, 0);
+        // Carries the template's definition.
+        assert_eq!(inst.title, template.title);
+    }
+
+    #[test]
+    fn cron_template_is_never_time_ready() {
+        // A due template must NOT be dispatched directly (only its instances are).
+        let template = due_weekly_template("weekly-plan-sunday");
+        assert!(
+            !crate::query::is_time_ready(&template),
+            "cron template must never be time-ready"
+        );
+
+        // A legacy (non-template) due cron IS ready — backward compatibility.
+        let mut legacy = template.clone();
+        legacy.cron_template = false;
+        assert!(
+            crate::query::is_time_ready(&legacy),
+            "legacy due cron stays ready (unchanged behavior)"
+        );
+    }
+
+    #[test]
+    fn cron_advance_template_stays_open_and_advances() {
+        let mut template = due_weekly_template("weekly-plan-sunday");
+        let before = template.next_cron_fire.clone();
+        assert!(advance_cron_template(&mut template, Utc::now()));
+        assert_eq!(template.status, Status::Open, "template stays Open/dormant");
+        assert!(template.assigned.is_none());
+        assert!(template.last_cron_fire.is_some());
+        assert_ne!(
+            template.next_cron_fire, before,
+            "next fire advanced to the future"
+        );
+        let next: DateTime<Utc> = template.next_cron_fire.unwrap().parse().unwrap();
+        assert!(next > Utc::now(), "next fire is in the future");
+    }
+
+    #[test]
+    fn cron_mint_due_instances_is_idempotent_per_period() {
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(due_weekly_template("weekly-plan-sunday")));
+
+        // First tick fires: exactly one instance minted, template advanced.
+        let minted = mint_due_cron_instances(&mut graph, Utc::now());
+        assert_eq!(minted.len(), 1, "one instance minted for the due period");
+        let inst_id = minted[0].clone();
+        assert!(graph.get_task(&inst_id).is_some());
+        // Template is no longer due (next fire advanced to the future).
+        assert!(!is_cron_due(graph.get_task("weekly-plan-sunday").unwrap(), Utc::now()));
+
+        // Second tick with the template not due: nothing new minted.
+        let again = mint_due_cron_instances(&mut graph, Utc::now());
+        assert!(again.is_empty(), "no duplicate instance while not due");
+        let instance_count = graph
+            .tasks()
+            .filter(|t| t.cron_instance_of.as_deref() == Some("weekly-plan-sunday"))
+            .count();
+        assert_eq!(instance_count, 1, "still exactly one instance");
+    }
+
+    /// The exact tonight deadlock, as a regression test.
+    ///
+    /// Old behavior (reset-in-place, reproduced by `reset_cron_task`): a child
+    /// created `--after weekly-plan-sunday` re-blocks the moment the completed
+    /// cron flips Done→Open — its finished work strands. The template/instance
+    /// model must NOT do this: children bind to a distinct run id, so the next
+    /// firing (a new id) never re-blocks them.
+    #[test]
+    fn cron_tonight_scenario_reregistration_does_not_reblock_children() {
+        // Two consecutive Sundays (distinct ISO weeks W28 / W29) so each firing
+        // yields a distinct instance id — the exact tonight timeline.
+        let week1_fire = Utc.with_ymd_and_hms(2026, 7, 12, 20, 30, 0).unwrap();
+        let week2_fire = Utc.with_ymd_and_hms(2026, 7, 19, 20, 30, 0).unwrap();
+
+        let mut graph = WorkGraph::new();
+        let mut template = due_weekly_template("weekly-plan-sunday");
+        template.next_cron_fire = Some(week1_fire.to_rfc3339());
+        graph.add_node(Node::Task(template));
+
+        // Week 1 fires → a distinct instance is minted and dispatched.
+        let minted = mint_due_cron_instances(&mut graph, week1_fire + Duration::minutes(5));
+        assert_eq!(minted.len(), 1);
+        let run1 = minted[0].clone();
+        assert_eq!(run1, "weekly-plan-sunday-2026-W28");
+
+        // The run's agent creates a child `--after <run1>` and finishes it; the
+        // run itself completes (stays Done forever — a finished run, not the
+        // recurring definition).
+        let child = Task {
+            id: "plan-child".to_string(),
+            title: "downstream plan work".to_string(),
+            status: Status::Done,
+            after: vec![run1.clone()],
+            ..Default::default()
+        };
+        graph.add_node(Node::Task(child));
+        graph.get_task_mut(&run1).unwrap().status = Status::Done;
+
+        // Nothing blocks the child now (its blocker run1 is Done).
+        assert!(
+            crate::query::after(&graph, "plan-child").is_empty(),
+            "child not blocked after its run completes"
+        );
+
+        // NEXT week fires: force the template due again and tick. A NEW instance
+        // id is minted — the re-registration.
+        graph.get_task_mut("weekly-plan-sunday").unwrap().next_cron_fire =
+            Some(week2_fire.to_rfc3339());
+        let minted2 = mint_due_cron_instances(&mut graph, week2_fire + Duration::minutes(5));
+        assert_eq!(minted2.len(), 1, "next week mints a fresh instance");
+        let run2 = minted2[0].clone();
+        assert_eq!(run2, "weekly-plan-sunday-2026-W29");
+        assert_ne!(run1, run2, "re-registration uses a DISTINCT id, not the same one");
+
+        // THE FIX: the child is STILL not blocked. Its `--after run1` edge binds
+        // to the finished run, so the new firing (run2) cannot re-block it —
+        // `wg done` on the child would not refuse.
+        assert!(
+            crate::query::after(&graph, "plan-child").is_empty(),
+            "re-registration must NOT re-block the already-finished child"
+        );
+        assert_eq!(
+            graph.get_task(&run1).unwrap().status,
+            Status::Done,
+            "the finished run stays Done — never flipped back to Open"
+        );
+    }
+
+    /// Documents the OLD bug the fix avoids: reset-in-place re-blocks children.
+    /// This is the failure mode template mode replaces (kept for legacy crons).
+    #[test]
+    fn cron_legacy_reset_in_place_reblocks_children_the_old_bug() {
+        let mut graph = WorkGraph::new();
+        let mut legacy = due_weekly_template("legacy-weekly");
+        legacy.cron_template = false; // legacy in-place cron
+        legacy.status = Status::Done; // just completed a run
+        legacy.next_cron_fire = None;
+        graph.add_node(Node::Task(legacy));
+
+        let child = Task {
+            id: "legacy-child".to_string(),
+            title: "child".to_string(),
+            status: Status::Done,
+            after: vec!["legacy-weekly".to_string()],
+            ..Default::default()
+        };
+        graph.add_node(Node::Task(child));
+
+        // Before reset: child unblocked (blocker Done).
+        assert!(crate::query::after(&graph, "legacy-child").is_empty());
+
+        // Reset-in-place flips the SAME id Done→Open → child re-blocks. This is
+        // exactly the deadlock; the template model above does not exhibit it.
+        reset_cron_task(graph.get_task_mut("legacy-weekly").unwrap());
+        assert_eq!(graph.get_task("legacy-weekly").unwrap().status, Status::Open);
+        assert!(
+            !crate::query::after(&graph, "legacy-child").is_empty(),
+            "legacy reset re-blocks the child — the bug template mode fixes"
+        );
     }
 }

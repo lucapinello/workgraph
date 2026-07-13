@@ -2044,6 +2044,8 @@ fn build_auto_assign_tasks(
                     cron_enabled: false,
                     last_cron_fire: None,
                     next_cron_fire: None,
+                    cron_template: false,
+                    cron_instance_of: None,
                 };
 
                 graph.add_node(Node::Task(create_task));
@@ -2444,6 +2446,8 @@ fn build_flip_verification_tasks(
             cron_enabled: false,
             last_cron_fire: None,
             next_cron_fire: None,
+            cron_template: false,
+            cron_instance_of: None,
         };
 
         graph.add_node(Node::Task(verify_task));
@@ -2719,6 +2723,8 @@ fn build_separate_verify_tasks(
             cron_enabled: false,
             last_cron_fire: None,
             next_cron_fire: None,
+            cron_template: false,
+            cron_instance_of: None,
         };
 
         graph.add_node(Node::Task(verify_task));
@@ -2926,6 +2932,8 @@ fn build_auto_evolve_task(
         cron_enabled: false,
         last_cron_fire: None,
         next_cron_fire: None,
+        cron_template: false,
+        cron_instance_of: None,
     };
 
     graph.add_node(Node::Task(evolve_task));
@@ -3136,6 +3144,8 @@ fn build_auto_create_task(
         cron_enabled: false,
         last_cron_fire: None,
         next_cron_fire: None,
+        cron_template: false,
+        cron_instance_of: None,
     };
 
     graph.add_node(Node::Task(create_task));
@@ -4756,12 +4766,32 @@ pub fn coordinator_tick(
         // dependencies or missed completion events.
         modified |= unblock_stuck_tasks(graph, dir);
 
-        // Phase 2.95: Cron task reset — reset Done cron tasks to Open and compute
-        // next fire time with jitter so they can be re-dispatched on schedule.
+        // Phase 2.94: Cron template firing — for each template-mode cron that is
+        // due, mint a fresh, DISTINCT instance task (`<id>-<period>`) and advance
+        // the template to its next fire. Because each firing produces a new task
+        // id, `--after <instance>` child edges bind to the finished RUN and are
+        // never re-blocked by the next firing. This replaces the reset-in-place
+        // path (below) for template-mode crons — the cron-re-registration fix.
+        {
+            let minted = worksgood::cron::mint_due_cron_instances(graph, Utc::now());
+            if !minted.is_empty() {
+                eprintln!(
+                    "[dispatcher] Cron template fired: minted {} instance(s): {:?}",
+                    minted.len(),
+                    minted
+                );
+                modified = true;
+            }
+        }
+
+        // Phase 2.95: Cron task reset (legacy, non-template) — reset Done cron
+        // tasks to Open and compute next fire time with jitter so they can be
+        // re-dispatched on schedule. Template-mode crons are handled by Phase
+        // 2.94 above and are excluded here.
         {
             let cron_task_ids: Vec<String> = graph
                 .tasks()
-                .filter(|t| t.cron_enabled && t.status == Status::Done)
+                .filter(|t| t.cron_enabled && !t.cron_template && t.status == Status::Done)
                 .map(|t| t.id.clone())
                 .collect();
             for task_id in &cron_task_ids {
