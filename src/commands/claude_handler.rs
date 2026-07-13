@@ -357,6 +357,18 @@ fn build_handler_system_prompt(workgraph_dir: &Path, chat_ref: &str, role: Optio
 
 // --- Claude stdio bridging ---------------------------------------------------
 
+/// Resolve the `[auth]` OAuth token for the chat/coordinator handler from the
+/// merged config under `workgraph_dir`. Returns the *configured* token (inline
+/// or `*_file`), so a headless daemon that carries credentials only in the
+/// `[auth]` block still authenticates. Returns `None` when nothing is
+/// configured — the spawned child then falls back to its own inherited env /
+/// `~/.claude/credentials.json` resolution, exactly as before this fix.
+fn resolve_handler_oauth_token(workgraph_dir: &Path) -> Option<String> {
+    worksgood::config::Config::load_merged(workgraph_dir)
+        .ok()
+        .and_then(|cfg| cfg.auth.resolve_configured_oauth_token())
+}
+
 /// Spawn `claude` with stream-json stdio. Mirrors the flags the daemon
 /// previously used inline.
 fn spawn_claude_process(
@@ -372,8 +384,23 @@ fn spawn_claude_process(
     let command = &executor_config.executor.command;
 
     let mut cmd = Command::new(command);
+    // Auth-gap fix (docs/22 §2): this chat/coordinator handler is the third
+    // `claude` spawn path. The task-agent and one-shot-compose paths already
+    // strip all four Claude-Code leak vars and inject the `[auth]` OAuth token;
+    // this path previously stripped only two and injected nothing, so on a
+    // headless server that relies on the `[auth]` block (not an exported
+    // CLAUDE_CODE_OAUTH_TOKEN) the coordinator + kiosk/Telegram chat would 401
+    // while the other two paths kept working — a confusing partial outage. Also
+    // a daemon that inherited CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST from a
+    // launching Claude Code session would silently 401 only here. Mirror the
+    // service/llm.rs behaviour so all three paths authenticate identically.
     cmd.env_remove("CLAUDECODE");
     cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+    cmd.env_remove("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST");
+    cmd.env_remove("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH");
+    if let Some(token) = resolve_handler_oauth_token(workgraph_dir) {
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+    }
     cmd.args([
         "--print",
         "--input-format",

@@ -628,6 +628,19 @@ impl AuthConfig {
         {
             return Some(v);
         }
+        self.resolve_configured_oauth_token()
+    }
+
+    /// Resolve the OAuth token from the `[auth]` block only (inline → file),
+    /// ignoring the ambient `CLAUDE_CODE_OAUTH_TOKEN` env var.
+    ///
+    /// Split out from [`resolve_claude_oauth_token`] so that tests are
+    /// deterministic regardless of whether the token happens to be exported in
+    /// the test runner's environment (agents run inside Claude Code, which
+    /// exports it). Also used by the chat/coordinator handler's auth-gap fix,
+    /// which wants the *configured* token to inject into a spawned child even
+    /// when the parent's own env already carries one.
+    pub fn resolve_configured_oauth_token(&self) -> Option<String> {
         if let Some(v) = self.claude_code_oauth_token.as_ref()
             && !v.is_empty()
         {
@@ -5716,6 +5729,59 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    // --- [auth] OAuth token resolution (docs/22 §1.2, §2 auth-gap fix) --------
+
+    #[test]
+    fn auth_resolve_configured_oauth_token_from_file() {
+        let dir = TempDir::new().unwrap();
+        let token_path = dir.path().join("oauth-token");
+        std::fs::write(&token_path, "sk-ant-oat01-fromfile\n").unwrap();
+        let auth = AuthConfig {
+            claude_code_oauth_token: None,
+            claude_code_oauth_token_file: Some(token_path.to_string_lossy().into_owned()),
+        };
+        // Reads the file, trims trailing newline. Deterministic: the
+        // `_configured_` variant never consults the ambient env var, so this
+        // passes whether or not CLAUDE_CODE_OAUTH_TOKEN is exported.
+        assert_eq!(
+            auth.resolve_configured_oauth_token().as_deref(),
+            Some("sk-ant-oat01-fromfile")
+        );
+    }
+
+    #[test]
+    fn auth_resolve_configured_oauth_token_inline_beats_file() {
+        let dir = TempDir::new().unwrap();
+        let token_path = dir.path().join("oauth-token");
+        std::fs::write(&token_path, "sk-ant-oat01-fromfile\n").unwrap();
+        let auth = AuthConfig {
+            claude_code_oauth_token: Some("sk-ant-oat01-inline".into()),
+            claude_code_oauth_token_file: Some(token_path.to_string_lossy().into_owned()),
+        };
+        assert_eq!(
+            auth.resolve_configured_oauth_token().as_deref(),
+            Some("sk-ant-oat01-inline")
+        );
+    }
+
+    #[test]
+    fn auth_resolve_configured_oauth_token_none_when_unset() {
+        let auth = AuthConfig {
+            claude_code_oauth_token: None,
+            claude_code_oauth_token_file: None,
+        };
+        assert_eq!(auth.resolve_configured_oauth_token(), None);
+    }
+
+    #[test]
+    fn auth_resolve_configured_oauth_token_missing_file_is_none() {
+        let auth = AuthConfig {
+            claude_code_oauth_token: None,
+            claude_code_oauth_token_file: Some("/nonexistent/oauth-token".into()),
+        };
+        assert_eq!(auth.resolve_configured_oauth_token(), None);
+    }
 
     #[test]
     fn tag_routing_matches_first_rule_by_order() {

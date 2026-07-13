@@ -284,6 +284,18 @@ fn check_host_tools() -> Vec<Check> {
 
 // ── auth ──────────────────────────────────────────────────────────────
 
+/// Expand a leading `~/` or `$HOME/` in a configured path to the user's home
+/// directory. Mirrors the expansion `AuthConfig::resolve_configured_oauth_token`
+/// performs, so the doctor checks the same file the handler will actually read.
+fn expand_home(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("$HOME/")) {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
 fn check_auth(dir: &Path) -> Vec<Check> {
     let mut out = Vec::new();
 
@@ -375,10 +387,53 @@ fn check_auth(dir: &Path) -> Vec<Check> {
         && let Ok(content) = std::fs::read_to_string(&cfg_path)
     {
         if content.contains("claude_code_oauth_token_file") {
-            out.push(Check::ok(
-                "[auth] config",
-                "token-file reference in .workgraph/config.toml",
-            ));
+            // Resolve the actual path and verify the token file exists and is
+            // not world/group-readable (C1: the headless credential lives in a
+            // gitignored, chmod-600 file). A dangling or over-permissive path
+            // is the most common way this setup silently fails on a server.
+            let file_path = worksgood::config::Config::load_merged(dir)
+                .ok()
+                .and_then(|cfg| cfg.auth.claude_code_oauth_token_file);
+            match file_path {
+                Some(p) => {
+                    let expanded = expand_home(&p);
+                    if !expanded.exists() {
+                        out.push(Check::err(
+                            "[auth] token file",
+                            format!("`{p}` is referenced but does not exist"),
+                            "Create it with `claude setup-token > <path> && chmod 600 <path>`, \
+                             or fix the path in `[auth] claude_code_oauth_token_file`.",
+                        ));
+                    } else {
+                        out.push(Check::ok(
+                            "[auth] config",
+                            "token-file reference in .workgraph/config.toml",
+                        ));
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(meta) = std::fs::metadata(&expanded) {
+                                let mode = meta.permissions().mode() & 0o077;
+                                if mode != 0 {
+                                    out.push(Check::warn(
+                                        "[auth] token file",
+                                        format!(
+                                            "`{p}` is group/other-accessible (mode {:o})",
+                                            meta.permissions().mode() & 0o777
+                                        ),
+                                        "Restrict it with `chmod 600 <path>` so only your user \
+                                         can read the OAuth token.",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                None => out.push(Check::ok(
+                    "[auth] config",
+                    "token-file reference in .workgraph/config.toml",
+                )),
+            }
         } else if content.contains("claude_code_oauth_token") {
             out.push(Check::warn(
                 "[auth] config",
