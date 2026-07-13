@@ -3638,6 +3638,13 @@ pub fn run_remind(
                 println!("WOULD DROP (too late): ⏰ {}", r.text);
             }
         }
+        // Show errands that WOULD nudge too (renders from live shopping state).
+        if !json {
+            let config = load_telegram_config().unwrap_or_default();
+            if let Err(e) = fire_errands(&root, now, current, &members, &bindings, &config, true) {
+                eprintln!("errand dry-run skipped: {e:#}");
+            }
+        }
         return Ok(());
     }
 
@@ -3652,53 +3659,59 @@ pub fn run_remind(
             r.text,
         );
     }
-    if result.fired.is_empty() {
-        if !json {
-            println!("Nothing due at {}.", now.format("%Y-%m-%d %H:%M"));
-        }
-        return Ok(());
-    }
-
     let config = load_telegram_config().unwrap_or_default();
-    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
     let mut sent = 0usize;
-    rt.block_on(async {
-        for f in &result.fired {
-            let (target, bot_id, bot) =
-                match resolve_reminder_target(&config, &bindings, &f.reminder) {
-                    Some(t) => t,
-                    None => {
-                        eprintln!(
-                            "[{}] no bound bot/chat for reminder recipient '{}' — skipping DM",
+    if !result.fired.is_empty() {
+        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+        rt.block_on(async {
+            for f in &result.fired {
+                let (target, bot_id, bot) =
+                    match resolve_reminder_target(&config, &bindings, &f.reminder) {
+                        Some(t) => t,
+                        None => {
+                            eprintln!(
+                                "[{}] no bound bot/chat for reminder recipient '{}' — skipping DM",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                f.reminder.recipient,
+                            );
+                            continue;
+                        }
+                    };
+                let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
+                match channel.send_text(&target, &f.message()).await {
+                    Ok(_) => {
+                        sent += 1;
+                        println!(
+                            "[{}] reminded {} via {}: {}",
                             chrono::Utc::now().format("%H:%M:%S"),
                             f.reminder.recipient,
+                            bot_id,
+                            f.message(),
                         );
-                        continue;
                     }
-                };
-            let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
-            match channel.send_text(&target, &f.message()).await {
-                Ok(_) => {
-                    sent += 1;
-                    println!(
-                        "[{}] reminded {} via {}: {}",
+                    Err(e) => eprintln!(
+                        "[{}] failed to DM reminder to {}: {e:#}",
                         chrono::Utc::now().format("%H:%M:%S"),
                         f.reminder.recipient,
-                        bot_id,
-                        f.message(),
-                    );
+                    ),
                 }
-                Err(e) => eprintln!(
-                    "[{}] failed to DM reminder to {}: {e:#}",
-                    chrono::Utc::now().format("%H:%M:%S"),
-                    f.reminder.recipient,
-                ),
             }
-        }
-        Ok::<(), anyhow::Error>(())
-    })?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+    }
+
+    // Errands ride the same tick: rendered from live shopping state, paced through
+    // the daily-digest layer, and DM'd standalone via the owning bot (e.g. Otto).
+    let errand_sent = fire_errands(&root, now, current, &members, &bindings, &config, false)?;
+
+    if result.fired.is_empty() && errand_sent == 0 && !json {
+        println!("Nothing due at {}.", now.format("%Y-%m-%d %H:%M"));
+    }
     if json {
-        println!("{}", serde_json::json!({ "fired": result.fired.len(), "sent": sent }));
+        println!(
+            "{}",
+            serde_json::json!({ "fired": result.fired.len(), "sent": sent, "errands_sent": errand_sent })
+        );
     }
     Ok(())
 }
@@ -3711,24 +3724,184 @@ fn resolve_reminder_target(
     bindings: &worksgood::agency::TelegramBindingMap,
     rem: &worksgood::notify::reminder::Reminder,
 ) -> Option<(String, String, TelegramBotConfig)> {
-    let binding = bindings.find_by_name_ci(&rem.recipient)?;
+    resolve_dm_target(config, bindings, &rem.recipient, &rem.bot)
+}
+
+/// Resolve the DM target (chat + bot) for a proactive nudge to `recipient`, sent
+/// in the voice `bot`: prefer the recipient's own bound bot + chat, else a bot
+/// whose `agent_id` matches the owning voice, else any configured bot. Shared by
+/// the reminder tick and the errand tick so both DMs leave via the same rule.
+fn resolve_dm_target(
+    config: &TelegramConfig,
+    bindings: &worksgood::agency::TelegramBindingMap,
+    recipient: &str,
+    bot: &str,
+) -> Option<(String, String, TelegramBotConfig)> {
+    let binding = bindings.find_by_name_ci(recipient)?;
     let target = binding.telegram_user.clone();
     let bots = config.all_bots();
     // 1) the recipient's configured bot.
     if let Some(bid) = &binding.bot_id {
-        if let Some((id, bot)) = bots.iter().find(|(id, _)| id == bid) {
-            return Some((target, id.clone(), bot.clone()));
+        if let Some((id, b)) = bots.iter().find(|(id, _)| id == bid) {
+            return Some((target, id.clone(), b.clone()));
         }
     }
-    // 2) a bot fronting the reminder's owning voice.
-    if let Some((id, bot)) = bots
+    // 2) a bot fronting the nudge's owning voice.
+    if let Some((id, b)) = bots
         .iter()
-        .find(|(id, bot)| id == &rem.bot || bot.agent_id.as_deref() == Some(rem.bot.as_str()))
+        .find(|(id, b)| id == &bot || b.agent_id.as_deref() == Some(bot))
     {
-        return Some((target, id.clone(), bot.clone()));
+        return Some((target, id.clone(), b.clone()));
     }
     // 3) any bot.
-    bots.first().map(|(id, bot)| (target, id.clone(), bot.clone()))
+    bots.first().map(|(id, b)| (target, id.clone(), b.clone()))
+}
+
+/// Fire due errand nudges as part of the `wg telegram remind` tick.
+///
+/// Builds errands from the current-week plan, ticks them (exactly-once + drop-if-
+/// stale via a dedicated `.casa/errand-fired.json` log), renders each from **live**
+/// shopping state fetched *now* (`GET /shopping.json`), routes every firing through
+/// the daily-digest pacing layer — time-critical, so under the daily standalone cap
+/// it DMs the runner standalone (via the errand's owning bot, e.g. Otto), and over
+/// the cap it folds into the morning digest — and returns how many were DM'd.
+///
+/// A live-shopping fetch failure **skips the whole tick without recording anything**
+/// (`Ok(0)`), so the one nudge is never burned on a stale or empty render.
+#[allow(clippy::too_many_arguments)]
+fn fire_errands(
+    root: &Path,
+    now: chrono::NaiveDateTime,
+    current: Option<&worksgood::notify::family_plan::PlanDoc>,
+    members: &[String],
+    bindings: &worksgood::agency::TelegramBindingMap,
+    config: &TelegramConfig,
+    dry_run: bool,
+) -> Result<usize> {
+    use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, Offer};
+    use worksgood::notify::errand::{self, ShoppingModel};
+    use worksgood::notify::reminder::{FiredLog, FirePolicy};
+
+    let plan = match current {
+        Some(p) => p,
+        None => return Ok(0),
+    };
+    let errands = errand::errands_from_plan(plan, members, errand::resolve_lead());
+    if errands.is_empty() {
+        return Ok(0);
+    }
+
+    // Which errands are due now? Own FiredLog namespace so it never collides with
+    // the reminder log (ids are `errand:…` vs `⏰` reminder ids anyway).
+    let log_path = root.join(".casa").join("errand-fired.json");
+    let mut work_log = FiredLog::load(&log_path);
+    let firings = errand::errand_tick(&errands, &mut work_log, now, &FirePolicy::default());
+    if firings.is_empty() {
+        return Ok(0);
+    }
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+
+    // Live shopping state, fetched AT FIRE TIME. A failure skips the tick (no nudge
+    // burned) — the body must never render from stale/empty state.
+    let base = worksgood::notify::telegram_photo::gateway_base_url();
+    let url = format!("{base}/shopping.json?back=0");
+    let shopping: ShoppingModel = match rt.block_on(async {
+        let body = reqwest::get(&url).await?.text().await?;
+        Ok::<_, anyhow::Error>(ShoppingModel::from_json(&body))
+    }) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "[{}] errand tick: live shopping fetch failed ({e:#}) — skipping, no nudge burned",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+            return Ok(0);
+        }
+    };
+
+    if dry_run {
+        for f in &firings {
+            let body = errand::route_errand_nudge(f, &shopping, &mut DigestStore::default(), now, &DigestPolicy::new()).0;
+            let who = if f.errand.recipient.is_empty() {
+                "(group)".to_string()
+            } else {
+                f.errand.recipient.clone()
+            };
+            println!(
+                "WOULD ERRAND-NUDGE {} via {}: {}",
+                who,
+                f.errand.bot,
+                body.replace('\n', " · "),
+            );
+        }
+        return Ok(0);
+    }
+
+    // Real firing: persist the fired-log FIRST (restart-safe exactly-once), then pace + send.
+    work_log
+        .save(&log_path)
+        .with_context(|| format!("failed to persist errand state to {}", log_path.display()))?;
+
+    let digest_path = DigestStore::path(root);
+    let mut digest = DigestStore::load(&digest_path);
+    let policy = DigestPolicy::new();
+
+    let mut sent = 0usize;
+    rt.block_on(async {
+        for f in &firings {
+            let (_, offer) = errand::route_errand_nudge(f, &shopping, &mut digest, now, &policy);
+            match offer {
+                Offer::SendNow(text) => {
+                    let (target, bot_id, bot) =
+                        match resolve_dm_target(config, bindings, &f.errand.recipient, &f.errand.bot) {
+                            Some(t) => t,
+                            None => {
+                                eprintln!(
+                                    "[{}] no bound bot/chat for errand recipient '{}' — skipping DM",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                    f.errand.recipient,
+                                );
+                                continue;
+                            }
+                        };
+                    let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
+                    match channel.send_text(&target, &text).await {
+                        Ok(_) => {
+                            sent += 1;
+                            println!(
+                                "[{}] errand-nudged {} via {} ({} still needed)",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                f.errand.recipient,
+                                bot_id,
+                                shopping.remaining_count(),
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "[{}] failed to DM errand to {}: {e:#}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            f.errand.recipient,
+                        ),
+                    }
+                }
+                Offer::Queued { overflow } => println!(
+                    "[{}] errand for {} folded into the morning digest (overflow={overflow})",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    f.errand.recipient,
+                ),
+                Offer::Pending | Offer::Duplicate => {}
+            }
+        }
+    });
+
+    // Persist the pacing state (standalone counter + any queued overflow) after the tick.
+    if let Err(e) = digest.save(&digest_path) {
+        eprintln!(
+            "[{}] warning: failed to persist digest pacing state: {e:#}",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+    }
+    Ok(sent)
 }
 
 /// Parse a `YYYY-MM-DDTHH:MM` (or space-separated) local wall-clock instant.

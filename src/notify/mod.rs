@@ -11,6 +11,7 @@ pub mod discord;
 pub mod dispatch;
 #[cfg(feature = "email")]
 pub mod email;
+pub mod errand;
 pub mod family_plan;
 pub mod meal_feedback;
 #[cfg(feature = "matrix-lite")]

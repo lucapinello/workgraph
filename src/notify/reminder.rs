@@ -167,7 +167,10 @@ fn clean_reminder_body(event: &str) -> String {
 
 /// Lower-case a Source cell into a bot/agent id: `"Otto"` → `"otto"`, and
 /// `"Mira/Otto"` → the first voice (`"mira"`) which owns the row.
-fn normalize_bot(source: &str) -> String {
+///
+/// `pub(crate)` so the errand engine ([`crate::notify::errand`]) resolves the
+/// owning voice of a `🛒 Market run` row with the identical rule.
+pub(crate) fn normalize_bot(source: &str) -> String {
     source
         .split(['/', '(', ' '])
         .map(|s| s.trim())
@@ -178,7 +181,10 @@ fn normalize_bot(source: &str) -> String {
 
 /// Find the first known member display name that appears in `text`, matched
 /// case-insensitively on a word boundary-ish basis.
-fn first_member(text: &str, members: &[String]) -> Option<String> {
+///
+/// `pub(crate)` so the errand engine reuses the identical person-resolution rule
+/// to pull the runner out of a `🛒 Market run (Luca)` row.
+pub(crate) fn first_member(text: &str, members: &[String]) -> Option<String> {
     let low = text.to_ascii_lowercase();
     members
         .iter()
@@ -213,8 +219,9 @@ fn is_word_byte(b: u8) -> bool {
 }
 
 /// Parse a `HH:MM` (or `H:MM`) clock cell into a [`NaiveTime`]; `None` when empty
-/// or unparseable.
-fn parse_clock(cell: &str) -> Option<NaiveTime> {
+/// or unparseable. `pub(crate)` — the errand engine parses the market-run Time
+/// cell with the same rule.
+pub(crate) fn parse_clock(cell: &str) -> Option<NaiveTime> {
     let c = cell.trim();
     if c.is_empty() {
         return None;
@@ -225,7 +232,8 @@ fn parse_clock(cell: &str) -> Option<NaiveTime> {
 }
 
 /// A `u64` hash of a string, used to keep reminder ids compact and stable.
-fn hash64(s: &str) -> u64 {
+/// `pub(crate)` so errand ids share the same compact stable-hash scheme.
+pub(crate) fn hash64(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
