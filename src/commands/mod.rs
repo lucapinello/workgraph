@@ -744,7 +744,7 @@ mod provenance_coverage_tests {
         )
         .unwrap();
 
-        super::abandon::run(dir, "prov-abandon", Some("no longer needed"), &[]).unwrap();
+        super::abandon::run(dir, "prov-abandon", Some("no longer needed"), &[], false).unwrap();
         let entries = ops_with_type(dir, "abandon");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].detail["reason"], "no longer needed");
@@ -1054,7 +1054,7 @@ mod provenance_coverage_tests {
         )
         .unwrap();
         super::fail::run(dir, "prov-gc", Some("oops"), None).unwrap();
-        super::abandon::run(dir, "prov-gc", Some("giving up"), &[]).unwrap();
+        super::abandon::run(dir, "prov-gc", Some("giving up"), &[], false).unwrap();
 
         super::gc::run(dir, false, false, None).unwrap();
         let entries = ops_with_type(dir, "gc");

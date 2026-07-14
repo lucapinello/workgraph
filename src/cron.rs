@@ -1,4 +1,4 @@
-use crate::graph::{LogEntry, Node, Task, WorkGraph};
+use crate::graph::{LogEntry, Node, Status, Task, WorkGraph};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use cron::Schedule;
 use std::collections::hash_map::DefaultHasher;
@@ -491,6 +491,64 @@ pub fn is_cron_due(task: &Task, now: DateTime<Utc>) -> bool {
     match calculate_next_fire(&schedule, last_fire) {
         Some(next_fire) => next_fire <= now,
         None => false,
+    }
+}
+
+/// Reasons a cron task will **not** fire even though its scheduled fire time
+/// has arrived. Returned by [`cron_will_not_fire_reason`].
+///
+/// The coordinator's `ready_tasks` only dispatches tasks whose status is
+/// `Open` / `Incomplete` and which are not paused. A cron task can therefore
+/// be *time-due* (`is_cron_due` / `is_time_ready` return true because
+/// `next_cron_fire <= now`) and yet be permanently stuck: the scheduler will
+/// silently skip it every tick. `wg cron` used to tag such tasks `DUE` /
+/// `OVERDUE`, indistinguishable from a healthy cron about to run — which is
+/// exactly how the abandoned `daily-digest` smoke-test cron showed up as
+/// "DUE, overdue 4.5h" while never producing its morning message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronStuckReason {
+    /// The task is paused; the dispatcher skips paused tasks.
+    Paused,
+    /// The task was abandoned — a terminal, non-dispatchable status.
+    Abandoned,
+    /// The task failed — a terminal, non-dispatchable status. Covers both
+    /// `Failed` and `FailedPendingEval`.
+    Failed,
+}
+
+impl CronStuckReason {
+    /// Lower-case one-word label used in `wg cron`'s `blocking_state` / JSON.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CronStuckReason::Paused => "paused",
+            CronStuckReason::Abandoned => "abandoned",
+            CronStuckReason::Failed => "failed",
+        }
+    }
+}
+
+/// If this cron task can never fire on its own — because it is paused or in a
+/// terminal-dead status — return why. Returns `None` for tasks the coordinator
+/// can still dispatch (`Open`/`Incomplete`) or that are transiently mid-cycle
+/// (`InProgress`, or `Done` awaiting the coordinator's cron reset, or the
+/// transient `Blocked`/`Waiting`/`PendingValidation` dispatch states, each of
+/// which `wg cron` already surfaces with its own blocking_state).
+///
+/// This is the primitive behind `wg cron`'s loud "WILL NOT FIRE" surfacing:
+/// an overdue cron that is paused/abandoned/failed must be flagged, never
+/// silently reported as `DUE`. A cron *template* (`cron_template`) is never
+/// dispatched itself — it mints instances — so a template is not "stuck".
+pub fn cron_will_not_fire_reason(task: &Task) -> Option<CronStuckReason> {
+    if !task.cron_enabled || task.cron_template {
+        return None;
+    }
+    if task.paused {
+        return Some(CronStuckReason::Paused);
+    }
+    match task.status {
+        Status::Abandoned => Some(CronStuckReason::Abandoned),
+        Status::Failed | Status::FailedPendingEval => Some(CronStuckReason::Failed),
+        _ => None,
     }
 }
 
@@ -1686,5 +1744,90 @@ mod tests {
             !crate::query::after(&graph, "legacy-child").is_empty(),
             "legacy reset re-blocks the child — the bug template mode fixes"
         );
+    }
+
+    fn daily_cron_task(id: &str, status: Status) -> Task {
+        let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        Task {
+            id: id.to_string(),
+            status,
+            cron_enabled: true,
+            cron_schedule: Some("0 0 9 * * *".to_string()),
+            next_cron_fire: Some(past),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cron_will_not_fire_flags_abandoned_and_failed() {
+        // The abandoned `daily-digest` smoke-test cron is time-due yet the
+        // coordinator will never dispatch a terminal-dead task — it must be
+        // flagged so `wg cron` can surface it loudly.
+        assert_eq!(
+            cron_will_not_fire_reason(&daily_cron_task("dead", Status::Abandoned)),
+            Some(CronStuckReason::Abandoned)
+        );
+        assert_eq!(
+            cron_will_not_fire_reason(&daily_cron_task("boom", Status::Failed)),
+            Some(CronStuckReason::Failed)
+        );
+        assert_eq!(
+            cron_will_not_fire_reason(&daily_cron_task("boom2", Status::FailedPendingEval)),
+            Some(CronStuckReason::Failed)
+        );
+    }
+
+    #[test]
+    fn cron_will_not_fire_flags_paused_over_status() {
+        let mut t = daily_cron_task("napping", Status::Open);
+        t.paused = true;
+        assert_eq!(
+            cron_will_not_fire_reason(&t),
+            Some(CronStuckReason::Paused),
+            "a paused cron never fires regardless of an otherwise-healthy Open status"
+        );
+    }
+
+    #[test]
+    fn cron_will_not_fire_none_for_dispatchable_and_transient() {
+        // Open / Incomplete are dispatchable; InProgress / Done (awaiting cron
+        // reset) / Blocked / Waiting are transient and carry their own
+        // blocking_state — none of these are the "will never fire" condition.
+        for status in [
+            Status::Open,
+            Status::Incomplete,
+            Status::InProgress,
+            Status::Done,
+            Status::Blocked,
+            Status::Waiting,
+            Status::PendingValidation,
+        ] {
+            assert_eq!(
+                cron_will_not_fire_reason(&daily_cron_task("live", status)),
+                None,
+                "status {:?} should not be flagged as will-not-fire",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn cron_will_not_fire_none_for_template() {
+        // A cron *template* is never dispatched itself (it mints instances), so
+        // it is not "stuck" even in a non-Open status.
+        let mut t = daily_cron_task("tmpl", Status::Done);
+        t.cron_template = true;
+        assert_eq!(cron_will_not_fire_reason(&t), None);
+    }
+
+    #[test]
+    fn cron_will_not_fire_none_for_non_cron_task() {
+        let t = Task {
+            id: "plain".to_string(),
+            status: Status::Abandoned,
+            cron_enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(cron_will_not_fire_reason(&t), None);
     }
 }

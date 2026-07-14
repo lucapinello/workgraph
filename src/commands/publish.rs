@@ -405,6 +405,7 @@ pub fn run_remove(workgraph_dir: &Path, name: &str) -> Result<()> {
             task_id,
             Some(&format!("Removed publish deployment '{}'.", name)),
             &[],
+            false,
         ) {
             eprintln!(
                 "Warning: could not abandon scheduling task '{}': {}",

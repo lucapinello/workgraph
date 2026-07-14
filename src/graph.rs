@@ -995,11 +995,30 @@ pub const DISPOSABLE_TAG: &str = "disposable";
 /// docs/14-disposable-lifecycle.md §ingest.
 pub const SPAWNED_BY_TAG_PREFIX: &str = "spawned-by:";
 
+/// Tag marking a task as a **protected production recurring task** — a live
+/// cron (the daily digest, the Sunday plan/review) whose schedule the family
+/// depends on. A protected task must survive routine cleanup: `wg abandon`
+/// refuses to abandon it without an explicit `--force` (which logs the reason),
+/// and `wg gc` never garbage-collects it even when terminal. This exists
+/// because the production `daily-digest` cron was abandoned as a "smoke-test
+/// … not real work" by a cleanup sweep — friendly fire that silently killed
+/// the family's 12:00 UTC digest (task `re-arm-the`). See
+/// [`Task::is_protected`].
+pub const PROTECTED_TAG: &str = "protected";
+
 impl Task {
     /// True when this task opts into the disposable lifecycle by carrying the
     /// [`DISPOSABLE_TAG`].
     pub fn is_disposable(&self) -> bool {
         self.tags.iter().any(|t| t == DISPOSABLE_TAG)
+    }
+
+    /// True when this task is a protected production recurring task (carries the
+    /// [`PROTECTED_TAG`]). Protected tasks are shielded from routine cleanup:
+    /// `wg abandon` requires `--force` and `wg gc` skips them. See
+    /// [`PROTECTED_TAG`].
+    pub fn is_protected(&self) -> bool {
+        self.tags.iter().any(|t| t == PROTECTED_TAG)
     }
 
     /// The agent (content-hash / id) of the named agent that spawned this
