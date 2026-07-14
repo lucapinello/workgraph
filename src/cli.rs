@@ -6753,6 +6753,33 @@ pub enum TelegramCommands {
         mock_send: bool,
     },
 
+    /// Flush each family member's ONE calm morning digest (the daily-digest cron)
+    ///
+    /// The production caller the daily 12:00 UTC `daily-digest` cron runs: the
+    /// digest engine (one-calm-daily) queues every bundled + overflow proactive
+    /// item per person; this emits the single `Today: …` morning message, sends
+    /// it via the recipient's bot, and mirrors it to the canonical pane ledger —
+    /// the same one-path contract the lifecycle report-backs obey. At most one
+    /// digest per person per day; a failed send keeps the queue for the next
+    /// tick. `--dry-run` prints what would go to whom without sending.
+    Digest {
+        /// Print what would be sent to whom, without sending or recording state.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Override "now" as `YYYY-MM-DDTHH:MM` (local wall clock) for
+        /// deterministic tests; defaults to the system clock.
+        #[arg(long)]
+        now: Option<String>,
+
+        /// Credential-free cross-surface seam: run the REAL tick and the REAL
+        /// casa-feed mirror, but record each Telegram send instead of hitting the
+        /// network. Lets a smoke test prove the morning digest lands in the pane
+        /// ledger AND is "sent", without a live bot.
+        #[arg(long = "mock-send", hide = true)]
+        mock_send: bool,
+    },
+
     /// Audit whether a composed reply's PROMISE would leave an artifact
     ///
     /// The promise-action parity test seam: runs the exact pattern-based
