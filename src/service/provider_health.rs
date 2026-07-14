@@ -10,6 +10,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Plain-language operator alert emitted when the provider pause trips. Mirrors
+/// the spawn breaker's alert voice: no jargon, says what happened and that it
+/// will recover on its own.
+pub const PROVIDER_PAUSED_ALERT_TEXT: &str =
+    "⚠️ The family team can't reach its AI right now — usually a login issue. \
+The task runner has paused and will keep checking; it resumes on its own once the connection is back.";
+
+/// Plain-language operator alert emitted when the provider pause auto-resumes.
+pub const PROVIDER_RESUMED_ALERT_TEXT: &str =
+    "✅ The family team can reach its AI again — the task runner has resumed and is back to work.";
+
 /// Classification of provider errors based on exit codes and stderr patterns
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderErrorKind {
@@ -111,6 +122,19 @@ pub struct ProviderHealth {
     pub paused_at: Option<String>,
     /// Auto-resume cooldown period (if configured)
     pub auto_resume_at: Option<String>,
+    /// Monotonic counter of how many times the service transitioned
+    /// unpaused→paused. Used as the alert episode id so a re-pause is never
+    /// deduped against the first pause by the digest store.
+    #[serde(default)]
+    pub pause_generation: u32,
+    /// Armed on the unpaused→paused transition; consumed once by the daemon to
+    /// emit the operator alert (mirrors the spawn breaker's one-shot alert).
+    #[serde(default)]
+    pub pending_pause_alert: bool,
+    /// RFC3339 timestamp of the last auto-probe attempt while paused. Drives the
+    /// probe cadence so we probe at most once per configured interval.
+    #[serde(default)]
+    pub last_probe_at: Option<String>,
 }
 
 impl ProviderHealth {
@@ -172,6 +196,10 @@ impl ProviderHealth {
     /// Check if any providers should be paused and apply pause
     pub fn check_and_apply_pauses(&mut self, threshold: u32, behavior: &str) -> Vec<String> {
         let mut paused_providers = Vec::new();
+        // Remember whether the *service* was already paused so we only arm the
+        // operator alert on a genuine unpaused→paused edge (not on every triage
+        // pass that finds the service already frozen).
+        let was_service_paused = self.service_paused;
 
         for provider in self.providers.values_mut() {
             if provider.should_pause(threshold) {
@@ -215,6 +243,15 @@ impl ProviderHealth {
             }
         }
 
+        // Arm the one-shot operator alert only on a real unpaused→paused edge.
+        if self.service_paused && !was_service_paused {
+            self.pause_generation = self.pause_generation.saturating_add(1);
+            self.pending_pause_alert = true;
+            // A fresh pause window starts fresh: the next probe should fire
+            // after one interval, not immediately reuse a stale probe stamp.
+            self.last_probe_at = None;
+        }
+
         paused_providers
     }
 
@@ -224,13 +261,73 @@ impl ProviderHealth {
         self.pause_reason = None;
         self.paused_at = None;
         self.auto_resume_at = None;
+        // Clear any un-consumed pause alert and the probe stamp so a future
+        // pause starts from a clean slate. `pause_generation` is monotonic and
+        // deliberately preserved (episode ids must never repeat).
+        self.pending_pause_alert = false;
+        self.last_probe_at = None;
 
-        // Also resume all paused providers
+        // Also resume all paused providers. resume() resets each provider's
+        // consecutive_failures to 0 — so one bad window never permanently
+        // lowers the effective trip threshold.
         for provider in self.providers.values_mut() {
             if provider.is_paused {
                 provider.resume();
             }
         }
+    }
+
+    /// Consume the one-shot pause alert. Returns the pause generation (episode
+    /// id) exactly once per unpaused→paused edge, then disarms. Mirrors the
+    /// spawn breaker's `take_alert()`.
+    pub fn take_pause_alert(&mut self) -> Option<u32> {
+        if self.pending_pause_alert {
+            self.pending_pause_alert = false;
+            Some(self.pause_generation)
+        } else {
+            None
+        }
+    }
+
+    /// How long the service has been paused, in seconds, relative to `now`.
+    /// `None` if not paused or the stamp is unparseable.
+    pub fn pause_duration_secs(&self, now: chrono::DateTime<Utc>) -> Option<i64> {
+        let paused_at = self.paused_at.as_deref()?;
+        let parsed = chrono::DateTime::parse_from_rfc3339(paused_at).ok()?;
+        Some(now.signed_duration_since(parsed).num_seconds().max(0))
+    }
+
+    /// Whether an auto-probe is due: the service is paused, probing is enabled
+    /// (`interval_secs > 0`), and either we have never probed this window or at
+    /// least `interval_secs` have elapsed since the last probe.
+    pub fn should_probe(&self, now: chrono::DateTime<Utc>, interval_secs: u64) -> bool {
+        if !self.service_paused || interval_secs == 0 {
+            return false;
+        }
+        match self.last_probe_at.as_deref() {
+            None => true,
+            Some(stamp) => match chrono::DateTime::parse_from_rfc3339(stamp) {
+                Ok(last) => {
+                    now.signed_duration_since(last).num_seconds() >= interval_secs as i64
+                }
+                // Unparseable stamp → don't get stuck; probe now.
+                Err(_) => true,
+            },
+        }
+    }
+
+    /// Record that a probe was just attempted (regardless of outcome).
+    pub fn mark_probed(&mut self, now: chrono::DateTime<Utc>) {
+        self.last_probe_at = Some(now.to_rfc3339());
+    }
+
+    /// Ids of providers currently flagged paused (for targeted probing).
+    pub fn paused_provider_ids(&self) -> Vec<String> {
+        self.providers
+            .values()
+            .filter(|p| p.is_paused)
+            .map(|p| p.provider_id.clone())
+            .collect()
     }
 
     /// Check if the service should be paused
@@ -469,6 +566,104 @@ mod tests {
         let provider = health.get_or_create_provider(provider_id);
         assert_eq!(provider.consecutive_failures, 0);
         assert!(!provider.should_pause(3));
+    }
+
+    #[test]
+    fn test_pause_arms_one_shot_alert_on_edge_only() {
+        let mut health = ProviderHealth::default();
+        for _ in 0..3 {
+            health.record_failure("claude", ProviderErrorKind::FatalProvider, "auth".into());
+        }
+        let paused = health.check_and_apply_pauses(3, "pause");
+        assert_eq!(paused, vec!["claude".to_string()]);
+        assert!(health.service_paused);
+        assert_eq!(health.pause_generation, 1);
+
+        // The alert is armed exactly once for this edge.
+        assert_eq!(health.take_pause_alert(), Some(1));
+        assert_eq!(health.take_pause_alert(), None);
+
+        // A second triage pass while STILL paused must not re-arm the alert.
+        health.record_failure("claude", ProviderErrorKind::FatalProvider, "auth".into());
+        let paused2 = health.check_and_apply_pauses(3, "pause");
+        assert!(paused2.is_empty(), "already-paused provider does not re-pause");
+        assert_eq!(health.take_pause_alert(), None);
+        assert_eq!(health.pause_generation, 1);
+    }
+
+    #[test]
+    fn test_resume_resets_failures_and_bumps_generation_on_repause() {
+        let mut health = ProviderHealth::default();
+        for _ in 0..3 {
+            health.record_failure("claude", ProviderErrorKind::FatalProvider, "auth".into());
+        }
+        health.check_and_apply_pauses(3, "pause");
+        assert_eq!(health.pause_generation, 1);
+        let _ = health.take_pause_alert();
+
+        // Auto-resume: counter must be back to 0 so one bad window never
+        // permanently lowers the effective trip threshold.
+        health.resume_service();
+        assert!(!health.service_paused);
+        assert!(!health.pending_pause_alert);
+        assert!(health.last_probe_at.is_none());
+        assert_eq!(
+            health.get_or_create_provider("claude").consecutive_failures,
+            0
+        );
+
+        // A fresh bad window re-pauses and arms a NEW episode id.
+        for _ in 0..3 {
+            health.record_failure("claude", ProviderErrorKind::FatalProvider, "auth".into());
+        }
+        health.check_and_apply_pauses(3, "pause");
+        assert_eq!(health.pause_generation, 2);
+        assert_eq!(health.take_pause_alert(), Some(2));
+    }
+
+    #[test]
+    fn test_should_probe_cadence() {
+        let mut health = ProviderHealth::default();
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-07-14T15:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Not paused → never probe.
+        assert!(!health.should_probe(t0, 300));
+
+        for _ in 0..3 {
+            health.record_failure("claude", ProviderErrorKind::FatalProvider, "auth".into());
+        }
+        health.check_and_apply_pauses(3, "pause");
+
+        // Paused, never probed → probe now (unless disabled).
+        assert!(health.should_probe(t0, 300));
+        assert!(!health.should_probe(t0, 0), "interval 0 disables probing");
+
+        // After probing, wait the full interval before the next probe.
+        health.mark_probed(t0);
+        let t_soon = t0 + chrono::Duration::seconds(299);
+        let t_due = t0 + chrono::Duration::seconds(300);
+        assert!(!health.should_probe(t_soon, 300));
+        assert!(health.should_probe(t_due, 300));
+    }
+
+    #[test]
+    fn test_pause_duration_and_paused_ids() {
+        let mut health = ProviderHealth::default();
+        for _ in 0..3 {
+            health.record_failure("claude", ProviderErrorKind::FatalProvider, "auth".into());
+        }
+        health.check_and_apply_pauses(3, "pause");
+        assert_eq!(health.paused_provider_ids(), vec!["claude".to_string()]);
+
+        let paused_at = chrono::DateTime::parse_from_rfc3339(
+            health.paused_at.as_deref().unwrap(),
+        )
+        .unwrap()
+        .with_timezone(&Utc);
+        let later = paused_at + chrono::Duration::seconds(90);
+        assert_eq!(health.pause_duration_secs(later), Some(90));
     }
 
     #[test]

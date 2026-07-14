@@ -3877,6 +3877,14 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub provider_failure_cooldown: String,
 
+    /// While the service is paused for provider-health failures, the dispatcher
+    /// runs a cheap provider reachability probe (e.g. `claude -p ping`) every
+    /// this-many seconds; on success it auto-resumes and announces to the
+    /// operator. Default: 300 (5m). Set to 0 to disable auto-probing (manual
+    /// resume only).
+    #[serde(default = "default_provider_probe_interval_secs")]
+    pub provider_probe_interval_secs: u64,
+
     /// Resource management configuration for worktree cleanup and recovery.
     #[serde(default)]
     pub resource_management: ResourceManagementConfig,
@@ -3961,6 +3969,10 @@ fn default_on_provider_failure() -> String {
 
 fn default_provider_failure_threshold() -> u32 {
     3
+}
+
+fn default_provider_probe_interval_secs() -> u64 {
+    300
 }
 
 fn default_max_agents() -> usize {
@@ -4178,6 +4190,7 @@ impl Default for CoordinatorConfig {
             on_provider_failure: default_on_provider_failure(),
             provider_failure_threshold: default_provider_failure_threshold(),
             provider_failure_cooldown: String::new(),
+            provider_probe_interval_secs: default_provider_probe_interval_secs(),
             compaction_threshold_ratio: default_compaction_threshold_ratio(),
             eval_frequency: default_eval_frequency(),
             worktree_isolation: true,

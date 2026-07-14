@@ -1760,6 +1760,199 @@ fn emit_operator_alert(dir: &Path, logger: &DaemonLogger, episode: &str, text: &
     }
 }
 
+/// Hard timeout for a single provider reachability probe. A hung probe must
+/// never wedge the daemon tick, so the child is killed if it overruns.
+const PROVIDER_PROBE_TIMEOUT_SECS: u64 = 90;
+
+/// Provider-health self-healing, run once per daemon tick.
+///
+/// 1. If the provider pause just tripped (unpaused→paused edge), emit the loud
+///    plain-language operator alert exactly once for this episode.
+/// 2. While the service is paused for provider health, run a cheap provider
+///    reachability probe at most once per `provider_probe_interval_secs`. On
+///    success, auto-resume the service (which also resets the failure counter)
+///    and announce the recovery to the operator.
+///
+/// Everything is best-effort and wrapped so a missing config / probe hiccup can
+/// never wedge the daemon: the loud logs remain the floor.
+fn maybe_probe_and_resume_provider(dir: &Path, logger: &DaemonLogger) {
+    maybe_probe_and_resume_provider_with(dir, logger, run_provider_probe);
+}
+
+/// Testable core of [`maybe_probe_and_resume_provider`] with the reachability
+/// probe injected, so tests can drive the pause→probe-success→auto-resume and
+/// pause→probe-fail→stay-paused edges without spawning a real CLI.
+fn maybe_probe_and_resume_provider_with(
+    dir: &Path,
+    logger: &DaemonLogger,
+    probe: impl Fn(&str, &DaemonLogger) -> bool,
+) {
+    let mut health = match worksgood::service::ProviderHealth::load(dir) {
+        Ok(h) => h,
+        Err(e) => {
+            logger.warn(&format!(
+                "[provider-health] failed to load provider health: {}",
+                e
+            ));
+            return;
+        }
+    };
+    let mut dirty = false;
+
+    // (1) One-shot pause alert on the trip edge.
+    if let Some(generation) = health.take_pause_alert() {
+        let reason = health
+            .pause_reason
+            .as_deref()
+            .unwrap_or("provider unreachable");
+        logger.warn(&format!("[provider-health] service PAUSED: {}", reason));
+        emit_operator_alert(
+            dir,
+            logger,
+            &format!("provider-paused-{}", generation),
+            worksgood::service::PROVIDER_PAUSED_ALERT_TEXT,
+        );
+        dirty = true;
+    }
+
+    // (2) Auto-probe + auto-resume while paused.
+    if health.service_paused {
+        let interval = worksgood::config::Config::load_or_default(dir)
+            .coordinator
+            .provider_probe_interval_secs;
+        let now = chrono::Utc::now();
+        if health.should_probe(now, interval) {
+            health.mark_probed(now);
+            dirty = true;
+            let paused_for = health.pause_duration_secs(now).unwrap_or(0);
+            let targets = health.paused_provider_ids();
+            logger.info(&format!(
+                "[provider-health] paused for {} — running reachability probe ({} provider(s))",
+                worksgood::format_duration(paused_for, false),
+                targets.len().max(1),
+            ));
+            // If the map has no flagged provider (defensive), probe claude by
+            // default since that is the family team's dispatch provider.
+            let reachable = if targets.is_empty() {
+                probe("claude", logger)
+            } else {
+                targets.iter().any(|p| probe(p, logger))
+            };
+            if reachable {
+                let generation = health.pause_generation;
+                health.resume_service();
+                logger.info(&format!(
+                    "[provider-health] probe succeeded — AUTO-RESUMING after {} paused",
+                    worksgood::format_duration(paused_for, false),
+                ));
+                emit_operator_alert(
+                    dir,
+                    logger,
+                    &format!("provider-resumed-{}", generation),
+                    worksgood::service::PROVIDER_RESUMED_ALERT_TEXT,
+                );
+            } else {
+                logger.warn(
+                    "[provider-health] probe still failing — staying paused, will retry next interval",
+                );
+            }
+        }
+    }
+
+    if dirty
+        && let Err(e) = health.save(dir)
+    {
+        logger.warn(&format!(
+            "[provider-health] failed to persist provider health: {}",
+            e
+        ));
+    }
+}
+
+/// Run a cheap provider reachability probe. Returns true iff the provider
+/// answered successfully (exit 0) within [`PROVIDER_PROBE_TIMEOUT_SECS`].
+///
+/// Seam: `WG_PROVIDER_PROBE_CMD` overrides the probe command (whitespace-split);
+/// it must exit 0 iff the provider is reachable. This lets tests and operators
+/// inject a fake probe without a live CLI. Without the override, the claude
+/// provider is probed with `claude -p ping`; providers with no known cheap
+/// probe stay paused until a manual resume (logged, not silent).
+fn run_provider_probe(provider_id: &str, logger: &DaemonLogger) -> bool {
+    use std::process::Stdio;
+
+    let (program, args): (String, Vec<String>) =
+        if let Ok(cmd) = std::env::var("WG_PROVIDER_PROBE_CMD") {
+            let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
+            if parts.is_empty() {
+                logger.warn("[provider-health] WG_PROVIDER_PROBE_CMD is empty — skipping probe");
+                return false;
+            }
+            let program = parts.remove(0);
+            (program, parts)
+        } else if provider_id == "claude"
+            || provider_id.contains("claude")
+            || provider_id.contains("anthropic")
+        {
+            (
+                "claude".to_string(),
+                vec!["-p".to_string(), "ping".to_string()],
+            )
+        } else {
+            logger.info(&format!(
+                "[provider-health] no auto-probe available for provider '{}' — staying paused until manual resume",
+                provider_id
+            ));
+            return false;
+        };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            logger.warn(&format!("[provider-health] probe: no async runtime: {}", e));
+            return false;
+        }
+    };
+
+    let timeout = Duration::from_secs(PROVIDER_PROBE_TIMEOUT_SECS);
+    rt.block_on(async move {
+        let mut command = tokio::process::Command::new(&program);
+        command
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                logger.warn(&format!(
+                    "[provider-health] probe failed to spawn '{}': {}",
+                    program, e
+                ));
+                return false;
+            }
+        };
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => status.success(),
+            Ok(Err(e)) => {
+                logger.warn(&format!("[provider-health] probe wait failed: {}", e));
+                false
+            }
+            Err(_) => {
+                // Timed out — kill_on_drop reaps the child when it drops here.
+                logger.warn(&format!(
+                    "[provider-health] probe timed out after {}s",
+                    PROVIDER_PROBE_TIMEOUT_SECS
+                ));
+                false
+            }
+        }
+    })
+}
+
 /// Dispatch notifications for recently changed tasks via the notification router.
 ///
 /// Scans the graph for tasks that recently failed or became blocked, and sends
@@ -3156,6 +3349,18 @@ pub fn run_daemon(
                         let _ = breaker.save(&breaker_path);
                     }
 
+                    // Provider-health pause: heal itself + always tell the
+                    // operator. This is distinct from the spawn breaker: it
+                    // fires when a *provider* (e.g. claude) repeatedly returns a
+                    // fatal error (expired login, quota) and the service freezes
+                    // spawning. TWICE on 2026-07-14 it sat paused for an hour+
+                    // silently while the CLI itself was fine.
+                    //   (1) On the unpaused→paused edge, DM the operator loudly.
+                    //   (2) While paused, run a cheap reachability probe every
+                    //       `provider_probe_interval_secs`; on success,
+                    //       auto-resume and announce so it never sits frozen.
+                    maybe_probe_and_resume_provider(&dir, &logger);
+
                     // Dispatch watchdog (fix-wedge): detect a starved dispatcher —
                     // ready tasks present, yet nothing spawned and no live agents.
                     // Suppressed while the breaker is intentionally holding spawns
@@ -3640,6 +3845,18 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
     let breaker_phase = breaker.phase(breaker_now, &breaker_cfg);
     let breaker_line = breaker.status_line(breaker_now, &breaker_cfg);
 
+    // Provider-health pause readout — prominent so a service frozen because it
+    // can't reach its AI is obvious at a glance (previously only a daemon.log
+    // grep surfaced it).
+    let provider_health =
+        worksgood::service::ProviderHealth::load(dir).unwrap_or_default();
+    let provider_paused = provider_health.service_paused;
+    let provider_pause_reason = provider_health.pause_reason.clone();
+    let provider_pause_secs = provider_health.pause_duration_secs(breaker_now);
+    let provider_pause_human =
+        provider_pause_secs.map(|s| worksgood::format_duration(s, false));
+    let provider_last_probe = provider_health.last_probe_at.clone();
+
     // Log file info
     let log_path = log_file_path(dir);
     let log_path_str = log_path.to_string_lossy().to_string();
@@ -3685,6 +3902,15 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
                 "total_opens": breaker.total_opens,
                 "last_recovered_at": breaker.last_recovered_at,
                 "summary": breaker_line,
+            },
+            "provider_health": {
+                "paused": provider_paused,
+                "pause_reason": provider_pause_reason,
+                "paused_at": provider_health.paused_at,
+                "paused_for": provider_pause_human,
+                "paused_for_secs": provider_pause_secs,
+                "last_probe_at": provider_last_probe,
+                "pause_generation": provider_health.pause_generation,
             },
             "log": {
                 "path": log_path_str,
@@ -3785,6 +4011,30 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
                     breaker.consecutive_failures
                 );
             }
+        }
+        // Provider pause — prominent when frozen because the AI is unreachable.
+        if provider_paused {
+            println!(
+                "Provider: ⚠️  PAUSED{} — {}",
+                provider_pause_human
+                    .as_deref()
+                    .map(|d| format!(" for {}", d))
+                    .unwrap_or_default(),
+                provider_pause_reason
+                    .as_deref()
+                    .unwrap_or("provider unreachable"),
+            );
+            match provider_last_probe.as_deref() {
+                Some(p) => println!(
+                    "  (auto-probing to auto-resume; last probe {} — usually a login issue)",
+                    p
+                ),
+                None => println!(
+                    "  (auto-probing to auto-resume; usually a login issue — check the server if this persists)"
+                ),
+            }
+        } else {
+            println!("Provider: OK");
         }
         println!("Log: {}", log_path_str);
         if !recent_errors.is_empty() || !recent_fatals.is_empty() {
@@ -4632,6 +4882,69 @@ pub fn send_request(dir: &Path, request: &IpcRequest) -> Result<IpcResponse> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Build a service-paused ProviderHealth on disk (mirrors what triage does
+    /// after 3 consecutive fatal-provider errors) and return the temp dir.
+    fn paused_health_dir() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut health = worksgood::service::ProviderHealth::default();
+        for _ in 0..3 {
+            health.record_failure(
+                "claude",
+                worksgood::service::ProviderErrorKind::FatalProvider,
+                "authentication failed (HTTP 401)".to_string(),
+            );
+        }
+        let paused = health.check_and_apply_pauses(3, "pause");
+        assert_eq!(paused, vec!["claude".to_string()]);
+        assert!(health.service_paused);
+        health.save(&dir).unwrap();
+        (tmp, dir)
+    }
+
+    /// The core incident: pause → a successful reachability probe → the service
+    /// AUTO-RESUMES on its own (no human, no manual `wg service resume`), and
+    /// the failure counter is reset so one bad window can't lower the threshold.
+    #[test]
+    fn test_provider_probe_success_auto_resumes() {
+        let (_tmp, dir) = paused_health_dir();
+        let logger = DaemonLogger::open(&dir).unwrap();
+
+        // Probe reports the provider is reachable again.
+        maybe_probe_and_resume_provider_with(&dir, &logger, |_provider, _logger| true);
+
+        let mut after = worksgood::service::ProviderHealth::load(&dir).unwrap();
+        assert!(!after.service_paused, "a successful probe must auto-resume");
+        assert!(after.pause_reason.is_none());
+        assert_eq!(
+            after
+                .get_or_create_provider("claude")
+                .consecutive_failures,
+            0,
+            "resume must reset the failure counter"
+        );
+    }
+
+    /// While the provider is still unreachable, the probe fails and the service
+    /// stays paused (it must not falsely resume) — but the probe stamp advances
+    /// so the next attempt waits for the configured interval.
+    #[test]
+    fn test_provider_probe_failure_stays_paused() {
+        let (_tmp, dir) = paused_health_dir();
+        let logger = DaemonLogger::open(&dir).unwrap();
+
+        maybe_probe_and_resume_provider_with(&dir, &logger, |_provider, _logger| false);
+
+        let after = worksgood::service::ProviderHealth::load(&dir).unwrap();
+        assert!(after.service_paused, "a failing probe must NOT resume");
+        assert!(
+            after.last_probe_at.is_some(),
+            "a probe attempt must be stamped so the cadence advances"
+        );
+        // The one-shot pause alert was consumed on this tick (edge already fired).
+        assert!(!after.pending_pause_alert);
+    }
 
     /// Regression test for the 14h-401 incident: a coordinator launched
     /// `wg service start/daemon --model openrouter:z-ai/glm-5.2` silently

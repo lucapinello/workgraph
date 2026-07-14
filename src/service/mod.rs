@@ -23,7 +23,8 @@ pub use executor::{
     ExecutorConfig, ExecutorRegistry, ExecutorSettings, PromptTemplate, TemplateVars,
 };
 pub use provider_health::{
-    ProviderErrorKind, ProviderHealth, ProviderHealthStatus, classify_error, extract_provider_id,
+    PROVIDER_PAUSED_ALERT_TEXT, PROVIDER_RESUMED_ALERT_TEXT, ProviderErrorKind, ProviderHealth,
+    ProviderHealthStatus, classify_error, extract_provider_id,
 };
 pub use registry::{AgentEntry, AgentRegistry, AgentStatus, LockedRegistry};
 
