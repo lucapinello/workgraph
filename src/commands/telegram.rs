@@ -14,6 +14,7 @@ use worksgood::notify::NotificationChannel;
 use worksgood::notify::casa_feed;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
+use worksgood::notify::fast_lane;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
 use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
@@ -3003,6 +3004,26 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 /// itself sends into the group.
 ///
 /// [`SilenceReason::BotSender`]: worksgood::notify::telegram_group::SilenceReason
+/// Pick the `(bot_id, chat)` a fast-lane confirmation should go out as: the
+/// elected single voice when the ask elected one (so a food edit confirms in the
+/// chef's voice, a workout edit in the coach's), else the first configured bot in
+/// the family group. A fast-lane hit always has *something* to answer with.
+fn fast_lane_reply_target(
+    election: &Election,
+    config: &TelegramConfig,
+    target: &str,
+) -> (String, String) {
+    if let Election::One { bot, reply_chat, .. } = election {
+        return (bot.bot_id.clone(), reply_chat.clone());
+    }
+    let bot_id = config
+        .all_bots()
+        .first()
+        .map(|(id, _)| id.clone())
+        .unwrap_or_default();
+    (bot_id, target.to_string())
+}
+
 pub fn run_web_inbound(
     workgraph_dir: &Path,
     sender: &str,
@@ -3110,6 +3131,68 @@ pub fn run_web_inbound(
             );
         }
         return Ok(());
+    }
+
+    // ── FAST LANE ─────────────────────────────────────────────────────────
+    // A closed set of simple plan edits — a single meal swap/add/remove, a
+    // shopping add, a reminder — applies DIRECTLY to the week's plan file right
+    // here, in seconds, instead of spawning a full agent (worktree, edit, tests,
+    // eval) that takes twenty minutes for "swap Friday to tacos". The edit is
+    // round-tripped through the real plan parser before we confirm; anything
+    // outside the closed set (or a compound ask like "…and rebalance the week")
+    // returns Fallback and drops through to the full election pipeline below,
+    // exactly as today. Only a confirmed human may trigger a direct write.
+    if convo::sender_is_confirmed(workgraph_dir, &auth_sender) {
+        let today = chrono::Local::now().date_naive();
+        if let fast_lane::FastLaneResult::Applied { report, op, .. } =
+            fast_lane::run_fast_lane(&project_root(workgraph_dir), message, today)
+        {
+            let (bot_id, chat) = fast_lane_reply_target(&election, &config, &target);
+            let persona = convo::agent_for_bot(&config, &bot_id);
+            println!(
+                "[{}] fast-lane {} applied for {} -> {} ({})",
+                chrono::Utc::now().format("%H:%M:%S"),
+                op.kind_label(),
+                sender,
+                bot_id,
+                report,
+            );
+            let sink = FeedMirrorSink::new(
+                convo::BotReplySink::new(config.clone()),
+                feed_path.clone(),
+                config.clone(),
+            );
+            let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+            rt.block_on(async {
+                use convo::ReplySink as _;
+                let _ = sink.send(&bot_id, &chat, &report).await;
+            });
+            // Origin-stamp + brief graph visibility (a queued→done light) so the
+            // fast-lane edit still shows in the constellation/timeline.
+            let origin = worksgood::graph::TaskOrigin::new(
+                worksgood::graph::OriginChannel::Web,
+                chat.clone(),
+                auth_sender.clone(),
+                persona,
+                Some(bot_id.clone()),
+            );
+            fast_lane::stamp_graph_node(workgraph_dir, &origin, &op, &report);
+
+            if json {
+                let out = serde_json::json!({
+                    "category": "fast-lane",
+                    "fast_lane_op": op.kind_label(),
+                    "sender": sender,
+                    "auth_sender": auth_sender,
+                    "target": chat,
+                    "outcome": report,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("web-inbound [fast-lane {}] from {sender}: {report}", op.kind_label());
+            }
+            return Ok(());
+        }
     }
 
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;

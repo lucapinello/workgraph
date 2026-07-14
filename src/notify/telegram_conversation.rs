@@ -315,7 +315,7 @@ pub fn canonical_agent_id(workgraph_dir: &Path, agent_ref: &str) -> String {
 /// Is this Telegram sender a *confirmed* human? Unknown or unconfirmed senders
 /// are not eligible for conversation — they get the onboarding line. A missing
 /// binding file (first-ever onboard) reads as "not confirmed".
-fn sender_is_confirmed(workgraph_dir: &Path, sender: &str) -> bool {
+pub fn sender_is_confirmed(workgraph_dir: &Path, sender: &str) -> bool {
     let agency_dir = workgraph_dir.join("agency");
     match TelegramBindingMap::load(&agency_dir) {
         Ok(map) => map
