@@ -85,9 +85,13 @@ pub enum NudgeKind {
     ErrandNudge,
     /// A conversational-task lifecycle notification — "on it", "done", or an
     /// honest "snag" — reporting back on a task the human *asked for* in chat
-    /// (see [`crate::notify::lifecycle`]). Unlike the others these are direct
-    /// replies to an ask, not proactive pings, so they fire time-critically but
-    /// stay capped so a burst of asks can't flood the chat.
+    /// (see [`crate::notify::lifecycle`]). Unlike every other kind these are
+    /// direct REPLIES to an ask, not proactive pings, so they are exempt from
+    /// the daily standalone cap: a reply the human is actively waiting for
+    /// always reaches them standalone and never overflows into the morning
+    /// digest. (Earlier this kind was capped like the others; that silently
+    /// dropped real replies once a burst of asks spent the cap — see
+    /// [`DigestStore::offer`].)
     Lifecycle,
     /// Any other future proactive DM. New senders route through here by default.
     Proactive,
@@ -401,9 +405,12 @@ impl DigestStore {
     /// * Not yet due → [`Offer::Pending`] (nothing recorded).
     /// * Already-seen id → [`Offer::Duplicate`].
     /// * Bundled → queued for the next digest ([`Offer::Queued`] `overflow:false`).
-    /// * Time-critical under the daily cap → [`Offer::SendNow`] (counter++), even
-    ///   inside quiet hours.
-    /// * Time-critical over the cap → queued as overflow ([`Offer::Queued`]
+    /// * Lifecycle report-back ([`NudgeKind::Lifecycle`]) → always
+    ///   [`Offer::SendNow`]: a reply to the human's own ask is never capped and
+    ///   never counts against the standalone budget.
+    /// * Other time-critical under the daily cap → [`Offer::SendNow`] (counter++),
+    ///   even inside quiet hours.
+    /// * Other time-critical over the cap → queued as overflow ([`Offer::Queued`]
     ///   `overflow:true`) for the next digest's honest line.
     ///
     /// This is the single choke point recommendation #5 asks every proactive
@@ -428,6 +435,22 @@ impl DigestStore {
                     overflow: false,
                 });
                 Offer::Queued { overflow: false }
+            }
+            // A lifecycle report-back is a DIRECT REPLY to an ask the human made
+            // in chat — not an unsolicited proactive ping — so it ALWAYS reaches
+            // them standalone and is never capped or counted against the
+            // proactive standalone budget. The daily cap exists to stop
+            // *unsolicited* senders (reminders, errands, feedback asks) from
+            // flooding; silencing a reply the human is actively waiting for
+            // breaks the conversational contract. This was a live regression:
+            // Luca made a burst of meal-swap asks, the cap of 3 was spent, and
+            // his "Done — Wednesday is now pesto ✅" was folded into the next
+            // morning's digest instead of sent, so the loop looked broken (see
+            // .casa/digest-state.json overflow:true entries). If N asks come in,
+            // N replies are proportionate — the human opened each loop.
+            Urgency::TimeCritical if nudge.kind == NudgeKind::Lifecycle => {
+                st.seen.push(nudge.id.clone());
+                Offer::SendNow(nudge.text.clone())
             }
             Urgency::TimeCritical if st.standalone_sent < cap => {
                 st.seen.push(nudge.id.clone());
@@ -670,6 +693,50 @@ mod tests {
         );
         assert_eq!(store.state("Luca").unwrap().standalone_sent(), 3, "cap not exceeded");
         assert_eq!(store.state("Luca").unwrap().pending().len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_replies_bypass_the_standalone_cap() {
+        // A burst of asks spends the proactive cap, then a lifecycle report-back
+        // still fires standalone — it is a reply to the human's own ask, not a
+        // proactive ping. This is the live regression: the pesto "done" reply was
+        // folded into the digest because the cap was spent by earlier asks.
+        let mut store = DigestStore::default();
+        let policy = DigestPolicy::new(); // cap = 3
+        // Spend the whole proactive cap with reminders.
+        for (h, s) in [(9, "a"), (10, "b"), (11, "c")] {
+            let n = Nudge::time_critical(
+                format!("tc-{h}"), "Luca", NudgeKind::Reminder, dt(2026, 7, 13, h, 0), s);
+            assert!(matches!(store.offer(&n, dt(2026, 7, 13, h, 0), &policy), Offer::SendNow(_)));
+        }
+        assert_eq!(store.state("Luca").unwrap().standalone_sent(), 3, "cap spent");
+
+        // A further reminder overflows (control) …
+        let more = Nudge::time_critical(
+            "tc-more", "Luca", NudgeKind::Reminder, dt(2026, 7, 13, 12, 0), "held");
+        assert_eq!(
+            store.offer(&more, dt(2026, 7, 13, 12, 0), &policy),
+            Offer::Queued { overflow: true }
+        );
+
+        // … but a lifecycle report-back for the SAME person at the SAME time
+        // still sends standalone, and does not touch the proactive counter.
+        let reply = Nudge::time_critical(
+            "lifecycle:pesto:done", "Luca", NudgeKind::Lifecycle,
+            dt(2026, 7, 13, 12, 0), "Done — Wednesday is now pesto ✅");
+        assert_eq!(
+            store.offer(&reply, dt(2026, 7, 13, 12, 0), &policy),
+            Offer::SendNow("Done — Wednesday is now pesto ✅".to_string())
+        );
+        assert_eq!(
+            store.state("Luca").unwrap().standalone_sent(), 3,
+            "lifecycle reply does not consume the proactive budget"
+        );
+        // Exactly-once still holds: re-offering the same reply is a no-op.
+        assert_eq!(
+            store.offer(&reply, dt(2026, 7, 13, 12, 30), &policy),
+            Offer::Duplicate
+        );
     }
 
     #[test]

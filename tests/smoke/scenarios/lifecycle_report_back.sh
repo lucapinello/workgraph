@@ -80,4 +80,31 @@ echo "$out2" | grep -qi "Nothing to report" \
     || loud_fail "after firing, the loop is quiet (not a nag): $out2"
 echo "   → $out2"
 
-echo "PASS: the conversational loop reports start + done back to the origin chat, exactly once."
+echo "5. a report-back is a REPLY, so it fires standalone even when the proactive"
+echo "   standalone cap is already spent (the pesto-round-2 regression):"
+# Live root cause of the 2nd failed test: Luca made a burst of meal-swap asks;
+# the day's proactive standalone cap (default 3) was spent, so the "done" reply
+# was folded into the NEXT-MORNING digest instead of sent — the loop looked
+# broken. A reply to the human's own ask must bypass that cap. Seed the pacing
+# store with the cap already spent for Luca, add a fresh done origin task, and
+# assert the dry-run reports it standalone — NOT "folds into digest".
+cat > "$scratch/.casa/digest-state.json" <<'JSON'
+{"people":{"Luca":{"day":"2026-07-13","standalone_sent":3,"digest_sent":false,"pending":[],"seen":[]}}}
+JSON
+cat >> "$scratch/.wg/graph.jsonl" <<'JSONL'
+{"kind":"task","id":"swap-friday-to-pesto","title":"swap Friday dinner to pesto","status":"done","assigned":"nora","log":[{"timestamp":"2026-07-13T12:00:00","message":"LIFECYCLE_SUMMARY: Friday is now pesto pasta"}],"origin":{"channel":"telegram-1:1","chat_id":"555","requester":"Luca","persona":"otto","bot_id":"otto"}}
+JSONL
+out5="$(life --dry-run --now 2026-07-13T14:00)"
+echo "$out5"
+echo "$out5" | grep -q "done → chat 555" \
+    || loud_fail "the report-back must fire even with the standalone cap spent: $out5"
+echo "$out5" | grep -q "Done! Friday is now pesto pasta" \
+    || loud_fail "the payoff must carry the family-voice change summary: $out5"
+# The pesto done is the only not-yet-fired report-back in this dry-run (steps 1-4
+# already fired the others), so ANY "folds into digest" here is the regression.
+if echo "$out5" | grep -qi "folds into digest"; then
+    loud_fail "a reply must NOT be capped into the digest — the pesto regression: $out5"
+fi
+echo "   → report-back reached the human standalone despite the spent cap"
+
+echo "PASS: the conversational loop reports start + done back to the origin chat, exactly once, and a reply is never capped into the digest."

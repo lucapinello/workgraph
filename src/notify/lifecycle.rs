@@ -971,22 +971,25 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_tick_respects_the_pacing_cap() {
+    fn lifecycle_tick_bypasses_the_pacing_cap() {
         let mut log = FiredLog::default();
         let mut store = DigestStore::default();
         let policy = DigestPolicy::default(); // standalone_cap = 3
 
-        // Four distinct notifications to the same person at once: three fire
-        // standalone, the fourth is capped (folded into the digest), never lost.
+        // Four distinct report-backs to the same person at once. A report-back is
+        // a REPLY to an ask the human made, not a proactive ping, so it is exempt
+        // from the daily standalone cap — all four fire standalone, none folds
+        // into the digest. (This is the live regression: the pesto "done" reply
+        // was swallowed once earlier asks had spent the cap of 3.)
         let inputs = vec![
-            input("a", LifecycleEvent::Started),
-            input("b", LifecycleEvent::Started),
-            input("c", LifecycleEvent::Started),
-            input("d", LifecycleEvent::Started),
+            input("a", LifecycleEvent::Done),
+            input("b", LifecycleEvent::Done),
+            input("c", LifecycleEvent::Done),
+            input("d", LifecycleEvent::Done),
         ];
         let r = lifecycle_tick(&inputs, &mut log, &mut store, now(), &policy);
-        assert_eq!(r.fired.len(), 3, "cap of 3 standalone");
-        assert_eq!(r.capped.len(), 1, "the 4th folds into the digest");
+        assert_eq!(r.fired.len(), 4, "every report-back reaches the human standalone");
+        assert!(r.capped.is_empty(), "a reply is never folded into the digest");
         // All four are recorded so a re-tick fires none of them again.
         let r2 = lifecycle_tick(&inputs, &mut log, &mut store, now(), &policy);
         assert!(r2.fired.is_empty() && r2.capped.is_empty());

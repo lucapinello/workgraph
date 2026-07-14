@@ -437,6 +437,54 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
 
     println!("Press Ctrl+C to stop\n");
 
+    // Periodic conversational report-back tick. The listener is the process that
+    // OWNS the Telegram sockets, and its stdout is `.casa/telegram.log`, so
+    // report-backs are delivered — and logged where all other family-facing
+    // Telegram traffic lands — from HERE, not from the coordinator (round 1 sent
+    // them from a detached thread in the wg-service process, logging only to the
+    // daemon log; the second live test's pesto "done" reply was invisible there
+    // and, worse, swallowed by the pacing cap). Every LIFECYCLE_TICK_SECS this
+    // observes the live graph: for any origin-stamped task whose start/done/fail
+    // transition is not yet in the FiredLog it delivers the family-voice report
+    // exactly once (see `run_lifecycle`). A cheap `pending_fires` gate keeps an
+    // idle house silent — no per-tick chatter in the log. It runs on a plain OS
+    // thread, NOT a tokio task: `run_lifecycle` builds its own runtime to send,
+    // which would panic if nested inside this listener's runtime. Read-only
+    // against the graph; it never touches the message-routing pipeline below.
+    const LIFECYCLE_TICK_SECS: u64 = 15;
+    {
+        let lifecycle_dir = dir.to_path_buf();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(LIFECYCLE_TICK_SECS));
+            let graph_path = crate::commands::graph_path(&lifecycle_dir);
+            let graph = match worksgood::parser::load_graph(&graph_path) {
+                Ok(g) => g,
+                Err(_) => continue, // no graph yet — nothing to report
+            };
+            let root = project_root(&lifecycle_dir);
+            let fired = worksgood::notify::reminder::FiredLog::load(
+                &worksgood::notify::reminder::FiredLog::path(&root),
+            );
+            let pending = worksgood::notify::lifecycle::pending_fires(
+                graph.tasks(),
+                |id| fired.contains(id),
+            );
+            if pending.is_empty() {
+                continue; // no unreported transition — stay quiet
+            }
+            // Something transitioned: deliver every pending report-back (same code
+            // path as `wg telegram lifecycle`, real send). Exactly-once + pacing
+            // are enforced inside via the persisted FiredLog.
+            if let Err(e) = run_lifecycle(&lifecycle_dir, None, false, None, false) {
+                eprintln!(
+                    "[{}] lifecycle report-back tick failed: {}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                );
+            }
+        });
+    }
+
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
 
     // Config for group @mention resolution in the routing pipeline.
@@ -3947,7 +3995,7 @@ pub fn run_lifecycle(
                 .collect();
             println!("{}", serde_json::to_string_pretty(&rows)?);
         } else if result.fired.is_empty() && result.capped.is_empty() {
-            println!("Nothing to report at {}.", now.format("%Y-%m-%d %H:%M"));
+            println!("Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).", now.format("%Y-%m-%d %H:%M"));
         } else {
             for f in &result.fired {
                 println!("{}", lifecycle::dry_run_line(f));
@@ -4024,7 +4072,7 @@ pub fn run_lifecycle(
             })
         );
     } else if result.fired.is_empty() && result.capped.is_empty() {
-        println!("Nothing to report at {}.", now.format("%Y-%m-%d %H:%M"));
+        println!("Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).", now.format("%Y-%m-%d %H:%M"));
     }
     Ok(())
 }
