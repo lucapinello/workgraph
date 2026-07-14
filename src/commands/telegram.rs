@@ -1839,6 +1839,32 @@ fn resolve_send_bot(
     Ok((bot_id, bot, effective_chat_id))
 }
 
+/// Resolve the family group chat id for an inbound/reply target, in priority
+/// order: explicit `--chat-id` override → legacy top-level `[telegram] chat_id`
+/// → the first non-empty `[telegram.bots.*]` chat id (all family bots share the
+/// one group chat). Returns `None` only when nothing configures a chat id.
+///
+/// This mirrors what `resolve_send_bot`/`run_listen` already do: the multi-bot
+/// map is now the norm and the legacy top-level `chat_id` is often empty, so a
+/// caller that reads only `config.chat_id` bails on a perfectly-valid bots-map
+/// config (task `urgent-web-inbound` — the kiosk web-inbound regression).
+fn resolve_group_chat_id(config: &TelegramConfig, chat_id_override: Option<&str>) -> Option<String> {
+    if let Some(o) = chat_id_override {
+        let o = o.trim();
+        if !o.is_empty() {
+            return Some(o.to_string());
+        }
+    }
+    if !config.chat_id.trim().is_empty() {
+        return Some(config.chat_id.clone());
+    }
+    config
+        .all_bots()
+        .into_iter()
+        .map(|(_, bot)| bot.chat_id)
+        .find(|c| !c.trim().is_empty())
+}
+
 /// `wg telegram route` — show how a group message would be routed to a family
 /// voice, without sending anything.
 ///
@@ -2984,13 +3010,19 @@ pub fn run_web_inbound(
     let config = load_telegram_config()?;
 
     // Reply target: an explicit override wins, else the configured family group.
-    let target = chat_id_override
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| config.chat_id.clone());
-    if target.is_empty() {
-        anyhow::bail!("no chat id — pass --chat-id or configure telegram.chat_id in notify.toml");
-    }
+    // A recent engine change made the multi-bot `[telegram.bots.*]` map the norm
+    // and left the legacy top-level `chat_id` empty, so a bots-map-only config made
+    // this command bail with "no chat id" and Luca's kiosk asks died silently. Fall
+    // back to the bots map the SAME way every send path does (`resolve_send_bot`,
+    // `run_listen`): all family bots point at the one group chat, so the first
+    // non-empty bot chat id is that group. See task `urgent-web-inbound`.
+    let target = match resolve_group_chat_id(&config, chat_id_override) {
+        Some(t) => t,
+        None => anyhow::bail!(
+            "no chat id — pass --chat-id, or configure telegram.chat_id / a \
+             [telegram.bots.*] chat_id in notify.toml"
+        ),
+    };
 
     // Resolve the web identity to a confirmed human's binding key so the composer
     // treats them as a known human and answers grounded (see `resolve_web_sender`).
@@ -5665,6 +5697,67 @@ mod tests {
         assert!(banner.contains("2 bots configured"));
         assert!(banner.contains("nora"));
         assert!(banner.contains("bruno"));
+    }
+
+    #[test]
+    fn web_inbound_chat_id_resolves_from_bots_map_when_top_level_empty() {
+        // Regression (task urgent-web-inbound): a bots-map-only config leaves the
+        // legacy top-level `chat_id` empty, so `run_web_inbound` used to bail with
+        // "no chat id" and the kiosk ask died silently. The group chat id must fall
+        // back to the bots map, exactly as every send path does.
+        let mut bots = HashMap::new();
+        bots.insert(
+            "nora".to_string(),
+            TelegramBotConfig {
+                bot_token: "111:AAA".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("nora".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        // No override, empty top-level: resolves the group from the bots map.
+        assert_eq!(
+            resolve_group_chat_id(&config, None).as_deref(),
+            Some("-100777"),
+        );
+        // An explicit override still wins.
+        assert_eq!(
+            resolve_group_chat_id(&config, Some("-100999")).as_deref(),
+            Some("-100999"),
+        );
+        // A blank override is ignored (falls through to the bots map).
+        assert_eq!(
+            resolve_group_chat_id(&config, Some("  ")).as_deref(),
+            Some("-100777"),
+        );
+    }
+
+    #[test]
+    fn web_inbound_chat_id_prefers_legacy_top_level_then_none_when_unconfigured() {
+        // Legacy top-level chat_id wins over the (absent) bots map.
+        let legacy = TelegramConfig {
+            bot_token: "123:ABC".to_string(),
+            chat_id: "-100555".to_string(),
+            bots: HashMap::new(),
+        };
+        assert_eq!(
+            resolve_group_chat_id(&legacy, None).as_deref(),
+            Some("-100555"),
+        );
+
+        // Nothing configured anywhere → None (caller bails with a helpful error).
+        let empty = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots: HashMap::new(),
+        };
+        assert_eq!(resolve_group_chat_id(&empty, None), None);
     }
 
     #[test]
