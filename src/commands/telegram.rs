@@ -4350,6 +4350,230 @@ pub fn run_lifecycle(
     Ok(())
 }
 
+/// `wg telegram digest` — flush each family member's ONE calm morning digest.
+///
+/// This is the missing production caller the daily 12:00 UTC `daily-digest` cron
+/// runs (task `re-arm-the`). The digest ENGINE (`DigestStore`, one-calm-daily)
+/// already accumulates every bundled + overflow proactive item per person, but
+/// nothing ever EMITTED the bundled morning message: `emit_digest` had no
+/// caller, so even when the cron fired it sent nothing (and the cron itself was
+/// registered with an empty description, so a cleanup sweep read it as junk and
+/// abandoned it — the friendly fire this task fixes).
+///
+/// For each known member whose digest is due at `now` — past the digest hour,
+/// out of quiet hours, pending non-empty, not already sent today (see
+/// [`DigestStore::digest_due`]) — compose the calm `Today: …` line, deliver it
+/// through the SAME one-path writer the lifecycle report-backs use
+/// ([`deliver_digest_fire`]: send + verify + retry once, then mirror to the
+/// canonical `.casa/group-feed.jsonl` ledger the pane reads), and — ONLY on a
+/// confirmed delivery — mark the digest sent + clear the queue. A failed send
+/// leaves the queue intact so the next tick retries; at most one per person/day.
+///
+/// `--dry-run` prints what would go to whom and touches no state. `--mock-send`
+/// runs the REAL tick + REAL ledger mirror against a network-free recorder so a
+/// smoke/test proves the full path (engine → Telegram → ledger) without a bot.
+pub fn run_digest(
+    workgraph_dir: &Path,
+    dry_run: bool,
+    now_override: Option<&str>,
+    json: bool,
+    mock_send: bool,
+) -> Result<()> {
+    use worksgood::agency::TelegramBindingMap;
+    use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, compose_digest};
+    use worksgood::notify::telegram_conversation::{BotReplySink, ReplySink};
+
+    let root = project_root(workgraph_dir);
+    let now = match now_override {
+        Some(s) => parse_naive_now(s)
+            .with_context(|| format!("invalid --now '{s}', expected YYYY-MM-DDTHH:MM"))?,
+        None => chrono::Local::now().naive_local(),
+    };
+
+    // Known family members (recipients we can name/DM), from the agency bindings.
+    let agency_dir = workgraph_dir.join("agency");
+    let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+    let members: Vec<String> = bindings
+        .bindings
+        .iter()
+        .map(|b| b.name.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    let config = load_telegram_config().unwrap_or_default();
+    let policy = DigestPolicy::default();
+    let store_path = DigestStore::path(&root);
+    let mut store = DigestStore::load(&store_path);
+
+    // Peek (without mutating) each member's due digest so a --dry-run and the
+    // real send agree on exactly what would go out.
+    let due: Vec<(String, String)> = members
+        .iter()
+        .filter(|m| store.digest_due(m, now, &policy))
+        .filter_map(|m| {
+            store
+                .state(m)
+                .map(|st| (m.clone(), compose_digest(st.pending())))
+        })
+        .filter(|(_, text)| !text.trim().is_empty())
+        .collect();
+
+    if dry_run {
+        if json {
+            let rows: Vec<_> = due
+                .iter()
+                .map(|(m, text)| serde_json::json!({ "recipient": m, "text": text }))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        } else if due.is_empty() {
+            println!(
+                "No digest due at {} (nothing pending, already sent, or quiet hours).",
+                now.format("%Y-%m-%d %H:%M")
+            );
+        } else {
+            for (m, text) in &due {
+                println!("WOULD DIGEST to {}: {}", m, text.replace('\n', " · "));
+            }
+        }
+        return Ok(());
+    }
+
+    let feed_path = casa_feed::feed_path_for(&root);
+    // `--mock-send` swaps in a network-free recorder so the cross-surface smoke
+    // exercises the real tick + real feed mirror without a live bot.
+    let sink: Box<dyn ReplySink> = if mock_send {
+        Box::new(RecordingSink::default())
+    } else {
+        Box::new(BotReplySink::new(config.clone()))
+    };
+
+    let mut sent = 0usize;
+    let mut undelivered = 0usize;
+    if !due.is_empty() {
+        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+        rt.block_on(async {
+            for (member, text) in &due {
+                // Resolve the recipient's DM target; the digest is the household
+                // concierge's calm summary, so it fronts as the recipient's own
+                // bot when bound, else Otto (see `resolve_dm_target`).
+                let (target, bot_id, _bot) =
+                    match resolve_dm_target(&config, &bindings, member, "otto") {
+                        Some(t) => t,
+                        None => {
+                            eprintln!(
+                                "[{}] no bound bot/chat for digest recipient '{}' — skipping",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                member,
+                            );
+                            continue;
+                        }
+                    };
+                match deliver_digest_fire(
+                    sink.as_ref(),
+                    &config,
+                    &feed_path,
+                    &bot_id,
+                    &target,
+                    text,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        // Confirmed delivery: NOW mark today's digest sent and
+                        // clear the queue (restart-safe — a failed send above
+                        // leaves the queue intact for the next tick to retry).
+                        store.emit_digest(member, now, &policy);
+                        sent += 1;
+                        println!(
+                            "[{}] digest → {} via {}: {}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            member,
+                            bot_id,
+                            text.replace('\n', " · "),
+                        );
+                    }
+                    Err(e) => {
+                        undelivered += 1;
+                        eprintln!(
+                            "[{}] UNDELIVERED digest for {} after 2 attempts: {}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            member,
+                            worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // Persist the pacing store after the tick (digest_sent flags + drained queues
+    // for confirmed deliveries; untouched for failed ones).
+    store
+        .save(&store_path)
+        .with_context(|| format!("failed to persist digest state to {}", store_path.display()))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "due": due.len(), "sent": sent, "undelivered": undelivered })
+        );
+    } else if due.is_empty() {
+        println!(
+            "No digest due at {} (nothing pending, already sent, or quiet hours).",
+            now.format("%Y-%m-%d %H:%M")
+        );
+    }
+    Ok(())
+}
+
+/// Deliver ONE morning digest through the same one-path writer the lifecycle
+/// report-backs use (see [`deliver_lifecycle_fire`]): send + verify with a single
+/// retry, then mirror the delivered text into the canonical `.casa/group-feed.jsonl`
+/// ledger the constellation pane reads, via the SAME [`casa_feed`] writer.
+///
+/// The digest is the household's calm morning summary of family-group activity
+/// (bundled report-backs, reminders, errands), so — unlike a private 1:1 reply —
+/// it belongs in the shared pane ledger: "arrives in Telegram AND the ledger"
+/// (task `re-arm-the`, sequenced with `lifecycle-messages-obey`). A feed-write
+/// failure is logged and swallowed so a full disk can't lose the Telegram send.
+/// Returns `Ok(())` on confirmed delivery, `Err` when BOTH send attempts failed
+/// (the caller then leaves the pending queue intact for the next tick).
+async fn deliver_digest_fire(
+    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
+    config: &TelegramConfig,
+    feed_path: &Path,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+) -> Result<()> {
+    use worksgood::notify::telegram_conversation as convo;
+
+    // DELIVERY VERIFICATION with a single retry (matches the lifecycle path).
+    let mut result = sink.send(bot_id, chat_id, text).await;
+    if let Err(first) = &result {
+        eprintln!(
+            "[{}] digest send to {} failed (attempt 1/2), retrying: {}",
+            chrono::Utc::now().format("%H:%M:%S"),
+            chat_id,
+            worksgood::notify::telegram::redact_bot_token(&format!("{first:#}")),
+        );
+        result = sink.send(bot_id, chat_id, text).await;
+    }
+    let _message_id = result?.unwrap_or_default();
+
+    // LEDGER MIRROR — the morning digest lands in the canonical feed the pane
+    // reads, via the exact same `casa_feed` writer the conversation replies use.
+    let agent_id = convo::agent_for_bot(config, bot_id);
+    let entry = casa_feed::agent_entry(&agent_id, text, casa_feed::now_ms());
+    if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
+        eprintln!(
+            "[{}] casa feed: failed to mirror digest to ledger: {e}",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+    }
+    Ok(())
+}
+
 /// The persona name(s) doing a task's work, for the "on it" line: the task's
 /// assignee display name when it reads like a plain roster name (not an agent
 /// content-hash), else the origin persona so the line still names a voice.
@@ -6681,6 +6905,72 @@ mod tests {
         assert!(
             !feed.exists() || feed_lines(&feed).is_empty(),
             "an undelivered report-back must not appear in the pane"
+        );
+    }
+
+    // ── Daily-digest flush delivery (task re-arm-the) ──────────────────────
+    //
+    // The morning digest must reach Telegram AND land in the canonical ledger
+    // the pane reads — the same one-path contract lifecycle report-backs obey
+    // (lifecycle-messages-obey). These exercise `deliver_digest_fire` directly,
+    // mirroring the lifecycle delivery tests above.
+
+    #[test]
+    fn digest_delivers_to_telegram_and_mirrors_to_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let config = TelegramConfig::default();
+        let sink = RecordingSink::default();
+        let text = "Today: PT check-in at 19:30 · how was last night's salmon?";
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(deliver_digest_fire(
+            &sink, &config, &feed, "otto", "-100777", text,
+        ))
+        .unwrap();
+
+        // Telegram: exactly one send, to the resolved chat.
+        let sends = sink.sends.lock().unwrap();
+        assert_eq!(sends.len(), 1, "exactly one digest telegram send");
+        assert_eq!(sends[0].1, "-100777", "sent to the resolved chat");
+        assert_eq!(sends[0].2, text, "the composed digest is what goes out");
+        drop(sends);
+
+        // Ledger: exactly one `agent` line carrying the digest text.
+        let lines = feed_lines(&feed);
+        assert_eq!(lines.len(), 1, "exactly one feed line, got {lines:?}");
+        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(v["kind"], "agent", "{v}");
+        assert!(
+            v["text"].as_str().unwrap().contains("PT check-in"),
+            "the ledger carries the morning digest: {v}"
+        );
+    }
+
+    #[test]
+    fn digest_send_that_fails_twice_errors_and_does_not_mirror() {
+        // Both attempts fail → Err so `run_digest` leaves the pending queue
+        // intact for the next tick, and NOTHING is mirrored (no phantom digest
+        // in the pane for a message that never reached the human).
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let config = TelegramConfig::default();
+        let sink = FlakySink::new(2);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(deliver_digest_fire(
+            &sink, &config, &feed, "otto", "-100777", "Today: something",
+        ));
+
+        assert!(res.is_err(), "two failures surface an error so the queue is kept");
+        assert_eq!(
+            sink.attempts.lock().unwrap().len(),
+            2,
+            "exactly two attempts: the send plus one retry"
+        );
+        assert!(
+            !feed.exists() || feed_lines(&feed).is_empty(),
+            "an undelivered digest must not appear in the ledger"
         );
     }
 }

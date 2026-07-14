@@ -3842,6 +3842,17 @@ fn main() -> Result<()> {
                 cli.json,
                 mock_send,
             ),
+            TelegramCommands::Digest {
+                dry_run,
+                now,
+                mock_send,
+            } => commands::telegram::run_digest(
+                &workgraph_dir,
+                dry_run,
+                now.as_deref(),
+                cli.json,
+                mock_send,
+            ),
             TelegramCommands::Parity {
                 reply_text,
                 human,
