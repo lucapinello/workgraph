@@ -1059,8 +1059,15 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     // collapse to one reply; a follow-up after the reply was sent
                     // is a NEW turn (BUG 2 — the swallowed "why they don't reply?").
                     // Explicit @mentions / addressed names / reply-chains are
-                    // deliberate and are ALWAYS answered — never coalesced.
-                    if matches!(addressed_by, worksgood::notify::telegram_group::AddressedBy::Concierge) {
+                    // deliberate and are ALWAYS answered — never coalesced. A
+                    // DOMAIN-elected auto-route (an unaddressed ask sent to its
+                    // domain owner's voice) is the same kind of auto-routed team
+                    // ask as the concierge case, so it coalesces the same way.
+                    if matches!(
+                        addressed_by,
+                        worksgood::notify::telegram_group::AddressedBy::Concierge
+                            | worksgood::notify::telegram_group::AddressedBy::Domain(_)
+                    ) {
                         let agent = bot.agent_id.as_deref().unwrap_or(&bot.bot_id);
                         if !coalescer
                             .lock()
