@@ -3815,6 +3815,26 @@ pub struct CoordinatorConfig {
     #[serde(default = "default_max_spawn_failures")]
     pub max_spawn_failures: u32,
 
+    /// Dispatcher-level self-healing spawn circuit breaker: how many CONSECUTIVE
+    /// dispatcher-wide spawn failures (across all tasks) trip the breaker open,
+    /// pausing all spawns for a cooldown. Unlike `max_spawn_failures` (a per-task
+    /// final give-up), this guards the whole dispatcher against a systemic spawn
+    /// outage (a crash window, a downed provider) so it stops thrashing, alerts
+    /// the operator, and heals itself. Default: 10. Set to 0 to disable.
+    #[serde(default = "default_spawn_breaker_threshold")]
+    pub spawn_breaker_threshold: u32,
+
+    /// Base cooldown (seconds) the dispatcher spawn breaker stays open before it
+    /// half-opens and allows ONE probe spawn. Doubles on each failed probe
+    /// (exponential backoff) up to `spawn_breaker_max_cooldown_secs`. Default: 600 (10m).
+    #[serde(default = "default_spawn_breaker_cooldown_secs")]
+    pub spawn_breaker_cooldown_secs: u64,
+
+    /// Cap (seconds) on the exponentially-backed-off spawn-breaker cooldown.
+    /// Default: 3600 (1h).
+    #[serde(default = "default_spawn_breaker_max_cooldown_secs")]
+    pub spawn_breaker_max_cooldown_secs: u64,
+
     /// Maximum tier escalation depth for model fallback on retry.
     /// When a task fails and the active profile has a ranked model list,
     /// the coordinator tries the next model in the tier. If the entire tier
@@ -4036,6 +4056,18 @@ fn default_max_spawn_failures() -> u32 {
     5
 }
 
+fn default_spawn_breaker_threshold() -> u32 {
+    10
+}
+
+fn default_spawn_breaker_cooldown_secs() -> u64 {
+    600
+}
+
+fn default_spawn_breaker_max_cooldown_secs() -> u64 {
+    3600
+}
+
 fn default_max_escalation_depth() -> u32 {
     3
 }
@@ -4156,6 +4188,9 @@ impl Default for CoordinatorConfig {
             verify_autospawn_enabled: false,
             max_verify_failures: default_max_verify_failures(),
             max_spawn_failures: default_max_spawn_failures(),
+            spawn_breaker_threshold: default_spawn_breaker_threshold(),
+            spawn_breaker_cooldown_secs: default_spawn_breaker_cooldown_secs(),
+            spawn_breaker_max_cooldown_secs: default_spawn_breaker_max_cooldown_secs(),
             max_escalation_depth: default_max_escalation_depth(),
             auto_test_discovery: default_auto_test_discovery(),
             scoped_verify_enabled: default_scoped_verify_enabled(),

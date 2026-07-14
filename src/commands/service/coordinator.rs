@@ -27,6 +27,7 @@ use worksgood::query::{blocked_open_cycle_diagnostics, ready_tasks_with_peers_cy
 use worksgood::service::registry::AgentRegistry;
 
 use super::human_dispatch;
+use super::spawn_breaker::{SpawnBreakerConfig, SpawnBreakerState, SpawnGate};
 use super::triage;
 use crate::commands::{graph_path, is_process_alive, kill_process_graceful, spawn};
 
@@ -4155,8 +4156,51 @@ fn spawn_agents_for_ready_tasks(
     // Sort ready tasks by priority with starvation prevention and priority inheritance
     let final_ready = sort_tasks_by_priority_with_features(graph, ready_tasks_raw, config);
 
+    // Dispatcher-level self-healing spawn circuit breaker. When spawning is
+    // systemically broken (a crash window, a downed provider) the breaker opens
+    // and pauses ALL spawns for a cooldown so the dispatcher stops thrashing;
+    // after the cooldown it half-opens and lets exactly ONE probe spawn through.
+    // `spawn_attempts` (successes + failures) drives the observation below; a
+    // successful spawn closes the breaker, a run of failures opens it.
+    let breaker_cfg = SpawnBreakerConfig::from_config(config);
+    let breaker_path = SpawnBreakerState::path(dir);
+    let mut breaker = SpawnBreakerState::load(&breaker_path);
+    let breaker_now = Utc::now();
+    let mut slots_available = slots_available;
+    let mut probe_mode = false;
+    match breaker.gate(breaker_now, &breaker_cfg) {
+        SpawnGate::Allow => {}
+        SpawnGate::Probe => {
+            // Half-open: allow a single probe attempt this tick.
+            probe_mode = true;
+            slots_available = slots_available.min(1);
+            eprintln!(
+                "[dispatcher] spawn breaker HALF-OPEN — allowing one probe spawn to test recovery"
+            );
+        }
+        SpawnGate::Blocked {
+            cooldown_remaining_secs,
+        } => {
+            eprintln!(
+                "[dispatcher] spawn breaker OPEN — skipping all spawns this tick ({} until a retry, {} consecutive failures)",
+                worksgood::format_duration(cooldown_remaining_secs, false),
+                breaker.consecutive_failures,
+            );
+            return 0;
+        }
+    }
+    // Total spawn *attempts* (successful or failed) across all spawn paths this
+    // tick. `spawned` counts only successes, so `spawn_attempts - spawned` is the
+    // failure count fed to the breaker after the loop.
+    let mut spawn_attempts = 0usize;
+
     for task in final_ready.iter() {
         if spawned >= slots_available {
+            break;
+        }
+        // Half-open probe: stop after the single attempt (whether it succeeded or
+        // failed) so a failing probe doesn't thrash the rest of the ready set.
+        if probe_mode && spawn_attempts >= 1 {
             break;
         }
         // Skip if already claimed
@@ -4211,6 +4255,7 @@ fn spawn_agents_for_ready_tasks(
                 "[dispatcher] Spawning shell task inline for: {} - {}",
                 task_id, title,
             );
+            spawn_attempts += 1;
             match spawn_shell_inline(dir, &task_id) {
                 Ok((agent_id, pid)) => {
                     eprintln!("[dispatcher] Spawned shell {} (PID {})", agent_id, pid);
@@ -4259,6 +4304,7 @@ fn spawn_agents_for_ready_tasks(
                     "[dispatcher] Spawning assignment inline for: {} - {}",
                     task_id, title,
                 );
+                spawn_attempts += 1;
                 match spawn_assign_inline(dir, &task_id) {
                     Ok((agent_id, pid)) => {
                         eprintln!("[dispatcher] Spawned assignment {} (PID {})", agent_id, pid);
@@ -4289,6 +4335,7 @@ fn spawn_agents_for_ready_tasks(
                         .map(|m| format!(" (model: {})", m))
                         .unwrap_or_default(),
                 );
+                spawn_attempts += 1;
                 match spawn_eval_inline(dir, &task_id, eval_model) {
                     Ok((agent_id, pid)) => {
                         eprintln!("[dispatcher] Spawned eval {} (PID {})", agent_id, pid);
@@ -4367,6 +4414,7 @@ fn spawn_agents_for_ready_tasks(
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[dispatcher] plan_spawn failed for {}: {}", task.id, e);
+                spawn_attempts += 1;
                 record_spawn_failure(
                     &gp,
                     &task.id,
@@ -4391,6 +4439,7 @@ fn spawn_agents_for_ready_tasks(
             "[dispatcher] Spawning agent for: {} - {} (executor: {})",
             task.id, task.title, effective_executor
         );
+        spawn_attempts += 1;
         match spawn::spawn_agent(
             dir,
             &task.id,
@@ -4414,6 +4463,26 @@ fn spawn_agents_for_ready_tasks(
                     config.coordinator.max_spawn_failures,
                 );
             }
+        }
+    }
+
+    // Feed this tick's spawn outcome to the dispatcher breaker. A successful
+    // spawn closes it (recovery); a run of failures with no success climbs the
+    // consecutive-failure counter and trips it open once the threshold is hit.
+    // The alert is armed inside the state and consumed by the daemon loop, which
+    // has the logger and notify channels to surface it to the operator.
+    if breaker_cfg.enabled() {
+        let observe_now = Utc::now();
+        if spawned > 0 {
+            breaker.record_success(observe_now);
+        } else {
+            let failures = spawn_attempts.saturating_sub(spawned);
+            for _ in 0..failures {
+                breaker.record_failure(observe_now, &breaker_cfg);
+            }
+        }
+        if let Err(e) = breaker.save(&breaker_path) {
+            eprintln!("[dispatcher] failed to persist spawn breaker state: {}", e);
         }
     }
 
