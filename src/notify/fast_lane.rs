@@ -291,6 +291,9 @@ fn match_meal_add(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
     if addition.is_empty() {
         return None;
     }
+    // Same ask → dish gate as the swap path: the addition must read like a dish
+    // component, not the leftover of a raw request.
+    let addition = ask_to_dish(&addition)?;
     Some(FastLaneOp::MealAdd { day, addition })
 }
 
@@ -342,6 +345,10 @@ fn match_meal_swap(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
     if dish.is_empty() || dish == "it" {
         return None;
     }
+    // Ask → dish: strip any greeting/request husk that leaked through and gate
+    // on the result reading like a dish. A miss falls back to the full pipeline
+    // rather than writing the raw sentence into the meal cell.
+    let dish = ask_to_dish(&dish)?;
     Some(FastLaneOp::MealSwap { day, dish })
 }
 
@@ -577,6 +584,148 @@ fn scrub_fillers(s: &str) -> String {
         }
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Ask → dish transform + semantic sanity gate
+// ---------------------------------------------------------------------------
+//
+// The round-trip parse check ([`verify_round_trip`]) proves an edit is
+// *syntactically* placeable — it parses back to the change we intended. It does
+// **not** prove the dish title reads like a dish. That gap is how a raw ask like
+// "hey can you swap monday with zuxxhini and tofu" once landed verbatim in a meal
+// cell (marked SET): the dish extraction handed the sentence straight through and
+// the round-trip check happily confirmed the sentence was in the cell.
+//
+// These two helpers close that gap with *semantics*: before an extracted dish is
+// accepted, [`ask_to_dish`] strips the greeting / request-verb / politeness husk
+// off it and [`looks_like_dish`] asserts what remains actually reads like a dish
+// (no "hey"/"can you"/"please", no question mark, a sensible length, and not a
+// bare vagueness like "something nice"). If the transform cannot confidently
+// produce a dish, it returns `None` and the matcher falls back — the ask goes to
+// the full pipeline rather than writing a sentence into the plan.
+
+/// Leading ask-shaped tokens/phrases peeled off the front of an extracted dish
+/// fragment. Greetings, polite request verbs, the swap verbs themselves, and the
+/// little connectors ("with"/"to"/"for") that trail them.
+const LEADING_ASK_PHRASES: &[&str] = &[
+    "hey there", "hey", "hi there", "hi", "hello", "ok", "okay", "yo", "so",
+    "please", "pls", "kindly", "just", "maybe", "actually",
+    "can you", "could you", "would you", "can we", "could we", "will you",
+    "i'd like", "id like", "i would like", "i want", "we want", "we'd like",
+    "how about", "what about", "lets", "let's", "us to", "me to",
+    "swap", "change", "switch", "replace", "make", "cook", "do", "have", "turn",
+    "us", "it", "to", "into", "with", "for", "the", "a", "an", "some",
+];
+
+/// Trailing junk peeled off the end — dangling connectors and courtesy left over
+/// once the day and verb are gone ("something nice **for**", "tacos **please**").
+const TRAILING_ASK_JUNK: &[&str] = &[
+    "for", "with", "to", "and", "or", "instead", "please", "thanks",
+    "tonight", "today", "for dinner", "for the week",
+];
+
+/// Transform a raw dish fragment pulled from an ask into a clean dish title:
+/// strip the leading greeting / request-verb / politeness husk and any trailing
+/// dangling connector, then apply [`looks_like_dish`]. Returns `None` when it
+/// cannot confidently produce something that reads like a dish, so the caller
+/// falls back to the full pipeline instead of writing the raw ask.
+fn ask_to_dish(raw: &str) -> Option<String> {
+    let mut s = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ';' | ':'))
+        .trim()
+        .to_lowercase();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for p in LEADING_ASK_PHRASES {
+            if let Some(rest) = s.strip_prefix(&format!("{p} ")) {
+                s = rest.trim().to_string();
+                changed = true;
+            }
+        }
+        for t in TRAILING_ASK_JUNK {
+            if let Some(rest) = s.strip_suffix(&format!(" {t}")) {
+                s = rest.trim().to_string();
+                changed = true;
+            } else if s == *t {
+                s.clear();
+                changed = true;
+            }
+        }
+    }
+
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if looks_like_dish(&s) {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// The semantic sanity gate: does `title` read like a dish rather than the raw
+/// ask that produced it? Rejects empty/over-long strings, question marks,
+/// leftover greeting/request markers, and bare vagueness. Kept pure and
+/// conservative — a false reject just sends the ask to the full pipeline (safe),
+/// while a false accept is exactly the garbage-in-the-plan bug this closes.
+fn looks_like_dish(title: &str) -> bool {
+    let t = title.trim();
+    if t.is_empty() || t.contains('?') {
+        return false;
+    }
+    // A dish is a handful of words, not a sentence.
+    if t.chars().count() > 60 {
+        return false;
+    }
+    let words: Vec<String> = t
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect();
+    if words.is_empty() || words.len() > 8 {
+        return false;
+    }
+
+    // Single words that betray a raw ask rather than a dish.
+    const BANNED_WORDS: &[&str] = &[
+        "hey", "hi", "hello", "please", "pls", "thanks", "thx",
+        "swap", "switch", "replace", "wanna", "gonna",
+    ];
+    if words.iter().any(|w| BANNED_WORDS.contains(&w.as_str())) {
+        return false;
+    }
+
+    // Adjacent pairs that only appear in a request ("can you", "i want", …).
+    const BANNED_BIGRAMS: &[(&str, &str)] = &[
+        ("can", "you"), ("could", "you"), ("would", "you"), ("can", "we"),
+        ("will", "you"), ("i", "want"), ("we", "want"), ("i'd", "like"),
+        ("how", "about"), ("what", "about"), ("change", "to"),
+    ];
+    if words
+        .windows(2)
+        .any(|w| BANNED_BIGRAMS.iter().any(|(a, b)| w[0] == *a && w[1] == *b))
+    {
+        return false;
+    }
+
+    // A "dish" made only of placeholders — "something nice", "anything",
+    // "whatever you like" — carries no actual food and cannot be applied.
+    !is_vague_dish(&words)
+}
+
+/// True when every word is a vague placeholder/adjective with no concrete food.
+fn is_vague_dish(words: &[String]) -> bool {
+    const VAGUE: &[&str] = &[
+        "something", "anything", "everything", "whatever", "some", "any",
+        "nice", "good", "great", "tasty", "yummy", "nicer", "better", "different",
+        "healthy", "light", "quick", "easy", "simple", "you", "like", "for",
+        "dinner", "lunch", "supper", "meal", "food", "thing", "please", "else",
+        "it", "them", "one", "that", "this",
+    ];
+    words.iter().all(|w| VAGUE.contains(&w.as_str()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,6 +1469,60 @@ mod tests {
             fallback("change Friday to pizza and Saturday to sushi"),
             FallbackReason::Compound
         );
+    }
+
+    // ---- ask → dish transform + semantic sanity gate ---------------------
+
+    #[test]
+    fn fast_lane_asks_become_dishes_not_sentences() {
+        // Luca's exact sentence (2026-07-14): a raw greeting+request must be
+        // transformed into a dish, never applied verbatim as the meal title.
+        assert_eq!(
+            fast("hey can you swap monday with zuxxhini and tofu"),
+            FastLaneOp::MealSwap { day: Weekday::Mon, dish: "zuxxhini and tofu".into() }
+        );
+        // A polite request husk on a swap is peeled to the dish.
+        assert_eq!(
+            fast("can you please make friday tacos"),
+            FastLaneOp::MealSwap { day: Weekday::Fri, dish: "tacos".into() }
+        );
+        // A meal add still resolves to a clean component.
+        assert_eq!(
+            fast("add pasta thursday"),
+            FastLaneOp::MealAdd { day: Weekday::Thu, addition: "pasta".into() }
+        );
+    }
+
+    #[test]
+    fn fast_lane_vague_dish_falls_back_to_full_pipeline() {
+        // "swap something nice for friday" carries no actual dish — the sanity
+        // gate refuses it so the full pipeline can ask what "nice" means.
+        assert_eq!(fallback("swap something nice for friday"), FallbackReason::NotASimpleEdit);
+        assert_eq!(fallback("change monday to something healthy"), FallbackReason::NotASimpleEdit);
+    }
+
+    #[test]
+    fn looks_like_dish_gate_rejects_asks_and_accepts_dishes() {
+        // Accepts real dishes.
+        assert!(looks_like_dish("zucchini & tofu stir-fry"));
+        assert!(looks_like_dish("tacos"));
+        assert!(looks_like_dish("homemade margherita pizza"));
+        // Rejects raw asks, questions, vagueness, and sentences.
+        assert!(!looks_like_dish("hey can you swap with zuxxhini and tofu"));
+        assert!(!looks_like_dish("what's for dinner?"));
+        assert!(!looks_like_dish("something nice"));
+        assert!(!looks_like_dish(""));
+        assert!(!looks_like_dish(
+            "please could you change it to a really long rambling sentence about dinner tonight"
+        ));
+    }
+
+    #[test]
+    fn ask_to_dish_strips_husk_or_refuses() {
+        assert_eq!(ask_to_dish("hey can you swap with tacos").as_deref(), Some("tacos"));
+        assert_eq!(ask_to_dish("please make it homemade pizza").as_deref(), Some("homemade pizza"));
+        assert_eq!(ask_to_dish("something nice for"), None);
+        assert_eq!(ask_to_dish("can you swap it"), None);
     }
 
     #[test]
