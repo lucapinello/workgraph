@@ -379,6 +379,27 @@ pub fn classify_error(exit_code: Option<i32>, stderr: &str) -> ProviderErrorKind
     // Analyze stderr patterns
     let stderr_lower = stderr.to_lowercase();
 
+    // Workflow / task-logic refusals from `wg done` (Fatal-Task, NEVER Fatal-Provider).
+    //
+    // ROOT CAUSE of the 2026-07-14 flapping: when a satellite agent runs to
+    // completion but `wg done` REFUSES for a graph/workflow reason ("blocked by
+    // unresolved parent", failed deliverable preflight, uncommitted worktree,
+    // etc.), the agent exits non-zero. The AI provider worked perfectly — the
+    // agent ran and produced output — the *graph* declined the completion. These
+    // refusals must never count against provider health, or a handful of
+    // FailedPendingEval parents + their retrying satellites can poison the
+    // provider counter into pause after pause even with a fully working provider.
+    //
+    // This guard runs BEFORE the auth/quota/CLI keyword matching on purpose: a
+    // refusal message embeds the blocker task list (whose titles may contain
+    // words like "authentication"/"quota") or a git 401 from the merge step, and
+    // must not be mistaken for a provider auth failure. If the provider itself
+    // were down the agent would never have reached `wg done`, so this text can
+    // only appear when the provider is healthy.
+    if is_wg_done_refusal(&stderr_lower) {
+        return ProviderErrorKind::FatalTask;
+    }
+
     // Auth/Authorization failures (Fatal-Provider)
     if stderr_lower.contains("authentication failed")
         || stderr_lower.contains("http 401")
@@ -466,6 +487,41 @@ pub fn classify_error(exit_code: Option<i32>, stderr: &str) -> ProviderErrorKind
     ProviderErrorKind::Transient
 }
 
+/// Detect whether `stderr` (already lowercased) is a `wg done` workflow refusal —
+/// i.e. the agent ran to completion but the GRAPH declined to mark the task done.
+///
+/// These are task-logic failures, not provider failures: the AI provider was
+/// reachable and did its job. The phrases below are the exact refusals emitted by
+/// `wg done` (see `src/commands/done.rs`): blocked-by-unresolved-parent,
+/// deliverable-preflight, disposable-contract, integrated-validation, smoke-gate,
+/// verify-gate, uncommitted-worktree, merge-conflict, and the agent skip-flag
+/// guards. Matching any one means "count this against the TASK, never the provider."
+fn is_wg_done_refusal(stderr_lower: &str) -> bool {
+    // The shared prefix of the blocked / preflight / disposable / validation
+    // refusals — "Cannot mark '<id>' as done: ...".
+    (stderr_lower.contains("cannot mark") && stderr_lower.contains("as done"))
+        // Blocked by unresolved parent(s) — the exact scenario that poisoned the
+        // counter on 2026-07-14.
+        || (stderr_lower.contains("blocked by") && stderr_lower.contains("unresolved task"))
+        // Deliverable preflight refused.
+        || stderr_lower.contains("deliverable preflight refused")
+        // Disposable completion contract unmet.
+        || stderr_lower.contains("completion contract is unmet")
+        // Integrated validation requires a validation log entry.
+        || stderr_lower.contains("requires a validation log entry")
+        // Smoke gate refused the completion.
+        || stderr_lower.contains("smoke gate refused")
+        // Verify gate: the verify command must pass.
+        || stderr_lower.contains("the verify command must pass")
+        // Agent tried to bypass a gate.
+        || stderr_lower.contains("cannot use --skip-smoke")
+        || stderr_lower.contains("cannot use --skip-verify")
+        // Worktree has uncommitted changes — refusing to mark done.
+        || (stderr_lower.contains("uncommitted") && stderr_lower.contains("refusing to mark"))
+        // Merge conflict blocking the done-time merge-back.
+        || (stderr_lower.contains("merge conflict") && stderr_lower.contains("cannot mark"))
+}
+
 /// Extract provider/executor identifier from configuration
 pub fn extract_provider_id(executor: &str, model: Option<&str>) -> String {
     match executor {
@@ -526,6 +582,92 @@ mod tests {
         assert_eq!(
             classify_error(Some(1), "Some random error"),
             ProviderErrorKind::Transient
+        );
+    }
+
+    /// A `wg done` refusal because the parent is blocked is a TASK-LOGIC failure,
+    /// not a provider failure — the agent ran fine, the graph declined it.
+    #[test]
+    fn test_wg_done_blocked_refusal_is_task_logic_not_provider() {
+        let refusal =
+            "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
+             parent-y (failed_pending_eval)";
+        assert_eq!(
+            classify_error(Some(1), refusal),
+            ProviderErrorKind::FatalTask,
+            "a blocked-parent done-refusal must never count against provider health"
+        );
+    }
+
+    /// Every `wg done` workflow refusal classifies as FatalTask, including ones
+    /// whose embedded text (blocker titles, git 401 from the merge step) would
+    /// otherwise trip the auth/quota keyword matchers.
+    #[test]
+    fn test_all_wg_done_refusals_are_task_logic() {
+        let refusals = [
+            "Cannot mark 'a' as done: blocked by 3 unresolved task(s):\n  fix-authentication (open)",
+            "Cannot mark 'b' as done: deliverable preflight refused — required deliverables were not produced.",
+            "Cannot mark 'c' as done: this is a disposable and its completion contract is unmet.",
+            "Cannot mark 'd' as done: integrated validation requires a validation log entry.",
+            "Smoke gate refused 'wg done e': 2 scenario(s) broken",
+            "The verify command must pass:\n  cargo test",
+            "Agents cannot use --skip-smoke. The smoke gate is the regression contract;",
+            "Agents cannot use --skip-verify. The verify command must pass:",
+            "Worktree has uncommitted changes — refusing to mark 'f' as done.",
+            "Merge conflict — cannot mark 'g' as done.",
+        ];
+        for r in refusals {
+            assert_eq!(
+                classify_error(Some(1), r),
+                ProviderErrorKind::FatalTask,
+                "wg-done refusal misclassified: {r:?}"
+            );
+        }
+        // A real auth 401 (never wrapped in a done-refusal, because the agent
+        // never reached `wg done`) still counts as a provider failure.
+        assert_eq!(
+            classify_error(Some(1), "authentication failed (HTTP 401)"),
+            ProviderErrorKind::FatalProvider
+        );
+    }
+
+    /// The exact 2026-07-14 poisoning scenario, end to end at the health level:
+    /// a satellite completes, `wg done` is refused because its parent is blocked,
+    /// this repeats well past the pause threshold — and the PROVIDER counter never
+    /// moves and the service never pauses. This mirrors the classify → record
+    /// flow in `commands::service::triage::track_provider_health`.
+    #[test]
+    fn test_done_refused_for_blocked_parent_never_pauses_provider() {
+        let mut health = ProviderHealth::default();
+        let provider_id = "claude";
+        let refusal =
+            "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
+             parent-y (failed_pending_eval)";
+
+        // The satellite's agent ran fine but was done-refused, five times — well
+        // past the threshold of 3 that would otherwise pause the service.
+        for _ in 0..5 {
+            let kind = classify_error(Some(1), refusal);
+            // triage records the failure with the classified kind; a FatalTask is
+            // a no-op for provider health (the agent ran, only `wg done` refused).
+            health.record_failure(provider_id, kind, refusal.to_string());
+        }
+
+        let provider = health.get_or_create_provider(provider_id);
+        assert_eq!(
+            provider.consecutive_failures, 0,
+            "wg-done refusals for a blocked parent must not touch the provider counter"
+        );
+        assert!(!provider.should_pause(3), "the provider must not be near pausing");
+
+        let paused = health.check_and_apply_pauses(3, "pause");
+        assert!(
+            paused.is_empty(),
+            "no provider should be paused by done-refusals"
+        );
+        assert!(
+            !health.service_paused,
+            "the service must never pause because the graph refused a completion"
         );
     }
 
