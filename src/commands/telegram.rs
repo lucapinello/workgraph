@@ -18,9 +18,11 @@ use worksgood::notify::fast_lane;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
 use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
+use worksgood::notify::ownership;
 use worksgood::notify::telegram_group::{
-    CONCIERGE_BOT, Election, NaturalRoute, elect_responders, election_decision_summary,
-    is_discussion_ask, parse_at_mention_tokens, route_natural,
+    CONCIERGE_BOT, Election, NaturalRoute, elect_group_inbound, elect_responders,
+    election_decision_summary, is_discussion_ask, parse_at_mention_tokens, resolve_mentioned_bot,
+    route_natural,
 };
 
 /// Whether an inbound listener message may fire a FAMILY command and/or the
@@ -3060,18 +3062,47 @@ pub fn run_web_inbound(
     let human_count = human_agent_id_set(workgraph_dir).len();
 
     // A web-origin message is first-class GROUP inbound — run the exact election
-    // the listener runs, as a supergroup message in the family chat. No
-    // reply-chain (the pane has none) and never bot-sent.
-    let election = elect_responders(
-        Some("supergroup"),
-        Some(&target),
+    // the listener runs, via the shared `elect_group_inbound` seam (supergroup,
+    // no reply-chain, never bot-sent). The path-parity test locks this to the
+    // listener's decision.
+    let mut election =
+        elect_group_inbound(&target, message, &mention_usernames, human_count, &config);
+
+    // ── CLARIFICATION CONTINUATION ────────────────────────────────────────
+    // A bare "yes"/"ok"/"si" from the same human within the clarify window is not
+    // a fresh ask — it CONTINUES the exchange a persona just opened by asking a
+    // clarifying question. Route it back to THAT voice carrying the ORIGINAL ask,
+    // with NO re-election (the fennel bug re-elected a bare "yes" from scratch and
+    // a different voice answered) and reusing the original fingerprint so the
+    // downstream turn dedupes against the first task instead of minting a second.
+    let clarify_root = project_root(workgraph_dir);
+    let clarify_now = chrono::Utc::now().timestamp();
+    let clarify_window = ownership::ClarifyLedger::window_secs();
+    let mut clarify_continued_body: Option<String> = None;
+    if let Some(ex) = ownership::clarify_continuation(
+        &clarify_root,
+        &target,
+        &auth_sender,
         message,
-        &mention_usernames,
-        None,
-        false,
-        human_count,
-        &config,
-    );
+        clarify_now,
+        clarify_window,
+    ) {
+        if let Some(bot) = resolve_mentioned_bot(&ex.voice, &config) {
+            println!(
+                "[{}] web-inbound clarify-continuation from {} -> {} (reusing original ask)",
+                chrono::Utc::now().format("%H:%M:%S"),
+                sender,
+                ex.voice,
+            );
+            election = Election::One {
+                bot,
+                reply_chat: target.clone(),
+                body: ex.original_ask.clone(),
+                addressed_by: worksgood::notify::telegram_group::AddressedBy::ReplyChain,
+            };
+            clarify_continued_body = Some(ex.original_ask.clone());
+        }
+    }
 
     // Observability: one decision line, PII-safe (no tokens, no chat id text).
     println!(
@@ -3271,6 +3302,28 @@ pub fn run_web_inbound(
                     &sink,
                 )
                 .await?;
+                // Open a clarification window: if this human sends a bare
+                // "yes"/"ok"/"si" in the next few minutes, it continues WITH THIS
+                // VOICE carrying THIS ask (the clarify-continuation block above),
+                // instead of re-electing from scratch. Skipped when this turn is
+                // itself a continuation so a confirmed exchange can't loop. Best
+                // effort — a ledger write failure never blocks the reply.
+                if clarify_continued_body.is_none() {
+                    let voice = bot
+                        .agent_id
+                        .clone()
+                        .unwrap_or_else(|| bot.bot_id.clone());
+                    if let Err(e) = ownership::ClarifyLedger::open(
+                        &clarify_root,
+                        &target,
+                        &auth_sender,
+                        &voice,
+                        body,
+                        clarify_now,
+                    ) {
+                        eprintln!("web-inbound clarify-ledger open failed (non-fatal): {e}");
+                    }
+                }
                 Ok(format!(
                     "single voice ({}) answered [{}]",
                     bot.bot_id,

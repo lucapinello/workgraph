@@ -110,6 +110,64 @@ fn has_any(words: &[String], needles: &[&str]) -> bool {
     needles.iter().any(|n| has_word(words, n))
 }
 
+/// True when strings `a` and `b` are within Damerau-free edit distance 1 (a
+/// single insertion, deletion, or substitution). A dependency-free mirror of the
+/// [`telegram_group`] fuzzy matcher, kept local so `ownership` stays pure and
+/// unit-testable without a model call or the group module.
+///
+/// [`telegram_group`]: crate::notify::telegram_group
+fn edit_distance_le_1(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (longer, shorter) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let ldiff = longer.len() - shorter.len();
+    if ldiff > 1 {
+        return false;
+    }
+    if ldiff == 0 {
+        return longer
+            .iter()
+            .zip(shorter.iter())
+            .filter(|(x, y)| x != y)
+            .count()
+            <= 1;
+    }
+    // Length differs by one — `shorter` must embed in `longer` with a single
+    // insertion. Walk both, permitting exactly one skip in `longer`.
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut skipped = false;
+    while i < longer.len() && j < shorter.len() {
+        if longer[i] == shorter[j] {
+            i += 1;
+            j += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            i += 1;
+        }
+    }
+    true
+}
+
+/// A message `word` matches a `needle` when identical, or — for needles of 4+
+/// chars — within edit distance 1. Short needles ("egg", "sub") require an exact
+/// match so a one-letter slip in a common short word can't misfire. This is the
+/// SAME tolerance the roster-name matcher uses ("guyd"→"guys"), applied here so a
+/// misspelled dish/ingredient ("tacod"→"taco", "fennle"→"fennel") still classifies
+/// as food.
+fn fuzzy_word_matches(word: &str, needle: &str) -> bool {
+    word == needle || (needle.chars().count() >= 4 && edit_distance_le_1(word, needle))
+}
+
+/// Any of `needles` present as a token, matched typo-tolerantly
+/// ([`fuzzy_word_matches`]).
+fn has_any_fuzzy(words: &[String], needles: &[&str]) -> bool {
+    words
+        .iter()
+        .any(|w| needles.iter().any(|n| fuzzy_word_matches(w, n)))
+}
+
 /// Split an ask into lower-case alphanumeric tokens (apostrophes dropped, so
 /// "what's" → "whats"). The shared tokenizer for classification and
 /// fingerprinting, so the two never drift.
@@ -177,11 +235,69 @@ const DISH_WORDS: &[&str] = &[
     "pancakes", "waffles", "quesadilla", "enchiladas", "stirfry",
 ];
 
+/// Raw edible ingredients (not prepared dishes, not the generic meal nouns). A
+/// bare ingredient is NOT itself a domain signal — "we're out of fennel" is not a
+/// meal-plan ask — but an ingredient on EITHER side of a swap ("swap tacod for
+/// grilled **fennel**") clinches the swap as a food-plan change. Kept separate
+/// from [`DISH_WORDS`] so the swap-shape rule can treat both as edible while the
+/// bare-dish rule stays limited to prepared dishes.
+const INGREDIENT_WORDS: &[&str] = &[
+    "fennel", "tofu", "tempeh", "seitan", "trout", "salmon", "tuna", "cod",
+    "chicken", "beef", "pork", "lamb", "turkey", "sausage", "bacon", "shrimp",
+    "prawns", "artichoke", "artichokes", "broccoli", "spinach", "kale",
+    "mushroom", "mushrooms", "eggplant", "aubergine", "zucchini", "courgette",
+    "cauliflower", "asparagus", "lentils", "chickpeas", "beans", "quinoa",
+    "couscous", "polenta", "risotto", "gnocchi", "halloumi", "feta", "avocado",
+    "aubergines", "peppers", "squash",
+];
+
+/// Verbs that mark a "replace A with B" SWAP shape. When one of these appears
+/// alongside an edible token (dish, meal noun, or ingredient — [`is_edible`]),
+/// the ask is a PLAN change even when the food words are misspelled or otherwise
+/// unrecognised, so "swap tacod for grilled fennel" reaches the planner instead
+/// of dropping to the concierge. Matched typo-tolerantly for 4+-char verbs.
+///
+/// Deliberately EXCLUDES generic verbs like "make"/"do": "how do I cook the
+/// lentils" is a recipe ask (the kitchen's), not a plan swap, and must not be
+/// hijacked by an incidental "do" next to an edible word — the recipe rule
+/// (`cooking_flavored`) is checked first for exactly that reason.
+const SWAP_VERBS: &[&str] = &["swap", "replace", "change", "switch", "substitute", "sub"];
+
+/// The connector tokens that turn a swap verb into an explicit "A → B"
+/// replacement: "swap tacod **for** fennel", "replace chicken **with** trout",
+/// "switch dinner **to** pasta". REQUIRING a connector keeps a bare craving
+/// ("I *changed* my mind, I want tacos" — no connector) out of the swap rule, so
+/// it still reaches the chef as a dish, exactly as before.
+const SWAP_CONNECTORS: &[&str] = &["for", "to", "with", "into"];
+
+/// True if `word` is an edible token — a prepared dish, a meal noun, or a raw
+/// ingredient — matched typo-tolerantly so "tacod"→"taco" and "fennle"→"fennel"
+/// still count. The edibility test that powers the swap-shape rule.
+fn is_edible(word: &str) -> bool {
+    DISH_WORDS.iter().any(|d| fuzzy_word_matches(word, d))
+        || MEAL_WORDS.iter().any(|m| fuzzy_word_matches(word, m))
+        || INGREDIENT_WORDS.iter().any(|i| fuzzy_word_matches(word, i))
+}
+
+/// True when the ask is a "replace A with B" SWAP that names something edible on
+/// at least one side — the [`SWAP_VERBS`] + [`is_edible`] shape. This is the fix
+/// for Luca's fennel transcript: "hey can you swap **tacod** for grilled
+/// **fennel**" has no recognised meal noun (the dish is misspelled and the target
+/// is a raw vegetable), so the old classifier dropped it to Coordination → Otto;
+/// the swap shape now pins it to a food plan change.
+fn is_food_swap(words: &[String]) -> bool {
+    let has_swap_verb = has_any_fuzzy(words, SWAP_VERBS);
+    let has_connector = has_any(words, SWAP_CONNECTORS);
+    has_swap_verb && has_connector && words.iter().any(|w| is_edible(w))
+}
+
 /// Classify a conversational ask into its household [`Domain`]. Pure keyword
 /// heuristics (never a model call) so the routing decision is deterministic and
 /// unit-testable. The order encodes precedence: an explicit workout/calendar
 /// signal wins, then meals (planning-vs-cooking split), then shopping, then a
-/// standalone cooking verb, else the coordination catch-all.
+/// food SWAP shape (typo-tolerant, so a misspelled dish still routes to the
+/// planner), then a standalone cooking verb, a bare dish, else the coordination
+/// catch-all.
 pub fn classify_domain(ask: &str) -> Domain {
     let lower = ask.to_lowercase();
     let words = tokens(ask);
@@ -208,14 +324,26 @@ pub fn classify_domain(ask: &str) -> Domain {
     if has_any(&words, SHOPPING_WORDS) {
         return Domain::Shopping;
     }
-    // A standalone cooking ask with no meal noun ("can you bake something?").
+    // A standalone cooking ask with no meal noun ("can you bake something?",
+    // "how do I cook the lentils"). Checked BEFORE the swap shape so a recipe ask
+    // that happens to sit next to a "change"/"swap" verb stays with the kitchen.
     if cooking_flavored {
         return Domain::Cooking;
+    }
+    // A "replace A with B" swap that names something edible — a PLAN change, so
+    // it belongs to the planner (Nora) exactly like "swap dinner to tofu" above,
+    // even when the dish is misspelled ("tacod") or the target is a raw
+    // ingredient ("fennel") that no meal noun covers. Checked AFTER shopping (so
+    // "swap the milk on the shopping list…" stays shopping) and after the recipe
+    // rule, but BEFORE the bare-dish rule.
+    if is_food_swap(&words) {
+        return Domain::MealPlanning;
     }
     // A bare named dish ("pizza on Friday") — the kitchen's, so plain food
     // chatter reaches the chef's voice instead of falling through to the
     // concierge. Checked after shopping so "add pizza to the list" stays shopping.
-    if has_any(&words, DISH_WORDS) {
+    // Typo-tolerant so "carbonaraa tonight" still reaches the chef.
+    if has_any_fuzzy(&words, DISH_WORDS) {
         return Domain::Cooking;
     }
     Domain::Coordination
@@ -525,6 +653,187 @@ impl IntentLedger {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Clarification continuation
+// ---------------------------------------------------------------------------
+
+/// Default clarify window: a bare confirmation this many seconds after a voice
+/// asked a clarifying question still continues THAT exchange. 3 minutes — long
+/// enough for a human to read the question and tap "yes", short enough that an
+/// unrelated later "ok" doesn't get glued onto a stale ask. Overridable with
+/// `CASA_CLARIFY_WINDOW_SECS`.
+pub const DEFAULT_CLARIFY_WINDOW_SECS: i64 = 180;
+
+/// The short, self-contained confirmations that CONTINUE an open clarification
+/// rather than start a new ask. Matched against the WHOLE normalized message, so
+/// "yes" continues but "yes but make it pasta" (which carries new content) falls
+/// through to a fresh election. English + the Italian the family uses.
+const CONFIRMATION_PHRASES: &[&str] = &[
+    "yes", "yep", "yeah", "yup", "y", "ok", "okay", "k", "sure", "sounds good",
+    "yes please", "please do", "do it", "go ahead", "go for it", "perfect",
+    "great", "confirmed", "correct", "that works", "works for me", "si", "sì",
+    "certo", "va bene", "vabene", "fallo", "perfetto",
+];
+
+/// True when `text`, once normalized to space-joined lower-case alphanumeric
+/// tokens, is EXACTLY one of the [`CONFIRMATION_PHRASES`]. A bare "yes"/"ok"/"si"
+/// is a continuation; anything carrying new words is a new ask.
+pub fn is_bare_confirmation(text: &str) -> bool {
+    let normalized = tokens(text).join(" ");
+    if normalized.is_empty() {
+        return false;
+    }
+    CONFIRMATION_PHRASES.iter().any(|p| *p == normalized)
+}
+
+/// One open clarification exchange: a `voice` (persona / agent id) asked `human`
+/// a clarifying question about `original_ask` in `chat` at `ts`. A bare
+/// confirmation from the same human within the window is routed back to `voice`
+/// carrying `original_ask`, so the confirmation is answered by the persona that
+/// asked — not re-elected from scratch (the fennel bug, where a "yes" summoned a
+/// different voice) — and reuses the original ask's [`fingerprint`] so no
+/// duplicate task is minted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClarifyExchange {
+    /// Unix epoch seconds the clarifying question was asked.
+    pub ts: i64,
+    /// The chat the exchange lives in.
+    pub chat_id: String,
+    /// The human who was asked.
+    pub human: String,
+    /// The persona / agent id that asked (the voice a confirmation continues).
+    pub voice: String,
+    /// The original ask text — replayed as the body of the continued turn so the
+    /// composer (and any task it creates) works the ORIGINAL intent.
+    pub original_ask: String,
+}
+
+impl ClarifyExchange {
+    /// The fingerprint of the ORIGINAL ask, so a task minted on confirmation is
+    /// deduped against one minted on the first turn ([`IntentLedger`]).
+    pub fn fingerprint(&self) -> String {
+        fingerprint(&self.original_ask, &self.chat_id)
+    }
+
+    fn to_json_line(&self) -> String {
+        serde_json::json!({
+            "ts": self.ts,
+            "chat_id": self.chat_id,
+            "human": self.human,
+            "voice": self.voice,
+            "original_ask": self.original_ask,
+        })
+        .to_string()
+    }
+
+    fn from_json_line(line: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        Some(Self {
+            ts: v.get("ts")?.as_i64()?,
+            chat_id: v.get("chat_id")?.as_str()?.to_string(),
+            human: v.get("human")?.as_str()?.to_string(),
+            voice: v.get("voice")?.as_str()?.to_string(),
+            original_ask: v.get("original_ask")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// Durable, file-backed clarification ledger — the twin of [`IntentLedger`],
+/// append-only JSONL under `<root>/.casa/clarify.jsonl` so a confirmation that
+/// arrives in a SEPARATE listener/gateway invocation (they always are) still
+/// finds the open exchange. Dependency-free file I/O, no model call.
+pub struct ClarifyLedger;
+
+impl ClarifyLedger {
+    /// Path to the append-only JSONL under `<root>/.casa/`.
+    pub fn path(root: &Path) -> PathBuf {
+        root.join(".casa").join("clarify.jsonl")
+    }
+
+    /// The clarify window in seconds — [`DEFAULT_CLARIFY_WINDOW_SECS`] unless
+    /// `CASA_CLARIFY_WINDOW_SECS` overrides it.
+    pub fn window_secs() -> i64 {
+        std::env::var("CASA_CLARIFY_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_CLARIFY_WINDOW_SECS)
+    }
+
+    /// Open a clarification window: record that `voice` asked `human` about
+    /// `original_ask` in `chat` at `now_epoch`. Creates `.casa/` if needed.
+    pub fn open(
+        root: &Path,
+        chat_id: &str,
+        human: &str,
+        voice: &str,
+        original_ask: &str,
+        now_epoch: i64,
+    ) -> std::io::Result<()> {
+        let rec = ClarifyExchange {
+            ts: now_epoch,
+            chat_id: chat_id.trim().to_string(),
+            human: human.trim().to_string(),
+            voice: voice.trim().to_string(),
+            original_ask: original_ask.to_string(),
+        };
+        let path = Self::path(root);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(f, "{}", rec.to_json_line())?;
+        Ok(())
+    }
+
+    /// The most recent still-open exchange for `(chat, human)` within
+    /// `window_secs` of `now_epoch`, or `None`. The last matching record wins so
+    /// a fresh clarifying question supersedes an older one.
+    pub fn pending(
+        root: &Path,
+        chat_id: &str,
+        human: &str,
+        now_epoch: i64,
+        window_secs: i64,
+    ) -> Option<ClarifyExchange> {
+        let path = Self::path(root);
+        let body = std::fs::read_to_string(&path).ok()?;
+        let chat = chat_id.trim();
+        let who = human.trim();
+        body.lines()
+            .filter_map(ClarifyExchange::from_json_line)
+            .filter(|r| {
+                r.chat_id == chat
+                    && r.human == who
+                    && (now_epoch - r.ts) >= 0
+                    && (now_epoch - r.ts) <= window_secs
+            })
+            .last()
+    }
+}
+
+/// The clarification-continuation decision: if `text` is a bare confirmation
+/// ([`is_bare_confirmation`]) AND `(chat, human)` has an open exchange within the
+/// window, return it so the caller can route the confirmation back to the voice
+/// that asked — reusing the original ask, WITHOUT a new election. Otherwise
+/// `None`, and the caller runs the normal election.
+pub fn clarify_continuation(
+    root: &Path,
+    chat_id: &str,
+    human: &str,
+    text: &str,
+    now_epoch: i64,
+    window_secs: i64,
+) -> Option<ClarifyExchange> {
+    if !is_bare_confirmation(text) {
+        return None;
+    }
+    ClarifyLedger::pending(root, chat_id, human, now_epoch, window_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,5 +1021,148 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fp = fingerprint("anything", "c1");
         assert_eq!(IntentLedger::find_recent(dir.path(), &fp, 0, 300), None);
+    }
+
+    // ---- typo-tolerant + swap-shaped classification ----------------------
+
+    #[test]
+    fn fennel_swap_inbound_classifies_as_meal_planning_not_coordination() {
+        // THE LIVE REGRESSION (Luca's fennel transcript, chat 8905220378,
+        // 2026-07-14): "hey can you swap tacod for grilled fennel". The dish is
+        // misspelled ("tacod") and the target is a raw vegetable ("fennel") that
+        // no meal noun covers, so the OLD classifier dropped it to Coordination →
+        // Otto — and Otto (calendar/shopping) is the wrong owner for a food swap.
+        // It is a PLAN change and must classify as MealPlanning → Nora.
+        assert_eq!(
+            classify_domain("hey can you swap tacod for grilled fennel"),
+            Domain::MealPlanning
+        );
+        let m = OwnerMap::casa_default();
+        assert_eq!(
+            m.owner_for_ask("hey can you swap tacod for grilled fennel"),
+            Some("nora"),
+            "a food swap must NOT fall to the concierge (otto)"
+        );
+    }
+
+    #[test]
+    fn misspelled_dish_swaps_still_route_to_food() {
+        // Typo tolerance mirrors the roster-name matcher: a one-letter slip in the
+        // dish/ingredient still classifies as a food plan change.
+        assert_eq!(classify_domain("swap tacod for burgers"), Domain::MealPlanning);
+        assert_eq!(classify_domain("replace the chiken with trout"), Domain::MealPlanning);
+        assert_eq!(classify_domain("switch fridays pizzza for pasta"), Domain::MealPlanning);
+        // Correctly-spelled ingredient swap with no meal noun, too.
+        assert_eq!(classify_domain("swap chicken for tofu"), Domain::MealPlanning);
+    }
+
+    #[test]
+    fn swap_shape_does_not_hijack_non_food_or_recipe_asks() {
+        // A recipe ask sitting next to a swap-ish verb stays with the kitchen —
+        // "change" + "lentils" must NOT become a plan swap.
+        assert_eq!(classify_domain("how do I cook the lentils"), Domain::Cooking);
+        assert_eq!(classify_domain("change how you roast the chicken"), Domain::Cooking);
+        // A workout / calendar swap is still owned by workouts / calendar, not food.
+        assert_eq!(classify_domain("swap my gym session to friday"), Domain::Workouts);
+        assert_eq!(
+            classify_domain("reschedule the dentist appointment"),
+            Domain::Calendar
+        );
+        // A swap with NOTHING edible is not a food swap.
+        assert_eq!(classify_domain("swap my seat with yours"), Domain::Coordination);
+        // A bare craving with an incidental "changed" but NO connector is a dish
+        // for the chef, not a plan swap (morning-taco-bugs must stay green).
+        assert_eq!(
+            classify_domain("hey I changed my mind on friday I want tacos"),
+            Domain::Cooking
+        );
+    }
+
+    #[test]
+    fn pre_existing_classifications_unchanged_by_typo_tolerance() {
+        // The typo-tolerant edible matcher must not disturb the shipped cases.
+        assert_eq!(
+            classify_domain("swap Thursday dinner to grilled tofu"),
+            Domain::MealPlanning
+        );
+        assert_eq!(classify_domain("pizza on friday"), Domain::Cooking);
+        assert_eq!(classify_domain("add pizza to the shopping list"), Domain::Shopping);
+        assert_eq!(classify_domain("add rice to the list"), Domain::Coordination);
+        assert_eq!(classify_domain("who is picking up the kids?"), Domain::Coordination);
+    }
+
+    #[test]
+    fn edit_distance_le_1_basics() {
+        assert!(edit_distance_le_1("tacod", "taco")); // insertion
+        assert!(edit_distance_le_1("chiken", "chicken")); // deletion
+        assert!(edit_distance_le_1("pizzza", "pizza")); // insertion
+        assert!(edit_distance_le_1("tofo", "tofu")); // substitution
+        // A transposition ("fennle"→"fennel") is distance 2 — deliberately NOT
+        // matched, so we never over-reach on distinct words.
+        assert!(!edit_distance_le_1("fennle", "fennel"));
+        assert!(!edit_distance_le_1("taco", "sushi"));
+        assert!(!edit_distance_le_1("list", "salad")); // 2+ apart
+    }
+
+    // ---- clarification continuation --------------------------------------
+
+    #[test]
+    fn bare_confirmations_recognised_but_content_replies_are_not() {
+        for yes in ["yes", "Yes", "  ok  ", "yep", "sure", "si", "sì", "do it", "sounds good"] {
+            assert!(is_bare_confirmation(yes), "{yes:?} should be a confirmation");
+        }
+        for no in ["yes but make it pasta", "no", "actually pizza", "maybe later", ""] {
+            assert!(!is_bare_confirmation(no), "{no:?} should NOT be a confirmation");
+        }
+    }
+
+    #[test]
+    fn clarify_continuation_routes_yes_back_to_the_asking_voice() {
+        // The fennel "yes" bug: Nora asked a clarifying question, and a bare "yes"
+        // re-elected from scratch (Coach Mira answered). With an open exchange, the
+        // "yes" continues with NORA and replays the original ask.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let chat = "8905220378";
+        let human = "luca";
+        let ask = "hey can you swap tacod for grilled fennel";
+        // No exchange yet → a "yes" is not a continuation.
+        assert_eq!(clarify_continuation(root, chat, human, "yes", 1000, 180), None);
+        // Nora asks a clarifying question → window opens.
+        ClarifyLedger::open(root, chat, human, "nora", ask, 1000).unwrap();
+        let ex = clarify_continuation(root, chat, human, "yes", 1030, 180)
+            .expect("a bare yes within the window continues the exchange");
+        assert_eq!(ex.voice, "nora");
+        assert_eq!(ex.original_ask, ask);
+        // The continuation reuses the ORIGINAL ask's fingerprint → no dup task.
+        assert_eq!(ex.fingerprint(), fingerprint(ask, chat));
+    }
+
+    #[test]
+    fn clarify_continuation_respects_window_human_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let chat = "grp";
+        ClarifyLedger::open(root, chat, "luca", "nora", "swap x for y", 1000).unwrap();
+        // Outside the window → not a continuation.
+        assert_eq!(clarify_continuation(root, chat, "luca", "yes", 1400, 180), None);
+        // A DIFFERENT human's "yes" does not continue Luca's exchange.
+        assert_eq!(clarify_continuation(root, chat, "mara", "yes", 1030, 180), None);
+        // A content-bearing reply is a fresh ask, not a continuation.
+        assert_eq!(
+            clarify_continuation(root, chat, "luca", "make it pasta instead", 1030, 180),
+            None
+        );
+    }
+
+    #[test]
+    fn clarify_pending_latest_supersedes_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let chat = "grp";
+        ClarifyLedger::open(root, chat, "luca", "nora", "swap a for b", 1000).unwrap();
+        ClarifyLedger::open(root, chat, "luca", "bruno", "how do i cook b", 1050).unwrap();
+        let ex = ClarifyLedger::pending(root, chat, "luca", 1060, 180).unwrap();
+        assert_eq!(ex.voice, "bruno", "the freshest open exchange wins");
     }
 }
