@@ -17,6 +17,15 @@
 # introduced the regression and the task that fixed it.
 
 [[scenario]]
+name = "protected_cron_survives_cleanup_sweep"
+script = "scenarios/protected_cron_survives_cleanup_sweep.sh"
+owners = [
+    "re-arm-the",
+]
+description = "Regression (re-arm-the): a production recurring cron tagged `protected` must survive routine cleanup. `wg abandon` REFUSES a protected task without `--force` (and leaves its status unchanged), succeeds WITH `--force`, and `wg gc` never collects a protected task even when terminal — while an ordinary terminal task is still collected. Pins the two guards that stop a cleanup sweep from silently killing the daily-digest cron the way it did before."
+timeout_seconds = 30
+
+[[scenario]]
 name = "agency_csv_roundtrip"
 script = "scenarios/agency_csv_roundtrip.sh"
 owners = [
