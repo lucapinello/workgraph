@@ -1600,6 +1600,37 @@ pub fn elect_responders(
     Election::Silence(SilenceReason::SmallTalk)
 }
 
+/// Elect responders for a WEB-ORIGIN (kiosk conversation-pane) inbound message,
+/// as a first-class supergroup group turn.
+///
+/// This is the SINGLE election entry `run_web_inbound` calls, so a kiosk-typed
+/// message runs the EXACT same brain as the same words typed into Telegram. It
+/// pins the three invariants a web message always has — it is a `supergroup`
+/// message, it has no reply-chain (the pane threads nothing), and it is never
+/// bot-sent — and otherwise defers entirely to [`elect_responders`]. Keeping this
+/// as a named seam (rather than inlining the literals at the call site) is what
+/// the path-parity test locks: a web ask and a phone ask can never drift into
+/// different election decisions, owners, or voices (the fennel regression, where
+/// a kiosk ask answered differently from a phone ask, stays impossible).
+pub fn elect_group_inbound(
+    chat_id: &str,
+    text: &str,
+    mention_usernames: &[String],
+    human_count: usize,
+    config: &TelegramConfig,
+) -> Election {
+    elect_responders(
+        Some("supergroup"),
+        Some(chat_id),
+        text,
+        mention_usernames,
+        None,  // the pane has no reply-chain
+        false, // a human typed it; never bot-sent
+        human_count,
+        config,
+    )
+}
+
 /// True if `text` begins with a Telegram bot command (`/word`). In groups these
 /// are commonly suffixed with the target bot (`/status@bruno_chef_bot`).
 fn is_bot_command(text: &str) -> bool {
@@ -3546,5 +3577,84 @@ mod tests {
             !line.contains("hunter2") && !line.contains("987:ABC"),
             "decision line must not echo message text, got {line:?}"
         );
+    }
+
+    // ---- ONE INBOUND BRAIN: web-inbound / listener path parity -----------
+
+    /// PATH PARITY (task redo-one-inbound). The kiosk web-inbound path
+    /// (`run_web_inbound` → [`elect_group_inbound`]) and the listener path
+    /// (`run_listen` → [`elect_responders`]) must run the IDENTICAL brain: for the
+    /// same words, the same election decision, the same elected voice, the same
+    /// routed body. The two paths differ only in where the arguments come from —
+    /// this locks that a group human message elects identically no matter which
+    /// surface it arrived on, so a kiosk ask can never answer differently from a
+    /// phone ask (the fennel regression).
+    #[test]
+    fn web_inbound_and_listener_paths_elect_identically() {
+        let cfg = casa_config();
+        let chat = "-100999";
+        // Luca's fennel transcript verbatim + representative asks across every
+        // domain and the collective/silence shapes.
+        let texts = [
+            "hey can you swap tacod for grilled fennel", // THE live regression
+            "swap Thursday dinner to grilled tofu",
+            "pizza on friday",
+            "am I training tomorrow?",
+            "when is the dentist?",
+            "add oat milk to the shopping list",
+            "hey guys are you around?",
+            "who is picking up the kids?",
+        ];
+        for text in texts {
+            // Listener path: elect_responders as `run_listen` calls it for a plain
+            // human supergroup message (no reply-chain, not bot-sent).
+            let mentions = parse_at_mention_tokens(text);
+            let listener = elect_responders(
+                Some("supergroup"),
+                Some(chat),
+                text,
+                &mentions,
+                None,
+                false,
+                1,
+                &cfg,
+            );
+            // Web-inbound path: the shared seam `run_web_inbound` actually calls.
+            let web_mentions = parse_at_mention_tokens(text);
+            let web = elect_group_inbound(chat, text, &web_mentions, 1, &cfg);
+            assert_eq!(
+                listener, web,
+                "election diverged between listener and web-inbound for {text:?}"
+            );
+        }
+    }
+
+    /// REGRESSION FIXTURE — Luca's fennel transcript verbatim (chat 8905220378,
+    /// 2026-07-14). "hey can you swap tacod for grilled fennel" dropped to
+    /// Coordination → Otto (a food swap answered by the calendar concierge). With
+    /// the typo-tolerant swap-shaped classifier it now elects the food PLAN owner,
+    /// Nora — the SAME single voice on both surfaces (web-inbound proven above).
+    #[test]
+    fn fennel_web_inbound_elects_nora_not_otto() {
+        use crate::notify::ownership::Domain;
+        let cfg = casa_config();
+        let election = elect_group_inbound(
+            "-100999",
+            "hey can you swap tacod for grilled fennel",
+            &[],
+            1,
+            &cfg,
+        );
+        match &election {
+            Election::One { bot, addressed_by, .. } => {
+                assert_eq!(
+                    bot.agent_id.as_deref(),
+                    Some("nora"),
+                    "a food swap must reach the planner, not the concierge (otto)"
+                );
+                assert_eq!(*addressed_by, AddressedBy::Domain(Domain::MealPlanning));
+            }
+            other => panic!("expected One(nora) for the fennel ask, got {other:?}"),
+        }
     }
 }
