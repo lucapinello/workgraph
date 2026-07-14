@@ -188,6 +188,17 @@ pub fn run(dir: &Path, dry_run: bool, include_done: bool, older: Option<&str>) -
             }
         }
 
+        // Protected production tasks (live crons the family depends on) are
+        // never garbage-collected, even when terminal. Without this, an
+        // accidental abandon followed by a routine `wg gc` would erase the
+        // daily-digest cron from the graph entirely (task `re-arm-the`).
+        to_gc.retain(|id| {
+            graph
+                .get_task(id)
+                .map(|t| !t.is_protected())
+                .unwrap_or(true)
+        });
+
         if to_gc.is_empty() {
             was_empty = true;
             return false;
@@ -360,6 +371,36 @@ mod tests {
             "abandoned task should be removed"
         );
         assert!(remaining.contains("task-b"), "open task should remain");
+    }
+
+    #[test]
+    fn gc_skips_protected_terminal_task() {
+        // Regression (task re-arm-the): a protected production cron that was
+        // (accidentally) abandoned must NOT be garbage-collected — otherwise
+        // the schedule is erased from the graph and cannot be re-armed.
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        let mut protected = make_task("daily-digest", "Daily digest", Status::Abandoned);
+        protected.tags = vec![worksgood::graph::PROTECTED_TAG.to_string()];
+        setup_graph(
+            wg_dir,
+            vec![
+                protected,
+                make_task("task-b", "Ordinary abandoned", Status::Abandoned),
+            ],
+        );
+
+        run(wg_dir, false, false, None).unwrap();
+
+        let remaining = load_task_ids(wg_dir);
+        assert!(
+            remaining.contains("daily-digest"),
+            "protected task must survive gc even when terminal"
+        );
+        assert!(
+            !remaining.contains("task-b"),
+            "ordinary abandoned task is still collected"
+        );
     }
 
     #[test]

@@ -684,6 +684,13 @@ pub enum Commands {
         /// Task IDs that supersede/replace this task (comma-separated)
         #[arg(long, value_delimiter = ',')]
         superseded_by: Vec<String>,
+
+        /// Force-abandon a PROTECTED production task (a live cron the family
+        /// depends on). Without this flag, `wg abandon` refuses to touch a
+        /// task tagged `protected` — the guard that stops a cleanup sweep from
+        /// silently killing the daily digest. The reason is logged loudly.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Retry a failed, incomplete, or in-progress (hung) task.
@@ -957,6 +964,18 @@ pub enum Commands {
         /// Output as JSON instead of formatted text
         #[arg(long)]
         json: bool,
+
+        /// Re-arm a stuck production cron by ID: reopen it (from abandoned /
+        /// failed / paused), clear the failure state, and recompute the next
+        /// fire time from now so it is `scheduled` again. This is the recovery
+        /// path for a cron that a cleanup sweep killed (task `re-arm-the`).
+        #[arg(long, value_name = "TASK")]
+        rearm: Option<String>,
+
+        /// With `--rearm`: also mark the task PROTECTED (tag `protected`) so a
+        /// future routine sweep cannot abandon or gc it without `--force`.
+        #[arg(long)]
+        protect: bool,
     },
 
     /// List all tasks

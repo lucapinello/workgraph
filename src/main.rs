@@ -1371,7 +1371,8 @@ fn main() -> Result<()> {
             id,
             reason,
             superseded_by,
-        } => commands::abandon::run(&workgraph_dir, &id, reason.as_deref(), &superseded_by),
+            force,
+        } => commands::abandon::run(&workgraph_dir, &id, reason.as_deref(), &superseded_by, force),
         Commands::Retry {
             id,
             preserve_session,
@@ -1455,7 +1456,14 @@ fn main() -> Result<()> {
             commands::cleanup::run(args)
         }
         Commands::Cycles => commands::cycles::run(&workgraph_dir, cli.json),
-        Commands::Cron { json } => commands::cron_cmd::run(&workgraph_dir, json),
+        Commands::Cron {
+            json,
+            rearm,
+            protect,
+        } => match rearm {
+            Some(id) => commands::cron_cmd::rearm(&workgraph_dir, &id, protect),
+            None => commands::cron_cmd::run(&workgraph_dir, json),
+        },
         Commands::List {
             status,
             paused,

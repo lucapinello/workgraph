@@ -9,7 +9,13 @@ use super::graph_path;
 #[cfg(test)]
 use worksgood::parser::load_graph;
 
-pub fn run(dir: &Path, id: &str, reason: Option<&str>, superseded_by: &[String]) -> Result<()> {
+pub fn run(
+    dir: &Path,
+    id: &str,
+    reason: Option<&str>,
+    superseded_by: &[String],
+    force: bool,
+) -> Result<()> {
     let path = super::graph_path(dir);
     if !path.exists() {
         anyhow::bail!("WG not initialized. Run 'wg init' first.");
@@ -19,6 +25,7 @@ pub fn run(dir: &Path, id: &str, reason: Option<&str>, superseded_by: &[String])
     let mut already_abandoned = false;
     let mut prev_assigned: Option<String> = None;
     let mut cascade_targets: Vec<String> = Vec::new();
+    let mut forced_protected = false;
 
     let _graph = modify_graph(&path, |graph| {
         let task = match graph.get_task_mut(id) {
@@ -42,6 +49,23 @@ pub fn run(dir: &Path, id: &str, reason: Option<&str>, superseded_by: &[String])
             return false;
         }
 
+        // Protected production tasks (live crons the family depends on) refuse
+        // to be abandoned without an explicit `--force`. This is the guard that
+        // stops a routine cleanup sweep from silently killing the daily digest
+        // the way it did before (task `re-arm-the`). `--force` still works, but
+        // the override is recorded loudly in the task log below.
+        if task.is_protected() && !force {
+            error = Some(anyhow::anyhow!(
+                "Task '{}' is PROTECTED (a production recurring task the family \
+                 depends on) and will not be abandoned by a routine sweep. If you \
+                 genuinely mean to retire it, re-run with `--force` and a `--reason` \
+                 explaining why — the override is logged.",
+                id
+            ));
+            return false;
+        }
+        forced_protected = task.is_protected() && force;
+
         prev_assigned = task.assigned.clone();
         task.status = Status::Abandoned;
         task.failure_reason = reason.map(String::from);
@@ -49,9 +73,11 @@ pub fn run(dir: &Path, id: &str, reason: Option<&str>, superseded_by: &[String])
             task.superseded_by = superseded_by.to_vec();
         }
 
-        let log_message = match reason {
-            Some(r) => format!("Task abandoned: {}", r),
-            None => "Task abandoned".to_string(),
+        let log_message = match (forced_protected, reason) {
+            (true, Some(r)) => format!("PROTECTED task force-abandoned (--force): {}", r),
+            (true, None) => "PROTECTED task force-abandoned (--force), no reason given".to_string(),
+            (false, Some(r)) => format!("Task abandoned: {}", r),
+            (false, None) => "Task abandoned".to_string(),
         };
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
@@ -130,7 +156,14 @@ pub fn run(dir: &Path, id: &str, reason: Option<&str>, superseded_by: &[String])
     );
 
     let reason_msg = reason.map(|r| format!(" ({})", r)).unwrap_or_default();
-    println!("Marked '{}' as abandoned{}", id, reason_msg);
+    if forced_protected {
+        println!(
+            "⚠️  Force-abandoned PROTECTED task '{}'{} — override logged.",
+            id, reason_msg
+        );
+    } else {
+        println!("Marked '{}' as abandoned{}", id, reason_msg);
+    }
     for target in &cascade_targets {
         println!("  Auto-abandoned: {}", target);
     }
@@ -165,7 +198,7 @@ mod tests {
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Open task")));
         setup_graph(&dir, &graph);
-        let result = run(&dir, "t1", Some("no longer needed"), &[]);
+        let result = run(&dir, "t1", Some("no longer needed"), &[], false);
         assert!(result.is_ok());
         let task = load_graph(graph_path(&dir))
             .unwrap()
@@ -185,7 +218,7 @@ mod tests {
         t.status = Status::Done;
         graph.add_node(Node::Task(t));
         setup_graph(&dir, &graph);
-        assert!(run(&dir, "t1", None, &[]).is_err());
+        assert!(run(&dir, "t1", None, &[], false).is_err());
     }
 
     #[test]
@@ -197,7 +230,7 @@ mod tests {
         t.status = Status::Abandoned;
         graph.add_node(Node::Task(t));
         setup_graph(&dir, &graph);
-        assert!(run(&dir, "t1", None, &[]).is_ok());
+        assert!(run(&dir, "t1", None, &[], false).is_ok());
     }
 
     #[test]
@@ -217,7 +250,7 @@ mod tests {
         graph.add_node(Node::Task(dep));
         setup_graph(&dir, &graph);
 
-        assert!(run(&dir, "t1", Some("decomposed"), &[]).is_ok());
+        assert!(run(&dir, "t1", Some("decomposed"), &[], false).is_ok());
         let g = load_graph(graph_path(&dir)).unwrap();
         assert_eq!(g.get_task("t1").unwrap().status, Status::Abandoned);
         assert_eq!(
@@ -239,7 +272,7 @@ mod tests {
         eval.status = Status::Done;
         graph.add_node(Node::Task(eval));
         setup_graph(&dir, &graph);
-        run(&dir, "t1", None, &[]).unwrap();
+        run(&dir, "t1", None, &[], false).unwrap();
         assert_eq!(
             load_graph(graph_path(&dir))
                 .unwrap()
@@ -274,7 +307,7 @@ mod tests {
         graph.add_node(Node::Task(dep));
 
         setup_graph(&dir, &graph);
-        assert!(run(&dir, "t1", Some("decomposed"), &[]).is_ok());
+        assert!(run(&dir, "t1", Some("decomposed"), &[], false).is_ok());
 
         let g = load_graph(graph_path(&dir)).unwrap();
         assert_eq!(g.get_task("t1").unwrap().status, Status::Abandoned);
@@ -304,7 +337,7 @@ mod tests {
         graph.add_node(Node::Task(assign));
 
         setup_graph(&dir, &graph);
-        run(&dir, "t1", Some("no longer needed"), &[]).unwrap();
+        run(&dir, "t1", Some("no longer needed"), &[], false).unwrap();
 
         let g = load_graph(graph_path(&dir)).unwrap();
         assert_eq!(g.get_task("t1").unwrap().status, Status::Abandoned);
@@ -327,7 +360,7 @@ mod tests {
         graph.add_node(Node::Task(assign));
 
         setup_graph(&dir, &graph);
-        run(&dir, "t1", None, &[]).unwrap();
+        run(&dir, "t1", None, &[], false).unwrap();
 
         let g = load_graph(graph_path(&dir)).unwrap();
         assert_eq!(g.get_task(".assign-t1").unwrap().status, Status::Done);
@@ -341,12 +374,90 @@ mod tests {
         graph.add_node(Node::Task(make_task("t1", "Original")));
         setup_graph(&dir, &graph);
         let r = vec!["t2".to_string(), "t3".to_string()];
-        run(&dir, "t1", Some("decomposed"), &r).unwrap();
+        run(&dir, "t1", Some("decomposed"), &r, false).unwrap();
         let task = load_graph(graph_path(&dir))
             .unwrap()
             .get_task("t1")
             .unwrap()
             .clone();
         assert_eq!(task.superseded_by, vec!["t2", "t3"]);
+    }
+
+    fn make_protected(id: &str) -> Task {
+        let mut t = make_task(id, "Protected cron");
+        t.tags = vec![worksgood::graph::PROTECTED_TAG.to_string()];
+        t
+    }
+
+    #[test]
+    fn test_abandon_protected_without_force_is_refused() {
+        // Regression (task re-arm-the): a routine sweep abandoned the production
+        // daily-digest cron. A protected task must refuse abandonment without
+        // --force, and must stay OPEN (untouched) when refused.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".wg");
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_protected("daily-digest")));
+        setup_graph(&dir, &graph);
+
+        let err = run(&dir, "daily-digest", Some("cleanup"), &[], false);
+        assert!(err.is_err(), "protected task must refuse abandon without --force");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("PROTECTED"), "error must name the protection: {msg}");
+
+        // Status is unchanged — the sweep did NOT kill the cron.
+        let task = load_graph(graph_path(&dir))
+            .unwrap()
+            .get_task("daily-digest")
+            .unwrap()
+            .clone();
+        assert_eq!(task.status, Status::Open, "refused abandon must leave it Open");
+    }
+
+    #[test]
+    fn test_abandon_protected_with_force_succeeds_and_logs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".wg");
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_protected("daily-digest")));
+        setup_graph(&dir, &graph);
+
+        run(&dir, "daily-digest", Some("truly retiring it"), &[], true).unwrap();
+        let task = load_graph(graph_path(&dir))
+            .unwrap()
+            .get_task("daily-digest")
+            .unwrap()
+            .clone();
+        assert_eq!(task.status, Status::Abandoned);
+        // The override is recorded loudly so it is auditable.
+        assert!(
+            task.log
+                .iter()
+                .any(|e| e.message.contains("PROTECTED task force-abandoned")),
+            "force-abandon of a protected task must be logged loudly"
+        );
+    }
+
+    #[test]
+    fn test_abandon_unprotected_task_ignores_force() {
+        // --force on an ordinary task behaves exactly like a normal abandon.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".wg");
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t1", "Ordinary")));
+        setup_graph(&dir, &graph);
+        run(&dir, "t1", Some("no longer needed"), &[], true).unwrap();
+        let task = load_graph(graph_path(&dir))
+            .unwrap()
+            .get_task("t1")
+            .unwrap()
+            .clone();
+        assert_eq!(task.status, Status::Abandoned);
+        assert!(
+            task.log
+                .iter()
+                .any(|e| e.message == "Task abandoned: no longer needed"),
+            "ordinary force-abandon is not tagged as a protected override"
+        );
     }
 }
