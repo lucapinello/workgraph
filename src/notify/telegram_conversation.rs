@@ -1105,6 +1105,21 @@ async fn finalize_composed_reply(
         ownership::OwnerMap::load(&root).decide_owner(&origin.persona, human_message)
     };
 
+    // DEFER DISCIPLINE (morning-taco-bugs): the defer line ("Bruno's got this
+    // one 🍳") must NEVER appear on the OWNER's own reply. `decide_owner` keys on
+    // `origin.persona`, but a group-elected turn stamps that from the bot's
+    // agent id — and a bot with no configured `agent_id` falls back to its bot id
+    // ("bruno_casapinello_bot"), which does not textually equal the owner id
+    // ("bruno"). That mismatch made Bruno defer to *himself* out loud. Correct a
+    // Defer back to Owner whenever the speaking voice actually IS the owner (by
+    // persona or bot id), so only a genuinely off-domain voice ever defers.
+    let decision = match decision {
+        ownership::OwnerDecision::Defer { owner } if speaker_is_owner(origin, &owner) => {
+            ownership::OwnerDecision::Owner
+        }
+        other => other,
+    };
+
     match decision {
         ownership::OwnerDecision::Defer { owner } => {
             // OFF-DOMAIN GUARD. This voice does not own the ask, so it must NOT
@@ -1323,6 +1338,26 @@ fn origin_as_persona(
     let mut owned = origin.clone();
     owned.persona = persona.trim().to_string();
     owned
+}
+
+/// True when the speaking voice in `origin` IS the domain `owner` — so it must
+/// never defer to itself (morning-taco-bugs). Matches on the persona id, and,
+/// because a bot with no configured `agent_id` stamps its bot id as the persona,
+/// also on the bot id — treating a `"bruno"` owner as the speaker behind
+/// `"bruno"`, `"bruno_casapinello_bot"`, or `"bruno-bot"`.
+fn speaker_is_owner(origin: &crate::graph::TaskOrigin, owner: &str) -> bool {
+    let owner = owner.trim().to_ascii_lowercase();
+    if owner.is_empty() {
+        return false;
+    }
+    let matches_owner = |id: &str| {
+        let id = id.trim().to_ascii_lowercase();
+        id == owner
+            || id.starts_with(&format!("{owner}_"))
+            || id.starts_with(&format!("{owner}-"))
+    };
+    matches_owner(&origin.persona)
+        || origin.bot_id.as_deref().map(matches_owner).unwrap_or(false)
 }
 
 /// Persist a standing preference to the durable store under the project's
@@ -2762,5 +2797,40 @@ mod tests {
         let edits = sink.edits();
         assert_eq!(edits.len(), 1);
         assert!(edits[0].3.contains("glitched"), "ack edited into glitch: {:?}", edits[0].3);
+    }
+
+    /// DEFER DISCIPLINE (morning-taco-bugs): the owner never defers to itself. The
+    /// self-owner guard recognises the owner whether the turn stamped the persona
+    /// as the roster id ("bruno") or fell back to the bot id
+    /// ("bruno_casapinello_bot" / "bruno-bot"); a genuinely different voice
+    /// (Coach Mira) is NOT mistaken for the owner and still defers.
+    #[test]
+    fn speaker_is_owner_recognises_persona_and_bot_id_forms() {
+        use crate::graph::{OriginChannel, TaskOrigin};
+        let origin = |persona: &str, bot: Option<&str>| {
+            TaskOrigin::new(
+                OriginChannel::TelegramGroup,
+                "-100999",
+                "Luca",
+                persona,
+                bot.map(str::to_string),
+            )
+        };
+        // Persona stamped as the roster id.
+        assert!(speaker_is_owner(&origin("bruno", None), "bruno"));
+        assert!(speaker_is_owner(&origin("Bruno", None), "bruno"));
+        // Persona fell back to the bot id (no configured agent_id).
+        assert!(speaker_is_owner(&origin("bruno_casapinello_bot", None), "bruno"));
+        assert!(speaker_is_owner(&origin("bruno-bot", None), "bruno"));
+        // Owner recognised via the bot_id channel even when persona is a bot id.
+        assert!(speaker_is_owner(
+            &origin("bruno_casapinello_bot", Some("bruno_casapinello_bot")),
+            "bruno"
+        ));
+        // A different voice is NOT the owner — it still defers.
+        assert!(!speaker_is_owner(&origin("mira", Some("mira_casapinello_bot")), "bruno"));
+        assert!(!speaker_is_owner(&origin("otto", None), "bruno"));
+        // No owner resolved → never a self-owner.
+        assert!(!speaker_is_owner(&origin("bruno", None), ""));
     }
 }

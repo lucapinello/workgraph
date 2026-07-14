@@ -1016,6 +1016,17 @@ pub fn is_collective_address(text: &str) -> bool {
     if is_gratitude_opener(text) || is_endearment_opener(text) {
         return false;
     }
+    has_collective_trigger(text) || is_greeting_shaped_summon(text) || is_greeting_collective(text)
+}
+
+/// True if `text` contains an EXPLICIT collective trigger — a
+/// [`COLLECTIVE_TRIGGERS`] phrase ("hey guys", "ciao a tutti") or single-word
+/// broadcast ("everyone", "team"). Unlike the greeting-shaped summon (a mere
+/// "hey … ?"), an explicit trigger addresses the whole family unambiguously, so
+/// it stays a collective broadcast even when the message also names a household
+/// domain — the domain-outranks-greeting precedence (morning-taco-bugs) only
+/// bends the looser greeting-summon shape, never a genuine address-all.
+pub fn has_collective_trigger(text: &str) -> bool {
     let tokens = word_list(text);
     for trig in COLLECTIVE_TRIGGERS {
         if trig.contains(' ') {
@@ -1027,7 +1038,7 @@ pub fn is_collective_address(text: &str) -> bool {
             return true;
         }
     }
-    is_greeting_shaped_summon(text) || is_greeting_collective(text)
+    false
 }
 
 /// True if `text` *opens with* a gratitude token ("thanks …", "thank you …",
@@ -1518,11 +1529,23 @@ pub fn elect_responders(
 
     // d. Collective address — a greeting to the whole family, no specific ask.
     // The whole roster answers, each briefly and in-voice, in roster order.
+    //
+    // DOMAIN CLASSIFICATION OUTRANKS A GREETING-SHAPED SUMMON (morning-taco-bugs).
+    // A message that merely OPENS with a greeting and carries substantive domain
+    // content — "hey ... I want tacos?" — is an ask for that domain's owner, not a
+    // four-way hello. An EXPLICIT broadcast (a collective trigger word like "hey
+    // guys" / "everyone" / "ciao a tutti", or a greeting that names the whole
+    // family like "morning everybody") is a genuine address-all and stays
+    // collective even when it names a dish; only the looser greeting-summon shape
+    // yields, falling through to the domain routing below.
     if is_collective_address(text) {
-        return Election::All {
-            reply_chat,
-            body: text.to_string(),
-        };
+        let explicit_broadcast = has_collective_trigger(text) || is_greeting_collective(text);
+        if explicit_broadcast || domain_voice(text, config).is_none() {
+            return Election::All {
+                reply_chat,
+                body: text.to_string(),
+            };
+        }
     }
 
     // Membership-aware silence boundary. Rule f's silence protects human-to-
@@ -1534,7 +1557,18 @@ pub fn elect_responders(
     // The moment a second human joins (`human_count >= 2`) the conservative
     // silence below returns and family small-talk is protected again.
     if human_count <= 1 {
-        if is_greeting_shaped(text) {
+        // DOMAIN CLASSIFICATION OUTRANKS A LEADING GREETING (morning-taco-bugs).
+        // A message that opens with a greeting word but carries SUBSTANTIVE
+        // content — Luca's 7:20 "hey I changed my mind on friday I want tacos" —
+        // is NOT a warm whole-roster hello; it is an ask, and the ask's domain
+        // owner answers it. The leading "hey" fanned that message out into four
+        // greeting replies because the greeting rule fired before the domain
+        // check. So the domain voice is resolved FIRST: only when the content is
+        // NOT classifiable into a non-concierge domain (a bare "hey", "goodnight",
+        // "hey guys are you around?") does the greeting shape earn a collective
+        // whole-roster greeting.
+        let domain = domain_voice(text, config);
+        if domain.is_none() && is_greeting_shaped(text) {
             return Election::All {
                 reply_chat,
                 body: text.to_string(),
@@ -1543,7 +1577,7 @@ pub fn elect_responders(
         // Round-2 refinement (same as the team-ask branch): a content-classifiable
         // ask goes to its DOMAIN owner's voice; anything ambiguous stays with the
         // concierge (Otto).
-        if let Some((bot, domain)) = domain_voice(text, config) {
+        if let Some((bot, domain)) = domain {
             return Election::One {
                 bot,
                 reply_chat,
@@ -2426,6 +2460,63 @@ mod tests {
         // Calendar/logistics and genuinely ambiguous asks stay with the concierge.
         expect_one("when is the dentist?", "otto", AddressedBy::Concierge);
         expect_one("can you help me?", "otto", AddressedBy::Concierge);
+    }
+
+    /// PRECEDENCE (morning-taco-bugs): a message that OPENS with a greeting word
+    /// ("hey"/"hi"/"ciao") but carries SUBSTANTIVE domain content is an ask for
+    /// that domain's OWNER — never a four-way collective greeting. Luca's 7:20
+    /// "hey I changed my mind on friday I want tacos" produced FOUR full replies
+    /// because the leading "hey" tripped the greeting-collective rule before the
+    /// content was classified. Domain classification must OUTRANK the greeting.
+    /// Meanwhile BARE greetings (no domain ask) stay collective. Single-human Casa
+    /// group (human_count = 1), unaddressed, no `?` on the taco line.
+    #[test]
+    fn elect_leading_greeting_with_domain_content_routes_to_owner_not_collective() {
+        use crate::notify::ownership::Domain;
+
+        // THE SCREENSHOT FIXTURE — his exact message → the chef (Bruno), by domain.
+        assert_one(
+            &elect_solo("hey I changed my mind on friday I want tacos", &[], None),
+            "bruno",
+            AddressedBy::Domain(Domain::Cooking),
+        );
+
+        // Siblings: a leading greeting + domain content still routes to the owner,
+        // including the `?`-shaped variant that would otherwise read as a
+        // greeting-summon collective.
+        assert_one(
+            &elect_solo("hi can we do pizza friday", &[], None),
+            "bruno",
+            AddressedBy::Domain(Domain::Cooking),
+        );
+        assert_one(
+            &elect_solo("hey am I training tomorrow?", &[], None),
+            "mira",
+            AddressedBy::Domain(Domain::Workouts),
+        );
+        assert_one(
+            &elect_solo("ciao I want tacos tonight?", &[], None),
+            "bruno",
+            AddressedBy::Domain(Domain::Cooking),
+        );
+
+        // BARE greetings — no domain ask — stay a warm whole-roster greeting, in
+        // BOTH the single-human group and (for the explicit-broadcast forms) the
+        // two-human group.
+        for t in ["hey", "hey guys are you around?", "morning everybody", "hello all"] {
+            assert!(
+                matches!(elect_solo(t, &[], None), Election::All { .. }),
+                "bare greeting {t:?} must stay collective, got {:?}",
+                elect_solo(t, &[], None)
+            );
+        }
+        for t in ["hey guys are you around?", "morning everybody", "hello all"] {
+            assert!(
+                matches!(elect(t, &[], None), Election::All { .. }),
+                "explicit broadcast {t:?} must stay collective (2 humans), got {:?}",
+                elect(t, &[], None)
+            );
+        }
     }
 
     /// Explicit addressing is SUPREME: naming Otto on a food ask keeps Otto, even
