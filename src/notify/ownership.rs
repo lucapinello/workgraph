@@ -618,6 +618,28 @@ mod tests {
     }
 
     #[test]
+    fn cooking_owner_bruno_never_defers_on_his_own_ask() {
+        // DEFER DISCIPLINE (morning-taco-bugs): the taco ask is the kitchen's, so
+        // Bruno OWNS it and must never be told to defer to himself — regardless of
+        // casing / trailing space in how the composer stamped the persona.
+        let m = OwnerMap::casa_default();
+        let ask = "hey I changed my mind on friday I want tacos";
+        assert_eq!(m.owner_for_ask(ask), Some("bruno"));
+        for persona in ["bruno", "Bruno", "  BRUNO  "] {
+            assert_eq!(
+                m.decide_owner(persona, ask),
+                OwnerDecision::Owner,
+                "owner {persona:?} must not defer to itself"
+            );
+        }
+        // A genuinely off-domain voice (Coach Mira) still defers to Bruno.
+        assert_eq!(
+            m.decide_owner("mira", ask),
+            OwnerDecision::Defer { owner: "bruno".into() }
+        );
+    }
+
+    #[test]
     fn off_domain_persona_defers_to_owner() {
         // Otto trying to own a workout re-routes to Mira.
         let m = OwnerMap::casa_default();

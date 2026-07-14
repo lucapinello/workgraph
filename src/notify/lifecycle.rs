@@ -178,6 +178,47 @@ pub fn derive_task_id(title: &str, exists: impl Fn(&str) -> bool) -> String {
 // Rendering the family-voice lines
 // ---------------------------------------------------------------------------
 
+/// The family-voice gate for a lifecycle NAME: is `name` a plausible persona /
+/// human display name, safe to speak in the family group?
+///
+/// Lifecycle lines address the family in plain voice — "Bruno's on it 🍳" — and
+/// must NEVER leak a raw worker id, task id, or content hash. The 7:20 taco run
+/// composed "Agent-2972 is on it 🍳" because the worker's agency id
+/// (`agent-2972`) slipped through as a "name". This gate is the hard backstop:
+/// the composer only ever renders a name that passes it, falling back to the
+/// owning persona (or a name-free "On it") otherwise. Rejects, in order:
+/// * an `agent-…` worker id (the exact leak);
+/// * anything containing a digit — machine ids, `task-3`, hashes, `w29`;
+/// * a long hex run (a content hash even with no digits, e.g. `deadbeefcafe`);
+/// * an underscore (an id separator, never name punctuation);
+/// * a multi-segment kebab slug (`morning-taco-bugs` — a task id, not a name);
+/// * anything with no letter, empty, or absurdly long.
+pub fn is_family_safe_name(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() || n.len() > 24 {
+        return false;
+    }
+    let low = n.to_ascii_lowercase();
+    // The exact leak: an `agent-<n>` worker id.
+    if low.starts_with("agent-") {
+        return false;
+    }
+    // Any digit marks a machine id / task-N / week code / hash — never a name.
+    if n.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // A long all-hex token is a content hash even without digits.
+    if n.len() >= 12 && n.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    // Underscores are id separators; a multi-hyphen kebab string is a task slug.
+    if n.contains('_') || n.matches('-').count() >= 2 {
+        return false;
+    }
+    // Must actually contain a letter to be a spoken name.
+    n.chars().any(|c| c.is_ascii_alphabetic())
+}
+
 /// Title-case a single lowercase roster token for display ("otto" → "Otto").
 fn pretty(name: &str) -> String {
     let mut chars = name.trim().chars();
@@ -224,16 +265,26 @@ pub fn render_line(
 ) -> String {
     match event {
         LifecycleEvent::Started => {
-            let names = join_names(workers);
-            if names.is_empty() {
-                let who = pretty(&origin.persona);
-                if who.is_empty() {
-                    "On it 🍳".to_string()
+            // FAMILY-VOICE GATE (morning-taco-bugs): speak only names that pass
+            // [`is_family_safe_name`]. A raw worker id ("agent-2972") is dropped
+            // here so it can never reach the family as "Agent-2972 is on it 🍳";
+            // the line falls back to the OWNING PERSONA's name, or a name-free
+            // "On it 🍳" when even that is not a speakable name.
+            let safe: Vec<String> = workers
+                .iter()
+                .filter(|w| is_family_safe_name(w))
+                .cloned()
+                .collect();
+            if safe.is_empty() {
+                let persona = origin.persona.trim();
+                if is_family_safe_name(persona) {
+                    format!("{}'s on it 🍳", pretty(persona))
                 } else {
-                    format!("{who}'s on it 🍳")
+                    "On it 🍳".to_string()
                 }
             } else {
-                let is_are = if workers.len() > 1 { "are" } else { "is" };
+                let names = join_names(&safe);
+                let is_are = if safe.len() > 1 { "are" } else { "is" };
                 format!("{names} {is_are} on it 🍳")
             }
         }
@@ -836,6 +887,96 @@ mod tests {
             render_line(&o, LifecycleEvent::Started, &[], None),
             "Otto's on it 🍳"
         );
+    }
+
+    /// THE 7:20 TACO LEAK (morning-taco-bugs). The started-notification composed
+    /// "Agent-2972 is on it 🍳" (telegram.log 11:21:48) — a raw worker id spoken
+    /// to the family. A worker id must NEVER be a lifecycle name: it is dropped
+    /// and the line falls back to the OWNING PERSONA (the origin persona = Bruno
+    /// here), producing "Bruno's on it 🍳".
+    #[test]
+    fn lifecycle_started_never_leaks_a_raw_worker_id() {
+        let o = TaskOrigin::new(
+            OriginChannel::TelegramGroup,
+            "-100999",
+            "Luca",
+            "bruno",
+            Some("bruno".to_string()),
+        );
+        assert_eq!(
+            render_line(&o, LifecycleEvent::Started, &["agent-2972".into()], None),
+            "Bruno's on it 🍳"
+        );
+        // A safe co-worker still speaks; the junk id is filtered out of the join.
+        assert_eq!(
+            render_line(
+                &o,
+                LifecycleEvent::Started,
+                &["nora".into(), "agent-2972".into()],
+                None
+            ),
+            "Nora is on it 🍳"
+        );
+    }
+
+    /// The HARD family-voice gate: across every lifecycle event and a battery of
+    /// adversarial worker/origin values (worker ids, task ids, content hashes,
+    /// week codes), NO composed line may contain "agent-", a task-id slug, a hash,
+    /// or any bare digit. This is the regression guard the composer must satisfy
+    /// forever — the family only ever hears a persona's name, never machine jargon.
+    #[test]
+    fn lifecycle_lines_never_contain_agent_ids_task_ids_or_hashes() {
+        let junk = [
+            "agent-2972",
+            "Agent-2972",
+            "task-3",
+            "morning-taco-bugs",
+            "c10fe2fbdeadbeef",
+            "deadbeefcafe",
+            "w29",
+            "agent_2972",
+        ];
+        let forbidden = |line: &str| {
+            let low = line.to_ascii_lowercase();
+            assert!(!low.contains("agent-"), "leaked agent id in {line:?}");
+            assert!(!low.contains("agent_"), "leaked agent id in {line:?}");
+            assert!(!low.contains("task-"), "leaked task id in {line:?}");
+            assert!(
+                !low.contains("morning-taco-bugs"),
+                "leaked task slug in {line:?}"
+            );
+            assert!(!low.contains("deadbeef"), "leaked hash in {line:?}");
+            assert!(
+                !line.chars().any(|c| c.is_ascii_digit()),
+                "leaked a raw digit (machine id/hash/week code) in {line:?}"
+            );
+        };
+        for bad in junk {
+            for (persona, workers) in [
+                (bad, vec![]),
+                (bad, vec![bad.to_string()]),
+                ("bruno", vec![bad.to_string()]),
+            ] {
+                let o = TaskOrigin::new(
+                    OriginChannel::TelegramGroup,
+                    "-100999",
+                    "Luca",
+                    persona,
+                    None,
+                );
+                // A clean, family-voice summary — the Done "what changed" text is
+                // gated elsewhere; here we prove the NAME channel (workers +
+                // origin persona) never leaks machine jargon on any event.
+                let clean_summary = "the week's updated";
+                for event in [
+                    LifecycleEvent::Started,
+                    LifecycleEvent::Done,
+                    LifecycleEvent::Failed,
+                ] {
+                    forbidden(&render_line(&o, event, &workers, Some(clean_summary)));
+                }
+            }
+        }
     }
 
     #[test]

@@ -4120,15 +4120,15 @@ pub fn run_lifecycle(
 /// assignee display name when it reads like a plain roster name (not an agent
 /// content-hash), else the origin persona so the line still names a voice.
 fn lifecycle_workers(task: &worksgood::graph::Task) -> Vec<String> {
-    let looks_like_name = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 24
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            && s.chars().any(|c| c.is_ascii_alphabetic())
-            // an agency content-hash is long lowercase hex; a roster name is short
-            && !(s.len() >= 16 && s.chars().all(|c| c.is_ascii_hexdigit()))
-    };
-    if let Some(a) = task.assigned.as_deref().filter(|a| looks_like_name(a)) {
+    // The SAME family-voice gate the composer enforces (morning-taco-bugs): a
+    // raw worker id ("agent-2972"), task id, or content hash is not a speakable
+    // name, so the "on it" line falls back to the owning persona instead of
+    // leaking "Agent-2972 is on it 🍳" into the family group.
+    if let Some(a) = task
+        .assigned
+        .as_deref()
+        .filter(|a| worksgood::notify::lifecycle::is_family_safe_name(a))
+    {
         return vec![a.to_string()];
     }
     Vec::new()
