@@ -476,7 +476,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // Something transitioned: deliver every pending report-back (same code
             // path as `wg telegram lifecycle`, real send). Exactly-once + pacing
             // are enforced inside via the persisted FiredLog.
-            if let Err(e) = run_lifecycle(&lifecycle_dir, None, false, None, false) {
+            if let Err(e) = run_lifecycle(&lifecycle_dir, None, false, None, false, false) {
                 eprintln!(
                     "[{}] lifecycle report-back tick failed: {}",
                     chrono::Utc::now().format("%H:%M:%S"),
@@ -4035,6 +4035,109 @@ pub fn run_owner(
     Ok(())
 }
 
+/// A network-free [`ReplySink`](worksgood::notify::telegram_conversation::ReplySink)
+/// that records each send instead of hitting Telegram — the credential-free seam
+/// behind `wg telegram lifecycle --mock-send`. It lets the cross-surface smoke
+/// drive the REAL lifecycle tick and the REAL casa-feed mirror end-to-end (only
+/// the transport is stubbed): every send is recorded and returns a synthetic
+/// message id, so `deliver_lifecycle_fire` treats it as a confirmed delivery and
+/// mirrors a group report-back into the pane feed exactly as a live send would.
+#[derive(Default)]
+struct RecordingSink {
+    sends: std::sync::Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait]
+impl worksgood::notify::telegram_conversation::ReplySink for RecordingSink {
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
+        let mut sends = self.sends.lock().unwrap();
+        let n = sends.len() + 1;
+        sends.push((bot_id.to_string(), chat_id.to_string(), text.to_string()));
+        Ok(Some(format!("mock-{n}")))
+    }
+}
+
+/// Deliver ONE lifecycle report-back through the same one-path writer the
+/// conversation replies use — the fix for docs/20 ("every origin writes to the
+/// ledger; Telegram is a mirror") and the "sends must verify delivery" rule.
+///
+/// 1. **Send + verify** — `sink.send` resolves the origin persona's bot, calls
+///    the Telegram API, and returns `Ok(message_id)` ONLY when the API confirmed
+///    `ok:true` (see [`TelegramChannel::api_call`]); any other outcome is `Err`.
+///    On a transport/API failure it retries **once** before giving up.
+/// 2. **Ledger mirror** — on a confirmed send of a GROUP report-back, it appends
+///    an `agent` line to the canonical `.casa/group-feed.jsonl` the constellation
+///    pane reads, via the SAME [`casa_feed`] writer the conversation replies use.
+///    Gated to group origins (the pane is "our end of the family group chat"); a
+///    1:1 DM report-back never leaks into the shared pane. A feed-write failure is
+///    logged and swallowed so a full disk can't lose the Telegram delivery.
+///
+/// Exactly-once is the caller's FiredLog (`notification_id` = the source id,
+/// recorded before the send): a delivered `(task, event)` is never re-sent, so
+/// the line lands in the pane and in Telegram exactly once. Returns `Ok(())` when
+/// delivered, `Err` when BOTH attempts failed — the caller re-arms the FiredLog so
+/// a later tick retries rather than the human silently never hearing back.
+async fn deliver_lifecycle_fire(
+    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
+    config: &TelegramConfig,
+    feed_path: &Path,
+    fire: &worksgood::notify::lifecycle::LifecycleFire,
+) -> Result<()> {
+    use worksgood::graph::OriginChannel;
+    use worksgood::notify::telegram_conversation as convo;
+
+    // Send AS the origin persona's bot (bot_id when known, else the persona id):
+    // the reply leaves via the same voice the human addressed, never a wrong face.
+    let bot_id = fire
+        .origin
+        .bot_id
+        .clone()
+        .unwrap_or_else(|| fire.origin.persona.clone());
+
+    // DELIVERY VERIFICATION with a single retry. `send` bails on a non-`ok`
+    // Telegram response, so `Ok` here means the API accepted the message.
+    let mut result = sink.send(&bot_id, &fire.origin.chat_id, &fire.text).await;
+    if let Err(first) = &result {
+        eprintln!(
+            "[{}] lifecycle {} for {} send failed (attempt 1/2), retrying: {}",
+            chrono::Utc::now().format("%H:%M:%S"),
+            fire.event.slug(),
+            fire.task_id,
+            worksgood::notify::telegram::redact_bot_token(&format!("{first:#}")),
+        );
+        result = sink.send(&bot_id, &fire.origin.chat_id, &fire.text).await;
+    }
+    let message_id = result?.unwrap_or_default();
+
+    println!(
+        "[{}] lifecycle {} for {} → chat {} via {} (message_id {}): {}",
+        chrono::Utc::now().format("%H:%M:%S"),
+        fire.event.slug(),
+        fire.task_id,
+        fire.origin.chat_id,
+        bot_id,
+        message_id,
+        fire.text,
+    );
+
+    // LEDGER MIRROR — a group report-back is part of the family group
+    // conversation, so it lands in the canonical feed the pane reads, via the
+    // exact same `casa_feed` writer the conversation replies use.
+    if matches!(fire.origin.channel, OriginChannel::TelegramGroup) {
+        let agent_id = convo::agent_for_bot(config, &bot_id);
+        let entry = casa_feed::agent_entry(&agent_id, &fire.text, casa_feed::now_ms());
+        if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
+            eprintln!(
+                "[{}] casa feed: failed to mirror lifecycle {} for {}: {e}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                fire.event.slug(),
+                fire.task_id,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Report conversational tasks' progress back to the chats they came from — the
 /// `wg telegram lifecycle` seam (see [`crate::cli::TelegramCommands::Lifecycle`]).
 ///
@@ -4051,10 +4154,12 @@ pub fn run_lifecycle(
     dry_run: bool,
     now_override: Option<&str>,
     json: bool,
+    mock_send: bool,
 ) -> Result<()> {
     use worksgood::notify::daily_digest::{DigestPolicy, DigestStore};
     use worksgood::notify::lifecycle::{self, LifecycleInput};
     use worksgood::notify::reminder::FiredLog;
+    use worksgood::notify::telegram_conversation::{BotReplySink, ReplySink};
 
     let root = project_root(workgraph_dir);
     let now = match now_override {
@@ -4138,47 +4243,39 @@ pub fn run_lifecycle(
         .with_context(|| format!("failed to persist pacing state to {}", store_path.display()))?;
 
     let config = load_telegram_config().unwrap_or_default();
+    let feed_path = casa_feed::feed_path_for(&root);
+    // The ONE-PATH writer: lifecycle report-backs leave through the same
+    // `ReplySink` the conversation replies use, so a group report-back both
+    // reaches Telegram AND lands in the canonical `.casa/group-feed.jsonl` the
+    // constellation pane reads — no more sends that bypass the ledger (docs/20).
+    // `--mock-send` swaps in a network-free recorder so the cross-surface smoke
+    // exercises the real tick + real feed mirror without a live bot.
+    let sink: Box<dyn ReplySink> = if mock_send {
+        Box::new(RecordingSink::default())
+    } else {
+        Box::new(BotReplySink::new(config.clone()))
+    };
     let mut sent = 0usize;
+    let mut undelivered = 0usize;
     if !result.fired.is_empty() {
         let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
         rt.block_on(async {
             for f in &result.fired {
-                // Reply in the ORIGIN chat, as the ORIGIN persona's bot. A
-                // misconfigured persona hard-fails resolution rather than
-                // delivering under the wrong face (same rule as `send --persona`).
-                let persona = f.origin.bot_id.as_deref().unwrap_or(&f.origin.persona);
-                match resolve_send_bot(&config, Some(&f.origin.chat_id), Some(persona)) {
-                    Ok((bot_id, bot, chat)) => {
-                        let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
-                        match channel.send_text(&chat, &f.text).await {
-                            Ok(_) => {
-                                sent += 1;
-                                println!(
-                                    "[{}] lifecycle {} for {} → chat {} via {}: {}",
-                                    chrono::Utc::now().format("%H:%M:%S"),
-                                    f.event.slug(),
-                                    f.task_id,
-                                    chat,
-                                    bot_id,
-                                    f.text,
-                                );
-                            }
-                            Err(e) => eprintln!(
-                                "[{}] failed to deliver lifecycle {} for {}: {}",
-                                chrono::Utc::now().format("%H:%M:%S"),
-                                f.event.slug(),
-                                f.task_id,
-                                worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
-                            ),
-                        }
+                match deliver_lifecycle_fire(sink.as_ref(), &config, &feed_path, f).await {
+                    Ok(()) => sent += 1,
+                    Err(e) => {
+                        // Both attempts failed — surface it LOUDLY (matching the
+                        // web-inbound "make failure visible" rule) so a dropped
+                        // report-back can never masquerade as delivered in the log.
+                        undelivered += 1;
+                        eprintln!(
+                            "[{}] UNDELIVERED lifecycle {} for {} after 2 attempts: {}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            f.event.slug(),
+                            f.task_id,
+                            worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                        );
                     }
-                    Err(e) => eprintln!(
-                        "[{}] no bot for lifecycle persona '{}' on task {} — skipping: {}",
-                        chrono::Utc::now().format("%H:%M:%S"),
-                        persona,
-                        f.task_id,
-                        e,
-                    ),
                 }
             }
         });
@@ -4190,6 +4287,7 @@ pub fn run_lifecycle(
             serde_json::json!({
                 "fired": result.fired.len(),
                 "sent": sent,
+                "undelivered": undelivered,
                 "capped": result.capped.len(),
             })
         );
@@ -6360,6 +6458,176 @@ mod tests {
             InboundOutcome::Unmatched,
             "a hardened-auth REJECTION of a confirmed human's chat turn must fall through to \
              conversation, never be silently swallowed (pr51-auth regression)"
+        );
+    }
+
+    // --- lifecycle cross-surface delivery (lifecycle-messages-obey) --------
+    //
+    // The one-path writer: a lifecycle report-back must reach BOTH surfaces the
+    // family sees — Telegram AND the constellation pane's `.casa/group-feed.jsonl`
+    // ledger — for a GROUP origin, and must VERIFY delivery (retry once, then
+    // surface an error so the caller re-arms). Luca's screenshots showed the pane
+    // missing 'is on it'/'Done!' because the send bypassed the ledger; these pin
+    // that it no longer can.
+
+    use worksgood::graph::{OriginChannel, TaskOrigin};
+    use worksgood::notify::lifecycle::{LifecycleEvent, LifecycleFire};
+    use worksgood::notify::telegram_conversation::ReplySink;
+
+    fn lc_fire(channel: OriginChannel, event: LifecycleEvent, text: &str) -> LifecycleFire {
+        LifecycleFire {
+            task_id: "tweak-the-week".to_string(),
+            event,
+            origin: TaskOrigin::new(channel, "-100999", "Luca", "nora", Some("nora".to_string())),
+            text: text.to_string(),
+        }
+    }
+
+    /// A [`ReplySink`] that fails its first `fail_first` attempts, then succeeds —
+    /// records every attempt so a test can count sends and prove the retry.
+    struct FlakySink {
+        fail_first: std::sync::Mutex<u32>,
+        attempts: std::sync::Mutex<Vec<String>>,
+    }
+    impl FlakySink {
+        fn new(fail_first: u32) -> Self {
+            Self {
+                fail_first: std::sync::Mutex::new(fail_first),
+                attempts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl ReplySink for FlakySink {
+        async fn send(&self, _bot: &str, _chat: &str, text: &str) -> Result<Option<String>> {
+            self.attempts.lock().unwrap().push(text.to_string());
+            let mut left = self.fail_first.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                anyhow::bail!("induced send failure");
+            }
+            Ok(Some("mid-1".to_string()))
+        }
+    }
+
+    fn feed_lines(feed: &Path) -> Vec<String> {
+        std::fs::read_to_string(feed)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn lifecycle_group_report_back_lands_in_feed_and_telegram_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let config = TelegramConfig::default();
+        let sink = RecordingSink::default();
+        let fire = lc_fire(
+            OriginChannel::TelegramGroup,
+            LifecycleEvent::Started,
+            "Nora is on it 🍳",
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
+            .unwrap();
+
+        // Telegram: exactly one send.
+        assert_eq!(sink.sends.lock().unwrap().len(), 1, "exactly one telegram send");
+        // Pane feed: exactly one `agent` line carrying the report-back.
+        let lines = feed_lines(&feed);
+        assert_eq!(lines.len(), 1, "exactly one feed line, got {lines:?}");
+        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(v["kind"], "agent", "{v}");
+        assert_eq!(v["agentId"], "nora", "{v}");
+        assert!(
+            v["text"].as_str().unwrap().contains("is on it"),
+            "the ledger carries the 'is on it' report-back: {v}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_direct_report_back_never_leaks_into_the_shared_feed() {
+        // A 1:1 DM report-back is private — it reaches Telegram but must NEVER be
+        // written into the shared group-feed the pane renders (docs/15 privacy).
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let config = TelegramConfig::default();
+        let sink = RecordingSink::default();
+        let fire = lc_fire(
+            OriginChannel::TelegramDirect,
+            LifecycleEvent::Done,
+            "Done! that's sorted ✅",
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
+            .unwrap();
+
+        assert_eq!(sink.sends.lock().unwrap().len(), 1, "the 1:1 DM is still sent");
+        assert!(
+            !feed.exists() || feed_lines(&feed).is_empty(),
+            "a 1:1 DM report-back must not touch the shared group feed"
+        );
+    }
+
+    #[test]
+    fn lifecycle_send_retries_once_then_succeeds_and_still_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let config = TelegramConfig::default();
+        let sink = FlakySink::new(1); // first attempt fails, retry succeeds
+        let fire = lc_fire(
+            OriginChannel::TelegramGroup,
+            LifecycleEvent::Started,
+            "Nora is on it 🍳",
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
+            .unwrap();
+
+        assert_eq!(
+            sink.attempts.lock().unwrap().len(),
+            2,
+            "a transient failure is retried exactly once"
+        );
+        assert_eq!(
+            feed_lines(&feed).len(),
+            1,
+            "a retried-then-delivered report-back still mirrors to the ledger exactly once"
+        );
+    }
+
+    #[test]
+    fn lifecycle_send_that_fails_twice_errors_and_does_not_mirror() {
+        // Both attempts fail → Err (so run_lifecycle re-arms the FiredLog) and the
+        // undelivered line must NOT appear in the pane (no phantom "Done!").
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let config = TelegramConfig::default();
+        let sink = FlakySink::new(2);
+        let fire = lc_fire(
+            OriginChannel::TelegramGroup,
+            LifecycleEvent::Started,
+            "Nora is on it 🍳",
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire));
+
+        assert!(res.is_err(), "two failures surface an error for the caller to re-arm");
+        assert_eq!(
+            sink.attempts.lock().unwrap().len(),
+            2,
+            "exactly two attempts: the send plus one retry"
+        );
+        assert!(
+            !feed.exists() || feed_lines(&feed).is_empty(),
+            "an undelivered report-back must not appear in the pane"
         );
     }
 }

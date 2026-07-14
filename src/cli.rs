@@ -6724,6 +6724,14 @@ pub enum TelegramCommands {
         /// deterministic tests; defaults to the system clock.
         #[arg(long)]
         now: Option<String>,
+
+        /// Credential-free cross-surface seam: run the REAL tick and the REAL
+        /// casa-feed mirror, but record each Telegram send instead of hitting the
+        /// network (every send is treated as confirmed). Lets a smoke test prove a
+        /// group report-back lands in the pane feed AND is "sent" exactly once,
+        /// without a live bot. Still records/persists the FiredLog + pacing state.
+        #[arg(long = "mock-send", hide = true)]
+        mock_send: bool,
     },
 
     /// Audit whether a composed reply's PROMISE would leave an artifact
