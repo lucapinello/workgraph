@@ -1235,6 +1235,37 @@ fn try_create_origin_task(
     origin: &crate::graph::TaskOrigin,
 ) -> Option<String> {
     let root = project_root_of(workgraph_dir);
+
+    // AUTHORITATIVE OFF-DOMAIN GUARD — the round-2 fix. EVERY conversationally
+    // created task funnels through this choke point: a collective round, a
+    // single-voice/concierge turn (Otto answering 1:1-style in the group), a
+    // parity retry, a fallback — and a restart-replayed sibling of any of them.
+    // finalize_composed_reply already routes the COLLECTIVE case, but its guard
+    // keys on the election shape; a single-voice turn that reaches creation with
+    // the answering voice as `origin.persona` would otherwise land a meals task on
+    // Otto (Luca, 2026-07-14: "why is otto dealing with dishes"). So ownership is
+    // decided HERE, next to the intent dedupe, independent of who called: whatever
+    // persona the caller stamped, re-route ownership to the ask's DOMAIN OWNER
+    // from household.toml (Casa default as fallback). A voice that already owns the
+    // domain, or an ask whose owner cannot be resolved, is left untouched
+    // (fail-open — a real ask is never dropped; the intent ledger still dedupes).
+    let owned_origin = match ownership::OwnerMap::load(&root)
+        .decide_owner(&origin.persona, human_message)
+    {
+        ownership::OwnerDecision::Owner => None,
+        ownership::OwnerDecision::Defer { owner } => {
+            eprintln!(
+                "[{}] creation choke-point off-domain guard: {} does not own a {} task — re-stamping ownership to {}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                if origin.persona.is_empty() { "an unnamed voice" } else { origin.persona.as_str() },
+                ownership::classify_domain(human_message).slug(),
+                owner,
+            );
+            Some(origin_as_persona(origin, &owner))
+        }
+    };
+    let origin = owned_origin.as_ref().unwrap_or(origin);
+
     let fp = ownership::fingerprint(human_message, &origin.chat_id);
     let now = chrono::Utc::now().timestamp();
     let window = ownership::IntentLedger::window_secs();
@@ -2169,6 +2200,143 @@ mod tests {
             mira_last.contains("Nora"),
             "an off-domain voice should defer to the owner by name, got: {mira_last:?}"
         );
+    }
+
+    /// THE ROUND-2 CHOKE-POINT INVARIANT (fails before the fix). Every
+    /// conversationally created task funnels through [`try_create_origin_task`];
+    /// this proves that layer is AUTHORITATIVE for ownership regardless of which
+    /// persona the caller stamped or which election shape produced the turn. Otto
+    /// (off-domain for meals) tries to create a carbonara task directly — the exact
+    /// single-voice/concierge shape Luca hit ("why is otto dealing with dishes").
+    /// Before the fix the choke point trusted the caller's persona and Otto owned
+    /// the dish; after it, the task lands owned by Nora.
+    #[test]
+    fn choke_point_restamps_off_domain_meal_task_to_owner_nora() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let origin = crate::graph::TaskOrigin::new(
+            crate::graph::OriginChannel::TelegramGroup,
+            "-100555",
+            "Luca",
+            "otto",
+            Some("otto".to_string()),
+        );
+        let id = try_create_origin_task(
+            &wg,
+            "update Friday dinner to carbonara instead",
+            "update Friday dinner to carbonara",
+            &origin,
+        );
+        assert!(id.is_some(), "the ask must not be dropped");
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
+        assert_eq!(stamped.len(), 1, "one ask, one task");
+        assert_eq!(
+            stamped[0].origin.as_ref().unwrap().persona,
+            "nora",
+            "the creation choke point re-stamps an off-domain meal task to its owner (Nora)"
+        );
+    }
+
+    /// The choke point leaves an ON-domain creation untouched: Otto creating a
+    /// coordination task (his domain) stays owned by Otto — the guard re-routes
+    /// only OFF-domain asks, never hijacks a legitimate one.
+    #[test]
+    fn choke_point_leaves_on_domain_owner_untouched() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let origin = crate::graph::TaskOrigin::new(
+            crate::graph::OriginChannel::TelegramGroup,
+            "-100556",
+            "Luca",
+            "otto",
+            Some("otto".to_string()),
+        );
+        let id = try_create_origin_task(
+            &wg,
+            "who is picking up the kids on Friday?",
+            "arrange Friday kid pickup",
+            &origin,
+        );
+        assert!(id.is_some());
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
+        assert_eq!(stamped.len(), 1);
+        assert_eq!(
+            stamped[0].origin.as_ref().unwrap().persona,
+            "otto",
+            "an on-domain (coordination) task stays with its owner"
+        );
+    }
+
+    /// THE ROUND-2 REGRESSION FIXTURE (Luca, 2026-07-14): Otto answers a meal ask
+    /// 1:1-style in the group — a single [`Election::One`] turn, NOT a collective
+    /// round — and the composer emits a `TASK_CREATE` tail. The created task must
+    /// be owned by Nora (the meal owner), not the answering voice (Otto). This
+    /// drives the full single-voice production path (plan → compose → finalize →
+    /// choke point), the human-flow analog of the constellation bug.
+    #[tokio::test]
+    async fn single_voice_otto_meal_ask_owner_is_nora() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = setup_collective(&wg);
+        let chat = "-100777";
+        let ask = "update Friday dinner to carbonara instead";
+        let sink = RecSink::default();
+        run_voice(
+            &wg, &cfg, "otto", chat, ask,
+            "On it!\nTASK_CREATE: update Friday dinner to carbonara",
+            &sink,
+        )
+        .await;
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
+        assert_eq!(stamped.len(), 1, "one ask, one task");
+        assert_eq!(
+            stamped[0].origin.as_ref().unwrap().persona,
+            "nora",
+            "single-voice meal ask must be owned by Nora, not Otto"
+        );
+    }
+
+    /// The single-voice OWNER matrix: one concierge (Otto) turn per domain, each
+    /// creating a task, asserting ownership lands on the DOMAIN owner — meals →
+    /// Nora, recipes → Bruno, workouts → Mira, calendar/shopping/coordination →
+    /// Otto. This is the single-voice sibling of the collective stampede matrix:
+    /// the guard is election-shape agnostic.
+    #[tokio::test]
+    async fn single_voice_owner_matrix_routes_each_domain() {
+        // (ask, task title, expected owner). One Otto turn per row, separate chats
+        // so the intent ledger never cross-dedupes distinct asks.
+        let cases: &[(&str, &str, &str)] = &[
+            ("update Friday dinner to carbonara", "update Friday dinner", "nora"),
+            ("what's a good recipe for the tofu?", "share a tofu recipe", "bruno"),
+            ("can we move my gym session to Friday?", "reschedule gym to Friday", "mira"),
+            ("book a dentist appointment next week", "book the dentist", "otto"),
+            ("add oat milk to the shopping list", "add oat milk", "otto"),
+            ("who is picking up the kids?", "arrange kid pickup", "otto"),
+        ];
+        for (i, (ask, title, expected)) in cases.iter().enumerate() {
+            let dir = tempdir().unwrap();
+            let wg = dir.path().to_path_buf();
+            let cfg = setup_collective(&wg);
+            let chat = format!("-1006{i:02}");
+            let sink = RecSink::default();
+            run_voice(
+                &wg, &cfg, "otto", &chat, ask,
+                &format!("On it!\nTASK_CREATE: {title}"),
+                &sink,
+            )
+            .await;
+            let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+            let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
+            assert_eq!(stamped.len(), 1, "ask {ask:?}: exactly one task");
+            assert_eq!(
+                stamped[0].origin.as_ref().unwrap().persona,
+                *expected,
+                "single-voice ask {ask:?} must be owned by {expected}",
+            );
+        }
     }
 
     /// The off-domain re-route creates the task under the OWNER even when the
