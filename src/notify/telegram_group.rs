@@ -332,17 +332,24 @@ pub enum AddressedBy {
     ReplyChain,
     /// Nobody was named — routed to the concierge ([`CONCIERGE_BOT`]).
     Concierge,
+    /// Nobody was named, but the ask's CONTENT clearly falls in a household
+    /// [`Domain`] whose owner is not the concierge — so the DOMAIN OWNER answers
+    /// as the voice (meals → Nora/Bruno, workouts → Mira), the same classifier
+    /// that decides task ownership. Carries the domain so `wg telegram elect` can
+    /// show the reasoning. Calendar/shopping/coordination and genuinely ambiguous
+    /// asks stay [`Concierge`](AddressedBy::Concierge) (Otto).
+    Domain(crate::notify::ownership::Domain),
 }
 
 impl std::fmt::Display for AddressedBy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            AddressedBy::Mention => "@mention",
-            AddressedBy::Name => "name",
-            AddressedBy::ReplyChain => "reply-chain",
-            AddressedBy::Concierge => "concierge",
-        };
-        f.write_str(s)
+        match self {
+            AddressedBy::Mention => f.write_str("@mention"),
+            AddressedBy::Name => f.write_str("name"),
+            AddressedBy::ReplyChain => f.write_str("reply-chain"),
+            AddressedBy::Concierge => f.write_str("concierge"),
+            AddressedBy::Domain(d) => write!(f, "domain:{}", d.slug()),
+        }
     }
 }
 
@@ -812,12 +819,14 @@ pub fn election_decision_summary(
             bot, addressed_by, ..
         } => {
             let rule = match addressed_by {
-                AddressedBy::Mention => "mention",
-                AddressedBy::Name => "name",
-                AddressedBy::ReplyChain => "reply",
-                AddressedBy::Concierge => "otto-concierge",
-            }
-            .to_string();
+                AddressedBy::Mention => "mention".to_string(),
+                AddressedBy::Name => "name".to_string(),
+                AddressedBy::ReplyChain => "reply".to_string(),
+                AddressedBy::Concierge => "otto-concierge".to_string(),
+                // Show WHY a non-concierge voice was elected for an unaddressed
+                // ask: the domain the classifier read the content into.
+                AddressedBy::Domain(d) => format!("domain-{}", d.slug()),
+            };
             let target = bot
                 .agent_id
                 .clone()
@@ -1338,6 +1347,44 @@ pub fn is_team_directed_ask(text: &str) -> bool {
 /// concierge (otto) instead of falling silent. With 2+ humans the conservative
 /// silence returns unchanged (family chatter is protected the moment a second
 /// human joins).
+/// The family voice that should ANSWER an unaddressed but content-classifiable
+/// ask — the round-2 election refinement (Luca, 2026-07-14: "otto replied for
+/// food instead of the chef or dietician").
+///
+/// It reuses the SAME [`ownership::classify_domain`] + owner map that decides task
+/// ownership, so the VOICE that answers and the persona that eventually OWNS the
+/// resulting task agree: food → Bruno (cooking/recipes) or Nora (nutrition /
+/// what-should-we-eat), workouts → Mira. Returns `Some((bot, domain))` only when
+/// the resolved owner is a NON-concierge persona that the group actually has a bot
+/// for — so calendar / shopping / coordination (Otto's domains) and any genuinely
+/// ambiguous ask fall through to the concierge unchanged, and a voice the group
+/// never configured is never elected. Explicit addressing (mention / name / reply)
+/// is resolved BEFORE this in [`elect_responders`], so a named voice always wins.
+///
+/// The owner map is the shipped Casa roster ([`OwnerMap::casa_default`]); a
+/// household that reassigns domains still gets authoritative ownership at the
+/// creation choke point (which reads `household.toml`), and its election voice
+/// follows the default roster.
+///
+/// [`ownership::classify_domain`]: crate::notify::ownership::classify_domain
+/// [`OwnerMap::casa_default`]: crate::notify::ownership::OwnerMap::casa_default
+fn domain_voice(
+    text: &str,
+    config: &TelegramConfig,
+) -> Option<(ResolvedBot, crate::notify::ownership::Domain)> {
+    use crate::notify::ownership::{classify_domain, OwnerMap};
+    let domain = classify_domain(text);
+    let map = OwnerMap::casa_default();
+    let owner = map.owner_for_domain(domain)?;
+    // An Otto-owned domain (calendar / shopping / coordination) or ambiguous ask
+    // keeps the concierge rule — only a more-specific in-domain voice refines it.
+    if owner.eq_ignore_ascii_case(CONCIERGE_BOT) {
+        return None;
+    }
+    let bot = resolve_mentioned_bot(owner, config)?;
+    Some((bot, domain))
+}
+
 pub fn elect_responders(
     chat_type: Option<&str>,
     chat_id: Option<&str>,
@@ -1446,6 +1493,18 @@ pub fn elect_responders(
     // the concierge's (otto). So a team-directed ask is routed to otto here even
     // when it also happens to contain a collective trigger word.
     if is_team_directed_ask(text) {
+        // Round-2 refinement: when the ask's CONTENT belongs to a household domain
+        // whose owner is not the concierge (food → Bruno/Nora, workouts → Mira),
+        // that owner ANSWERS as the voice. Otherwise the unaddressed ask is the
+        // concierge's (Otto), exactly as before.
+        if let Some((bot, domain)) = domain_voice(text, config) {
+            return Election::One {
+                bot,
+                reply_chat,
+                body: text.to_string(),
+                addressed_by: AddressedBy::Domain(domain),
+            };
+        }
         return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
             Some(bot) => Election::One {
                 bot,
@@ -1479,6 +1538,17 @@ pub fn elect_responders(
             return Election::All {
                 reply_chat,
                 body: text.to_string(),
+            };
+        }
+        // Round-2 refinement (same as the team-ask branch): a content-classifiable
+        // ask goes to its DOMAIN owner's voice; anything ambiguous stays with the
+        // concierge (Otto).
+        if let Some((bot, domain)) = domain_voice(text, config) {
+            return Election::One {
+                bot,
+                reply_chat,
+                body: text.to_string(),
+                addressed_by: AddressedBy::Domain(domain),
             };
         }
         return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
@@ -2315,6 +2385,96 @@ mod tests {
         }
     }
 
+    /// SCOPE ADDITION (Luca, 2026-07-14: "otto replied for food instead of the
+    /// chef or dietician"). An UNADDRESSED ask whose content clearly falls in a
+    /// household domain is answered by that domain's OWNER voice — the same
+    /// classifier that decides task ownership — not always the concierge. Explicit
+    /// addressing (tested elsewhere) still wins; these rows are all name-free.
+    #[test]
+    fn elect_unaddressed_ask_routes_to_domain_owner_voice() {
+        let cfg = casa_config();
+        // (text, expected voice agent, expected addressed_by). human_count = 1
+        // (the Casa single-human group), so an unaddressed ask is answered.
+        let expect_one = |text: &str, agent: &str, by: AddressedBy| {
+            let e = elect_responders(
+                Some("supergroup"),
+                Some("-100999"),
+                text,
+                &[],
+                None,
+                false,
+                1,
+                &cfg,
+            );
+            match &e {
+                Election::One { bot, addressed_by, .. } => {
+                    assert_eq!(bot.agent_id.as_deref(), Some(agent), "voice for {text:?}");
+                    assert_eq!(*addressed_by, by, "addressed_by for {text:?}");
+                }
+                other => panic!("expected One({agent}) for {text:?}, got {other:?}"),
+            }
+        };
+        use crate::notify::ownership::Domain;
+        // Food → the chef (Bruno), not Otto.
+        expect_one("pizza on friday", "bruno", AddressedBy::Domain(Domain::Cooking));
+        // Workouts → Coach Mira.
+        expect_one(
+            "am I training tomorrow?",
+            "mira",
+            AddressedBy::Domain(Domain::Workouts),
+        );
+        // Calendar/logistics and genuinely ambiguous asks stay with the concierge.
+        expect_one("when is the dentist?", "otto", AddressedBy::Concierge);
+        expect_one("can you help me?", "otto", AddressedBy::Concierge);
+    }
+
+    /// Explicit addressing is SUPREME: naming Otto on a food ask keeps Otto, even
+    /// though the content would otherwise elect the chef. The domain-voice refine
+    /// only ever applies to UNADDRESSED asks.
+    #[test]
+    fn elect_explicit_name_beats_domain_voice() {
+        let e = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "otto, sort out pizza for friday",
+            &[],
+            None,
+            false,
+            1,
+            &casa_config(),
+        );
+        match &e {
+            Election::One { bot, addressed_by, .. } => {
+                assert_eq!(bot.agent_id.as_deref(), Some("otto"));
+                assert_eq!(*addressed_by, AddressedBy::Name);
+            }
+            other => panic!("expected One(otto) by name, got {other:?}"),
+        }
+    }
+
+    /// `wg telegram elect` surfaces the domain reasoning: a domain-elected voice
+    /// shows `rule=domain-<slug>` in the observability summary, so an operator can
+    /// see WHY the chef (not Otto) answered.
+    #[test]
+    fn election_summary_shows_domain_reasoning() {
+        let e = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "pizza on friday",
+            &[],
+            None,
+            false,
+            1,
+            &casa_config(),
+        );
+        let summary = election_decision_summary(Some("m1"), Some("supergroup"), &e);
+        assert!(
+            summary.contains("rule=domain-cooking"),
+            "summary should show the domain reasoning, got: {summary}"
+        );
+        assert!(summary.contains("target=bruno"), "got: {summary}");
+    }
+
     #[test]
     fn elect_full_precedence_ladder_on_live_username_less_config() {
         // Every precedence level, exercised against the live config shape (no
@@ -2363,10 +2523,20 @@ mod tests {
         );
         // 4. collective greeting → the whole roster.
         assert!(matches!(elect("hey everyone!", &[], None), Election::All { .. }));
-        // 5. unaddressed team ask → the concierge (otto).
+        // 5. unaddressed coordination ask → the concierge (otto). A food/workout
+        //    ask instead reaches its domain owner (rung 5' below).
         assert_eq!(
-            agent_of(&elect("can someone plan dinner?", &[], None)),
+            agent_of(&elect("can someone sort out the logistics?", &[], None)),
             (Some("otto".to_string()), Some(AddressedBy::Concierge))
+        );
+        // 5'. unaddressed DOMAIN ask → that domain's owner voice (round-2): a
+        //     food question reaches the meal owner (nora), not the concierge.
+        assert_eq!(
+            agent_of(&elect("what's for dinner tonight?", &[], None)),
+            (
+                Some("nora".to_string()),
+                Some(AddressedBy::Domain(crate::notify::ownership::Domain::MealPlanning))
+            )
         );
         // 6. pure small talk → silence.
         assert_eq!(
@@ -2631,8 +2801,11 @@ mod tests {
 
     #[test]
     fn elect_unaddressed_someone_ask_to_otto() {
+        // A coordination ask (no clear domain) → the concierge (Otto). A food or
+        // workout ask instead reaches its domain owner — see
+        // `elect_unaddressed_ask_routes_to_domain_owner_voice`.
         assert_one(
-            &elect("can someone plan Saturday dinner?", &[], None),
+            &elect("can someone sort out the logistics?", &[], None),
             "otto",
             AddressedBy::Concierge,
         );
@@ -2648,11 +2821,14 @@ mod tests {
     }
 
     #[test]
-    fn elect_domain_question_not_second_person_to_otto() {
+    fn elect_domain_question_not_second_person_to_domain_owner() {
+        // A meal question addressed to no one is a SINGLE-voice answer (not a
+        // roster broadcast) — and post round-2 that voice is the meal owner
+        // (Nora), not the concierge.
         assert_one(
             &elect("what's the plan for dinner tonight?", &[], None),
-            "otto",
-            AddressedBy::Concierge,
+            "nora",
+            AddressedBy::Domain(crate::notify::ownership::Domain::MealPlanning),
         );
     }
 
@@ -2728,7 +2904,9 @@ mod tests {
         let e = elect_responders(
             Some("supergroup"),
             Some("-100999"),
-            "can someone plan dinner?",
+            // A coordination ask (owner = Otto, absent here) → silence. A food ask
+            // would reach Nora, who is present, so it must NOT be used here.
+            "can someone sort out the logistics?",
             &[],
             None,
             false,
@@ -2813,14 +2991,15 @@ mod tests {
     // ---- Fix #4a: content questions do NOT elect collective --------------
 
     #[test]
-    fn elect_menu_question_routes_to_otto_not_silence() {
+    fn elect_menu_question_routes_to_dietician_not_silence() {
         // Luca's realistic question. It names no one and carries no greeting, so
-        // it must reach otto-as-concierge (rule e) — NOT be silenced and NOT fan
-        // out to the whole roster.
+        // it must be ANSWERED — NOT silenced and NOT fanned out to the whole
+        // roster. Post round-2 the meal owner (Nora) answers it, not Otto ("otto
+        // replied for food instead of the dietician").
         assert_one(
             &elect("what is on the menu tomorrow?", &[], None),
-            "otto",
-            AddressedBy::Concierge,
+            "nora",
+            AddressedBy::Domain(crate::notify::ownership::Domain::MealPlanning),
         );
     }
 
@@ -2839,12 +3018,13 @@ mod tests {
     #[test]
     fn elect_greeting_plus_question_prefers_ask_over_collective() {
         // A collective trigger ("everyone") AND a real ask ("what's for
-        // dinner?") → the ask wins: one grounded answer from otto, not a
-        // four-way roster broadcast of greetings.
+        // dinner?") → the ask wins: one grounded answer, not a four-way roster
+        // broadcast of greetings. Post round-2 the meal owner (Nora) is that
+        // single grounded voice.
         assert_one(
             &elect("hey everyone what's for dinner tonight?", &[], None),
-            "otto",
-            AddressedBy::Concierge,
+            "nora",
+            AddressedBy::Domain(crate::notify::ownership::Domain::MealPlanning),
         );
     }
 
@@ -2986,7 +3166,7 @@ mod tests {
         // team-directed asks still win exactly as before, even in a solo group.
         assert_one(&elect_solo("nora, hi", &[], None), "nora", AddressedBy::Name);
         assert_one(
-            &elect_solo("can someone plan dinner?", &[], None),
+            &elect_solo("can someone sort out the logistics?", &[], None),
             "otto",
             AddressedBy::Concierge,
         );
@@ -3168,8 +3348,8 @@ mod tests {
 
     #[test]
     fn decision_line_for_otto_concierge() {
-        // Unaddressed team ask with otto present → otto coordinates.
-        let line = decision("can someone plan dinner?", &[], None);
+        // Unaddressed coordination ask with otto present → otto coordinates.
+        let line = decision("can someone sort out the logistics?", &[], None);
         assert_eq!(line, "msg=42 chat=supergroup rule=otto-concierge target=otto");
     }
 
@@ -3211,7 +3391,9 @@ mod tests {
         let election = elect_responders(
             Some("supergroup"),
             Some("-100999"),
-            "can someone plan dinner?",
+            // A coordination ask whose owner (Otto) is absent → no coordinator, so
+            // silence. (A food ask here would reach Nora, who IS configured.)
+            "can someone sort out the logistics?",
             &[],
             None,
             false,

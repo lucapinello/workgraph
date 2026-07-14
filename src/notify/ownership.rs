@@ -164,6 +164,19 @@ const COOKING_PHRASES: &[&str] = &[
     "recipe for", "how do you cook", "how do you make",
 ];
 
+/// Specific, prepared DISH names (not raw ingredients). A bare dish mention with
+/// no meal noun ("dinner") and no planning verb — "pizza on Friday", "carbonara
+/// tonight" — is a KITCHEN signal: it should reach the chef's voice (Bruno), not
+/// the concierge. Deliberately excludes generic groceries ("rice", "milk") that
+/// belong on the shopping list, and is checked LAST (after shopping) so
+/// "add pizza to the shopping list" still routes to shopping, not the kitchen.
+const DISH_WORDS: &[&str] = &[
+    "pizza", "pasta", "carbonara", "lasagna", "lasagne", "risotto", "ravioli",
+    "gnocchi", "sushi", "ramen", "taco", "tacos", "burrito", "burritos",
+    "burger", "burgers", "curry", "paella", "pesto", "omelette", "omelet",
+    "pancakes", "waffles", "quesadilla", "enchiladas", "stirfry",
+];
+
 /// Classify a conversational ask into its household [`Domain`]. Pure keyword
 /// heuristics (never a model call) so the routing decision is deterministic and
 /// unit-testable. The order encodes precedence: an explicit workout/calendar
@@ -197,6 +210,12 @@ pub fn classify_domain(ask: &str) -> Domain {
     }
     // A standalone cooking ask with no meal noun ("can you bake something?").
     if cooking_flavored {
+        return Domain::Cooking;
+    }
+    // A bare named dish ("pizza on Friday") — the kitchen's, so plain food
+    // chatter reaches the chef's voice instead of falling through to the
+    // concierge. Checked after shopping so "add pizza to the list" stays shopping.
+    if has_any(&words, DISH_WORDS) {
         return Domain::Cooking;
     }
     Domain::Coordination
@@ -532,6 +551,22 @@ mod tests {
             classify_domain("how do I cook the lentils"),
             Domain::Cooking
         );
+    }
+
+    #[test]
+    fn bare_dish_name_is_cooking_but_shopping_list_stays_shopping() {
+        // A bare dish mention reaches the kitchen (Bruno) — "otto replied for food
+        // instead of the chef" (Luca, 2026-07-14).
+        assert_eq!(classify_domain("pizza on friday"), Domain::Cooking);
+        assert_eq!(classify_domain("carbonara tonight"), Domain::Cooking);
+        // But a dish on the SHOPPING list is a shopping ask, not a cooking one.
+        assert_eq!(
+            classify_domain("add pizza to the shopping list"),
+            Domain::Shopping
+        );
+        // A raw grocery is NOT a dish — it stays coordination/shopping, never the
+        // kitchen (guards the "add rice to the list" owner test).
+        assert_eq!(classify_domain("add rice to the list"), Domain::Coordination);
     }
 
     #[test]
