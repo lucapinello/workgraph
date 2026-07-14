@@ -3825,12 +3825,14 @@ fn main() -> Result<()> {
                 task_id,
                 dry_run,
                 now,
+                mock_send,
             } => commands::telegram::run_lifecycle(
                 &workgraph_dir,
                 task_id.as_deref(),
                 dry_run,
                 now.as_deref(),
                 cli.json,
+                mock_send,
             ),
             TelegramCommands::Parity {
                 reply_text,

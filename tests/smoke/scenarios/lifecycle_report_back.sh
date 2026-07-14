@@ -107,4 +107,60 @@ if echo "$out5" | grep -qi "folds into digest"; then
 fi
 echo "   → report-back reached the human standalone despite the spent cap"
 
-echo "PASS: the conversational loop reports start + done back to the origin chat, exactly once, and a reply is never capped into the digest."
+echo "6. CROSS-SURFACE (lifecycle-messages-obey): a GROUP report-back lands in BOTH"
+echo "   Telegram (verified send, message id logged) AND the pane feed"
+echo "   (.casa/group-feed.jsonl the constellation pane reads), exactly once:"
+# --mock-send is a hidden flag on a wg built with this fix — run the REAL tick +
+# REAL casa-feed mirror while recording (not sending) the Telegram call, so the
+# cross-surface contract is exercised credential-free. A stale binary lacks the
+# flag and clap rejects it — skip loudly rather than FAIL.
+probe="$(life --mock-send --dry-run --now 2026-07-13T15:00 2>&1 || true)"
+if echo "$probe" | grep -qiE "unexpected argument|unrecognized|invalid value|no such"; then
+    loud_skip "STALE WG BINARY" "wg telegram lifecycle has no --mock-send; rebuild from the fork"
+fi
+
+# A fresh GROUP-origin in-progress ask (elected voice: Nora). Scoped by task id
+# so this step is isolated from the 1:1 tasks above.
+cat >> "$scratch/.wg/graph.jsonl" <<'JSONL'
+{"kind":"task","id":"swap-sat-lunch-group","title":"swap Saturday lunch","status":"in_progress","assigned":"nora","origin":{"channel":"telegram-group","chat_id":"-100999","requester":"Luca","persona":"nora","bot_id":"nora"}}
+JSONL
+feed="$scratch/.casa/group-feed.jsonl"
+
+out6="$(life swap-sat-lunch-group --mock-send --json --now 2026-07-13T15:00)"
+echo "$out6"
+# TELEGRAM surface: sent exactly once, none undelivered.
+echo "$out6" | grep -q '"sent":1' \
+    || loud_fail "the group report-back must be sent (delivery verified) exactly once: $out6"
+echo "$out6" | grep -q '"undelivered":0' \
+    || loud_fail "no undelivered report-backs expected on a confirmed send: $out6"
+# LEDGER surface: exactly one 'is on it' agent line landed in the pane feed.
+test -f "$feed" || loud_fail "the group report-back never reached the pane feed: $feed missing"
+n_isonit=$(grep -c 'is on it' "$feed" || true)
+[ "$n_isonit" -eq 1 ] || loud_fail "expected exactly one 'is on it' feed line, got $n_isonit:
+$(cat "$feed")"
+grep -q '"kind":"agent"' "$feed" \
+    || loud_fail "the mirrored line must be an agent line: $(cat "$feed")"
+grep -q '"agentId":"nora"' "$feed" \
+    || loud_fail "the mirrored line must be attributed to the persona: $(cat "$feed")"
+echo "   → the 'is on it' report-back is in the pane feed AND was sent, exactly once"
+
+echo "6b. EXACTLY-ONCE across surfaces: a re-tick re-fires nothing and adds NO 2nd feed line:"
+out6b="$(life swap-sat-lunch-group --mock-send --json --now 2026-07-13T15:05)"
+echo "$out6b" | grep -q '"fired":0' \
+    || loud_fail "an already-reported group transition must not re-fire: $out6b"
+n_isonit2=$(grep -c 'is on it' "$feed" || true)
+[ "$n_isonit2" -eq 1 ] \
+    || loud_fail "the pane feed gained a duplicate 'is on it' line ($n_isonit2):
+$(cat "$feed")"
+echo "   → re-tick is quiet on both surfaces (FiredLog exactly-once)"
+
+echo "6c. a 1:1 DM report-back is NEVER written into the SHARED group feed (privacy):"
+# Only the group report-back may sit in the shared pane feed — the 1:1 origin
+# tasks (tweak-w29-meals, book-dentist, pesto) must never leak into it.
+lines_in_feed=$(grep -c . "$feed" || true)
+[ "$lines_in_feed" -eq 1 ] \
+    || loud_fail "the shared feed must hold ONLY the one group line, has $lines_in_feed:
+$(cat "$feed")"
+echo "   → only the group report-back is in the shared pane; no 1:1 leak"
+
+echo "PASS: the conversational loop reports start + done back to the origin chat, exactly once, a reply is never capped into the digest, and a GROUP report-back lands in BOTH Telegram and the pane feed exactly once (no 1:1 leak)."
