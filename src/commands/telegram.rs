@@ -59,6 +59,92 @@ pub fn command_gate(msg: &worksgood::notify::IncomingMessage) -> CommandGate {
     }
 }
 
+/// Loopback gateway endpoint the web-identity `/start login_<nonce>` gate POSTs
+/// the verified telegram id to. One-directional, token-free, loopback-only — the
+/// gateway enforces the loopback guard (`403` for a non-loopback caller) and
+/// resolves the telegram id against the live binding roster itself. Overridable
+/// via `CASA_AUTH_CONFIRM_URL` ONLY so the live/scripted test can point the
+/// listener at a stub gateway; production always uses the loopback default. See
+/// docs/16-web-identity.md §The listener side.
+const AUTH_CONFIRM_URL_DEFAULT: &str = "http://127.0.0.1:7788/auth/confirm";
+
+fn auth_confirm_url() -> String {
+    std::env::var("CASA_AUTH_CONFIRM_URL").unwrap_or_else(|_| AUTH_CONFIRM_URL_DEFAULT.to_string())
+}
+
+/// The gateway's reply to `POST /auth/confirm`. `ok:true` → the telegram id
+/// resolved to a household human and the browser session is now bound;
+/// `ok:false` with `reason:"unknown-user"` → the id is not in the roster.
+#[derive(Debug, serde::Deserialize)]
+struct ConfirmResp {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Extract the login nonce from a `/start` deep-link message body, or `None`
+/// when this is not a `login_` deep link. Accepts `/start login_<nonce>` and
+/// the `@bot`-qualified `/start@otto_bot login_<nonce>` form. The command token
+/// must terminate cleanly (whitespace, `@bot`, or end-of-string) so `/started …`
+/// is never mistaken for `/start`. The returned slice is the raw nonce — callers
+/// MUST NOT log it (see the redaction note in the handler).
+fn parse_login_nonce(body: &str) -> Option<&str> {
+    let rest = body.trim_start().strip_prefix("/start")?;
+    let payload = match rest.chars().next() {
+        // "/start" with no payload.
+        None => return None,
+        // "/start login_…" — payload follows the whitespace.
+        Some(c) if c.is_whitespace() => rest.trim_start(),
+        // "/start@botname login_…" — drop the "@botname" token first.
+        Some('@') => match rest[1..].split_once(char::is_whitespace) {
+            Some((_bot, tail)) => tail.trim_start(),
+            None => return None,
+        },
+        // "/started…" — not the start command.
+        Some(_) => return None,
+    };
+    // The nonce is the first whitespace-delimited token after `login_`; drop any
+    // trailing text so a stray trailing space never corrupts the secret.
+    let nonce = payload
+        .strip_prefix("login_")?
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if nonce.is_empty() {
+        None
+    } else {
+        Some(nonce)
+    }
+}
+
+/// Handle a 1:1 `/start login_<nonce>` web-identity deep link: POST the sender's
+/// REAL telegram id to the loopback gateway `/auth/confirm` and return the
+/// family-voice reply to send back. One-directional and token-free; the gateway
+/// resolves the id against the household roster and binds the browser session.
+///
+/// NEVER logs the nonce or the confirm body — the confirm is token-free but the
+/// nonce is still a single-use secret (see docs/16-web-identity.md).
+async fn confirm_web_login(
+    client: &reqwest::Client,
+    nonce: &str,
+    telegram_id: &str,
+) -> String {
+    let body = serde_json::json!({ "nonce": nonce, "telegram_id": telegram_id });
+    let resp = client.post(auth_confirm_url()).json(&body).send().await;
+    let confirm = match resp {
+        Ok(r) => r.json::<ConfirmResp>().await.ok(),
+        Err(_) => None,
+    };
+    match confirm {
+        Some(c) if c.ok => "You're signed in on the kitchen tablet ✋".to_string(),
+        Some(c) if c.reason.as_deref() == Some("unknown-user") => {
+            "I don't recognise you yet — ask Otto to add you to the household.".to_string()
+        }
+        _ => "That sign-in link expired — tap the tablet to get a fresh one.".to_string(),
+    }
+}
+
 /// Run the Telegram listener.
 ///
 /// Starts a long-running process that polls for incoming messages via the
@@ -173,6 +259,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         let listener_start = chrono::Utc::now().timestamp();
         let mut backlog_notified = false;
         let mut coalescer = telegram_pacing::BurstCoalescer::default();
+
+        // Dedicated short-timeout client for the loopback web-identity confirm
+        // POST — separate from the long-poll clients so a slow/absent gateway
+        // never stalls a poll. See `confirm_web_login`.
+        let auth_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         while let Some(msg) = rx.recv().await {
             // Fix #0 — the bot-loop guard, FIRST (before dedupe, feed mirror,
@@ -311,6 +405,48 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // entity and is conversation — it flows to the election below and is
             // never parsed as a command. See `fix-command-leaks`.
             let gate = command_gate(&msg);
+
+            // Web-identity sign-in: a 1:1 `/start login_<nonce>` deep link. The
+            // household member scans the kitchen-tablet QR, which opens the bot
+            // with `?start=login_<nonce>`; Telegram delivers `/start login_<nonce>`
+            // as a genuine slash command (bot_command entity at offset 0, so
+            // `gate.family` is set). We take the sender's REAL numeric telegram id
+            // (`sender_id`, never a forwarded/spoofable field) and POST it with the
+            // nonce to the loopback gateway, which resolves it against the binding
+            // roster and binds the browser session. One-directional, token-free.
+            // NEVER log the nonce — it is a single-use secret. Only fires in a
+            // private chat; a group `/start` is not a sign-in. See
+            // docs/16-web-identity.md §The listener side.
+            let is_private = matches!(msg.chat_type.as_deref(), Some("private") | None);
+            if gate.operator && is_private {
+                if let Some(nonce) = parse_login_nonce(&msg.body) {
+                    let reply = match msg.sender_id.as_deref() {
+                        Some(telegram_id) => {
+                            confirm_web_login(&auth_client, nonce, telegram_id).await
+                        }
+                        // No numeric id to verify — cannot bind a session.
+                        None => "That sign-in link expired — tap the tablet to get a fresh one."
+                            .to_string(),
+                    };
+                    // Redacted breadcrumb — the outcome, never the nonce.
+                    println!(
+                        "[{}] web sign-in confirm from {} -> {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        msg.sender,
+                        if reply.starts_with("You're signed in") {
+                            "signed-in"
+                        } else if reply.starts_with("I don't recognise") {
+                            "unknown-user"
+                        } else {
+                            "no-session"
+                        },
+                    );
+                    if let Err(e) = channel.send_text(&reply_target, &reply).await {
+                        eprintln!("Failed to send web sign-in reply: {e}");
+                    }
+                    continue;
+                }
+            }
 
             // Family command set (/dinner /shopping /week /reminders /standup
             // /help). Commands ride ABOVE the election table: the surviving
@@ -2768,6 +2904,165 @@ mod tests {
         // operator reference may run.
         let g = command_gate(&gate_msg("private", true));
         assert!(g.operator, "operator reference is allowed in a 1:1 slash command");
+    }
+
+    #[test]
+    fn parse_login_nonce_extracts_deep_link_payload() {
+        // Plain deep link.
+        assert_eq!(parse_login_nonce("/start login_abc123"), Some("abc123"));
+        // @bot-qualified deep link (Telegram sends this in some clients).
+        assert_eq!(
+            parse_login_nonce("/start@otto_casapinello_bot login_deadbeef"),
+            Some("deadbeef")
+        );
+        // Leading/trailing whitespace tolerated.
+        assert_eq!(parse_login_nonce("  /start   login_xyz  "), Some("xyz"));
+    }
+
+    #[test]
+    fn parse_login_nonce_rejects_non_login_start() {
+        // Bare /start (onboarding) is not a sign-in.
+        assert_eq!(parse_login_nonce("/start"), None);
+        // A different deep-link payload.
+        assert_eq!(parse_login_nonce("/start invite_abc"), None);
+        // Empty nonce.
+        assert_eq!(parse_login_nonce("/start login_"), None);
+        // "/started" must not be mistaken for "/start".
+        assert_eq!(parse_login_nonce("/started login_abc"), None);
+        // "/start@bot" with no payload.
+        assert_eq!(parse_login_nonce("/start@otto_casapinello_bot"), None);
+        // Not the start command at all.
+        assert_eq!(parse_login_nonce("/dinner login_abc"), None);
+        assert_eq!(parse_login_nonce("hello there"), None);
+    }
+
+    #[test]
+    fn confirm_resp_deserializes_gateway_shapes() {
+        let ok: ConfirmResp = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(ok.ok);
+        let unknown: ConfirmResp =
+            serde_json::from_str(r#"{"ok":false,"reason":"unknown-user"}"#).unwrap();
+        assert!(!unknown.ok);
+        assert_eq!(unknown.reason.as_deref(), Some("unknown-user"));
+        // Tolerates missing fields (defaults to ok:false, reason:None).
+        let empty: ConfirmResp = serde_json::from_str("{}").unwrap();
+        assert!(!empty.ok);
+        assert!(empty.reason.is_none());
+    }
+
+    #[test]
+    fn auth_confirm_url_defaults_to_loopback() {
+        // Default (no override) is the loopback gateway. We do not mutate the
+        // process env here (tests run concurrently); just assert the constant.
+        assert_eq!(AUTH_CONFIRM_URL_DEFAULT, "http://127.0.0.1:7788/auth/confirm");
+    }
+
+    /// Spin a one-shot loopback HTTP stub standing in for the gateway
+    /// `POST /auth/confirm`. It captures the request body (so the test can assert
+    /// exactly `{nonce, telegram_id}` crossed the wire) and answers with
+    /// `response_json`. Drives the REAL `confirm_web_login` POST path end to end.
+    fn spawn_confirm_stub(response_json: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{}/auth/confirm", port);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 512];
+                // Read until the header terminator, then drain the declared body.
+                let header_end = loop {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break buf.len(),
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break buf.len(),
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let mut body = buf[header_end..].to_vec();
+                while body.len() < content_length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&body).to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_json.len(),
+                    response_json
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, rx)
+    }
+
+    /// A bound household member's `/start login_<nonce>` POSTs exactly
+    /// `{nonce, telegram_id}` to the gateway and gets the signed-in family reply.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_web_login_posts_nonce_and_signs_in_bound_user() {
+        let (url, rx) = spawn_confirm_stub(r#"{"ok":true}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let reply = rt.block_on(confirm_web_login(&client, "s3cr3t-nonce", "123456789"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        let body = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["nonce"], "s3cr3t-nonce");
+        assert_eq!(parsed["telegram_id"], "123456789");
+        assert!(reply.starts_with("You're signed in"), "reply: {reply}");
+    }
+
+    /// An unknown telegram id → the friendly "ask Otto" reply, no session.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_web_login_unknown_user_gets_ask_otto_reply() {
+        let (url, _rx) = spawn_confirm_stub(r#"{"ok":false,"reason":"unknown-user"}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let reply = rt.block_on(confirm_web_login(&client, "nonce", "999"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        assert!(reply.contains("ask Otto"), "reply: {reply}");
+        assert!(!reply.starts_with("You're signed in"));
+    }
+
+    /// Gateway unreachable → the expired/try-again reply, never a false sign-in.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_web_login_gateway_down_expired_reply() {
+        // Port 1 has no listener → connection refused.
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", "http://127.0.0.1:1/auth/confirm") };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let reply = rt.block_on(confirm_web_login(&client, "nonce", "1"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        assert!(reply.contains("expired"), "reply: {reply}");
+        assert!(!reply.starts_with("You're signed in"));
     }
 
     /// Record an unconfirmed binding exactly as `wg agency human add` would,
