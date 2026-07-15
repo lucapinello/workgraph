@@ -624,6 +624,28 @@ fn build_compose_prompt(
     agent_id: &str,
     human_message: &str,
 ) -> String {
+    // Household local time is the existing `chrono::Local` seam (same as the
+    // fast lane and task-stamping). Threaded through the `_at` variant so the
+    // scope/clock rules are testable with a fixed clock.
+    build_compose_prompt_at(
+        workgraph_dir,
+        session_ref,
+        agent_id,
+        human_message,
+        chrono::Local::now().naive_local(),
+    )
+}
+
+/// [`build_compose_prompt`] with the household's local time injected, so the
+/// scope (rule 3) and clock-aware (rule 4) grounding are fully deterministic
+/// under test. Production passes `chrono::Local::now()`.
+fn build_compose_prompt_at(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    agent_id: &str,
+    human_message: &str,
+    now: chrono::NaiveDateTime,
+) -> String {
     let summary = read_session_summary(workgraph_dir, session_ref);
 
     // A few recent turns for continuity (best-effort; empty on a fresh session).
@@ -678,9 +700,8 @@ fn build_compose_prompt(
     // turn one instead of a stall. This is the read-side twin of the fast lane's
     // edit-shaped classifier. Best-effort — a missing plan just omits the block.
     let root = project_root_of(workgraph_dir);
-    let today = chrono::Local::now().date_naive();
     if grounding::is_read_shaped(human_message) {
-        if let Some(block) = grounding::fetch(&root, today) {
+        if let Some(block) = grounding::fetch_scoped(&root, now, human_message) {
             prompt.push_str(&block);
             prompt.push('\n');
         }
@@ -1299,6 +1320,19 @@ async fn finalize_composed_reply(
     // the repetition guard so the honest fallback below is never itself trimmed.
     let already_used = grounding::count_formulaic(&prior_replies) > 0;
     reply_text = grounding::enforce_style(&reply_text, already_used);
+
+    // ANSWER-FIRST HARD RULE (rule 2 promoted): a plain read-ask must be
+    // answered, not bounced back with a question. If the human asked a
+    // read-shaped question and did NOT invite us to deliberate/plan, strip any
+    // trailing question so the reply ends on a statement. The deliberation
+    // escape hatch ("let's think about the day") keeps its question. Applied
+    // before the repetition guard so the honest fallback's own question — an
+    // offer to go read the source — is never trimmed.
+    if grounding::is_read_shaped(human_message)
+        && !grounding::is_deliberation_request(human_message)
+    {
+        reply_text = grounding::enforce_answer_shape(&reply_text, false);
+    }
 
     // REPETITION GUARD (rule 2): never send the same summary a third time. If
     // this draft is substantially the same as the previous reply, answer
@@ -2968,17 +3002,34 @@ mod tests {
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
         bind_agent(&wg, "otto", &uuid).unwrap();
 
-        // The fixture's opening ask: the plan data must be present, turn one.
-        let grounded = build_compose_prompt(&wg, &uuid, "otto", "Plans for tomorrow?");
+        // Asked on Wed 07-15 at noon (fixed clock). "Tomorrow" is Thu 07-16 —
+        // the plan data must be present turn one, SCOPED to Thursday: the
+        // Dentist appointment is in, and other days do NOT leak (rule 3).
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let grounded =
+            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now);
         assert!(
-            grounded.contains("Baked salmon"),
-            "grounding data missing from prompt:\n{grounded}"
+            grounded.contains("Dentist"),
+            "tomorrow's appointment missing from prompt:\n{grounded}"
         );
-        assert!(grounded.contains("Luca PT check-in"));
-        assert!(grounded.to_lowercase().contains("do not stall"));
+        assert!(grounded.contains("Thursday"));
+        // The answer-first instruction header is present.
+        assert!(grounded.to_lowercase().contains("answer the question directly"));
+        // Other days must NOT bleed into a scoped "tomorrow" ask.
+        assert!(!grounded.contains("Baked salmon"), "Tue meal leaked:\n{grounded}");
+        assert!(!grounded.contains("Chickpea"), "Mon meal leaked:\n{grounded}");
+
+        // A whole-week ask still surfaces the full week's meals.
+        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now);
+        assert!(week.contains("Baked salmon"));
+        assert!(week.contains("Luca PT check-in"));
+        assert!(week.to_lowercase().contains("do not stall"));
 
         // Small talk carries no grounding block.
-        let plain = build_compose_prompt(&wg, &uuid, "otto", "morning!");
+        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now);
         assert!(!plain.contains("Baked salmon"));
     }
 

@@ -28,10 +28,26 @@
 //! 4. **Style** — [`strip_trailing_formulaic`] and [`is_formulaic_question`] kill
 //!    the reflexive "Anything specific…?" tail that ended every single turn;
 //!    the caller allows at most one per conversation.
+//!
+//! Luca's 2026-07-15 follow-up ("just answer — no questions back, no week-dumps,
+//! and don't tell me about breakfast at 3pm") sharpens the read path into four
+//! more rules, all pure and testable here:
+//!
+//! - **Answer first, directly** — [`grounded_block`] leads the injected context
+//!   with an answer-first, brevity-budgeted instruction header.
+//! - **No unsolicited questions (hard)** — [`enforce_answer_shape`] strips ANY
+//!   trailing question from a plain read-reply; [`is_deliberation_request`] is
+//!   the one escape hatch ("let's think about the day" earns a question back).
+//! - **Scope to the question** — [`detect_scope`] resolves today / tomorrow /
+//!   a named weekday / the week, and [`grounded_block`] filters the plan to
+//!   exactly that, so "today" is never a week-dump.
+//! - **Clock-aware** — [`event_has_passed`] (via the household `chrono::Local`
+//!   seam) drops today's already-passed events; when the day is spent the block
+//!   says so in one line and offers tomorrow's first item.
 
 use std::path::Path;
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 
 use super::family_plan::{self, PlanDoc};
 
@@ -412,6 +428,393 @@ pub fn count_formulaic(replies: &[String]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Rule 2 (hard) — answer first: no unsolicited trailing questions
+// ---------------------------------------------------------------------------
+
+/// Phrases that mark the human *inviting* the agent to deliberate, weigh
+/// options, or plan together — the one case where a question back is fair play
+/// ("let's think about the day", "help me decide what to cook"). Matched as
+/// substrings against the normalised message (apostrophe-free, see `normalize`).
+const DELIBERATION_MARKERS: &[&str] = &[
+    "lets think",
+    "let us think",
+    "think about",
+    "lets plan",
+    "help me plan",
+    "help me decide",
+    "help me choose",
+    "help me figure",
+    "figure out",
+    "lets figure",
+    "lets discuss",
+    "lets brainstorm",
+    "brainstorm",
+    "talk through",
+    "what should we",
+    "what should i",
+    "what do you think",
+    "your thoughts",
+    "any ideas",
+    "cant decide",
+    "not sure what",
+    "weigh in",
+];
+
+/// True when the human's own message asks the agent to deliberate/plan rather
+/// than simply read the plan out. Only then may a composed reply end with a
+/// question (rule 2, case (a)). A plain read-ask ("what's for dinner today?")
+/// is NOT deliberation and must be answered, not bounced back.
+pub fn is_deliberation_request(message: &str) -> bool {
+    let norm = normalize(message);
+    DELIBERATION_MARKERS.iter().any(|m| norm.contains(m))
+}
+
+/// Split a reply's final sentence off and, if it is *any* question (ends with
+/// `?`), return `(body_without_it, Some(the_question))`. The generalisation of
+/// [`strip_trailing_formulaic`] that backs the hard no-question rule: a plain
+/// read-ask reply must end on a statement, not just avoid the *formulaic*
+/// filler. Pure. `(reply, None)` when the reply does not end in a question.
+pub fn strip_trailing_question(reply: &str) -> (String, Option<String>) {
+    let trimmed = reply.trim_end();
+    let last_q = match trimmed.rfind('?') {
+        Some(i) if i + 1 >= trimmed.trim_end().len() => i,
+        _ => return (reply.to_string(), None),
+    };
+    let before = &trimmed[..last_q];
+    let split_at = before
+        .rfind(|c| c == '.' || c == '!' || c == '?' || c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let body = trimmed[..split_at].trim_end().to_string();
+    let tail = trimmed[split_at..].trim().to_string();
+    (body, Some(tail))
+}
+
+/// Enforce rule 2 as a hard rule for read-shaped, non-deliberation asks: the
+/// reply must end on a statement. When `allow_question` is false and the reply
+/// ends in a question, strip that trailing question — UNLESS doing so would
+/// leave nothing to send (a reply that is *only* a question is kept, so we
+/// never send an empty message; grounding upstream makes this vanishingly
+/// rare). When `allow_question` is true (the human asked us to deliberate), the
+/// reply is returned untouched.
+pub fn enforce_answer_shape(reply: &str, allow_question: bool) -> String {
+    if allow_question {
+        return reply.to_string();
+    }
+    let (body, stripped) = strip_trailing_question(reply);
+    match stripped {
+        Some(_) if !body.trim().is_empty() => body,
+        _ => reply.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 3 — scope: answer exactly the day/window the human asked about
+// ---------------------------------------------------------------------------
+
+/// The time window a read-ask is about. "Today" means today, not the rest of
+/// the week; week-scope only when the ask says so. Resolved against the day the
+/// question was asked so the caller can filter the plan to exactly this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskScope {
+    /// A single concrete day (today, tomorrow, or a named weekday).
+    Day(NaiveDate),
+    /// The whole plan week — only when the ask says "week"/"weekend".
+    Week,
+}
+
+/// Match a whole token against a weekday name/abbreviation. Token equality (not
+/// substring) so "monday"/"mon" hit but "money" does not.
+fn weekday_token(tok: &str) -> Option<Weekday> {
+    match tok {
+        "monday" | "mon" => Some(Weekday::Mon),
+        "tuesday" | "tue" | "tues" => Some(Weekday::Tue),
+        "wednesday" | "wed" | "weds" => Some(Weekday::Wed),
+        "thursday" | "thu" | "thur" | "thurs" => Some(Weekday::Thu),
+        "friday" | "fri" => Some(Weekday::Fri),
+        "saturday" | "sat" => Some(Weekday::Sat),
+        "sunday" | "sun" => Some(Weekday::Sun),
+        _ => None,
+    }
+}
+
+/// The first date on or after `from` whose weekday is `wd` (so "Wednesday"
+/// asked on a Wednesday resolves to today, not next week).
+fn next_on_or_after(from: NaiveDate, wd: Weekday) -> NaiveDate {
+    let mut d = from;
+    for _ in 0..7 {
+        if d.weekday() == wd {
+            return d;
+        }
+        d = d.succ_opt().unwrap_or(d);
+    }
+    from
+}
+
+/// Detect the scope of a read-ask relative to `today`. Priority, most specific
+/// first: an explicit weekday name → that day; "day after tomorrow" → today+2;
+/// "tomorrow" → today+1; "week"/"weekend" → the whole week; otherwise (the
+/// default, including "today"/"tonight"/no time word at all) → today. This is
+/// what makes "what's the plan today" mean *today* and not a week-dump.
+pub fn detect_scope(message: &str, today: NaiveDate) -> AskScope {
+    let norm = normalize(message);
+    if let Some(wd) = norm.split_whitespace().find_map(weekday_token) {
+        return AskScope::Day(next_on_or_after(today, wd));
+    }
+    if norm.contains("day after tomorrow") {
+        let mut d = today;
+        for _ in 0..2 {
+            d = d.succ_opt().unwrap_or(d);
+        }
+        return AskScope::Day(d);
+    }
+    if norm.contains("tomorrow") || norm.contains("tmrw") || norm.contains("tmw") {
+        return AskScope::Day(today.succ_opt().unwrap_or(today));
+    }
+    if norm.contains("week") || norm.contains("weekend") || norm.contains("coming days")
+        || norm.contains("next few days") || norm.contains("days ahead")
+        || norm.contains("rest of")
+    {
+        return AskScope::Week;
+    }
+    AskScope::Day(today)
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4 — clock-aware: within the asked day, only what is still coming up
+// ---------------------------------------------------------------------------
+
+/// Parse a plan Time-column cell into a wall-clock time. Handles the plan's
+/// native 24-hour `"HH:MM"` (`"19:30"`, `"9:00"`), bare hours (`"7"`), and
+/// am/pm forms (`"7:30pm"`, `"7 pm"`). `None` for empty/unparseable cells —
+/// which the clock filter treats as *not* past (all-day / keep).
+pub fn parse_time_of_day(cell: &str) -> Option<NaiveTime> {
+    let s = cell.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (is_pm, is_am, core) = if let Some(rest) = s.strip_suffix("pm") {
+        (true, false, rest.trim().to_string())
+    } else if let Some(rest) = s.strip_suffix("am") {
+        (false, true, rest.trim().to_string())
+    } else if let Some(rest) = s.strip_suffix("p.m.") {
+        (true, false, rest.trim().to_string())
+    } else if let Some(rest) = s.strip_suffix("a.m.") {
+        (false, true, rest.trim().to_string())
+    } else {
+        (false, false, s.clone())
+    };
+    let core = core.replace('.', ":").replace('h', ":");
+    let (h_str, m_str) = match core.split_once(':') {
+        Some((h, m)) => (h.trim(), m.trim()),
+        None => (core.trim(), "0"),
+    };
+    let mut hour: u32 = h_str.parse().ok()?;
+    let minute: u32 = if m_str.is_empty() { 0 } else { m_str.parse().ok()? };
+    if is_pm && hour < 12 {
+        hour += 12;
+    }
+    if is_am && hour == 12 {
+        hour = 0;
+    }
+    NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
+/// True when an event on `event_day` at clock cell `time_cell` has already
+/// passed as of `now` (the household's local time). A day strictly before
+/// today's date is past; on today itself, an event is past only when its parsed
+/// time is at or before `now`'s time. An empty/unparseable time on today (or
+/// any future day) is never past — all-day items are always still "coming up".
+pub fn event_has_passed(time_cell: &str, event_day: NaiveDate, now: NaiveDateTime) -> bool {
+    if event_day < now.date() {
+        return true;
+    }
+    if event_day > now.date() {
+        return false;
+    }
+    match parse_time_of_day(time_cell) {
+        Some(t) => t <= now.time(),
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scoped, clock-aware grounding block (assembles rules 1-4 for the composer)
+// ---------------------------------------------------------------------------
+
+/// Does calendar/workout row `row_weekday` (a 3-letter code) fall on `day`?
+fn weekday_matches(row_weekday: &str, day: NaiveDate) -> bool {
+    family_plan::expand_weekday(row_weekday)
+        .eq_ignore_ascii_case(family_plan::long_weekday(day))
+}
+
+/// Calendar events for `day`, matched by concrete date when present else by
+/// weekday name, in document order.
+fn calendar_on<'a>(doc: &'a PlanDoc, day: NaiveDate) -> Vec<&'a family_plan::CalendarEvent> {
+    doc.calendar
+        .iter()
+        .filter(|e| e.date == Some(day) || (e.date.is_none() && weekday_matches(&e.weekday, day)))
+        .collect()
+}
+
+/// Workout sessions scheduled on `day`, in document order.
+fn workouts_on<'a>(doc: &'a PlanDoc, day: NaiveDate) -> Vec<&'a family_plan::WorkoutDay> {
+    doc.workouts
+        .iter()
+        .filter(|w| weekday_matches(&w.weekday, day))
+        .collect()
+}
+
+/// The single-line "coming up" description of a calendar event.
+fn event_line(e: &family_plan::CalendarEvent) -> String {
+    if e.time.trim().is_empty() {
+        format!("- {}", e.event.trim())
+    } else {
+        format!("- {} {}", e.time.trim(), e.event.trim())
+    }
+}
+
+/// The instruction header shared by every grounded read-reply: answer first,
+/// keep it to a few lines, and do not bounce a question back. Rule 2's prompt
+/// half (the hard post-filter is [`enforce_answer_shape`]); rules 3 & 4 are
+/// realised by the *data* below it already being scoped and clock-filtered.
+fn answer_shape_header(now: NaiveDateTime) -> String {
+    format!(
+        "GROUNDING — this is the family's ACTUAL plan for exactly what they asked about. \
+         Answer the question directly and specifically from it, then STOP. Rules: \
+         (1) lead with the answer — \"Here's today: …\" — no preamble, no \"want the rundown?\". \
+         (2) Keep it to 2-5 short lines; do not re-list anything they can already see. \
+         (3) Do NOT end with a question — end on a statement (the only exception is if they \
+         asked you to help decide or plan). \
+         (4) This is already scoped to what they asked and to what is still upcoming as of \
+         {} — do not add other days or events that have already passed.\n",
+        now.format("%H:%M"),
+    )
+}
+
+/// Build the scoped, clock-aware grounding block for a read-ask: detect the
+/// asked scope from `message`, filter [`PlanDoc`] to exactly that, drop
+/// today's already-passed events against `now`, and render a compact block the
+/// composer injects. This supersedes [`plan_digest`] for the conversation path.
+/// Pure — `now` is injected so behaviour is fully testable with a fixed clock.
+pub fn grounded_block(doc: &PlanDoc, now: NaiveDateTime, message: &str) -> String {
+    let today = now.date();
+    let scope = detect_scope(message, today);
+    let mut out = answer_shape_header(now);
+
+    match scope {
+        AskScope::Week => {
+            // Whole-week ask: the full model (unchanged rule-1 behaviour), but
+            // still drop days/events already behind us so "the week" means the
+            // rest of it, not Monday's done lunch.
+            out.push_str(&plan_digest(doc, today));
+            return out;
+        }
+        AskScope::Day(day) => {
+            let is_today = day == today;
+            out.push_str(&format!(
+                "You are answering about {} {}{}.\n",
+                family_plan::long_weekday(day),
+                day.format("%b %-d"),
+                if is_today { " (today)" } else { "" },
+            ));
+
+            let mut lines: Vec<String> = Vec::new();
+
+            if let Some(m) = doc.meal_on(day) {
+                let dish = m.dish.trim();
+                if !dish.is_empty() {
+                    lines.push(format!("Dinner: {dish}"));
+                }
+            }
+
+            let upcoming: Vec<&family_plan::CalendarEvent> = calendar_on(doc, day)
+                .into_iter()
+                .filter(|e| !(is_today && event_has_passed(&e.time, day, now)))
+                .collect();
+            if !upcoming.is_empty() {
+                lines.push(if is_today {
+                    "Still coming up today:".to_string()
+                } else {
+                    "On the calendar:".to_string()
+                });
+                for e in upcoming {
+                    lines.push(event_line(e));
+                }
+            }
+
+            let workouts = workouts_on(doc, day);
+            if !workouts.is_empty() {
+                lines.push("Workouts:".to_string());
+                for w in workouts {
+                    lines.push(format!("- {}: {}", w.person, w.session.trim()));
+                }
+            }
+
+            if lines.is_empty() {
+                // Rule 4 tail: nothing left on the asked day. Say so in one line
+                // and, for "today", offer tomorrow's first item.
+                if is_today {
+                    out.push_str(
+                        "Nothing left on today's plan — everything is already done for the day.\n",
+                    );
+                    if let Some(next) = next_item_after(doc, today) {
+                        out.push_str(&format!("Next up — {next}\n"));
+                    }
+                } else {
+                    out.push_str("Nothing is on the plan for that day.\n");
+                }
+            } else {
+                for l in lines {
+                    out.push_str(&l);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The first upcoming item strictly after `today`, scanning day by day up to a
+/// week out: a dinner or a calendar event, whichever a day carries first.
+/// Rendered as a short "Thu: 09:00 Dentist" style string. `None` if the plan
+/// holds nothing in the coming week.
+fn next_item_after(doc: &PlanDoc, today: NaiveDate) -> Option<String> {
+    let mut day = today.succ_opt()?;
+    for _ in 0..7 {
+        let label = family_plan::long_weekday(day);
+        let cal = calendar_on(doc, day);
+        if let Some(e) = cal.first() {
+            let when = if e.time.trim().is_empty() {
+                label.to_string()
+            } else {
+                format!("{} {}", label, e.time.trim())
+            };
+            return Some(format!("{}: {}", when, e.event.trim()));
+        }
+        if let Some(m) = doc.meal_on(day) {
+            let dish = m.dish.trim();
+            if !dish.is_empty() {
+                return Some(format!("{label}: {dish} for dinner"));
+            }
+        }
+        day = day.succ_opt()?;
+    }
+    None
+}
+
+/// Load the current week model under `root` and render it as a scoped,
+/// clock-aware grounding block for `message` as of `now`. The conversation
+/// path's replacement for [`fetch`]: same best-effort filesystem read, but the
+/// block is filtered to the asked scope and to what is still upcoming. `None`
+/// when there is no plan to read.
+pub fn fetch_scoped(root: &Path, now: NaiveDateTime, message: &str) -> Option<String> {
+    let plans = family_plan::load_plans(root);
+    let doc = family_plan::current_plan(&plans, now.date())?;
+    Some(grounded_block(doc, now, message))
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -669,5 +1072,170 @@ mod tests {
         // A reply that is ONLY a formulaic question must not be emptied.
         let reply = "Anything specific you want to know?";
         assert_eq!(enforce_style(reply, true), reply);
+    }
+
+    // -- Answer-shape: scope, clock, and the hard no-question rule -----------
+
+    fn at(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> NaiveDateTime {
+        date(y, m, d).and_hms_opt(hh, mm, 0).unwrap()
+    }
+
+    // (a) A plain read-ask reply ends on a statement — zero trailing question.
+    #[test]
+    fn shape_read_reply_has_zero_trailing_question() {
+        // The ask is read-shaped and NOT a deliberation → question stripped.
+        assert!(is_read_shaped("what's the plan today?"));
+        assert!(!is_deliberation_request("what's the plan today?"));
+
+        let drafted = "Here's today: leftovers for dinner and your lower-body \
+                       session. Anything else you want to know?";
+        let shaped = enforce_answer_shape(drafted, false);
+        assert!(!shaped.trim_end().ends_with('?'), "still a question: {shaped:?}");
+        assert_eq!(shaped, "Here's today: leftovers for dinner and your lower-body session.");
+
+        // A non-formulaic trailing question is stripped just the same — the
+        // rule is hard, not limited to the "Anything specific…?" reflex.
+        let q2 = "Dinner is salmon. Want me to walk through the workouts too?";
+        assert_eq!(enforce_answer_shape(q2, false), "Dinner is salmon.");
+
+        // A reply already ending on a statement is untouched.
+        let plain = "Here's today: leftovers for dinner.";
+        assert_eq!(enforce_answer_shape(plain, false), plain);
+    }
+
+    // (b) A "today" ask never includes other days' items.
+    #[test]
+    fn shape_today_ask_scopes_to_today_only() {
+        let doc = PlanDoc::parse("2026-W29", PLAN);
+        // Asked at noon on Wed 07-15; Wed's dinner is Leftovers.
+        let block = grounded_block(&doc, at(2026, 7, 15, 12, 0), "what's the plan today?");
+        assert!(block.contains("Leftovers"), "should have today's dinner:\n{block}");
+        assert!(block.contains("Wednesday"));
+        // NOTHING from other days may leak in.
+        assert!(!block.contains("Baked salmon"), "Tue meal leaked:\n{block}");
+        assert!(!block.contains("Chickpea"), "Mon meal leaked:\n{block}");
+        assert!(!block.contains("Dentist"), "Thu appt leaked:\n{block}");
+        assert!(!block.contains("Luca PT check-in"), "Tue appt leaked:\n{block}");
+    }
+
+    #[test]
+    fn shape_detect_scope_reads_the_asked_window() {
+        let today = date(2026, 7, 15); // Wednesday
+        assert_eq!(detect_scope("what's for dinner today?", today), AskScope::Day(today));
+        assert_eq!(detect_scope("what's the plan?", today), AskScope::Day(today));
+        assert_eq!(
+            detect_scope("plans for tomorrow?", today),
+            AskScope::Day(date(2026, 7, 16))
+        );
+        assert_eq!(
+            detect_scope("anything on friday?", today),
+            AskScope::Day(date(2026, 7, 17))
+        );
+        // A weekday that is today resolves to today, not next week.
+        assert_eq!(detect_scope("what's on wednesday?", today), AskScope::Day(today));
+        assert_eq!(detect_scope("how's the week looking?", today), AskScope::Week);
+        assert_eq!(detect_scope("anything this weekend?", today), AskScope::Week);
+    }
+
+    #[test]
+    fn shape_tomorrow_ask_shows_tomorrows_items() {
+        let doc = PlanDoc::parse("2026-W29", PLAN);
+        // Asked on Wed; tomorrow = Thu 07-16 → Dentist at 09:00, no meal row.
+        let block = grounded_block(&doc, at(2026, 7, 15, 12, 0), "what's on tomorrow?");
+        assert!(block.contains("Thursday"));
+        assert!(block.contains("Dentist"), "Thu appt missing:\n{block}");
+        assert!(!block.contains("Leftovers"), "today's meal leaked into tomorrow:\n{block}");
+    }
+
+    // (c) Clock-aware: past-time events drop given a fixed fake now.
+    #[test]
+    fn shape_clock_filter_drops_past_events() {
+        // Pure predicate: Tue 07-14 has the 19:30 PT check-in.
+        let day = date(2026, 7, 14);
+        // Before 19:30 → still coming up.
+        assert!(!event_has_passed("19:30", day, at(2026, 7, 14, 15, 0)));
+        // After 19:30 → passed.
+        assert!(event_has_passed("19:30", day, at(2026, 7, 14, 20, 0)));
+        // A day already behind us is entirely past regardless of clock.
+        assert!(event_has_passed("19:30", day, at(2026, 7, 15, 8, 0)));
+        // A future day is never past.
+        assert!(!event_has_passed("09:00", date(2026, 7, 16), at(2026, 7, 14, 23, 0)));
+        // Empty / all-day time on today is kept (not past).
+        assert!(!event_has_passed("", day, at(2026, 7, 14, 23, 0)));
+
+        let doc = PlanDoc::parse("2026-W29", PLAN);
+        // At 15:00 on Tue the 19:30 check-in is still ahead → present.
+        let early = grounded_block(&doc, at(2026, 7, 14, 15, 0), "what's the plan today?");
+        assert!(early.contains("Luca PT check-in"), "should still be upcoming:\n{early}");
+        // At 20:00 on Tue it has passed → gone from "still coming up".
+        let late = grounded_block(&doc, at(2026, 7, 14, 20, 0), "what's the plan today?");
+        assert!(!late.contains("Luca PT check-in"), "past event should be dropped:\n{late}");
+    }
+
+    #[test]
+    fn shape_time_parser_handles_common_forms() {
+        assert_eq!(parse_time_of_day("19:30"), NaiveTime::from_hms_opt(19, 30, 0));
+        assert_eq!(parse_time_of_day("9:00"), NaiveTime::from_hms_opt(9, 0, 0));
+        assert_eq!(parse_time_of_day("7:30pm"), NaiveTime::from_hms_opt(19, 30, 0));
+        assert_eq!(parse_time_of_day("7 pm"), NaiveTime::from_hms_opt(19, 0, 0));
+        assert_eq!(parse_time_of_day("12am"), NaiveTime::from_hms_opt(0, 0, 0));
+        assert_eq!(parse_time_of_day("12pm"), NaiveTime::from_hms_opt(12, 0, 0));
+        assert_eq!(parse_time_of_day(""), None);
+        assert_eq!(parse_time_of_day("whenever"), None);
+    }
+
+    // Rule 4 tail: everything today has passed → say so, offer tomorrow.
+    #[test]
+    fn shape_spent_day_offers_tomorrow() {
+        // A minimal plan where "today" (Fri 07-17) carries only an 08:00 event
+        // and no dinner/workout; Saturday has the next item.
+        const PLAN_TAIL: &str = "\
+# 2026-W29 Family Plan
+
+**Week of Monday 2026-07-13 to Sunday 2026-07-19**
+
+## 3. Calendar
+
+| Day | Time | Event | Source |
+|-----|------|-------|--------|
+| Fri 07-17 | 08:00 | Early call | Otto |
+| Sat 07-18 | 10:00 | Farmers market | Otto |
+";
+        let doc = PlanDoc::parse("2026-W29", PLAN_TAIL);
+        // Asked Fri at 18:00 — the 08:00 call is long done.
+        let block = grounded_block(&doc, at(2026, 7, 17, 18, 0), "what's left today?");
+        assert!(!block.contains("Early call"), "past event leaked:\n{block}");
+        assert!(
+            block.to_lowercase().contains("nothing left"),
+            "should announce the day is spent:\n{block}"
+        );
+        assert!(block.contains("Farmers market"), "should offer tomorrow's item:\n{block}");
+    }
+
+    // (d) A deliberation ask IS allowed to end with a question.
+    #[test]
+    fn shape_deliberation_ask_keeps_its_question() {
+        for ask in [
+            "let's think about the day",
+            "help me decide what to cook",
+            "what should we do this weekend?",
+            "not sure what to make — any ideas?",
+        ] {
+            assert!(is_deliberation_request(ask), "should be deliberation: {ask:?}");
+        }
+        // When deliberation is invited, the trailing question is preserved.
+        let reply = "We could do salmon or the curry. Which sounds better tonight?";
+        assert_eq!(enforce_answer_shape(reply, true), reply);
+        // And a plain read-ask is NOT mistaken for deliberation.
+        assert!(!is_deliberation_request("what's for dinner today?"));
+    }
+
+    #[test]
+    fn shape_week_ask_stays_a_week_view() {
+        let doc = PlanDoc::parse("2026-W29", PLAN);
+        let block = grounded_block(&doc, at(2026, 7, 13, 9, 0), "how's the week looking?");
+        // A week ask still surfaces multiple days' meals.
+        assert!(block.contains("Baked salmon"));
+        assert!(block.contains("Chickpea"));
     }
 }
