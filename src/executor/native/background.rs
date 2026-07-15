@@ -626,21 +626,51 @@ fn get_exit_code(pid: u32) -> Option<i32> {
 fn spawn_detached(command: &str, working_dir: &Path, log_path: &Path) -> Result<u32> {
     #[cfg(unix)]
     {
-        // On Unix, we use setsid to create a new session and detach from terminal
-        // The setsid command handles the detachment - the spawned process becomes session leader
+        use std::os::unix::process::CommandExt;
+
+        // Detach into a new session so the job survives the parent agent
+        // exiting, then `exec` so the shell REPLACES itself with the real
+        // command. This is the fix for the tracked-PID bug: the previous
+        // implementation shelled out to the external `setsid` *binary*
+        // (`bash -c "setsid <cmd> ..."`) and returned the bash PID. That was
+        // wrong two ways:
+        //   1. `setsid` is not installed on macOS, so bash exited 127
+        //      immediately and the command never ran at all.
+        //   2. Even where `setsid` exists, the real command runs as a setsid
+        //      grandchild in a new session, so the tracked bash PID exits
+        //      almost immediately — kill()/status then read a dead PID and
+        //      mis-mark the job Completed/Failed instead of Cancelled.
+        //
+        // Instead we call libc::setsid() in the forked child (pre_exec, before
+        // exec) — no external binary — and prefix the command with `exec` so
+        // bash hands its PID to the command. child.id() is therefore the PID of
+        // the actual running process, which is exactly what kill() must target.
         let bash_path = crate::platform_bash::bash_exe_path(None)
             .map_err(|e| anyhow!("Failed to resolve bash: {}", e))?;
-        let child = TokioCommand::new(&bash_path)
-            .arg("-c")
+        let mut cmd = TokioCommand::new(&bash_path);
+        cmd.arg("-c")
             .arg(format!(
-                "setsid {} > {} 2>&1 < /dev/null",
+                "exec {} > {} 2>&1 < /dev/null",
                 command,
                 log_path.display()
             ))
             .current_dir(working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+
+        // SAFETY: setsid() is async-signal-safe and the only work done in the
+        // child between fork and exec; we touch no shared allocator state.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let child = cmd
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn process: {}", e))?;
 
