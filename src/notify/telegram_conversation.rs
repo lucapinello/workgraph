@@ -51,6 +51,7 @@ use crate::agency::TelegramBindingMap;
 use crate::chat;
 use crate::chat_sessions;
 use crate::config::Config;
+use crate::notify::grounding;
 use crate::notify::lifecycle;
 use crate::notify::ownership;
 use crate::notify::parity;
@@ -671,6 +672,37 @@ fn build_compose_prompt(
          human sees your reply, so never mention it. Do NOT emit it for small talk, \
          questions, or things you can answer directly.\n\n",
     );
+
+    // GROUNDING (rule 1): a question/read-shaped ask about plans/calendar/meals
+    // /schedule gets the REAL week model injected, so the answer is grounded on
+    // turn one instead of a stall. This is the read-side twin of the fast lane's
+    // edit-shaped classifier. Best-effort — a missing plan just omits the block.
+    let root = project_root_of(workgraph_dir);
+    let today = chrono::Local::now().date_naive();
+    if grounding::is_read_shaped(human_message) {
+        if let Some(block) = grounding::fetch(&root, today) {
+            prompt.push_str(&block);
+            prompt.push('\n');
+        }
+    }
+
+    // CORRECTIONS (rule 3): replay every correction the family has made so the
+    // persona honours it for the rest of the window and every future turn, and
+    // never repeats a claim they already corrected.
+    let corrections: Vec<String> = parity::PreferenceStore::all(&root)
+        .into_iter()
+        .filter_map(|r| {
+            r.text
+                .strip_prefix(grounding::CORRECTION_PREFIX)
+                .map(|c| c.trim().to_string())
+        })
+        .filter(|c| !c.is_empty())
+        .collect();
+    if let Some(block) = grounding::corrections_block(&corrections) {
+        prompt.push_str(&block);
+        prompt.push('\n');
+    }
+
     prompt.push_str(&format!("Message: {}\n\nYour reply:", human_message.trim()));
     prompt
 }
@@ -977,6 +1009,31 @@ async fn run_composed_turn(
         }
     }
 
+    // CORRECTIONS STICK (rule 3): if the human is correcting a fact mid-chat
+    // ("Nadin is not logged so ignore this"), persist it BEFORE we compose so
+    // the very reply to this turn honours it (`build_compose_prompt` replays
+    // every recorded correction), and so does every future turn. Best-effort.
+    if let Some(correction) = grounding::detect_correction(human_message) {
+        let root = project_root_of(workgraph_dir);
+        let stored = format!("{}{}", grounding::CORRECTION_PREFIX, correction);
+        match parity::PreferenceStore::record(
+            &root,
+            &stored,
+            &origin.requester,
+            &origin.persona,
+        ) {
+            Ok(_) => println!(
+                "[{}] conversation recorded correction (chat {})",
+                chrono::Utc::now().format("%H:%M:%S"),
+                origin.chat_id,
+            ),
+            Err(e) => eprintln!(
+                "[{}] failed to record correction: {e}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            ),
+        }
+    }
+
     // Persist the human turn so a live nex session and the TUI stay consistent
     // with the answer we compose here (best-effort — a write failure must not
     // block the reply).
@@ -1228,6 +1285,35 @@ async fn finalize_composed_reply(
     if reply_text.is_empty() {
         // The whole reply was a bare directive — never send an empty message.
         reply_text = "On it 👍".to_string();
+    }
+
+    // Read this persona's prior replies (this turn's outbox is not appended
+    // yet) for the repetition and style guards.
+    let prior_replies: Vec<String> = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
+        .map(|out| out.into_iter().map(|m| m.content).collect())
+        .unwrap_or_default();
+
+    // STYLE (rule 4): at most one formulaic "Anything specific…?" tail per
+    // conversation. If a prior reply already spent the allowance, drop this
+    // one's trailing filler question (never emptying the reply). Applied before
+    // the repetition guard so the honest fallback below is never itself trimmed.
+    let already_used = grounding::count_formulaic(&prior_replies) > 0;
+    reply_text = grounding::enforce_style(&reply_text, already_used);
+
+    // REPETITION GUARD (rule 2): never send the same summary a third time. If
+    // this draft is substantially the same as the previous reply, answer
+    // honestly instead — own that the answer already went out and offer to
+    // actually go read the source. Delivered verbatim (style is not re-applied).
+    // With turn-one grounding in place this is a backstop; the transcript shows
+    // exactly why the backstop must exist.
+    if let Some(prev) = prior_replies.last() {
+        if grounding::is_repetitive(&reply_text, prev) {
+            eprintln!(
+                "[{}] repetition guard: {agent_id}'s draft repeats its previous reply — answering honestly",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+            reply_text = grounding::repetition_fallback_line();
+        }
     }
 
     let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &reply_text, request_id);
@@ -2832,5 +2918,151 @@ mod tests {
         assert!(!speaker_is_owner(&origin("otto", None), "bruno"));
         // No owner resolved → never a self-owner.
         assert!(!speaker_is_owner(&origin("bruno", None), ""));
+    }
+
+    // -----------------------------------------------------------------------
+    // otto-answers-like: grounded, non-repetitive, corrigible conversation.
+    //
+    // The regression fixture is Luca's 2026-07-15 transcript: he asked "Plans
+    // for tomorrow?" and Otto stalled four times with a near-identical "meals
+    // set, waiting on confirmations from you and Nadin, want the rundown?" —
+    // never reading the plan — even after a correction ("Nadin is not logged so
+    // ignore this"), until commanded "You need to read the calendar". These
+    // tests prove the composer now grounds turn one, refuses to repeat itself,
+    // and honours corrections.
+    // -----------------------------------------------------------------------
+
+    const W29_FIXTURE_PLAN: &str = "\
+# 2026-W29 Family Plan
+
+**Week of Monday 2026-07-13 to Sunday 2026-07-19**
+**Status:** DRAFT
+
+## 1. Meals
+
+| Day | Slot | Dinner | Prep |
+|-----|------|--------|------|
+| Mon 07-13 | Vegetarian | Chickpea & spinach curry, brown rice | ~35 min |
+| Tue 07-14 | Fish | Baked salmon, roasted potatoes, green beans | ~30 min |
+| Wed 07-15 | Flex | Leftovers | ~10 min |
+
+## 3. Calendar
+
+| Day | Time | Event | Source |
+|-----|------|-------|--------|
+| Tue 07-14 | 19:30 | Luca PT check-in | Otto |
+| Thu 07-16 | 09:00 | Dentist — Nadin | Otto |
+";
+
+    /// RULE 1 (grounding): a read-shaped ask about the plan pulls the REAL week
+    /// model into the compose prompt on turn one — the fix for four ungrounded
+    /// stalls. Chit-chat is left un-bloated.
+    #[test]
+    fn ground_compose_prompt_injects_the_week_model_for_read_shaped_asks() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let plans = dir.path().join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("2026-W29-family-plan.md"), W29_FIXTURE_PLAN).unwrap();
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+
+        // The fixture's opening ask: the plan data must be present, turn one.
+        let grounded = build_compose_prompt(&wg, &uuid, "otto", "Plans for tomorrow?");
+        assert!(
+            grounded.contains("Baked salmon"),
+            "grounding data missing from prompt:\n{grounded}"
+        );
+        assert!(grounded.contains("Luca PT check-in"));
+        assert!(grounded.to_lowercase().contains("do not stall"));
+
+        // Small talk carries no grounding block.
+        let plain = build_compose_prompt(&wg, &uuid, "otto", "morning!");
+        assert!(!plain.contains("Baked salmon"));
+    }
+
+    /// RULE 3 (corrections stick): "Nadin is not logged so ignore this" is
+    /// persisted durably AND replayed into every subsequent compose prompt so
+    /// the corrected claim is never repeated.
+    #[tokio::test]
+    async fn ground_correction_is_persisted_and_replayed() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok("Got it — I won't count Nadin as logged.");
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "Nadin is not logged so ignore this",
+            "req-corr",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        // Durably recorded under .casa, tagged as a correction.
+        let root = dir.path();
+        let prefs = parity::PreferenceStore::all(root);
+        assert!(
+            prefs.iter().any(|p| p
+                .text
+                .starts_with(grounding::CORRECTION_PREFIX)
+                && p.text.contains("Nadin")),
+            "correction not persisted: {prefs:?}"
+        );
+
+        // Replayed into the next turn's prompt so the claim is honoured.
+        let next = build_compose_prompt(&wg, &uuid, "otto", "what's for dinner?");
+        assert!(next.to_lowercase().contains("correction"), "prompt: {next}");
+        assert!(next.contains("Nadin is not logged"));
+    }
+
+    /// RULE 2 (repetition guard): the same summary is never sent twice. When the
+    /// composer drafts a reply substantially identical to its previous one, the
+    /// guard swaps in an honest offer to actually read the source.
+    #[tokio::test]
+    async fn ground_repetition_guard_replaces_the_repeated_summary() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+
+        let stall = "Meals are set, just waiting on confirmations from you and Nadin.";
+
+        // Turn 1: the stall is a fresh reply — it goes out as-is.
+        let sink1 = RecSink::default();
+        let c1 = FakeComposer::ok(stall);
+        run_conversation_turn(
+            &wg, &plan, "Plans for tomorrow?", "req-1", fast_timing(), Some(&c1), &sink1,
+        )
+        .await
+        .unwrap();
+        assert!(sink1.calls().last().unwrap().2.contains("waiting on confirmations"));
+
+        // Turn 2: the SAME stall is drafted again → guard answers honestly.
+        let sink2 = RecSink::default();
+        let c2 = FakeComposer::ok(stall);
+        run_conversation_turn(
+            &wg, &plan, "walk me through it", "req-2", fast_timing(), Some(&c2), &sink2,
+        )
+        .await
+        .unwrap();
+        let last = sink2.calls().last().unwrap().2.clone();
+        assert!(!last.contains("waiting on confirmations"), "stall repeated: {last}");
+        assert!(last.to_lowercase().contains("read"), "not the honest fallback: {last}");
     }
 }
