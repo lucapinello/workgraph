@@ -15,15 +15,33 @@
 //!
 //! ## PRIVACY — the load-bearing rule of this module
 //!
-//! A feed line carries ONLY six display-safe fields: `ts`, `sender`, `agentId`,
-//! `emoji`, `kind`, `text`. It NEVER carries a bot token, a Telegram `chat_id`,
-//! or a Telegram user id. [`FeedEntry`] has no field for a secret, and
-//! [`FeedEntry::to_json_line`] emits exactly those six keys — so a careless
-//! caller structurally cannot write a token or chat id onto disk. The gateway
-//! re-sanitizes on read as defence in depth, but this writer is the first and
-//! primary gate: secrets must never reach the file in the first place.
+//! A feed line carries ONLY display-safe fields: `ts`, `sender`, `agentId`,
+//! `emoji`, `kind`, `text`, plus the provenance pair `srcId` / `origin`
+//! (docs/20 §2). It NEVER carries a bot token, a Telegram `chat_id`, or a
+//! Telegram user id. [`FeedEntry`] has no field for a secret, and
+//! [`FeedEntry::to_json_line`] emits exactly those keys — so a careless caller
+//! structurally cannot write a token or chat id onto disk. Crucially `srcId` is
+//! an OPAQUE fingerprint (see [`source_id`]): it is a hash of the message's
+//! content, so it durably dedupes re-deliveries WITHOUT the chat id or user id
+//! ever appearing verbatim in the feed. The gateway re-sanitizes on read as
+//! defence in depth, but this writer is the first and primary gate: secrets must
+//! never reach the file in the first place.
+//!
+//! ## EXACTLY-ONCE — why `srcId` exists (docs/20 §2)
+//!
+//! The gateway reader (`conversation.mjs`) dedupes the feed by `srcId`, but only
+//! for a NON-NULL `srcId`; a `null` line is unique by construction. The Telegram
+//! listener at-least-once re-delivers on restart (an update whose offset was not
+//! advanced past a crash arrives again), and its in-memory cross-bot dedupe
+//! (`telegram_dedupe`) is empty on a fresh process — so without a durable id the
+//! SAME inbound group message appends twice and the pane shows it twice. Stamping
+//! each inbound line with a restart-stable [`source_id`] lets the reader's
+//! `dedupeBySrcId` collapse the re-delivery to one. This is the write half of the
+//! exactly-once contract; `conversation.mjs` is the read half.
 
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -47,8 +65,11 @@ impl FeedKind {
     }
 }
 
-/// One append-only feed line. The six fields here are the ENTIRE gateway
-/// contract — there is deliberately no field for a token, chat id, or user id.
+/// One append-only feed line. These fields are the ENTIRE gateway contract —
+/// there is deliberately no field for a token, chat id, or user id. `src_id` and
+/// `origin` are the display-safe provenance pair (docs/20 §2): `src_id` is an
+/// opaque restart-stable dedupe fingerprint (never a secret — see [`source_id`]),
+/// `origin` is where the line came from (always `"telegram"` for this writer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedEntry {
     /// Epoch milliseconds when the line was produced.
@@ -63,20 +84,39 @@ pub struct FeedEntry {
     pub kind: FeedKind,
     /// The message text (newlines collapsed, trimmed, length-capped).
     pub text: String,
+    /// Opaque, restart-stable dedupe id for the source message (docs/20 §2), or
+    /// `None` for a locally-originated line (an agent reply has no upstream id
+    /// and is unique by construction). Built by [`source_id`] from the message's
+    /// content fingerprint — NEVER a raw `message_id` (per-bot unstable; see
+    /// `notify::mod::IncomingMessage`) and NEVER a secret. The gateway reader
+    /// collapses duplicate non-null `srcId`s (`dedupeBySrcId` in
+    /// `conversation.mjs`), which is what makes a listener re-delivery show once.
+    pub src_id: Option<String>,
+    /// Where this line physically came from — provenance, orthogonal to `kind`
+    /// (who is speaking). Always [`ORIGIN_TELEGRAM`] here: this module is the
+    /// Telegram listener/relay writer. Matches the reader's `ORIGINS` allowlist
+    /// in `conversation.mjs`. Not a secret.
+    pub origin: &'static str,
 }
 
 /// Longest a mirrored message may be. Well beyond any real family message; caps
 /// a pathological line so it can neither bloat the feed nor the pane payload.
 const MAX_TEXT: usize = 2000;
 
+/// Provenance tag stamped on every line this module writes. The Telegram
+/// listener/relay is the sole writer here, so `origin` is always `"telegram"`;
+/// it must be one of the reader's `ORIGINS` allowlist in `conversation.mjs`.
+pub const ORIGIN_TELEGRAM: &str = "telegram";
+
 impl FeedEntry {
     /// Serialize to ONE compact JSON line (no trailing newline).
     ///
     /// Built from an explicit object literal — not `#[derive(Serialize)]` on the
-    /// struct — so the emitted keys are pinned to exactly the six display-safe
-    /// fields regardless of any future field added to [`FeedEntry`]. `agent_id`
-    /// serializes to JSON `null` when absent. This is the privacy gate's teeth:
-    /// there is no code path here that can emit a token or chat id.
+    /// struct — so the emitted keys are pinned to exactly the display-safe fields
+    /// regardless of any future field added to [`FeedEntry`]. `agent_id` and
+    /// `src_id` serialize to JSON `null` when absent. This is the privacy gate's
+    /// teeth: there is no code path here that can emit a token or chat id — even
+    /// `srcId` is an opaque hash (see [`source_id`]), never a raw id.
     pub fn to_json_line(&self) -> String {
         let value = serde_json::json!({
             "ts": self.ts,
@@ -85,6 +125,8 @@ impl FeedEntry {
             "emoji": self.emoji,
             "kind": self.kind.as_str(),
             "text": self.text,
+            "srcId": self.src_id,
+            "origin": self.origin,
         });
         value.to_string()
     }
@@ -138,13 +180,48 @@ fn title_case(s: &str) -> String {
     }
 }
 
+/// Build an opaque, restart-stable source id for an inbound Telegram message
+/// (docs/20 §2), for the gateway reader's `dedupeBySrcId`.
+///
+/// It must satisfy two hard properties:
+///   1. **Identical across every delivery of one physical message** — the four
+///      privacy-off bots each stamp a *different* `message_id`/`update_id`
+///      (observed 58/36/45/39; see `notify::telegram_dedupe`), and a fresh
+///      listener re-delivers on restart. The only thing that stays equal across
+///      all of that is the message's *content*: the chat it landed in, the human
+///      who sent it, the second it was sent, and the text — exactly the tuple
+///      `DedupeKey::from_content` keys on. So we fingerprint that tuple, NOT any
+///      transport id. This is why a raw `message_id` would be wrong here.
+///   2. **No secret** — the chat id and user id are secrets (this module's
+///      load-bearing rule). Folding them through a hash means the resulting token
+///      dedupes durably while the raw ids never appear verbatim in the feed.
+///
+/// The output is `tg-<16 hex>` — compact, opaque, and well under the reader's
+/// 80-char `srcId` cap. Uses the std `DefaultHasher` (fixed-key SipHash), which
+/// is deterministic across process runs, so a re-delivery after restart hashes
+/// to the same token as the original write.
+pub fn source_id(chat_id: &str, sender_id: &str, date_secs: i64, text: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    chat_id.hash(&mut hasher);
+    // A NUL separator so `("ab","c")` and `("a","bc")` can't collide.
+    0u8.hash(&mut hasher);
+    sender_id.hash(&mut hasher);
+    0u8.hash(&mut hasher);
+    date_secs.hash(&mut hasher);
+    text.hash(&mut hasher);
+    format!("tg-{:016x}", hasher.finish())
+}
+
 /// Build a `group` line for an inbound group message.
 ///
 /// `sender` is the human's display handle (the Telegram `@username`, never a
 /// numeric user id — see `notify::telegram` where the field is populated). If it
 /// happens to match a known persona it is presented as that persona; otherwise
 /// it is a human, so `agentId` is `null` and `emoji` is empty. `ts` is epoch ms.
-pub fn group_entry(sender: &str, text: &str, ts: i64) -> FeedEntry {
+/// `src_id` is the opaque dedupe fingerprint (from [`source_id`]) for this
+/// inbound message, or `None` when the transport didn't surface enough to build
+/// one (a `null` srcId is unique-by-construction on the read side).
+pub fn group_entry(sender: &str, text: &str, ts: i64, src_id: Option<String>) -> FeedEntry {
     match persona_identity(sender) {
         Some((name, emoji)) => FeedEntry {
             ts,
@@ -153,6 +230,8 @@ pub fn group_entry(sender: &str, text: &str, ts: i64) -> FeedEntry {
             emoji,
             kind: FeedKind::Group,
             text: normalize_text(text),
+            src_id,
+            origin: ORIGIN_TELEGRAM,
         },
         None => FeedEntry {
             ts,
@@ -161,6 +240,8 @@ pub fn group_entry(sender: &str, text: &str, ts: i64) -> FeedEntry {
             emoji: String::new(),
             kind: FeedKind::Group,
             text: normalize_text(text),
+            src_id,
+            origin: ORIGIN_TELEGRAM,
         },
     }
 }
@@ -171,6 +252,11 @@ pub fn group_entry(sender: &str, text: &str, ts: i64) -> FeedEntry {
 /// from the roster; `agentId` is always set (lower-cased) because this is, by
 /// definition, an agent line. An unknown id still yields a line (title-cased
 /// name, empty emoji) rather than being dropped. `ts` is epoch ms.
+///
+/// An agent reply is composed locally and relayed out, so it has no upstream
+/// source message and its `src_id` is `None` (unique by construction — the read
+/// side never collapses a null srcId). `origin` is still `"telegram"`: the line
+/// is physically written by the Telegram relay.
 pub fn agent_entry(agent_id: &str, text: &str, ts: i64) -> FeedEntry {
     let id = agent_id.trim().to_ascii_lowercase();
     let (sender, emoji) = match persona_identity(agent_id) {
@@ -184,6 +270,8 @@ pub fn agent_entry(agent_id: &str, text: &str, ts: i64) -> FeedEntry {
         emoji,
         kind: FeedKind::Agent,
         text: normalize_text(text),
+        src_id: None,
+        origin: ORIGIN_TELEGRAM,
     }
 }
 
@@ -224,12 +312,54 @@ mod tests {
 
     #[test]
     fn group_entry_human_has_null_agent_id_and_empty_emoji() {
-        let e = group_entry("nadin", "what's for dinner?", 1_720_000_000_000);
+        let e = group_entry("nadin", "what's for dinner?", 1_720_000_000_000, None);
         assert_eq!(e.sender, "nadin");
         assert_eq!(e.agent_id, None);
         assert_eq!(e.emoji, "");
         assert_eq!(e.kind, FeedKind::Group);
         assert_eq!(e.text, "what's for dinner?");
+        assert_eq!(e.origin, "telegram");
+    }
+
+    #[test]
+    fn group_entry_carries_the_passed_src_id() {
+        let id = source_id("-100999", "555", 1_700_000_000, "hi");
+        let e = group_entry("nadin", "hi", 1, Some(id.clone()));
+        assert_eq!(e.src_id.as_deref(), Some(id.as_str()));
+        // A persona-named group line carries the id too (both arms of the match).
+        let p = group_entry("nora", "hi", 1, Some(id.clone()));
+        assert_eq!(p.src_id.as_deref(), Some(id.as_str()));
+        // No id → null, unique-by-construction on the read side.
+        let n = group_entry("nadin", "hi", 1, None);
+        assert_eq!(n.src_id, None);
+    }
+
+    #[test]
+    fn agent_entry_has_null_src_id_and_telegram_origin() {
+        // A relayed agent reply is locally composed: no upstream id, unique by
+        // construction; still written via the Telegram relay so origin=telegram.
+        let e = agent_entry("nora", "pasta tonight", 0);
+        assert_eq!(e.src_id, None);
+        assert_eq!(e.origin, "telegram");
+    }
+
+    #[test]
+    fn source_id_is_stable_opaque_and_leaks_no_ids() {
+        let (chat, user, date, text) = ("-1000000000001", "123456789", 1_700_000_000, "hello");
+        let a = source_id(chat, user, date, text);
+        let b = source_id(chat, user, date, text);
+        // (1) Stable: identical content → identical id (so a listener restart /
+        // re-delivery of the same message hashes to the same token → deduped).
+        assert_eq!(a, b, "same content must yield the same source id across calls");
+        // Distinct content → distinct id (no accidental over-collapse).
+        assert_ne!(a, source_id(chat, user, date, "goodbye"));
+        assert_ne!(a, source_id(chat, user, date + 1, text));
+        assert_ne!(a, source_id(chat, "999", date, text));
+        assert_ne!(a, source_id("-100000", user, date, text));
+        // (2) Opaque + no secret: the raw chat id and user id NEVER appear.
+        assert!(a.starts_with("tg-"), "opaque token shape: {a}");
+        assert!(!a.contains(chat), "source id leaked the chat id: {a}");
+        assert!(!a.contains(user), "source id leaked the user id: {a}");
     }
 
     #[test]
@@ -256,19 +386,33 @@ mod tests {
     }
 
     #[test]
-    fn json_line_has_exactly_six_keys_and_null_agent_id() {
-        let line = group_entry("nadin", "hi", 42).to_json_line();
+    fn json_line_has_exactly_the_contract_keys_and_null_agent_id() {
+        let line = group_entry("nadin", "hi", 42, None).to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         let obj = v.as_object().unwrap();
         let mut keys: Vec<&String> = obj.keys().collect();
         keys.sort();
         assert_eq!(
             keys,
-            vec!["agentId", "emoji", "kind", "sender", "text", "ts"]
+            vec![
+                "agentId", "emoji", "kind", "origin", "sender", "srcId", "text", "ts"
+            ]
         );
         assert!(obj.get("agentId").unwrap().is_null());
         assert_eq!(obj.get("kind").unwrap(), "group");
         assert_eq!(obj.get("ts").unwrap(), 42);
+        // Provenance pair: origin present, srcId null when none was passed.
+        assert_eq!(obj.get("origin").unwrap(), "telegram");
+        assert!(obj.get("srcId").unwrap().is_null());
+    }
+
+    #[test]
+    fn json_line_emits_src_id_when_present() {
+        let id = source_id("-100999", "555", 1_700_000_000, "hi");
+        let line = group_entry("nadin", "hi", 42, Some(id.clone())).to_json_line();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v.get("srcId").unwrap(), &serde_json::Value::String(id));
+        assert_eq!(v.get("origin").unwrap(), "telegram");
     }
 
     #[test]
@@ -280,7 +424,7 @@ mod tests {
     #[test]
     fn text_is_capped_without_splitting_a_codepoint() {
         let long = "é".repeat(MAX_TEXT + 500);
-        let e = group_entry("luca", &long, 0);
+        let e = group_entry("luca", &long, 0, None);
         assert_eq!(e.text.chars().count(), MAX_TEXT);
     }
 
@@ -301,21 +445,24 @@ mod tests {
 
         // A synthetic inbound group message and a relayed agent reply — the same
         // two writes the listener performs for one round-trip.
-        append_entry(&feed, &group_entry("nadin", "nora, what's for dinner?", 1)).unwrap();
+        append_entry(&feed, &group_entry("nadin", "nora, what's for dinner?", 1, None)).unwrap();
         append_entry(&feed, &agent_entry("nora", "pasta tonight 🍝", 2)).unwrap();
 
         let contents = fs::read_to_string(&feed).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2, "exactly two feed lines");
 
-        // Both lines parse and carry exactly the six contract fields.
+        // Both lines parse and carry exactly the eight contract fields (the six
+        // display fields plus the provenance pair srcId/origin — docs/20 §2).
         for line in &lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             let obj = v.as_object().unwrap();
-            assert_eq!(obj.len(), 6, "exactly six fields: {line}");
-            for key in ["ts", "sender", "agentId", "emoji", "kind", "text"] {
+            assert_eq!(obj.len(), 8, "exactly eight fields: {line}");
+            for key in ["ts", "sender", "agentId", "emoji", "kind", "text", "srcId", "origin"] {
                 assert!(obj.contains_key(key), "missing {key} in {line}");
             }
+            // Provenance is always the Telegram writer's tag.
+            assert_eq!(obj.get("origin").unwrap(), "telegram");
         }
 
         // Line 1 is the human (agentId null), line 2 is the persona.
@@ -341,5 +488,44 @@ mod tests {
                 "feed leaked secret substring {secret:?}: {contents}"
             );
         }
+    }
+
+    /// THE exactly-once reproducer (docs/20 §2, task bug-chat-rust). The listener
+    /// at-least-once re-delivers on restart, so the SAME inbound group message can
+    /// be written to the feed twice. Because each write now carries a stable
+    /// [`source_id`] fingerprint, both physical lines share ONE non-null `srcId`,
+    /// which is exactly what the gateway's `dedupeBySrcId` collapses to a single
+    /// pane message. Before this fix both lines were `srcId:null` (unique by
+    /// construction), so the reader showed the message twice.
+    #[test]
+    fn identical_redelivered_inbound_lines_share_one_src_id() {
+        let dir = tempdir().unwrap();
+        let feed = feed_path_for(dir.path());
+
+        // The stable content fingerprint: identical across bot fan-out AND across
+        // a listener restart, because it is derived from the message content, not
+        // a per-bot transport id.
+        let (chat, user, date, text) = ("-1000000000001", "123456789", 1_700_000_000, "who cooks?");
+        let sid = source_id(chat, user, date, text);
+
+        // Two writes of the same physical message (the restart re-delivery).
+        append_entry(&feed, &group_entry("nadin", text, 10, Some(sid.clone()))).unwrap();
+        append_entry(&feed, &group_entry("nadin", text, 11, Some(sid.clone()))).unwrap();
+
+        let contents = fs::read_to_string(&feed).unwrap();
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "the append-only writer writes both physically");
+
+        // Both carry the SAME non-null srcId → the reader's dedupeBySrcId collapses
+        // them to one pane line. (On main both would be srcId:null → shown twice.)
+        let s0 = serde_json::from_str::<serde_json::Value>(lines[0]).unwrap();
+        let s1 = serde_json::from_str::<serde_json::Value>(lines[1]).unwrap();
+        assert!(!s0["srcId"].is_null(), "srcId must be non-null to dedupe");
+        assert_eq!(s0["srcId"], s1["srcId"], "re-delivery shares one srcId");
+
+        // PRIVACY still holds even though srcId is DERIVED from the chat/user ids:
+        // the fingerprint is a hash, so neither raw id appears verbatim.
+        assert!(!contents.contains(chat), "chat id leaked via srcId: {contents}");
+        assert!(!contents.contains(user), "user id leaked via srcId: {contents}");
     }
 }

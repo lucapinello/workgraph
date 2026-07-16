@@ -3827,12 +3827,14 @@ fn main() -> Result<()> {
                 sender,
                 agent_id,
                 text,
+                src_id,
             } => commands::telegram::run_feed_write(
                 &root,
                 &kind,
                 sender.as_deref(),
                 agent_id.as_deref(),
                 &text,
+                src_id.as_deref(),
             ),
             TelegramCommands::Classify {
                 channel,
