@@ -7004,6 +7004,13 @@ pub enum TelegramCommands {
         /// The message text to mirror.
         #[arg(long)]
         text: String,
+
+        /// Optional opaque source id (docs/20 §2) stamped as `srcId` on a
+        /// `--kind group` line, for durable read-side dedupe. Passing the SAME
+        /// value twice reproduces a listener re-delivery: the gateway collapses
+        /// both physical lines to one pane message. Not a secret.
+        #[arg(long)]
+        src_id: Option<String>,
     },
 
     /// Classify an inbound message exactly as `wg telegram listen` would

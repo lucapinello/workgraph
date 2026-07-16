@@ -654,7 +654,22 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 && matches!(msg.chat_type.as_deref(), Some("group") | Some("supergroup"))
                 && !msg.body.trim().is_empty()
             {
-                let entry = casa_feed::group_entry(&msg.sender, &msg.body, casa_feed::now_ms());
+                // Durable dedupe id (docs/20 §2): the SAME content fingerprint the
+                // cross-bot dedupe above keys on — stable across the four bot
+                // deliveries AND across a listener restart that re-delivers this
+                // update, so the gateway's `dedupeBySrcId` collapses a re-delivery
+                // to one pane line. Hashed, so no chat/user id reaches the feed.
+                // `None` when the transport didn't surface a chat id or send time
+                // (a null srcId is unique-by-construction on the read side).
+                let src_id = match (msg.chat_id.as_deref(), msg.sent_at) {
+                    (Some(cid), Some(date)) => {
+                        let sender = msg.sender_id.as_deref().unwrap_or(msg.sender.as_str());
+                        Some(casa_feed::source_id(cid, sender, date, &msg.body))
+                    }
+                    _ => None,
+                };
+                let entry =
+                    casa_feed::group_entry(&msg.sender, &msg.body, casa_feed::now_ms(), src_id);
                 if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
                     eprintln!(
                         "[{}] casa feed: failed to mirror inbound group message: {e}",
@@ -3507,11 +3522,15 @@ pub fn run_feed_write(
     sender: Option<&str>,
     agent_id: Option<&str>,
     text: &str,
+    src_id: Option<&str>,
 ) -> Result<()> {
     let entry = match kind {
         "group" => {
             let sender = sender.context("--kind group requires --sender")?;
-            casa_feed::group_entry(sender, text, casa_feed::now_ms())
+            // Thread the caller-supplied opaque source id (docs/20 §2) so a smoke
+            // test can drive the real writer with the SAME id twice and prove the
+            // reader's srcId dedupe collapses the re-delivery to one pane line.
+            casa_feed::group_entry(sender, text, casa_feed::now_ms(), src_id.map(str::to_string))
         }
         "agent" => {
             let agent_id = agent_id.context("--kind agent requires --agent-id")?;
