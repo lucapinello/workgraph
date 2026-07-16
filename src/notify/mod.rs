@@ -35,6 +35,7 @@ pub mod telegram_pacing;
 pub mod telegram_photo;
 pub mod telegram_sender;
 pub mod telegram_standup;
+pub mod telegram_voice;
 pub mod voice;
 pub mod webhook;
 
@@ -179,6 +180,23 @@ pub struct IncomingMessage {
     /// vision turn rather than answering each photo — see
     /// `telegram_photo::coalesce_album`. `None` for a lone photo or text.
     pub media_group_id: Option<String>,
+    /// If this message carried an **audio recording** — a Telegram `voice`
+    /// note (OGG/Opus), an `audio` file, or a `video_note` — the `file_id` of
+    /// that media. This is the handle the listener passes to `getFile` to
+    /// download the bytes for transcription (see `telegram_voice`). The
+    /// download URL embeds the bot token and is NEVER logged; the `file_id`
+    /// itself is opaque and safe to log. `None` for text/photo messages and
+    /// transports that don't surface audio. A recording carries no `text`, so
+    /// the listener transcribes it via the gateway and injects the transcript
+    /// as the message body — after which it routes exactly like a typed line.
+    pub voice_file_id: Option<String>,
+    /// The declared MIME type of the audio (`voice.mime_type` /
+    /// `audio.mime_type`, e.g. `audio/ogg`), when the transport surfaces one.
+    /// Passed as the `Content-Type` when POSTing the bytes to the gateway's
+    /// `/conversation/transcribe` so ffmpeg picks the right demuxer. `None`
+    /// (e.g. `video_note`, which declares no mime) → the listener falls back to
+    /// a per-kind default. See `telegram_voice::VoiceMeta`.
+    pub voice_mime: Option<String>,
 }
 
 /// Classification of notification events for routing.

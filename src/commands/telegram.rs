@@ -17,6 +17,7 @@ use worksgood::notify::family_plan;
 use worksgood::notify::fast_lane;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
 use worksgood::notify::telegram_family_commands as family_commands;
+use worksgood::notify::telegram_voice;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::ownership;
 use worksgood::notify::telegram_group::{
@@ -590,7 +591,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         // carries no group id and is never suppressed.
         let mut answered_media_groups: HashSet<String> = HashSet::new();
 
-        while let Some(msg) = rx.recv().await {
+        while let Some(mut msg) = rx.recv().await {
             // Fix #0 — the bot-loop guard, FIRST (before dedupe, feed mirror,
             // commands, and election). The family bots run as group admins, so
             // each bot's poller RECEIVES the replies the OTHER bots send. A
@@ -719,6 +720,140 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     eprintln!("Failed to send response: {e}");
                 }
                 continue;
+            }
+
+            // VOICE NOTE / AUDIO / VIDEO_NOTE → transcript → normal message
+            // (task telegram-voice-notes). A recording carries no text — its
+            // words are SPOKEN. Transcribe it with the SAME whisper engine the
+            // kiosk mic uses (the gateway's /conversation/transcribe), then
+            // INJECT the transcript as the message body so it routes EXACTLY
+            // like a typed line: election, single-owner routing, fast lane,
+            // composer, ledger and dedupe all run UNCHANGED below. The bot-loop,
+            // dedupe and stale-backlog guards above already applied — a recording
+            // has an empty body, so the content-fingerprint dedupe still collapses
+            // the four bot deliveries to one, and the earlier text-only feed mirror
+            // was skipped (empty body). We mirror the SPOKEN line here instead,
+            // with an honest 🎙️ marker. Never silent: every failure replies
+            // in-persona via the receiving bot.
+            if let Some(voice_file_id) = msg.voice_file_id.clone() {
+                // The `file_id` is only valid for the bot that RECEIVED the
+                // recording, so we download — and reply — via THAT bot's channel.
+                let Some(receiving) =
+                    channels.iter().find(|c| c.channel_type() == msg.channel)
+                else {
+                    eprintln!(
+                        "[{}] voice note from {}: no channel matches receiving bot {:?} — dropped",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        msg.sender,
+                        msg.channel,
+                    );
+                    continue;
+                };
+
+                // The mime is only a hint (ffmpeg sniffs the container); the raw
+                // kind isn't threaded through `IncomingMessage`, so default it to
+                // Voice — the post-download size guard runs regardless.
+                let meta = telegram_voice::VoiceMeta {
+                    file_id: voice_file_id.clone(),
+                    mime_type: msg.voice_mime.clone(),
+                    kind: telegram_voice::VoiceKind::Voice,
+                    file_size: None,
+                };
+                let gateway = telegram_voice::HttpTranscribeGateway::from_env();
+                let lang = telegram_voice::voice_lang();
+
+                println!(
+                    "[{}] voice note from {} (file {}) — transcribing via gateway",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    msg.sender,
+                    voice_file_id,
+                );
+
+                match telegram_voice::transcribe_voice_note(
+                    receiving,
+                    &gateway,
+                    &meta,
+                    &telegram_voice::VoiceLimits::default(),
+                    &lang,
+                )
+                .await
+                {
+                    Ok(telegram_voice::TranscribeResult::Transcript(text)) => {
+                        println!(
+                            "[{}] voice note from {} transcribed ({} chars) — injecting as message",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            msg.sender,
+                            text.chars().count(),
+                        );
+                        // Mirror the SPOKEN line to the group feed with the 🎙️
+                        // marker so everyone sees it was spoken. Group/supergroup
+                        // only — a 1:1 DM is private and never lands in the feed.
+                        if matches!(
+                            msg.chat_type.as_deref(),
+                            Some("group") | Some("supergroup")
+                        ) {
+                            let entry = casa_feed::group_entry(
+                                &msg.sender,
+                                &telegram_voice::spoken_feed_body(&text),
+                                casa_feed::now_ms(),
+                            );
+                            if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
+                                eprintln!(
+                                    "[{}] casa feed: failed to mirror spoken message: {e}",
+                                    chrono::Utc::now().format("%H:%M:%S"),
+                                );
+                            }
+                        }
+                        // Inject the transcript as the body and clear the voice
+                        // handle so the rest of the loop treats this as an
+                        // ordinary typed message. NO `continue` — fall through to
+                        // the UNCHANGED pipeline below (command gate, election,
+                        // routing, fast lane, composer), which all read `msg.body`.
+                        msg.body = text;
+                        msg.voice_file_id = None;
+                    }
+                    Ok(telegram_voice::TranscribeResult::Failed(failure)) => {
+                        println!(
+                            "[{}] voice note from {} not transcribed ({:?}) — replying in-persona",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            msg.sender,
+                            failure,
+                        );
+                        if let Err(e) =
+                            receiving.send_text(&reply_target, failure.message()).await
+                        {
+                            eprintln!(
+                                "Failed to send voice failure reply: {}",
+                                worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                            );
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        // A download / transport error — token already scrubbed by
+                        // the downloader, scrubbed again here for defence in depth.
+                        eprintln!(
+                            "[{}] voice note from {} failed to transcribe: {}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                            msg.sender,
+                            worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                        );
+                        // Never silent — send the honest "couldn't make it out" line.
+                        if let Err(e2) = receiving
+                            .send_text(
+                                &reply_target,
+                                telegram_voice::TranscribeFailure::Unclear.message(),
+                            )
+                            .await
+                        {
+                            eprintln!(
+                                "Failed to send voice error reply: {}",
+                                worksgood::notify::telegram::redact_bot_token(&format!("{e2:#}")),
+                            );
+                        }
+                        continue;
+                    }
+                }
             }
 
             // Command gate: a message is a command ONLY when it opens with a
@@ -4800,6 +4935,144 @@ fn parse_naive_now(s: &str) -> Option<chrono::NaiveDateTime> {
 /// fail-fast + graceful "glitched" follow-up path is provable through the built
 /// binary without a live model (the induced-failure test).
 #[allow(clippy::too_many_arguments)]
+/// Drive the voice-note path end-to-end from a recording FILE: detect →
+/// transcribe → inject (task `telegram-voice-notes`). The credential-free
+/// scripted-test seam behind `wg telegram voice --file`.
+///
+/// `detect`: read the file and build the same [`telegram_voice::VoiceMeta`] the
+/// listener parses from a real update. `transcribe`: POST the bytes to a
+/// gateway — a STUB (when `stub_ok`/`stub_reason` is set) so the whole path runs
+/// with NO live whisper, else the real `/conversation/transcribe`. `inject`: on
+/// a transcript, print it (the body that would be injected) AND how the SAME
+/// fast-lane classifier a typed line hits would route it — proving a spoken line
+/// == a typed line. On failure, print the honest in-persona line the listener
+/// would send.
+pub fn run_voice_dryrun(
+    file: &Path,
+    mime: &str,
+    lang: &str,
+    gateway: Option<&str>,
+    stub_ok: Option<&str>,
+    stub_reason: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use async_trait::async_trait;
+    use worksgood::notify::fast_lane;
+    use worksgood::notify::telegram_voice as tv;
+
+    // ── detect ────────────────────────────────────────────────────────────
+    let bytes = std::fs::read(file)
+        .with_context(|| format!("failed to read recording file {}", file.display()))?;
+    let meta = tv::VoiceMeta {
+        file_id: format!("local:{}", file.display()),
+        mime_type: Some(mime.to_string()),
+        kind: tv::VoiceKind::Voice,
+        file_size: Some(bytes.len() as u64),
+    };
+
+    // A downloader that just yields the already-read local bytes — the file IS
+    // the "download". The real listener path uses the Telegram getFile impl.
+    struct LocalBytes(Vec<u8>);
+    #[async_trait]
+    impl tv::VoiceDownloader for LocalBytes {
+        async fn download_bytes(&self, _file_id: &str) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    // A stub gateway returning a canned response, so the full detect→transcribe
+    // →inject path is provable with no live whisper engine.
+    struct StubGateway(serde_json::Value);
+    #[async_trait]
+    impl tv::TranscribeGateway for StubGateway {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _mime_type: &str,
+            _lang: &str,
+        ) -> Result<serde_json::Value> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let downloader = LocalBytes(bytes.clone());
+    let limits = tv::VoiceLimits::default();
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    let result: tv::TranscribeResult = rt.block_on(async {
+        if let Some(text) = stub_ok {
+            let gw = StubGateway(serde_json::json!({ "ok": true, "text": text }));
+            tv::transcribe_voice_note(&downloader, &gw, &meta, &limits, lang).await
+        } else if let Some(reason) = stub_reason {
+            let gw = StubGateway(serde_json::json!({ "ok": false, "reason": reason }));
+            tv::transcribe_voice_note(&downloader, &gw, &meta, &limits, lang).await
+        } else {
+            let base = gateway
+                .map(|g| g.to_string())
+                .unwrap_or_else(tv::gateway_base_url);
+            let gw = tv::HttpTranscribeGateway::new(base);
+            tv::transcribe_voice_note(&downloader, &gw, &meta, &limits, lang).await
+        }
+    })?;
+
+    // ── inject ────────────────────────────────────────────────────────────
+    match result {
+        tv::TranscribeResult::Transcript(text) => {
+            // Route the transcript through the SAME classifier a typed line hits.
+            let today = chrono::Local::now().date_naive();
+            let classification = fast_lane::classify(&text, today);
+            let route = match &classification {
+                fast_lane::Classification::FastLane(op) => {
+                    format!("fast-lane:{}", op.kind_label())
+                }
+                fast_lane::Classification::Fallback(_) => "composer".to_string(),
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "outcome": "transcript",
+                        "bytes": bytes.len(),
+                        "mime": mime,
+                        "transcript": text,
+                        "injected_body": text,
+                        "route": route,
+                    })
+                );
+            } else {
+                println!("detect: {} bytes, mime {}", bytes.len(), mime);
+                println!("transcribe: ok");
+                println!("inject: message body = {text:?}");
+                println!("route (same path as typed): {route}");
+            }
+        }
+        tv::TranscribeResult::Failed(failure) => {
+            let reason = match failure {
+                tv::TranscribeFailure::Unconfigured => "unconfigured",
+                tv::TranscribeFailure::Silence => "silence",
+                tv::TranscribeFailure::Unclear => "unclear",
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "outcome": "failed",
+                        "reason": reason,
+                        "reply": failure.message(),
+                    })
+                );
+            } else {
+                println!("detect: {} bytes, mime {}", bytes.len(), mime);
+                println!("transcribe: failed ({reason})");
+                println!("reply (in-persona): {}", failure.message());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run_conversation_dryrun(
     workgraph_dir: &Path,
     channel: &str,
@@ -5413,6 +5686,8 @@ async fn poll_once(
                     has_bot_command: false,
                     photo_file_id: None,
                     media_group_id: None,
+                    voice_file_id: None,
+                    voice_mime: None,
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -5487,6 +5762,11 @@ async fn poll_once(
                         .get("media_group_id")
                         .and_then(|m| m.as_str())
                         .map(|s| s.to_string()),
+                    voice_file_id: worksgood::notify::telegram_voice::voice_meta(message)
+                        .as_ref()
+                        .map(|v| v.file_id.clone()),
+                    voice_mime: worksgood::notify::telegram_voice::voice_meta(message)
+                        .and_then(|v| v.mime_type),
                 };
 
                 return Ok(Some((msg, new_offset)));
@@ -5620,6 +5900,8 @@ mod tests {
             has_bot_command,
             photo_file_id: None,
             media_group_id: None,
+            voice_file_id: None,
+            voice_mime: None,
         }
     }
 

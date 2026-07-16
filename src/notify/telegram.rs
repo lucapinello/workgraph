@@ -397,6 +397,58 @@ impl TelegramChannel {
             .with_context(|| format!("failed to write photo to {}", dest.display()))?;
         Ok(())
     }
+
+    /// Download a file this bot received (`getFile` → GET the file URL) and
+    /// return its raw bytes, enforcing `max_file_size` BEFORE spending
+    /// bandwidth. Used for voice notes / audio recordings, whose bytes are
+    /// POSTed straight to the gateway's transcriber (no on-disk temp). The
+    /// `file_id` is bot-specific, so this MUST be called on the channel of the
+    /// bot that received the recording. Both URLs embed the bot token, so any
+    /// transport error is scrubbed through [`redact_bot_token`] before it can be
+    /// returned/logged — the token never leaks.
+    pub async fn download_file_bytes(
+        &self,
+        file_id: &str,
+        max_file_size: u64,
+    ) -> Result<Vec<u8>> {
+        // 1. Resolve the on-server file path (and its declared size).
+        let resp = self
+            .api_call("getFile", &serde_json::json!({ "file_id": file_id }))
+            .await?;
+        let result = resp.get("result").context("getFile: no result")?;
+        if let Some(size) = result.get("file_size").and_then(|s| s.as_u64()) {
+            if size > max_file_size {
+                anyhow::bail!("recording {size} bytes exceeds max file size {max_file_size}");
+            }
+        }
+        let file_path = result
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .context("getFile: result missing file_path")?;
+
+        // 2. Download the bytes (scrub the token from any transport error).
+        let file_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.bot.bot_token, file_path
+        );
+        let bytes = self
+            .client
+            .get(&file_url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(redact_bot_token(&format!("{e:#}"))))?
+            .bytes()
+            .await
+            .map_err(|e| anyhow::anyhow!(redact_bot_token(&format!("{e:#}"))))?;
+
+        if bytes.len() as u64 > max_file_size {
+            anyhow::bail!(
+                "downloaded recording {} bytes exceeds max file size {max_file_size}",
+                bytes.len()
+            );
+        }
+        Ok(bytes.to_vec())
+    }
 }
 
 #[async_trait]
@@ -404,6 +456,14 @@ impl super::telegram_photo::PhotoDownloader for TelegramChannel {
     async fn download(&self, file_id: &str, dest: &std::path::Path) -> Result<()> {
         let max = super::telegram_photo::PhotoLimits::default().max_file_size;
         self.download_photo_to(file_id, dest, max).await
+    }
+}
+
+#[async_trait]
+impl super::telegram_voice::VoiceDownloader for TelegramChannel {
+    async fn download_bytes(&self, file_id: &str) -> Result<Vec<u8>> {
+        let max = super::telegram_voice::VoiceLimits::default().max_file_size;
+        self.download_file_bytes(file_id, max).await
     }
 }
 
@@ -851,6 +911,9 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             // A button press carries no photo.
             photo_file_id: None,
             media_group_id: None,
+            // A button press carries no audio recording.
+            voice_file_id: None,
+            voice_mime: None,
         });
     }
 
@@ -884,6 +947,16 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             .get("media_group_id")
             .and_then(|m| m.as_str())
             .map(|s| s.to_string());
+
+        // Audio intake: a `voice` note (OGG/Opus), an `audio` file, or a
+        // `video_note` carries no `text` — its words are SPOKEN. Pull the
+        // download handle + declared mime so the listener can fetch the bytes
+        // and hand them to the gateway's whisper. See `super::telegram_voice`.
+        let voice = super::telegram_voice::voice_meta(message);
+        let (voice_file_id, voice_mime) = match voice {
+            Some(v) => (Some(v.file_id), v.mime_type),
+            None => (None, None),
+        };
 
         let reply_to = message
             .get("reply_to_message")
@@ -946,6 +1019,8 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             has_bot_command,
             photo_file_id,
             media_group_id,
+            voice_file_id,
+            voice_mime,
         });
     }
 
@@ -1022,6 +1097,27 @@ mod tests {
         // Surrounding context (method name, error tail) stays readable.
         assert!(redacted.contains("getUpdates request failed"));
         assert!(redacted.contains("operation timed out"));
+    }
+
+    #[test]
+    fn redact_bot_token_scrubs_voice_file_download_url() {
+        // The voice-note download (task telegram-voice-notes) GETs the file
+        // API URL `https://api.telegram.org/file/bot<token>/<path>`, which
+        // embeds the token. A transport error there is scrubbed through
+        // `redact_bot_token` before it is returned/logged — the token from a
+        // failed recording download must NEVER reach the logs.
+        let leaked = "error sending request for url \
+             (https://api.telegram.org/file/bot987654321:AAF-voice_TOKEN-xyz123/voice/file_9.oga): \
+             connection reset";
+        let redacted = redact_bot_token(leaked);
+        assert!(
+            !redacted.contains("987654321:AAF-voice_TOKEN-xyz123"),
+            "voice download token must not survive redaction: {redacted}"
+        );
+        assert!(
+            redacted.contains("/bot<redacted>/"),
+            "file URL shape preserved with the token replaced: {redacted}"
+        );
     }
 
     #[test]
@@ -1438,6 +1534,53 @@ agent_id = "nora"
         assert!(msg.photo_file_id.is_none());
         assert!(msg.media_group_id.is_none());
         assert_eq!(msg.body, "hey bruno");
+    }
+
+    #[test]
+    fn decode_update_voice_note_populates_file_id_and_mime() {
+        // A real Bot API `voice` note (task telegram-voice-notes): OGG/Opus,
+        // carries NO text — its words are spoken. decode_update must surface the
+        // download handle + declared mime, leave the body empty (the listener
+        // fills it from the transcript), and NOT be a command.
+        let update = serde_json::json!({
+            "update_id": 500,
+            "message": {
+                "message_id": 91,
+                "from": { "id": 8905220378_i64, "username": "luca" },
+                "chat": { "id": -1001, "type": "supergroup" },
+                "date": 1_700_000_100_i64,
+                "voice": {
+                    "duration": 4,
+                    "mime_type": "audio/ogg",
+                    "file_id": "AwACAgQAAxVOICE",
+                    "file_unique_id": "uniq91",
+                    "file_size": 12345
+                }
+            }
+        });
+        let msg = decode_update(&update, "telegram:otto").unwrap();
+        assert_eq!(msg.voice_file_id.as_deref(), Some("AwACAgQAAxVOICE"));
+        assert_eq!(msg.voice_mime.as_deref(), Some("audio/ogg"));
+        assert_eq!(msg.body, "", "a recording carries no text body yet");
+        assert!(msg.photo_file_id.is_none(), "a voice note is not a photo");
+        assert!(!msg.has_bot_command, "a voice note is conversation, not a command");
+    }
+
+    #[test]
+    fn decode_update_text_message_has_no_voice() {
+        // A plain text message must never fabricate a voice handle.
+        let update = serde_json::json!({
+            "update_id": 501,
+            "message": {
+                "message_id": 8,
+                "from": { "id": 1_i64, "username": "luca" },
+                "chat": { "id": -1001, "type": "supergroup" },
+                "text": "what's for dinner"
+            }
+        });
+        let msg = decode_update(&update, "telegram:otto").unwrap();
+        assert!(msg.voice_file_id.is_none());
+        assert!(msg.voice_mime.is_none());
     }
 
     #[test]

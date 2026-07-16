@@ -6729,6 +6729,51 @@ pub enum TelegramCommands {
         compose_error: bool,
     },
 
+    /// Drive the voice-note path end-to-end from a recording FILE: detect →
+    /// transcribe → inject (task telegram-voice-notes).
+    ///
+    /// Reads `--file` as if it were an inbound Telegram `voice` note, POSTs the
+    /// bytes to a transcription gateway, classifies the response, and prints the
+    /// outcome: the transcript that WOULD be injected as the message body (and
+    /// how the fast lane would classify it), or the in-persona failure line.
+    ///
+    /// This is the credential-free scripted-test seam. Pass `--stub-ok <text>`
+    /// or `--stub-reason <reason>` to drive the whole path against a STUB gateway
+    /// (no live whisper) — the smoke scenario uses this. Without a stub it POSTs
+    /// to the real gateway at `--gateway` (or `CASA_GATEWAY_URL`).
+    Voice {
+        /// Path to a recording file (e.g. an OGG/Opus voice note) to feed in.
+        #[arg(long)]
+        file: PathBuf,
+
+        /// Content-Type to advertise for the bytes. Defaults to `audio/ogg`
+        /// (a Telegram voice note). ffmpeg sniffs the real container anyway.
+        #[arg(long, default_value = "audio/ogg")]
+        mime: String,
+
+        /// Recognition language to pass as `?lang=` (empty → the gateway's own
+        /// configured default).
+        #[arg(long, default_value = "")]
+        lang: String,
+
+        /// Gateway base URL for the real transcribe POST. Defaults to
+        /// `CASA_GATEWAY_URL` / the fixed kiosk port.
+        #[arg(long)]
+        gateway: Option<String>,
+
+        /// STUB mode: skip the real gateway and pretend it returned
+        /// `{ok:true, text:<this>}` — drives detect→transcribe→inject with no
+        /// live whisper engine.
+        #[arg(long)]
+        stub_ok: Option<String>,
+
+        /// STUB mode: pretend the gateway returned `{ok:false, reason:<this>}`
+        /// (e.g. `unconfigured`, `silence`, `decode-failed`) so each honest
+        /// failure line is provable through the binary.
+        #[arg(long)]
+        stub_reason: Option<String>,
+    },
+
     /// Drive the reminder engine: list, dry-run, register, or fire scheduled nudges
     ///
     /// Reads reminder-shaped rows from the current weekly plan's `## 3. Calendar`
