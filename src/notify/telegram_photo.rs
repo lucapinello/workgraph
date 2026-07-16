@@ -860,6 +860,8 @@ mod tests {
             has_bot_command: false,
             photo_file_id: Some(file_id.to_string()),
             media_group_id: media_group_id.map(|s| s.to_string()),
+            voice_file_id: None,
+            voice_mime: None,
         }
     }
 

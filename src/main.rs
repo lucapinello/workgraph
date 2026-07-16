@@ -3844,6 +3844,22 @@ fn main() -> Result<()> {
                 compose_error,
                 cli.json,
             ),
+            TelegramCommands::Voice {
+                file,
+                mime,
+                lang,
+                gateway,
+                stub_ok,
+                stub_reason,
+            } => commands::telegram::run_voice_dryrun(
+                &file,
+                &mime,
+                &lang,
+                gateway.as_deref(),
+                stub_ok.as_deref(),
+                stub_reason.as_deref(),
+                cli.json,
+            ),
             TelegramCommands::Remind {
                 list,
                 dry_run,

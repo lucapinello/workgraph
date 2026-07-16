@@ -2336,3 +2336,12 @@ owners = [
 ]
 description = "Real tmux/PTY regression for integration-test/TUI subprocess isolation: launch a scratch TUI with a sentinel parent WG_DIR plus worker task/agent identity, wait for first-use chat bootstrap, require .chat-0 in scratch, and prove the parent graph hash/content is unchanged with no legacy .coordinator ghost. Credential-free."
 timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_voice"
+script = "scenarios/telegram_voice.sh"
+owners = [
+    "telegram-voice-notes",
+]
+description = "Regression (telegram-voice-notes): a Telegram voice note / audio / video_note becomes a normal message. Drives `wg telegram voice` (the detect→transcribe→inject dry-run the live listener runs) against a STUB gateway so no live whisper/ffmpeg/token is needed. Pins that a spoken 'add milk to the shopping list' routes IDENTICALLY to a typed add (fast-lane:shopping-add, reaching the plan seam), a spoken open question goes to the composer, the recording bytes reach the transcriber, and every failure reason (unconfigured→casa voice-setup, decode-failed→'mind typing it', silence) produces an honest in-persona reply — never silent."
+timeout_seconds = 30
