@@ -152,6 +152,16 @@ struct ConfirmResp {
     ok: bool,
     #[serde(default)]
     reason: Option<String>,
+    /// A plain, family-voice label for the device that signed in — "your iPhone",
+    /// "a Mac", … — derived by the gateway from the browser's User-Agent at
+    /// /auth/start (task sign-in-confirmation). NEVER a raw UA string. Absent on an
+    /// older gateway, in which case the listener falls back to "a new device".
+    #[serde(default)]
+    device: Option<String>,
+    /// True only when the signing-in browser is the MARKED family tablet, so the
+    /// confirmation may legitimately say "the kitchen tablet" — never as a default.
+    #[serde(default)]
+    tablet: bool,
 }
 
 /// The gateway's reply to `POST /invite/redeem` (and `/auth/found`). `ok:true`
@@ -165,16 +175,37 @@ struct RedeemResp {
     name: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    /// Same family-voice device label as [`ConfirmResp::device`] — the founding
+    /// welcome names the REAL device the owner signed in on (task
+    /// sign-in-confirmation). Absent on an older gateway → "a new device".
+    #[serde(default)]
+    device: Option<String>,
+    /// True only when the founding scan came from the MARKED family tablet.
+    #[serde(default)]
+    tablet: bool,
 }
 
 /// Outcome of a `/start login_<nonce>` confirm against the gateway. The founding
 /// window (item 1) needs to distinguish an EMPTY roster (offer ownership) from a
 /// genuinely unknown user (ask Otto to add you), so the handler branches on this
 /// rather than only receiving a pre-baked reply string.
+/// The family-voice fallback label when the gateway did not carry a device
+/// descriptor (an older gateway, or a client with no User-Agent). NEVER a raw UA.
+const DEVICE_LABEL_FALLBACK: &str = "a new device";
+
+/// The family-voice label for the MARKED family tablet — the ONE case where the
+/// confirmation may say "the kitchen tablet" (task sign-in-confirmation).
+const TABLET_DEVICE_LABEL: &str = "the kitchen tablet";
+
 #[derive(Debug, PartialEq)]
 enum WebLoginOutcome {
     /// The telegram id resolved to a household human; the browser is signed in.
-    SignedIn,
+    /// Carries the family-voice device descriptor the gateway derived from the
+    /// signing-in browser (task sign-in-confirmation): `device` is a plain label
+    /// ("your iPhone", "a Mac", …) and `tablet` is true ONLY when the browser is
+    /// the marked family tablet, which is the one case the reply may name "the
+    /// kitchen tablet".
+    SignedIn { device: String, tablet: bool },
     /// The roster is EMPTY (fresh deployment) — the handler runs the "are you
     /// the owner?" founding handshake instead of rejecting.
     EmptyRoster,
@@ -189,12 +220,25 @@ impl WebLoginOutcome {
     /// handshake (EmptyRoster is handled specially by the caller).
     fn reply(&self) -> String {
         match self {
-            WebLoginOutcome::SignedIn => "You're signed in on the kitchen tablet ✋".to_string(),
+            // Name the REAL device (task sign-in-confirmation). Only the marked
+            // family tablet says "the kitchen tablet"; every other device uses the
+            // plain label the gateway mapped from its User-Agent, never a default
+            // tablet string and never a raw UA.
+            WebLoginOutcome::SignedIn { device, tablet } => {
+                let label = if *tablet {
+                    TABLET_DEVICE_LABEL
+                } else if device.trim().is_empty() {
+                    DEVICE_LABEL_FALLBACK
+                } else {
+                    device.as_str()
+                };
+                format!("You're signed in on {label} ✋")
+            }
             WebLoginOutcome::UnknownUser => {
                 "I don't recognise you yet — ask Otto to add you to the household.".to_string()
             }
             WebLoginOutcome::EmptyRoster | WebLoginOutcome::NoSession => {
-                "That sign-in link expired — tap the tablet to get a fresh one.".to_string()
+                "That sign-in link expired — open the sign-in page again to get a fresh one.".to_string()
             }
         }
     }
@@ -294,7 +338,10 @@ async fn confirm_web_login_outcome(
         Err(_) => None,
     };
     match confirm {
-        Some(c) if c.ok => WebLoginOutcome::SignedIn,
+        Some(c) if c.ok => WebLoginOutcome::SignedIn {
+            device: c.device.unwrap_or_default(),
+            tablet: c.tablet,
+        },
         Some(c) if c.reason.as_deref() == Some("empty-roster") => WebLoginOutcome::EmptyRoster,
         Some(c) if c.reason.as_deref() == Some("unknown-user") => WebLoginOutcome::UnknownUser,
         _ => WebLoginOutcome::NoSession,
@@ -390,12 +437,21 @@ async fn found_household(
     match founded {
         Some(r) if r.ok => {
             let who = r.name.as_deref().filter(|s| !s.is_empty()).unwrap_or(name);
+            // Name the REAL device the owner founded from (task
+            // sign-in-confirmation): the marked family tablet only when flagged,
+            // otherwise the gateway's plain device label (fallback "a new device").
+            let device = r.device.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let label = if r.tablet {
+                TABLET_DEVICE_LABEL
+            } else {
+                device.unwrap_or(DEVICE_LABEL_FALLBACK)
+            };
             format!(
                 "This home is yours now, {who} — you're the first member. \u{2705} \
-                 You're signed in on the tablet; invite the rest of the family from Manage household."
+                 You're signed in on {label}; invite the rest of the family from Manage household."
             )
         }
-        _ => "I couldn't finish setting up — tap the tablet for a fresh link and try again.".to_string(),
+        _ => "I couldn't finish setting up — tap the sign-in link for a fresh one and try again.".to_string(),
     }
 }
 
@@ -924,7 +980,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         }
                         // No numeric id to verify — cannot bind a session.
                         None => {
-                            let reply = "That sign-in link expired — tap the tablet to get a fresh one.";
+                            let reply = "That sign-in link expired — open the sign-in page again to get a fresh one.";
                             if let Err(e) = channel.send_text(&reply_target, reply).await {
                                 eprintln!("Failed to send web sign-in reply: {e}");
                             }
@@ -6204,6 +6260,93 @@ mod tests {
         assert!(!reply.starts_with("You're signed in"));
     }
 
+    // ── sign-in confirmation names the REAL device (task sign-in-confirmation) ──
+
+    /// The signed-in confirmation names the device the gateway passed through and
+    /// NEVER says "kitchen tablet" for an ordinary personal device. Parameterized
+    /// across the device families the gateway maps a User-Agent to.
+    #[test]
+    fn signed_in_reply_names_the_real_device_not_kitchen_tablet() {
+        for label in ["your iPhone", "your iPad", "a Mac", "a Windows PC", "an Android phone"] {
+            let reply = WebLoginOutcome::SignedIn {
+                device: label.to_string(),
+                tablet: false,
+            }
+            .reply();
+            assert_eq!(reply, format!("You're signed in on {label} ✋"));
+            assert!(reply.contains(label), "reply must name the device: {reply}");
+            assert!(
+                !reply.contains("kitchen tablet"),
+                "a personal device must NOT be called the kitchen tablet: {reply}"
+            );
+        }
+    }
+
+    /// "the kitchen tablet" appears ONLY when the marker flag is set — never as a
+    /// default — even if a device label also rode along.
+    #[test]
+    fn signed_in_reply_says_kitchen_tablet_only_when_marker_set() {
+        let marked = WebLoginOutcome::SignedIn {
+            device: "the kitchen tablet".to_string(),
+            tablet: true,
+        }
+        .reply();
+        assert_eq!(marked, "You're signed in on the kitchen tablet ✋");
+
+        // The marker flag WINS over any stray device label — the tablet phrasing is
+        // gated on the marker alone.
+        let marker_beats_label = WebLoginOutcome::SignedIn {
+            device: "your iPhone".to_string(),
+            tablet: true,
+        }
+        .reply();
+        assert!(marker_beats_label.contains("kitchen tablet"), "reply: {marker_beats_label}");
+    }
+
+    /// An older gateway that carries no device descriptor → a neutral fallback
+    /// label, never a raw UA and never "kitchen tablet".
+    #[test]
+    fn signed_in_reply_falls_back_when_no_device_descriptor() {
+        let reply = WebLoginOutcome::SignedIn {
+            device: String::new(),
+            tablet: false,
+        }
+        .reply();
+        assert_eq!(reply, "You're signed in on a new device ✋");
+        assert!(!reply.contains("kitchen tablet"), "reply: {reply}");
+    }
+
+    /// The full confirm path carries the gateway's `device` label through to the
+    /// family-voice reply: a signed-in iPhone is named as such, not the tablet.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_web_login_names_the_signing_in_device() {
+        let (url, _rx) = spawn_confirm_stub(r#"{"ok":true,"device":"your iPhone"}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let reply = rt.block_on(confirm_web_login(&client, "nonce", "123456789"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        assert_eq!(reply, "You're signed in on your iPhone ✋");
+        assert!(!reply.contains("kitchen tablet"), "reply: {reply}");
+    }
+
+    /// The marked family tablet path: the gateway sets `tablet:true`, so the reply
+    /// may (and does) say "the kitchen tablet".
+    #[test]
+    #[serial_test::serial]
+    fn confirm_web_login_marked_tablet_says_kitchen_tablet() {
+        let (url, _rx) = spawn_confirm_stub(r#"{"ok":true,"device":"the kitchen tablet","tablet":true}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let reply = rt.block_on(confirm_web_login(&client, "nonce", "123456789"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        assert_eq!(reply, "You're signed in on the kitchen tablet ✋");
+    }
+
     // ── onboarding-bootstrap: invite (join_) + founding gate ─────────────────
 
     #[test]
@@ -6331,8 +6474,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn onboarding_urls_derive_from_confirm_base() {
         // The two write paths share the confirm base so one override retargets all.
+        // Serial because it reads the CASA_AUTH_CONFIRM_URL-derived base, which the
+        // confirm/found stub tests set+clear — running in parallel with them races
+        // on that env var (task sign-in-confirmation).
         assert_eq!(auth_found_url(), "http://127.0.0.1:7788/auth/found");
         assert_eq!(invite_redeem_url(), "http://127.0.0.1:7788/invite/redeem");
     }
