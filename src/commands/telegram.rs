@@ -180,6 +180,8 @@ enum WebLoginOutcome {
     EmptyRoster,
     /// The id is not in a (non-empty) roster — ask Otto to add you.
     UnknownUser,
+    /// The sign-in link EXPIRED / was unknown (a slow new-device round-trip blew past the pending window). Recovery: reopen the page + tap the fresh link.
+    LinkExpired,
     /// Bad/expired nonce or the gateway was unreachable — tell them to retry.
     NoSession,
 }
@@ -193,8 +195,8 @@ impl WebLoginOutcome {
             WebLoginOutcome::UnknownUser => {
                 "I don't recognise you yet — ask Otto to add you to the household.".to_string()
             }
-            WebLoginOutcome::EmptyRoster | WebLoginOutcome::NoSession => {
-                "That sign-in link expired — tap the tablet to get a fresh one.".to_string()
+            WebLoginOutcome::EmptyRoster | WebLoginOutcome::LinkExpired | WebLoginOutcome::NoSession => {
+                "That sign-in link expired — reopen the Casa page and tap the fresh link.".to_string()
             }
         }
     }
@@ -211,9 +213,9 @@ struct PendingFounding {
     created: i64,
 }
 
-/// The founding handshake expires with the login nonce (5 minutes) — a YES that
+/// The founding handshake expires with the login nonce (15 minutes) — a YES that
 /// arrives after the window is ignored and the scanner just taps the tablet again.
-const FOUNDING_TTL_SECS: i64 = 5 * 60;
+const FOUNDING_TTL_SECS: i64 = 15 * 60;
 
 /// Is an inbound body an explicit decline (`no`/`n`)? The mirror of
 /// [`worksgood::agency::human_binding::is_affirmative`] for the founding
@@ -297,6 +299,7 @@ async fn confirm_web_login_outcome(
         Some(c) if c.ok => WebLoginOutcome::SignedIn,
         Some(c) if c.reason.as_deref() == Some("empty-roster") => WebLoginOutcome::EmptyRoster,
         Some(c) if c.reason.as_deref() == Some("unknown-user") => WebLoginOutcome::UnknownUser,
+        Some(c) if matches!(c.reason.as_deref(), Some("unknown-nonce") | Some("expired") | Some("used")) => WebLoginOutcome::LinkExpired,
         _ => WebLoginOutcome::NoSession,
     }
 }
@@ -924,7 +927,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         }
                         // No numeric id to verify — cannot bind a session.
                         None => {
-                            let reply = "That sign-in link expired — tap the tablet to get a fresh one.";
+                            let reply = "That sign-in link expired — reopen the Casa page and tap the fresh link.";
                             if let Err(e) = channel.send_text(&reply_target, reply).await {
                                 eprintln!("Failed to send web sign-in reply: {e}");
                             }
@@ -6184,6 +6187,24 @@ mod tests {
 
         assert!(reply.contains("ask Otto"), "reply: {reply}");
         assert!(!reply.starts_with("You're signed in"));
+    }
+
+    /// An UNKNOWN/expired nonce (slow new-device round-trip blew past the pending
+    /// window) → the actionable "reopen the Casa page" reply, matching the gateway
+    /// contract (`SIGN_IN_LINK_EXPIRED_REPLY` in auth.mjs). Never tells a
+    /// personal-device signer to "tap the tablet".
+    #[test]
+    #[serial_test::serial]
+    fn confirm_web_login_unknown_nonce_gets_reopen_reply() {
+        let (url, _rx) = spawn_confirm_stub(r#"{"ok":false,"reason":"unknown-nonce"}"#);
+        unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::new();
+        let reply = rt.block_on(confirm_web_login(&client, "nonce", "999"));
+        unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
+
+        assert!(reply.contains("reopen the Casa page"), "reply: {reply}");
+        assert!(!reply.contains("tap the tablet"), "reply: {reply}");
     }
 
     /// Gateway unreachable → the expired/try-again reply, never a false sign-in.
