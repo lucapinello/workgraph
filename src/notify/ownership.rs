@@ -249,6 +249,14 @@ const INGREDIENT_WORDS: &[&str] = &[
     "cauliflower", "asparagus", "lentils", "chickpeas", "beans", "quinoa",
     "couscous", "polenta", "risotto", "gnocchi", "halloumi", "feta", "avocado",
     "aubergines", "peppers", "squash",
+    // Fish & other proteins the family plans meals around. "branzino" is the
+    // exact miss from Luca's 2026-07-17 transcript ("plan for branzino for
+    // tomorrow night"): unknown to the classifier, it dropped to Coordination →
+    // Otto and the whole roster answered. Kept typo-tolerant via `is_edible`.
+    "branzino", "seabass", "bass", "halibut", "haddock", "tilapia", "sardines",
+    "anchovies", "mackerel", "swordfish", "snapper", "sole", "flounder",
+    "mussels", "clams", "scallops", "squid", "calamari", "octopus", "lobster",
+    "crab", "duck", "venison", "veal",
 ];
 
 /// Verbs that mark a "replace A with B" SWAP shape. When one of these appears
@@ -262,6 +270,15 @@ const INGREDIENT_WORDS: &[&str] = &[
 /// hijacked by an incidental "do" next to an edible word — the recipe rule
 /// (`cooking_flavored`) is checked first for exactly that reason.
 const SWAP_VERBS: &[&str] = &["swap", "replace", "change", "switch", "substitute", "sub"];
+
+/// Verbs that mark a "what should we eat / put this on the week" MEAL-PLANNING
+/// ask. Paired with an edible token ([`is_edible`]) this is a plan change even
+/// when NO meal noun ("dinner") appears — "plan branzino for tomorrow night",
+/// "let's do salmon saturday". Without the plan verb a bare ingredient stays
+/// neutral (a lone "branzino" or "we're out of fennel" is not a plan ask), so
+/// this rule only fires on an explicit planning intent. Matched typo-tolerantly
+/// for 4+-char verbs.
+const PLAN_VERBS: &[&str] = &["plan", "planning", "plans", "planned"];
 
 /// The connector tokens that turn a swap verb into an explicit "A → B"
 /// replacement: "swap tacod **for** fennel", "replace chicken **with** trout",
@@ -289,6 +306,18 @@ fn is_food_swap(words: &[String]) -> bool {
     let has_swap_verb = has_any_fuzzy(words, SWAP_VERBS);
     let has_connector = has_any(words, SWAP_CONNECTORS);
     has_swap_verb && has_connector && words.iter().any(|w| is_edible(w))
+}
+
+/// True when the ask is an explicit MEAL-PLANNING request that names something
+/// edible — a [`PLAN_VERBS`] verb + an edible token ([`is_edible`]). This is the
+/// fix for Luca's branzino transcript: "hey plan for branzino for tomorrow
+/// night" has no meal noun and no swap connector, so the older classifier
+/// dropped it to Coordination → Otto and the whole roster answered. "Plan" +
+/// an edible pins it to a food-plan change (Nora). The plan verb is REQUIRED so
+/// a bare ingredient ("we're out of fennel") stays neutral. Checked after the
+/// recipe rule so "plan how to cook the lentils" stays a kitchen ask.
+fn is_meal_plan_ask(words: &[String]) -> bool {
+    has_any_fuzzy(words, PLAN_VERBS) && words.iter().any(|w| is_edible(w))
 }
 
 /// Classify a conversational ask into its household [`Domain`]. Pure keyword
@@ -337,6 +366,14 @@ pub fn classify_domain(ask: &str) -> Domain {
     // "swap the milk on the shopping list…" stays shopping) and after the recipe
     // rule, but BEFORE the bare-dish rule.
     if is_food_swap(&words) {
+        return Domain::MealPlanning;
+    }
+    // An explicit "plan <edible>" request — a food-plan change even without a
+    // meal noun or swap connector ("plan branzino for tomorrow night"). Checked
+    // alongside the swap shape (both are PLAN changes → the planner, Nora) and
+    // before the bare-dish rule so "plan pizza saturday" reaches the planner,
+    // not the chef.
+    if is_meal_plan_ask(&words) {
         return Domain::MealPlanning;
     }
     // A bare named dish ("pizza on Friday") — the kitchen's, so plain food
@@ -1043,6 +1080,31 @@ mod tests {
             Some("nora"),
             "a food swap must NOT fall to the concierge (otto)"
         );
+    }
+
+    #[test]
+    fn plan_branzino_ask_classifies_as_meal_planning_not_coordination() {
+        // THE LIVE REGRESSION (Luca, 2026-07-17): "hey plan for branzino for
+        // tomorrow night" — a fish the classifier had never heard of, with a
+        // "plan" verb but no meal noun and no swap connector. The old classifier
+        // dropped it to Coordination → Otto, elect_responders fell to a
+        // whole-roster answer, and FOUR bots replied. It must classify as a food
+        // plan change → Nora.
+        assert_eq!(
+            classify_domain("hey plan for branzino for tomorrow night"),
+            Domain::MealPlanning
+        );
+        let m = OwnerMap::casa_default();
+        assert_eq!(
+            m.owner_for_ask("hey plan for branzino for tomorrow night"),
+            Some("nora"),
+            "a meal-plan ask must NOT fall to the concierge (otto)"
+        );
+        // The plan verb is required — a bare ingredient mention is still neutral.
+        assert_eq!(classify_domain("we're out of branzino"), Domain::Coordination);
+        // Other proteins + typo tolerance behave the same.
+        assert_eq!(classify_domain("plan salmon for saturday"), Domain::MealPlanning);
+        assert_eq!(classify_domain("can you plan branzin for friday"), Domain::MealPlanning);
     }
 
     #[test]
