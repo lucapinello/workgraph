@@ -695,6 +695,16 @@ fn build_compose_prompt_at(
          questions, or things you can answer directly.\n\n",
     );
 
+    // DATE ANCHOR (rule 1b): ALWAYS ground the persona in today's local date and
+    // resolve any relative day term in the message ("tomorrow", "tonight",
+    // "tomorrow night", a named weekday) to a concrete date. Unlike the scoped
+    // week block below, this runs for write/plan-change asks too — the branzino
+    // transcript (Luca, 2026-07-17) had the persona schedule "tomorrow night"
+    // for a PAST Thursday because a plan-change ask carried no date anchor at
+    // all. Pure/clock-seam only, so it is deterministic under `build_*_at`.
+    prompt.push_str(&grounding::date_anchor(human_message, now));
+    prompt.push('\n');
+
     // GROUNDING (rule 1): a question/read-shaped ask about plans/calendar/meals
     // /schedule gets the REAL week model injected, so the answer is grounded on
     // turn one instead of a stall. This is the read-side twin of the fast lane's
@@ -1017,6 +1027,28 @@ async fn run_composed_turn(
     composer: &dyn ReplyComposer,
     origin: &crate::graph::TaskOrigin,
 ) -> Result<TurnOutcome> {
+    // ONE REPLY PER TURN (idempotency). A single turn is keyed by `request_id`,
+    // and every reply we send is also appended to the outbox under that id. If an
+    // outbox reply for this exact request already exists, this turn has already
+    // been answered — a re-fire (a listener re-poll, a gateway retry, a
+    // restart-replay) must NOT post a second message. This is the guard against
+    // the back-to-back double-post Luca saw from Otto: one ask, two messages. We
+    // return without composing or sending again. Best-effort read — a missing
+    // outbox simply means "not answered yet".
+    if !request_id.trim().is_empty() {
+        let already_answered = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
+            .map(|out| out.iter().any(|m| m.request_id == request_id))
+            .unwrap_or(false);
+        if already_answered {
+            println!(
+                "[{}] convo idempotency: request {request_id} already answered for {agent_id} — \
+                 skipping duplicate reply",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+            return Ok(TurnOutcome::Replied { acked: false });
+        }
+    }
+
     // "Are they done yet?" — a status question from someone with recent
     // origin-stamped tasks is answered from LIVE graph state, not a generic chat
     // turn. This is the honest report-back: what's in progress / done, in the
@@ -2039,6 +2071,57 @@ mod tests {
             cfg.all_bots().into_iter().find(|(id, _)| id == "otto").unwrap().1.bot_token,
             "bruno and otto must carry distinct tokens for this test to be meaningful"
         );
+    }
+
+    /// ONE REPLY PER TURN (Luca, 2026-07-17): Otto posted two messages
+    /// back-to-back for a single ask. A re-fire of the SAME turn (same
+    /// `request_id`) — a listener re-poll, a gateway retry, a restart-replay —
+    /// must NOT compose or send a second time. The first turn answers; the
+    /// second is a no-op, so the human sees exactly one message.
+    #[tokio::test]
+    async fn same_request_id_never_double_posts() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok("Yeah, today's Friday the 17th.");
+
+        // First delivery of the turn.
+        let out1 = run_conversation_turn(
+            &wg, &plan, "what day is it?", "req-dup", fast_timing(), Some(&composer), &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out1, TurnOutcome::Replied { .. }));
+
+        // Same request id fires again (the double-post trigger).
+        let out2 = run_conversation_turn(
+            &wg, &plan, "what day is it?", "req-dup", fast_timing(), Some(&composer), &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out2, TurnOutcome::Replied { .. }));
+
+        // Exactly ONE human-visible message across BOTH invocations: the fast
+        // compose sends no ack, so the total send count is one and there are no
+        // edits. The second turn produced nothing.
+        assert_eq!(
+            sink.calls().len(),
+            1,
+            "one turn must post one message; a re-fired request must not double-post: {:?}",
+            sink.calls()
+        );
+        assert!(
+            sink.edits().is_empty(),
+            "no ack/edit expected on a fast turn: {:?}",
+            sink.edits()
+        );
+        assert_eq!(sink.calls()[0].0, "otto");
     }
 
     /// A 1:1 ask that the persona turns into work stamps the created task with

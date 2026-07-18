@@ -2597,6 +2597,59 @@ mod tests {
         assert!(summary.contains("target=bruno"), "got: {summary}");
     }
 
+    /// THE LIVE REGRESSION (Luca, 2026-07-17): a single meal-planning ask —
+    /// "hey plan for branzino for tomorrow night" — must elect EXACTLY ONE
+    /// responder (the meals owner, Nora), never the whole roster. Before the fix
+    /// the unknown fish dropped the ask to Coordination, `domain_voice` returned
+    /// None, and the collective / greeting branch fanned it out to four bots.
+    #[test]
+    fn single_meal_ask_elects_exactly_one_owner_not_the_roster() {
+        let ask = "hey plan for branzino for tomorrow night";
+        let elect = |humans: usize| {
+            elect_responders(
+                Some("supergroup"),
+                Some("-100999"),
+                ask,
+                &[],
+                None,
+                false,
+                humans,
+                &casa_config(),
+            )
+        };
+
+        // The real Casa group has ONE human (Luca): the meal-plan ask must elect
+        // EXACTLY the meals owner (Nora), a single domain voice — never the whole
+        // roster (the four-bot bug), never the concierge (Otto).
+        let single = elect(1);
+        match &single {
+            Election::One { bot, addressed_by, .. } => {
+                assert_eq!(
+                    bot.agent_id.as_deref(),
+                    Some("nora"),
+                    "meal-plan ask must elect the meals owner (nora), got {:?}",
+                    bot.agent_id
+                );
+                assert!(
+                    matches!(addressed_by, AddressedBy::Domain(_)),
+                    "expected a domain election, got {addressed_by:?}"
+                );
+            }
+            other => panic!("one meal ask must elect ONE owner (nora), got {other:?}"),
+        }
+
+        // The contract the four-bot bug violated: under NO membership count does a
+        // single meal ask fan out to the whole roster. With 2+ humans the
+        // conservative small-talk silence is fine (still no four-way broadcast);
+        // what must never happen is Election::All.
+        for humans in [1usize, 2usize, 3usize] {
+            assert!(
+                !matches!(elect(humans), Election::All { .. }),
+                "a single meal ask must never fan out to the whole roster (humans={humans})"
+            );
+        }
+    }
+
     #[test]
     fn elect_full_precedence_ladder_on_live_username_less_config() {
         // Every precedence level, exercised against the live config shape (no

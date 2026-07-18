@@ -551,6 +551,71 @@ fn next_on_or_after(from: NaiveDate, wd: Weekday) -> NaiveDate {
     from
 }
 
+/// A one-paragraph grounding block that anchors the composer to TODAY's local
+/// date and resolves every relative day term in `message` to a concrete date.
+///
+/// This is the fix for Luca's 2026-07-17 transcript: "plan for branzino for
+/// tomorrow night" was sent on Friday July 17, and the persona answered "I'll
+/// slot it in for Thursday" — a day in the PAST. The composer had no date
+/// anchor for a plan-change (write) ask; only read-shaped asks got the scoped
+/// week block. So the model guessed a weekday and guessed wrong.
+///
+/// Unlike [`fetch_scoped`], this block is ALWAYS emitted — a plan-change ask
+/// needs the same "today is …, tomorrow = …" anchor as a read-ask. It states
+/// the local weekday + date, resolves each relative term present ("tomorrow",
+/// "tonight"/"today", "day after tomorrow", and any named weekday → its next
+/// occurrence on or after today, never the past), and forbids scheduling into a
+/// day that has already passed. `now` is the household local time
+/// (`chrono::Local::now()` in production; a fixed clock under test).
+pub fn date_anchor(message: &str, now: NaiveDateTime) -> String {
+    let today = now.date();
+    let fmt = |d: NaiveDate| format!("{}, {}", family_plan::long_weekday(d), d.format("%b %-d"));
+
+    let mut out = format!(
+        "Today is {}, {} (the household's local date).",
+        family_plan::long_weekday(today),
+        today.format("%b %-d, %Y"),
+    );
+
+    let norm = normalize(message);
+    let mut parts: Vec<String> = Vec::new();
+    if norm.contains("day after tomorrow") {
+        let d = today
+            .succ_opt()
+            .and_then(|d| d.succ_opt())
+            .unwrap_or(today);
+        parts.push(format!("\"day after tomorrow\" = {}", fmt(d)));
+    } else if norm.contains("tomorrow") || norm.contains("tmrw") || norm.contains("tmw") {
+        let d = today.succ_opt().unwrap_or(today);
+        // "tomorrow night" is still tomorrow's date — the evening OF that day.
+        parts.push(format!("\"tomorrow\" (incl. \"tomorrow night\") = {}", fmt(d)));
+    }
+    if norm.contains("tonight") || norm.contains("today") || norm.contains("this evening") {
+        parts.push(format!("\"tonight\"/\"today\" = {} (today)", fmt(today)));
+    }
+    // Named weekdays → the next occurrence on or after today, so a weekday that
+    // already passed this week resolves to the coming one, never a past day.
+    let mut seen_wd: Vec<Weekday> = Vec::new();
+    for tok in norm.split_whitespace() {
+        if let Some(wd) = weekday_token(tok) {
+            if seen_wd.contains(&wd) {
+                continue;
+            }
+            seen_wd.push(wd);
+            let d = next_on_or_after(today, wd);
+            parts.push(format!("\"{}\" = {}", family_plan::long_weekday(d), fmt(d)));
+        }
+    }
+
+    if !parts.is_empty() {
+        out.push_str(" Resolve the dates in this message against today: ");
+        out.push_str(&parts.join("; "));
+        out.push('.');
+    }
+    out.push_str(" Never schedule anything for a day that has already passed.\n");
+    out
+}
+
 /// Detect the scope of a read-ask relative to `today`. Priority, most specific
 /// first: an explicit weekday name → that day; "day after tomorrow" → today+2;
 /// "tomorrow" → today+1; "week"/"weekend" → the whole week; otherwise (the
@@ -864,6 +929,62 @@ mod tests {
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn dt(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> NaiveDateTime {
+        date(y, m, d).and_hms_opt(hh, mm, 0).unwrap()
+    }
+
+    /// THE LIVE REGRESSION (Luca, 2026-07-17): on Friday July 17, "tomorrow
+    /// night" must resolve to SATURDAY July 18, never a past weekday (the
+    /// persona answered "Thursday"). The anchor states today AND resolves the
+    /// relative term, and forbids scheduling into the past.
+    #[test]
+    fn date_anchor_resolves_tomorrow_night_to_the_next_day_never_the_past() {
+        // Fixed fake "today" = Friday, July 17 2026.
+        let now = dt(2026, 7, 17, 9, 0);
+        let anchor = date_anchor("hey plan for branzino for tomorrow night", now);
+        assert!(
+            anchor.contains("Today is Friday, Jul 17, 2026"),
+            "anchor must state today's local date, got: {anchor}"
+        );
+        assert!(
+            anchor.contains("Saturday, Jul 18"),
+            "'tomorrow night' from Fri Jul 17 must resolve to Sat Jul 18, got: {anchor}"
+        );
+        // The wrong answer Otto gave — a PAST weekday — must never appear.
+        assert!(
+            !anchor.contains("Thursday"),
+            "'tomorrow' must never resolve to a past weekday, got: {anchor}"
+        );
+        assert!(
+            anchor.contains("already passed"),
+            "anchor must forbid scheduling into the past, got: {anchor}"
+        );
+    }
+
+    /// A named weekday that already went by this week resolves to the COMING
+    /// one, not the past instance — the same "never a past day" guarantee.
+    #[test]
+    fn date_anchor_named_weekday_resolves_forward_only() {
+        // Friday July 17: "Thursday" this week (Jul 16) is in the past, so the
+        // next Thursday is Jul 23.
+        let now = dt(2026, 7, 17, 9, 0);
+        let anchor = date_anchor("can we do salmon on thursday", now);
+        assert!(
+            anchor.contains("Thursday, Jul 23"),
+            "a passed weekday must resolve to next week, got: {anchor}"
+        );
+    }
+
+    /// "tonight"/"today" stay on today's date (the evening OF today).
+    #[test]
+    fn date_anchor_tonight_is_today() {
+        let now = dt(2026, 7, 17, 9, 0);
+        let anchor = date_anchor("what's for dinner tonight", now);
+        assert!(anchor.contains("(today)"), "tonight resolves to today, got: {anchor}");
+        assert!(anchor.contains("Friday, Jul 17"), "got: {anchor}");
+        assert!(!anchor.contains("Jul 18"), "tonight is not tomorrow, got: {anchor}");
     }
 
     const PLAN: &str = "\
