@@ -4102,6 +4102,20 @@ pub struct CoordinatorConfig {
     #[serde(default = "default_max_spawn_failures")]
     pub max_spawn_failures: u32,
 
+    /// Per-task spawn-failure QUARANTINE threshold. After this many consecutive
+    /// spawn failures on ONE task the dispatcher *parks* (pauses) that task
+    /// loudly and moves on, instead of letting it keep failing every tick. This
+    /// stops a single "poison" task (e.g. an ancient satellite that can never be
+    /// spawned) from (a) being re-selected forever as the highest-priority probe
+    /// and (b) driving the dispatcher-wide `spawn_breaker_threshold` open and
+    /// starving every healthy task behind it. Quarantined-task failures are
+    /// EXCLUDED from the dispatcher breaker's consecutive-failure count. Keep
+    /// this BELOW `spawn_breaker_threshold` so one poison task can never trip the
+    /// global breaker. Default: 3. Set to 0 to disable quarantine (legacy
+    /// behavior: poison tasks keep retrying and feed the breaker).
+    #[serde(default = "default_spawn_quarantine_threshold")]
+    pub spawn_quarantine_threshold: u32,
+
     /// Dispatcher-level self-healing spawn circuit breaker: how many CONSECUTIVE
     /// dispatcher-wide spawn failures (across all tasks) trip the breaker open,
     /// pausing all spawns for a cooldown. Unlike `max_spawn_failures` (a per-task
@@ -4355,6 +4369,10 @@ fn default_max_spawn_failures() -> u32 {
     5
 }
 
+fn default_spawn_quarantine_threshold() -> u32 {
+    3
+}
+
 fn default_spawn_breaker_threshold() -> u32 {
     10
 }
@@ -4488,6 +4506,7 @@ impl Default for CoordinatorConfig {
             verify_autospawn_enabled: false,
             max_verify_failures: default_max_verify_failures(),
             max_spawn_failures: default_max_spawn_failures(),
+            spawn_quarantine_threshold: default_spawn_quarantine_threshold(),
             spawn_breaker_threshold: default_spawn_breaker_threshold(),
             spawn_breaker_cooldown_secs: default_spawn_breaker_cooldown_secs(),
             spawn_breaker_max_cooldown_secs: default_spawn_breaker_max_cooldown_secs(),

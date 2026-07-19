@@ -592,6 +592,256 @@ fn pid_is_live_ours(pid: u32) -> bool {
     pid_is_alive(pid) && !pid_reused_by_foreign(pid)
 }
 
+// ── Boot-time session-lock reconciliation (zombie-handler reaping) ────────
+//
+// `wg service stop` leaves handler subprocesses running by design, so a handler
+// from a previous daemon generation can keep holding a session lock. Two shapes
+// wedged dispatch in the 2026-07-19 outage:
+//   * a `claude-handler` from two days earlier squatted `chat-2`'s lock; every
+//     new coordinator subprocess found the lock "held by a live handler" and
+//     exited as a cooperative handoff with backoff — forever.
+//   * four `wg`/`nex` processes ran from a `.wg-worktrees/agent-3024/target/
+//     debug/wg` binary whose directory had since been deleted — orphans of a
+//     removed worktree, still holding locks.
+//
+// `reconcile_session_locks` runs once on service start and reaps a lock whose
+// holder is: dead, a recycled foreign PID, running a binary whose path no longer
+// exists (deleted worktree), or older than a caller-supplied cutoff (a
+// generation predating the current daemon boot). Live, current handlers are left
+// untouched — the decision fails SAFE.
+
+/// The best-effort on-disk path of the executable backing `pid`, or `None` when
+/// it can't be determined (no `/proc`, permission, unsupported platform). Used
+/// only to detect a handler whose binary was deleted out from under it.
+#[cfg(target_os = "linux")]
+pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    // `/proc/<pid>/exe` is a symlink to the running executable. For a deleted
+    // binary the kernel appends " (deleted)" to the link target, so the returned
+    // path will not `exists()` — exactly the signal we want.
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    // macOS has no `/proc`; `ps -p <pid> -o comm=` prints the full executable
+    // path of the process (e.g. `/Users/.../target/debug/wg`).
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// True when `pid`'s backing executable path can be determined AND no longer
+/// exists on disk — the deleted-worktree-binary case. Fails SAFE: returns
+/// `false` whenever the path is undeterminable (so a live handler on a platform
+/// without exe introspection is never reaped for this reason). An absolute path
+/// is required; a bare comm name (unresolved) is treated as undeterminable.
+pub fn pid_binary_missing(pid: u32) -> bool {
+    match process_exe_path(pid) {
+        Some(path) if path.is_absolute() => !path.exists(),
+        _ => false,
+    }
+}
+
+/// Why a session lock was (or would be) reaped during reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReapReason {
+    /// Lock file couldn't be parsed — no usable holder identity.
+    Unparseable,
+    /// Holder PID is not alive (`kill(pid,0)` failed).
+    DeadPid,
+    /// Holder PID is alive but recycled to a foreign (non-wg/nex) process.
+    RecycledForeign,
+    /// Holder's executable path no longer exists (deleted worktree binary).
+    BinaryMissing,
+    /// Holder started before the reconcile cutoff — a stale generation squatter.
+    StaleGeneration,
+}
+
+impl ReapReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unparseable => "unparseable lock",
+            Self::DeadPid => "dead pid",
+            Self::RecycledForeign => "recycled foreign pid",
+            Self::BinaryMissing => "binary path no longer exists (deleted worktree)",
+            Self::StaleGeneration => "handler generation predates daemon boot",
+        }
+    }
+
+    /// Whether the still-live holder process should be signalled (SIGTERM) when
+    /// reaped. We only kill orphans that are unambiguously OURS-gone-bad — a
+    /// deleted-binary handler or a pre-boot generation squatter. A recycled
+    /// foreign PID belongs to an unrelated process and must NEVER be signalled.
+    pub fn should_kill_holder(self) -> bool {
+        matches!(self, Self::BinaryMissing | Self::StaleGeneration)
+    }
+}
+
+/// Pure reap decision from injected facts, so the policy is unit-testable
+/// without live processes. Ordered by severity/confidence.
+fn reap_reason_for(
+    parseable: bool,
+    alive: bool,
+    foreign: bool,
+    binary_missing: bool,
+    predates_cutoff: bool,
+) -> Option<ReapReason> {
+    if !parseable {
+        return Some(ReapReason::Unparseable);
+    }
+    if !alive {
+        return Some(ReapReason::DeadPid);
+    }
+    if foreign {
+        return Some(ReapReason::RecycledForeign);
+    }
+    if binary_missing {
+        return Some(ReapReason::BinaryMissing);
+    }
+    if predates_cutoff {
+        return Some(ReapReason::StaleGeneration);
+    }
+    None
+}
+
+/// Policy for `reconcile_session_locks`.
+#[derive(Clone, Debug, Default)]
+pub struct ReconcilePolicy {
+    /// Reap a lock whose holder started strictly before this RFC3339-parseable
+    /// instant — a generation predating the current daemon boot. `None` disables
+    /// the age check (only dead/foreign/binary-missing locks are reaped).
+    pub reap_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether to SIGTERM a still-live orphan holder (binary-missing / stale
+    /// generation) before removing its lock file.
+    pub kill_orphans: bool,
+}
+
+/// One reaped lock, for the boot log / report.
+#[derive(Clone, Debug)]
+pub struct ReapedLock {
+    pub chat_dir: PathBuf,
+    pub pid: u32,
+    pub kind: Option<HandlerKind>,
+    pub reason: ReapReason,
+    /// Whether the live holder process was signalled during reaping.
+    pub killed: bool,
+}
+
+/// Reconcile every `<chat_root>/*/.handler.pid` session lock against live
+/// process facts, reaping zombie/stale/orphan holders. Returns the reaped
+/// locks. Live, current handlers are left untouched.
+///
+/// Intended to run ONCE on service start (lock reconcile is engine-side). It
+/// removes the stale lock file (and any paired release marker) so the next
+/// handler generation can acquire cleanly, and — for orphans that are ours
+/// (deleted-binary / pre-boot generation) — best-effort SIGTERMs the squatter
+/// when `policy.kill_orphans` is set.
+pub fn reconcile_session_locks(chat_root: &Path, policy: &ReconcilePolicy) -> Vec<ReapedLock> {
+    let mut reaped = Vec::new();
+    let entries = match std::fs::read_dir(chat_root) {
+        Ok(e) => e,
+        Err(_) => return reaped, // no chat root yet → nothing to reconcile
+    };
+    for entry in entries.flatten() {
+        let chat_dir = entry.path();
+        if !chat_dir.is_dir() {
+            continue;
+        }
+        let lock_path = SessionLock::lock_path(&chat_dir);
+        if !lock_path.exists() {
+            continue;
+        }
+
+        let holder = read_holder_at(&lock_path).ok().flatten();
+        let (parseable, pid, kind, alive, started_at) = match &holder {
+            Some(h) => (true, h.pid, h.kind, h.alive, h.started_at.clone()),
+            None => (false, 0, None, false, String::new()),
+        };
+
+        // Gather live-process facts only when there's a live PID to inspect.
+        let foreign = alive && pid_reused_by_foreign(pid);
+        let binary_missing = alive && !foreign && pid_binary_missing(pid);
+        let predates_cutoff = alive
+            && policy.reap_before.is_some_and(|cutoff| {
+                chrono::DateTime::parse_from_rfc3339(&started_at)
+                    .map(|dt| dt.with_timezone(&chrono::Utc) < cutoff)
+                    .unwrap_or(false)
+            });
+
+        let Some(reason) =
+            reap_reason_for(parseable, alive, foreign, binary_missing, predates_cutoff)
+        else {
+            continue; // live, current handler — leave it alone
+        };
+
+        // Best-effort SIGTERM for orphans that are unambiguously ours-gone-bad.
+        let mut killed = false;
+        if policy.kill_orphans && alive && reason.should_kill_holder() {
+            killed = terminate_pid(pid);
+        }
+
+        // Remove the lock file and any paired cooperative release marker so the
+        // successor handler starts from a clean slate.
+        let _ = std::fs::remove_file(&lock_path);
+        clear_release_marker(&chat_dir);
+
+        eprintln!(
+            "[session-lock] reconcile: reaped {} lock (pid={}, kind={}, reason={}{})",
+            chat_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            pid,
+            kind.map(|k| k.label()).unwrap_or("unknown"),
+            reason.label(),
+            if killed { ", holder SIGTERM'd" } else { "" },
+        );
+
+        reaped.push(ReapedLock {
+            chat_dir,
+            pid,
+            kind,
+            reason,
+            killed,
+        });
+    }
+    reaped
+}
+
+/// Best-effort SIGTERM to a still-live orphan holder. Never signals pid 0 or
+/// ourselves. Returns whether the signal was delivered.
+#[cfg(unix)]
+fn terminate_pid(pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    // SAFETY: kill with SIGTERM to a specific pid is safe; failure is ignored.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
+}
+
+#[cfg(not(unix))]
+fn terminate_pid(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,6 +1154,134 @@ mod tests {
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // ── Fix 2: boot-time session-lock reconciliation ────────────────────
+
+    #[test]
+    fn reap_reason_ordering_and_safe_default() {
+        // A live, current, non-foreign handler with a good binary → NOT reaped.
+        assert_eq!(reap_reason_for(true, true, false, false, false), None);
+        // Unparseable wins even if "alive".
+        assert_eq!(
+            reap_reason_for(false, true, true, true, true),
+            Some(ReapReason::Unparseable)
+        );
+        // Dead pid.
+        assert_eq!(
+            reap_reason_for(true, false, false, false, false),
+            Some(ReapReason::DeadPid)
+        );
+        // Foreign recycled pid (before binary/age checks).
+        assert_eq!(
+            reap_reason_for(true, true, true, true, true),
+            Some(ReapReason::RecycledForeign)
+        );
+        // Deleted-worktree binary.
+        assert_eq!(
+            reap_reason_for(true, true, false, true, false),
+            Some(ReapReason::BinaryMissing)
+        );
+        // Pre-boot generation squatter.
+        assert_eq!(
+            reap_reason_for(true, true, false, false, true),
+            Some(ReapReason::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn reap_reason_kill_policy_never_kills_foreign() {
+        assert!(!ReapReason::RecycledForeign.should_kill_holder());
+        assert!(!ReapReason::DeadPid.should_kill_holder());
+        assert!(!ReapReason::Unparseable.should_kill_holder());
+        assert!(ReapReason::BinaryMissing.should_kill_holder());
+        assert!(ReapReason::StaleGeneration.should_kill_holder());
+    }
+
+    #[test]
+    fn reconcile_reaps_dead_and_unparseable_but_spares_live_current() {
+        let root = tempdir().unwrap();
+        // Session A: a dead-pid lock (zombie generation, no live process).
+        let a = root.path().join("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(
+            SessionLock::lock_path(&a),
+            "999999\n2020-01-01T00:00:00Z\nadapter\n",
+        )
+        .unwrap();
+        // Session B: an unparseable lock.
+        let b = root.path().join("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(SessionLock::lock_path(&b), "garbage\n").unwrap();
+        // Session C: a live, current handler (this process) — must be spared.
+        let c = root.path().join("cccccccc-cccc-cccc-cccc-cccccccccccc");
+        let _live = SessionLock::acquire(&c, HandlerKind::ChatNex).unwrap();
+
+        let policy = ReconcilePolicy {
+            reap_before: None,
+            kill_orphans: false,
+        };
+        let reaped = reconcile_session_locks(root.path(), &policy);
+
+        // A and B reaped; C left intact.
+        let reasons: std::collections::HashMap<_, _> = reaped
+            .iter()
+            .map(|r| (r.chat_dir.clone(), r.reason))
+            .collect();
+        assert_eq!(reasons.get(&a), Some(&ReapReason::DeadPid));
+        assert_eq!(reasons.get(&b), Some(&ReapReason::Unparseable));
+        assert!(!reasons.contains_key(&c), "live current handler must be spared");
+        assert!(!SessionLock::lock_path(&a).exists(), "dead lock removed");
+        assert!(!SessionLock::lock_path(&b).exists(), "corrupt lock removed");
+        assert!(SessionLock::lock_path(&c).exists(), "live lock preserved");
+    }
+
+    #[test]
+    fn reconcile_reaps_pre_boot_generation_squatter() {
+        // A live handler (this process) whose lock records a start time BEFORE
+        // the daemon-boot cutoff is a stale generation and must be reaped — the
+        // 2-day claude-handler squatting the lock. We reap without killing so
+        // the test process is unharmed.
+        let root = tempdir().unwrap();
+        let dir = root.path().join("dddddddd-dddd-dddd-dddd-dddddddddddd");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            SessionLock::lock_path(&dir),
+            format!("{}\n2020-01-01T00:00:00Z\nadapter\n", std::process::id()),
+        )
+        .unwrap();
+
+        let policy = ReconcilePolicy {
+            reap_before: Some(chrono::Utc::now()), // boot is "now"; lock is from 2020
+            kill_orphans: false,
+        };
+        let reaped = reconcile_session_locks(root.path(), &policy);
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].reason, ReapReason::StaleGeneration);
+        assert!(!reaped[0].killed, "kill_orphans=false → holder not signalled");
+        assert!(!SessionLock::lock_path(&dir).exists());
+    }
+
+    #[test]
+    fn reconcile_spares_recent_live_generation() {
+        // Same live process, but the lock's start time is AFTER the cutoff — a
+        // current-generation handler that must NOT be reaped.
+        let root = tempdir().unwrap();
+        let dir = root.path().join("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
+        let _live = SessionLock::acquire(&dir, HandlerKind::ChatNex).unwrap();
+        let policy = ReconcilePolicy {
+            reap_before: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            kill_orphans: true,
+        };
+        let reaped = reconcile_session_locks(root.path(), &policy);
+        assert!(reaped.is_empty(), "a handler started after the cutoff is current");
+        assert!(SessionLock::lock_path(&dir).exists());
+    }
+
+    #[test]
+    fn pid_binary_missing_is_false_for_live_self() {
+        // Our own process has a real, existing executable → not missing.
+        assert!(!pid_binary_missing(std::process::id()));
     }
 
     #[test]
