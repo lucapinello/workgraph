@@ -224,6 +224,111 @@ pub fn reset_cron_task(task: &mut Task) -> bool {
     true
 }
 
+/// Reset every completed (reset-in-place) cron in `graph` to Open for its next
+/// period AND satisfy the in-flight dependents of each reset cron, so a child
+/// chained `--after <cron-id>` during the just-completed run is never re-blocked
+/// when the recurring cron reschedules to its next firing.
+///
+/// This is the cron-fanout-orphaning fix (2026-07-19 post-mortem). A recurring
+/// cron flips the SAME id Done→Open on each firing, so any dependent created
+/// against that id re-blocks the moment the completed run resets — its finished
+/// work strands until the NEXT firing (up to a week later for a weekly cron).
+/// Here we drop the now-stale edge from every dependent that belonged to the
+/// just-completed run.
+///
+/// A dependent "belongs to the completed run" when its `created_at` is at or
+/// before the run's completion timestamp (captured BEFORE reset, which clears
+/// `completed_at`). A dependent created AFTER the run completed legitimately
+/// waits for the NEXT firing and keeps its edge — it is satisfied a cycle later
+/// when that firing completes. Dependents that are themselves cron tasks are
+/// left untouched so recurring cron→cron pipelines keep firing every period.
+///
+/// Returns `(reset_cron_ids, satisfied_dependent_ids)`.
+pub fn reset_due_legacy_crons(
+    graph: &mut crate::graph::WorkGraph,
+    now: DateTime<Utc>,
+) -> (Vec<String>, Vec<String>) {
+    // Capture completed crons and their run-completion timestamps BEFORE
+    // resetting — `reset_cron_task` clears `completed_at`.
+    let due: Vec<(String, DateTime<Utc>)> = graph
+        .tasks()
+        .filter(|t| t.cron_enabled && t.status == crate::graph::Status::Done)
+        .map(|t| {
+            let completed_at = t
+                .completed_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(now);
+            (t.id.clone(), completed_at)
+        })
+        .collect();
+
+    let mut reset_ids = Vec::new();
+    let mut satisfied = Vec::new();
+    for (cron_id, completed_at) in due {
+        let did_reset = graph
+            .get_task_mut(&cron_id)
+            .map(reset_cron_task)
+            .unwrap_or(false);
+        if !did_reset {
+            continue;
+        }
+        reset_ids.push(cron_id.clone());
+        satisfied.extend(satisfy_reset_cron_dependents(graph, &cron_id, completed_at, now));
+    }
+    (reset_ids, satisfied)
+}
+
+/// Drop the stale `--after <cron_id>` edge from every dependent that belonged to
+/// the cron run completing at `run_completed_at` (i.e. `created_at <=
+/// run_completed_at`), so the rescheduled recurring cron does not re-block a
+/// finished/in-flight child. Cron dependents are skipped (recurring pipelines).
+/// Returns the ids of dependents whose edge was cleared.
+fn satisfy_reset_cron_dependents(
+    graph: &mut crate::graph::WorkGraph,
+    cron_id: &str,
+    run_completed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let dependents: Vec<String> = graph
+        .tasks()
+        .filter(|t| t.after.iter().any(|a| a == cron_id))
+        // Never break a recurring cron→cron pipeline: a cron dependent must
+        // re-block every period, that is the whole point of the edge.
+        .filter(|t| !t.cron_enabled)
+        // Only dependents created during (or before) the completed run — a
+        // dependent created after it waits for the NEXT firing.
+        .filter(|t| {
+            t.created_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc) <= run_completed_at)
+                .unwrap_or(true) // no created_at → pre-existing, satisfy
+        })
+        .map(|t| t.id.clone())
+        .collect();
+
+    for dep_id in &dependents {
+        if let Some(dep) = graph.get_task_mut(dep_id) {
+            dep.after.retain(|a| a != cron_id);
+            dep.log.push(LogEntry {
+                timestamp: now.to_rfc3339(),
+                actor: Some("cron".to_string()),
+                user: None,
+                message: format!(
+                    "cron_dependent_satisfied: dropped stale `--after {}` edge. The \
+                     recurring cron run this task was chained on has completed and the \
+                     cron rescheduled to its next period; a rescheduled cron must not \
+                     re-block a finished/in-flight child (cron-fanout orphaning fix).",
+                    cron_id
+                ),
+            });
+        }
+    }
+    dependents
+}
+
 /// Check if a task with cron scheduling is due to run based on current time
 ///
 /// # Arguments
@@ -530,6 +635,92 @@ pub fn format_countdown(target: &str, now: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+
+    /// FIX (cron-fanout orphaning post-mortem, 2026-07-19): a reset-in-place cron
+    /// fires, a child is chained `--after <cron-id>` during the run, the cron
+    /// RESCHEDULES to its next period — and the finished child must become READY,
+    /// not re-block behind the next firing. This was the direct cause of the ~1h
+    /// W30 stall (children of `weekly-plan-sunday` re-blocked until NEXT Sunday).
+    /// `reset_due_legacy_crons` reschedules the cron AND drops the stale edge from
+    /// dependents of the completed run.
+    #[test]
+    fn cron_reschedule_satisfies_in_flight_dependents_fanout_fix() {
+        use crate::graph::{Node, Status, Task, WorkGraph};
+
+        let mut graph = WorkGraph::new();
+
+        // A recurring cron that just completed a run at `run_done`.
+        let run_done = Utc::now() - Duration::minutes(30);
+        let cron = Task {
+            id: "weekly-plan-sunday".to_string(),
+            title: "weekly plan".to_string(),
+            status: Status::Done, // its run just completed
+            cron_enabled: true,
+            cron_schedule: Some("0 0 2 * * *".to_string()),
+            completed_at: Some(run_done.to_rfc3339()),
+            next_cron_fire: None,
+            ..Default::default()
+        };
+        graph.add_node(Node::Task(cron));
+
+        // A child chained on the cron id DURING the run (created before the run
+        // completed). It is still Open — real downstream fanout work.
+        let child = Task {
+            id: "nora-plan-child".to_string(),
+            title: "downstream plan work".to_string(),
+            status: Status::Open,
+            created_at: Some((run_done - Duration::minutes(10)).to_rfc3339()),
+            after: vec!["weekly-plan-sunday".to_string()],
+            ..Default::default()
+        };
+        graph.add_node(Node::Task(child));
+
+        // A child created AFTER this run completed: it legitimately waits for the
+        // NEXT firing and must KEEP its edge (proves we don't over-satisfy).
+        let future_child = Task {
+            id: "next-week-child".to_string(),
+            title: "waits for next week".to_string(),
+            status: Status::Open,
+            created_at: Some((run_done + Duration::minutes(5)).to_rfc3339()),
+            after: vec!["weekly-plan-sunday".to_string()],
+            ..Default::default()
+        };
+        graph.add_node(Node::Task(future_child));
+
+        // Tick: reschedule the cron + satisfy in-flight dependents.
+        let (reset_ids, satisfied) = reset_due_legacy_crons(&mut graph, Utc::now());
+
+        // The cron rescheduled to its next period (Open, next fire in the future).
+        assert_eq!(reset_ids, vec!["weekly-plan-sunday".to_string()]);
+        let cron = graph.get_task("weekly-plan-sunday").unwrap();
+        assert_eq!(cron.status, Status::Open, "cron rescheduled to Open");
+        let next: DateTime<Utc> = cron.next_cron_fire.clone().unwrap().parse().unwrap();
+        assert!(next > Utc::now(), "next fire advanced to the future");
+
+        // THE FIX: the in-flight child is READY (its stale edge was dropped),
+        // even though the cron flipped back to Open for its next firing.
+        assert_eq!(satisfied, vec!["nora-plan-child".to_string()]);
+        assert!(
+            crate::query::after(&graph, "nora-plan-child").is_empty(),
+            "rescheduled cron must NOT re-block the in-flight child (the fanout fix)"
+        );
+        assert!(
+            !graph
+                .get_task("nora-plan-child")
+                .unwrap()
+                .after
+                .iter()
+                .any(|a| a == "weekly-plan-sunday"),
+            "stale cron edge dropped from the finished-run child"
+        );
+
+        // The next-week child KEEPS its edge and stays blocked — it waits for the
+        // firing it was actually created for.
+        assert!(
+            !crate::query::after(&graph, "next-week-child").is_empty(),
+            "a child created after the run must still wait for the next firing"
+        );
+    }
 
     #[test]
     fn test_parse_cron_expression_valid() {

@@ -5140,23 +5140,36 @@ pub fn coordinator_tick(
 
         // Phase 2.95: Cron task reset — reset Done cron tasks to Open and compute
         // next fire time with jitter so they can be re-dispatched on schedule.
+        //
+        // A reset-in-place cron flips the SAME id Done→Open on each firing, so a
+        // child chained `--after <cron-id>` during the just-completed run would
+        // re-block the moment the cron reschedules — its finished work stranding
+        // until the NEXT firing (the 2026-07-19 W30 fanout-orphaning outage).
+        // `reset_due_legacy_crons` reschedules each Done cron AND drops the stale
+        // edge from every dependent created during that run, so the recurring
+        // cron satisfies — never re-blocks — its in-flight fanout children.
         {
-            let cron_task_ids: Vec<String> = graph
-                .tasks()
-                .filter(|t| t.cron_enabled && t.status == Status::Done)
-                .map(|t| t.id.clone())
-                .collect();
-            for task_id in &cron_task_ids {
-                if let Some(task) = graph.get_task_mut(task_id)
-                    && worksgood::cron::reset_cron_task(task)
-                {
-                    eprintln!(
-                        "[dispatcher] Cron reset: '{}' → Open (next fire: {})",
-                        task_id,
-                        task.next_cron_fire.as_deref().unwrap_or("unknown")
-                    );
-                    modified = true;
-                }
+            let (reset_ids, satisfied_dependents) =
+                worksgood::cron::reset_due_legacy_crons(graph, Utc::now());
+            for cron_id in &reset_ids {
+                let next = graph
+                    .get_task(cron_id)
+                    .and_then(|t| t.next_cron_fire.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                eprintln!(
+                    "[dispatcher] Cron reset: '{}' → Open (next fire: {})",
+                    cron_id, next
+                );
+            }
+            for dep_id in &satisfied_dependents {
+                eprintln!(
+                    "[dispatcher] Cron fanout: dropped stale cron edge from '{}' \
+                     so the rescheduled cron does not re-block it",
+                    dep_id
+                );
+            }
+            if !reset_ids.is_empty() || !satisfied_dependents.is_empty() {
+                modified = true;
             }
         }
 
