@@ -2257,7 +2257,7 @@ if [ $EXIT_CODE -ne 0 ]; then
         # wrapper death produces immediate EOF even while the fallback lives.
         {{
             {fallback_run_command}
-        }} {{HEARTBEAT_GUARD_FD}}>&-
+        }} 9>&-
         EXIT_CODE=$?
     fi
 fi
@@ -2290,17 +2290,23 @@ unset CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH
 # owns the anonymous pipe's write descriptor. The executor runs with that
 # descriptor closed, so even an untrappable wrapper death produces immediate
 # EOF and the watcher exits instead of orphaning a `sleep 120` subprocess.
-exec {{HEARTBEAT_GUARD_FD}}> >(wg heartbeat-watch "$WG_AGENT_ID" --supervised-pid "$$" 2>/dev/null)
+#
+# Fd 9 is a FIXED descriptor number, not bash's varname auto-allocation.
+# The bash-4.1 named-fd redirection form is unsupported on macOS /bin/bash 3.2,
+# where it fails with `exec: ...: not found`, killing the whole wrapper BEFORE
+# the executor runs (every dispatched agent dies instantly with no output.log).
+# A literal fd works on bash 3.2+.
+exec 9> >(wg heartbeat-watch "$WG_AGENT_ID" --supervised-pid "$$" 2>/dev/null)
 HEARTBEAT_PID=$!
 
 # Run the agent command without inheriting the heartbeat guard writer.
 {{
     {run_command}
-}} {{HEARTBEAT_GUARD_FD}}>&-
+}} 9>&-
 EXIT_CODE=$?
 {session_fallback_block}
 # Stop the heartbeat watcher and close its guard on normal completion.
-exec {{HEARTBEAT_GUARD_FD}}>&-
+exec 9>&-
 kill $HEARTBEAT_PID 2>/dev/null; wait $HEARTBEAT_PID 2>/dev/null
 {stream_result}
 
@@ -5048,7 +5054,7 @@ mod tests {
             .nth(1)
             .expect("fallback block");
         assert!(
-            fallback.contains("} {HEARTBEAT_GUARD_FD}>&-"),
+            fallback.contains("} 9>&-"),
             "fallback executor must not inherit the heartbeat guard writer"
         );
     }
@@ -5075,12 +5081,18 @@ mod tests {
             "Wrapper should NOT contain session fallback when no fallback provided"
         );
         assert!(
-            script.contains("exec {HEARTBEAT_GUARD_FD}> >(wg heartbeat-watch \"$WG_AGENT_ID\""),
+            script.contains("exec 9> >(wg heartbeat-watch \"$WG_AGENT_ID\""),
             "wrapper must launch the pipe-guarded heartbeat watcher"
         );
         assert!(
-            script.matches("{HEARTBEAT_GUARD_FD}>&-").count() >= 2,
+            script.matches("9>&-").count() >= 2,
             "executor must close the guard writer and wrapper must close it on completion"
+        );
+        // Regression guard: the bash-4.1 `{var}>` auto-allocation form breaks
+        // macOS /bin/bash 3.2, killing every dispatched agent before it runs.
+        assert!(
+            !script.contains("{HEARTBEAT_GUARD_FD}"),
+            "wrapper must use a fixed fd, not the bash-4.1 named-fd form (breaks bash 3.2)"
         );
         assert!(
             !script

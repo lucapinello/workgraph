@@ -3028,10 +3028,12 @@ _WG_STDERR=$(mktemp)
 # The watcher owns no timer subprocess. Its stdin is an anonymous guard pipe
 # whose sole writer belongs to this wrapper; the inference child explicitly
 # closes the writer so wrapper death (including SIGKILL) produces immediate EOF.
-exec {{INLINE_HEARTBEAT_GUARD_FD}}> >({wg_cmd} heartbeat-watch '{escaped_agent_id}' --interval-seconds {heartbeat_interval_seconds} --supervised-pid "$$" 2>> '{escaped_output}')
+# Fd 9 is a FIXED number, NOT bash-4.1 `{{var}}>` auto-allocation, which fails
+# on macOS /bin/bash 3.2 (`exec: {{...}}: not found`) and kills the wrapper.
+exec 9> >({wg_cmd} heartbeat-watch '{escaped_agent_id}' --interval-seconds {heartbeat_interval_seconds} --supervised-pid "$$" 2>> '{escaped_output}')
 INLINE_HEARTBEAT_PID=$!
 _WG_STOP_INLINE_HEARTBEAT() {{
-    exec {{INLINE_HEARTBEAT_GUARD_FD}}>&- 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
     if [ -n "${{INLINE_HEARTBEAT_PID:-}}" ]; then
         kill "$INLINE_HEARTBEAT_PID" 2>/dev/null || true
         wait "$INLINE_HEARTBEAT_PID" 2>/dev/null || true
@@ -3042,7 +3044,7 @@ trap '_WG_STOP_INLINE_HEARTBEAT' EXIT
 trap '_WG_STOP_INLINE_HEARTBEAT; trap - EXIT; exit 143' TERM INT HUP
 {{
     {eval_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
-}} {{INLINE_HEARTBEAT_GUARD_FD}}>&-
+}} 9>&-
 EXIT_CODE=$?
 _WG_STOP_INLINE_HEARTBEAT
 trap - EXIT TERM INT HUP
@@ -3556,10 +3558,10 @@ fn spawn_assign_inline(dir: &Path, assign_task_id: &str) -> Result<(String, u32)
     let script = format!(
         r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
 _WG_STDERR=$(mktemp)
-exec {{INLINE_HEARTBEAT_GUARD_FD}}> >({wg_cmd} heartbeat-watch '{escaped_agent_id}' --interval-seconds {heartbeat_interval_seconds} --supervised-pid "$$" 2>> '{escaped_output}')
+exec 9> >({wg_cmd} heartbeat-watch '{escaped_agent_id}' --interval-seconds {heartbeat_interval_seconds} --supervised-pid "$$" 2>> '{escaped_output}')
 INLINE_HEARTBEAT_PID=$!
 _WG_STOP_INLINE_HEARTBEAT() {{
-    exec {{INLINE_HEARTBEAT_GUARD_FD}}>&- 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
     if [ -n "${{INLINE_HEARTBEAT_PID:-}}" ]; then
         kill "$INLINE_HEARTBEAT_PID" 2>/dev/null || true
         wait "$INLINE_HEARTBEAT_PID" 2>/dev/null || true
@@ -3570,7 +3572,7 @@ trap '_WG_STOP_INLINE_HEARTBEAT' EXIT
 trap '_WG_STOP_INLINE_HEARTBEAT; trap - EXIT; exit 143' TERM INT HUP
 {{
     {assign_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
-}} {{INLINE_HEARTBEAT_GUARD_FD}}>&-
+}} 9>&-
 EXIT_CODE=$?
 _WG_STOP_INLINE_HEARTBEAT
 trap - EXIT TERM INT HUP
@@ -5664,7 +5666,9 @@ mod tests {
         assert!(script.contains(
             "'/opt/wg/bin/wg' --dir '/srv/project/.wg' heartbeat-watch 'agent-41' --interval-seconds 2 --supervised-pid \"$$\""
         ));
-        assert!(script.contains("} {INLINE_HEARTBEAT_GUARD_FD}>&-"));
+        assert!(script.contains("} 9>&-"));
+        // Regression guard: bash-4.1 `{var}>` auto-allocation breaks bash 3.2.
+        assert!(!script.contains("{INLINE_HEARTBEAT_GUARD_FD}"));
         assert!(script.contains("trap '_WG_STOP_INLINE_HEARTBEAT' EXIT"));
         assert!(script.contains("kill \"$INLINE_HEARTBEAT_PID\""));
         assert!(script.contains("wait \"$INLINE_HEARTBEAT_PID\""));
