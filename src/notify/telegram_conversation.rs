@@ -703,13 +703,25 @@ fn build_compose_prompt_at(
     // for a PAST Thursday because a plan-change ask carried no date anchor at
     // all. Pure/clock-seam only, so it is deterministic under `build_*_at`.
     prompt.push_str(&grounding::date_anchor(human_message, now));
+
+    // ANTI-FABRICATION context (rule 5, docs/20 §6.7): ALWAYS put the real,
+    // clock-scoped calendar in front of the composer BEFORE it drafts — today's
+    // actual events, or an explicit "the calendar is clear". The transcript's
+    // fabrication ("birthday + back-to-back meetings, packed day" on an EMPTY
+    // calendar) was VOLUNTEERED in ordinary chatter, so it never hit the
+    // read-shaped grounding below; the calendar was simply not in the context.
+    // This line closes that hole for every message shape. Best-effort read.
+    // (root is bound once here and reused by the read-shaped grounding +
+    // corrections blocks below — #26 date-anchor and #28 anti-fabrication
+    // both landed, one binding.)
+    let root = project_root_of(workgraph_dir);
+    prompt.push_str(&grounding::fetch_schedule_context_line(&root, now));
     prompt.push('\n');
 
     // GROUNDING (rule 1): a question/read-shaped ask about plans/calendar/meals
     // /schedule gets the REAL week model injected, so the answer is grounded on
     // turn one instead of a stall. This is the read-side twin of the fast lane's
     // edit-shaped classifier. Best-effort — a missing plan just omits the block.
-    let root = project_root_of(workgraph_dir);
     if grounding::is_read_shaped(human_message) {
         if let Some(block) = grounding::fetch_scoped(&root, now, human_message) {
             prompt.push_str(&block);
@@ -1364,6 +1376,28 @@ async fn finalize_composed_reply(
         && !grounding::is_deliberation_request(human_message)
     {
         reply_text = grounding::enforce_answer_shape(&reply_text, false);
+    }
+
+    // ANTI-FABRICATION GUARD (rule 5, docs/20 §6.7): a composed reply must NEVER
+    // assert a schedule/calendar fact — a meeting, a birthday, "back-to-back",
+    // "packed" — with NO support in the REAL calendar. This runs on EVERY reply
+    // (greeting chatter, 1:1, group), not just read-shaped asks, because the
+    // transcript's fabrication was volunteered, not requested. It runs BEFORE the
+    // repetition guard (mirroring the JS twin's §6.7-before-§6.3 order): an
+    // invented schedule fact must not survive even if it is a fresh, non-repeated
+    // line. Grounding is scoped to what the model was shown; an empty/absent
+    // calendar is strict — any schedule claim is then a fabrication.
+    {
+        let now = chrono::Local::now().naive_local();
+        let sched = grounding::fetch_schedule_grounding(&project_root_of(workgraph_dir), now, human_message);
+        let unsourced = grounding::find_unsourced_schedule_claims(&reply_text, &sched);
+        if !unsourced.is_empty() {
+            eprintln!(
+                "[{}] anti-fabrication guard: {agent_id}'s draft asserts unsourced schedule facts {unsourced:?} — rewriting to the honest fallback",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+            reply_text = grounding::grounding_fallback_line();
+        }
     }
 
     // REPETITION GUARD (rule 2): never send the same summary a third time. If
@@ -3111,9 +3145,28 @@ mod tests {
         assert!(week.contains("Luca PT check-in"));
         assert!(week.to_lowercase().contains("do not stall"));
 
-        // Small talk carries no grounding block.
+        // Small talk carries no read-shaped WEEK block (no meal dump)...
         let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now);
         assert!(!plain.contains("Baked salmon"));
+        // ...but it DOES now carry the always-on anti-fabrication calendar-truth
+        // line (rule 5, §6.7). Wed 07-15 has no calendar events → the model is
+        // told the day is clear and forbidden from inventing one. This is the
+        // root-cause fix: the calendar is in the context for EVERY message shape.
+        assert!(
+            plain.to_lowercase().contains("nothing on the calendar")
+                && plain.to_lowercase().contains("do not invent"),
+            "small talk missing the anti-fabrication calendar-truth line:\n{plain}"
+        );
+
+        // A greeting on a day that DOES have a real upcoming event names ONLY
+        // that event (Tue 07-14 15:00 → the 19:30 PT check-in is still ahead).
+        let tue_noon = chrono::NaiveDate::from_ymd_opt(2026, 7, 14)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap();
+        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon);
+        assert!(greet.contains("PT check-in"), "real event missing from greeting prompt:\n{greet}");
+        assert!(greet.to_lowercase().contains("do not invent"), "{greet}");
     }
 
     /// RULE 3 (corrections stick): "Nadin is not logged so ignore this" is
@@ -3198,5 +3251,50 @@ mod tests {
         let last = sink2.calls().last().unwrap().2.clone();
         assert!(!last.contains("waiting on confirmations"), "stall repeated: {last}");
         assert!(last.to_lowercase().contains("read"), "not the honest fallback: {last}");
+    }
+
+    /// RULE 5 (§6.7 anti-fabrication): a composed reply that INVENTS a schedule
+    /// fact — a birthday, back-to-back meetings, a packed day — with nothing on
+    /// the calendar is rewritten to the honest fallback on the REAL delivery
+    /// path (run_conversation_turn → run_composed_turn's finalize), not merely in
+    /// a unit test of the guard. This is Luca's exact transcript bug, end to end:
+    /// the fabrication was volunteered on an ordinary greeting, so it never hit
+    /// the read-shaped grounding — the guard has to catch it regardless.
+    #[tokio::test]
+    async fn ground_anti_fabrication_rewrites_invented_schedule_on_the_real_path() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        // NO plan file → the calendar is EMPTY → strict grounding: any schedule
+        // claim in the drafted reply is a fabrication.
+        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "otto");
+        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+
+        // The exact fabrication from the transcript, volunteered on a greeting.
+        let fabricated = "Morning! You've got a birthday today and back-to-back meetings — \
+                          a pretty packed day ahead.";
+        let sink = RecSink::default();
+        let c = FakeComposer::ok(fabricated);
+        run_conversation_turn(
+            &wg, &plan, "how's your day?", "req-fab", fast_timing(), Some(&c), &sink,
+        )
+        .await
+        .unwrap();
+
+        let last = sink.calls().last().unwrap().2.clone();
+        let lc = last.to_lowercase();
+        // NONE of the invented specifics survive to the family.
+        assert!(!lc.contains("birthday"), "birthday survived: {last}");
+        assert!(!lc.contains("meeting"), "meeting survived: {last}");
+        assert!(!lc.contains("packed"), "packed survived: {last}");
+        assert!(
+            !lc.contains("back to back") && !lc.contains("back-to-back"),
+            "load claim survived: {last}"
+        );
+        // The honest, calendar-referencing fallback went out instead.
+        assert!(lc.contains("calendar"), "not the honest fallback: {last}");
     }
 }

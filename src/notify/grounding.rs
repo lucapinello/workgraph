@@ -880,6 +880,272 @@ pub fn fetch_scoped(root: &Path, now: NaiveDateTime, message: &str) -> Option<St
 }
 
 // ---------------------------------------------------------------------------
+// Rule 5 (docs/20 §6.7) — anti-fabrication: never assert an UNSOURCED schedule fact
+// ---------------------------------------------------------------------------
+//
+// Luca's transcript also caught Otto *volunteering* "you've got a birthday and
+// back-to-back meetings — packed day" when the calendar was EMPTY. That is a
+// trust-killer distinct from the stall: it is a fabrication, and — critically —
+// it was not asked for, so the rule-1 read-shaped grounding never fired on it.
+// This rule is the Rust twin of the in-repo JS guard (`composerGuard.mjs` §6.7)
+// and it runs on EVERY composed reply (greeting chatter, 1:1, group), at a
+// STRICTER tolerance than generic repetition: a single unsourced schedule claim
+// rejects the whole draft. Absent/empty grounding is strict — "I can't see the
+// calendar" must never license inventing one.
+
+/// SPECIFIC event nouns — a "meeting", a "birthday", an "appointment", a named
+/// happening. Groundable ONLY when the SAME noun literally appears in a real
+/// calendar title. A reply that says "birthday" with no birthday on the calendar
+/// is a fabrication. (Normalisation drops hyphens/apostrophes, see [`normalize`].)
+pub const SCHEDULE_EVENT_NOUNS: &[&str] = &[
+    "meeting",
+    "meetings",
+    "birthday",
+    "birthdays",
+    "appointment",
+    "appointments",
+    "appt",
+    "appts",
+    "interview",
+    "interviews",
+    "deadline",
+    "deadlines",
+    "anniversary",
+    "anniversaries",
+    "reservation",
+    "reservations",
+    "party",
+    "parties",
+    "checkup",
+    "check up",
+];
+
+/// QUALITATIVE load claims — "back-to-back", "packed", "busy day". Not a title
+/// you can string-match; they assert the day is HEAVY. Groundable ONLY when the
+/// grounding actually holds MULTIPLE events (`>= LOAD_CLAIM_MIN_EVENTS`). With an
+/// empty (or single-event) calendar, "you're packed today" is a fabrication.
+pub const SCHEDULE_LOAD_PHRASES: &[&str] = &[
+    "back to back",
+    "back-to-back",
+    "packed",
+    "jam packed",
+    "jam-packed",
+    "slammed",
+    "swamped",
+    "wall to wall",
+    "wall-to-wall",
+    "crammed",
+    "crazy busy",
+    "busy day",
+    "busy today",
+    "busy morning",
+    "busy afternoon",
+    "packed day",
+    "full day",
+    "fully booked",
+    "booked solid",
+    "hectic",
+];
+
+/// Bare single-word load adjectives, caught as a fallback so a rephrase the
+/// phrase list misses ("today's pretty busy" → "busy" is too generic, but
+/// "packed"/"booked"/"hectic" alone still trip). Matched as whole tokens.
+const BARE_LOAD_WORDS: &[&str] = &[
+    "back to back",
+    "packed",
+    "slammed",
+    "swamped",
+    "hectic",
+    "booked",
+];
+
+/// The density at/above which a QUALITATIVE load claim is considered grounded.
+/// One event does not make a "back-to-back" day.
+pub const LOAD_CLAIM_MIN_EVENTS: usize = 2;
+
+/// The grounding token bag against which a drafted reply's schedule claims are
+/// checked: a normalised haystack of every real event title (for noun matching)
+/// plus the event COUNT (for load claims). Built from the SAME plan calendar the
+/// read block uses. `Default` is the EMPTY/strict grounding — every schedule
+/// claim is then unsourced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleGrounding {
+    /// Normalised, ` | `-joined haystack of real event titles.
+    pub text: String,
+    /// Number of real events in the grounded window (for load-claim density).
+    pub count: usize,
+}
+
+/// Build a [`ScheduleGrounding`] from a list of real event titles (the same
+/// event shape `/calendar.json` / the Week view / [`grounded_block`] consume).
+/// Blank titles are dropped; the count is the number of real titles.
+pub fn build_schedule_grounding(titles: &[String]) -> ScheduleGrounding {
+    let kept: Vec<&str> = titles
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    ScheduleGrounding {
+        text: normalize(&kept.join(" | ")),
+        count: kept.len(),
+    }
+}
+
+/// True when `term` (already normalised, may be multi-word) appears as a whole
+/// token run in the normalised `hay`. Space-padded so "appt" != "apptx".
+fn contains_phrase(hay: &str, term: &str) -> bool {
+    let t = term.trim();
+    if t.is_empty() {
+        return false;
+    }
+    format!(" {hay} ").contains(&format!(" {t} "))
+}
+
+/// The schedule/calendar claims in `draft` that have NO support in `grounding`.
+/// Empty means the draft asserts nothing the calendar cannot back. A non-empty
+/// result is the list of offending terms — a SINGLE one is enough to reject the
+/// draft. Specific nouns are unsourced unless the same noun is literally on the
+/// calendar; load claims are unsourced unless the window holds `>=2` events.
+pub fn find_unsourced_schedule_claims(draft: &str, grounding: &ScheduleGrounding) -> Vec<String> {
+    let text = normalize(draft);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut offenders: Vec<String> = Vec::new();
+
+    // Specific event nouns — unsourced unless the SAME noun is on the calendar.
+    for noun in SCHEDULE_EVENT_NOUNS {
+        let n = normalize(noun);
+        if contains_phrase(&text, &n) && !contains_phrase(&grounding.text, &n) {
+            offenders.push((*noun).to_string());
+        }
+    }
+
+    // Qualitative load claims — unsourced unless the day genuinely has >=2 events.
+    if grounding.count < LOAD_CLAIM_MIN_EVENTS {
+        for phrase in SCHEDULE_LOAD_PHRASES {
+            let p = normalize(phrase);
+            if contains_phrase(&text, &p) && !offenders.iter().any(|o| normalize(o) == p) {
+                offenders.push((*phrase).to_string());
+            }
+        }
+        for bare in BARE_LOAD_WORDS {
+            let b = normalize(bare);
+            if contains_phrase(&text, &b) && !offenders.iter().any(|o| normalize(o) == b) {
+                offenders.push((*bare).to_string());
+            }
+        }
+    }
+
+    offenders
+}
+
+/// True when `draft` asserts a schedule/calendar fact absent from `grounding`.
+pub fn fabricates_schedule(draft: &str, grounding: &ScheduleGrounding) -> bool {
+    !find_unsourced_schedule_claims(draft, grounding).is_empty()
+}
+
+/// The honest, factually-EMPTY line sent in place of a fabricated schedule
+/// reply: warm, but volunteering NO invented specifics — it says plainly there
+/// is nothing on the calendar and hands the turn back. Like the repetition
+/// fallback it may end on a question, because it offers to do the real work
+/// rather than assert a fact it cannot back.
+pub fn grounding_fallback_line() -> String {
+    "I'm not seeing anything on the calendar for that — I don't want to make something up. \
+     Want me to open it and take a proper look?"
+        .to_string()
+}
+
+/// Build the anti-fabrication [`ScheduleGrounding`] for a composed reply: the
+/// REAL calendar events in the window the reply is about, as of `now`. Scope is
+/// resolved from `message` the same way [`grounded_block`] scopes the injected
+/// context (so the guard checks against exactly what the model was shown): a
+/// day-ask grounds on that day's still-upcoming events; a week-ask grounds on
+/// every still-upcoming event in the week; a greeting (default scope) grounds on
+/// today. Pure — `now` is injected for fixed-clock tests.
+pub fn schedule_grounding_for(doc: &PlanDoc, now: NaiveDateTime, message: &str) -> ScheduleGrounding {
+    let today = now.date();
+    let titles = match detect_scope(message, today) {
+        AskScope::Day(day) => upcoming_titles_on(doc, day, now),
+        AskScope::Week => {
+            let mut all: Vec<String> = Vec::new();
+            let mut day = today;
+            for _ in 0..7 {
+                all.extend(upcoming_titles_on(doc, day, now));
+                match day.succ_opt() {
+                    Some(d) => day = d,
+                    None => break,
+                }
+            }
+            all
+        }
+    };
+    build_schedule_grounding(&titles)
+}
+
+/// Real event titles on `day` that are still upcoming as of `now` (today's
+/// already-passed events are dropped; future days keep everything).
+fn upcoming_titles_on(doc: &PlanDoc, day: NaiveDate, now: NaiveDateTime) -> Vec<String> {
+    let is_today = day == now.date();
+    calendar_on(doc, day)
+        .into_iter()
+        .filter(|e| !(is_today && event_has_passed(&e.time, day, now)))
+        .map(|e| e.event.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Load the current week model under `root` and build the anti-fabrication
+/// [`ScheduleGrounding`] for `message` as of `now`. Best-effort filesystem read;
+/// when there is NO plan the grounding is EMPTY (strict): every schedule claim in
+/// the drafted reply is then treated as unsourced. This is the guard's data seam,
+/// the twin of [`fetch_scoped`] for the prompt-injection seam.
+pub fn fetch_schedule_grounding(root: &Path, now: NaiveDateTime, message: &str) -> ScheduleGrounding {
+    let plans = family_plan::load_plans(root);
+    match family_plan::current_plan(&plans, now.date()) {
+        Some(doc) => schedule_grounding_for(doc, now, message),
+        None => ScheduleGrounding::default(),
+    }
+}
+
+/// The ALWAYS-ON calendar-truth line injected into every compose prompt so the
+/// model has the real, clock-scoped calendar in front of it BEFORE it drafts —
+/// the root cause of the fabrication was that the calendar was simply not in the
+/// context for non-read-shaped chatter. Names today's real upcoming events (or
+/// states plainly that the day is clear) and forbids inventing any other
+/// meeting/appointment/birthday or calling the day packed/back-to-back. Pure.
+pub fn schedule_context_line(doc: Option<&PlanDoc>, now: NaiveDateTime) -> String {
+    let today = now.date();
+    let label = format!("{} {}", family_plan::long_weekday(today), today.format("%b %-d"));
+    let titles = doc
+        .map(|d| upcoming_titles_on(d, today, now))
+        .unwrap_or_default();
+    if titles.is_empty() {
+        format!(
+            "CALENDAR ({label}) — there is NOTHING on the calendar today. Do NOT invent a \
+             meeting, appointment, birthday, or any event, and do NOT say the day is \
+             busy/packed/back-to-back. If asked, say the calendar is clear.\n"
+        )
+    } else {
+        format!(
+            "CALENDAR ({label}) — the ONLY real events today are: {}. Mention ONLY these; do \
+             NOT invent any other meeting, appointment, or birthday, and only call the day \
+             busy/packed if there are genuinely several.\n",
+            titles.join("; ")
+        )
+    }
+}
+
+/// Load the current week model under `root` and render [`schedule_context_line`]
+/// for it as of `now`. Best-effort; a missing plan yields the empty-calendar
+/// (strict) truth line so the model is still told the day is clear.
+pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
+    let plans = family_plan::load_plans(root);
+    let doc = family_plan::current_plan(&plans, now.date());
+    schedule_context_line(doc, now)
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -1358,5 +1624,125 @@ mod tests {
         // A week ask still surfaces multiple days' meals.
         assert!(block.contains("Baked salmon"));
         assert!(block.contains("Chickpea"));
+    }
+
+    // -- Rule 5 (§6.7): anti-fabrication grounding guard --------------------
+
+    // The exact transcript fabrication: Otto volunteers a birthday + back-to-back
+    // meetings + a packed day on an EMPTY calendar. EVERY invented specific must
+    // be flagged so the draft is rejected.
+    #[test]
+    fn ground_fabrication_rejects_the_transcript_invention_on_empty_calendar() {
+        let empty = ScheduleGrounding::default();
+        let draft = "Morning! You've got a birthday today and back-to-back meetings — \
+                     pretty packed day ahead.";
+        let offenders = find_unsourced_schedule_claims(draft, &empty);
+        assert!(fabricates_schedule(draft, &empty), "must be flagged: {offenders:?}");
+        // Each distinct invented specific is caught.
+        assert!(offenders.iter().any(|o| o == "birthday"), "birthday missed: {offenders:?}");
+        assert!(offenders.iter().any(|o| o == "meetings"), "meetings missed: {offenders:?}");
+        assert!(
+            offenders.iter().any(|o| o.contains("back") || o == "packed" || o == "packed day"),
+            "load claim missed: {offenders:?}"
+        );
+    }
+
+    // Absent grounding is STRICT: a lone schedule noun with no calendar is a
+    // fabrication. "I can't see the calendar" never licenses inventing one.
+    #[test]
+    fn ground_fabrication_empty_grounding_is_strict() {
+        let empty = ScheduleGrounding::default();
+        for draft in [
+            "You have a meeting at 3.",
+            "Don't forget the appointment tomorrow.",
+            "It's going to be a hectic day.",
+            "Your day is booked solid.",
+        ] {
+            assert!(fabricates_schedule(draft, &empty), "should reject: {draft:?}");
+        }
+    }
+
+    // A claim SOURCED by the real calendar passes: the noun is literally on it,
+    // or the load claim has the >=2 events to back it.
+    #[test]
+    fn ground_fabrication_allows_sourced_claims() {
+        // Two real events → "back-to-back" is grounded; "meeting" is on a title.
+        let g = build_schedule_grounding(&[
+            "Team meeting".to_string(),
+            "Dentist — Nadin".to_string(),
+        ]);
+        assert!(!fabricates_schedule("You've got a meeting then the dentist — a busy day.", &g));
+        assert!(!fabricates_schedule("Back-to-back today: the meeting and the dentist.", &g));
+        // But a birthday nobody scheduled is STILL a fabrication even here.
+        assert!(fabricates_schedule("And it's someone's birthday too.", &g));
+    }
+
+    // One event does NOT make a back-to-back / packed day.
+    #[test]
+    fn ground_fabrication_single_event_is_not_packed() {
+        let g = build_schedule_grounding(&["Dentist — Nadin".to_string()]);
+        assert_eq!(g.count, 1);
+        assert!(fabricates_schedule("You're totally packed today.", &g));
+        assert!(fabricates_schedule("It's back to back all day.", &g));
+        // Mentioning the one real thing (no load claim, no invented noun) is fine.
+        assert!(!fabricates_schedule("You've got the dentist today.", &g));
+    }
+
+    // Ordinary, schedule-free chatter is never touched.
+    #[test]
+    fn ground_fabrication_ignores_ordinary_chatter() {
+        let empty = ScheduleGrounding::default();
+        for draft in [
+            "Doing great, thanks for asking! How are you?",
+            "Dinner tonight is salmon — sounds delicious.",
+            "Good morning! Hope you slept well.",
+        ] {
+            assert!(!fabricates_schedule(draft, &empty), "should NOT reject: {draft:?}");
+        }
+    }
+
+    // The guard's grounding is built from the REAL plan, scoped like the prompt.
+    #[test]
+    fn ground_schedule_grounding_scopes_from_the_plan() {
+        let doc = PlanDoc::parse("2026-W29", PLAN);
+        // Greeting on Tue at 15:00 → today's still-upcoming event = PT check-in.
+        let g = schedule_grounding_for(&doc, at(2026, 7, 14, 15, 0), "how's your day going?");
+        assert_eq!(g.count, 1, "Tue has one upcoming event: text={:?}", g.text);
+        assert!(g.text.contains("pt check in") || g.text.contains("check in"), "text={:?}", g.text);
+        // A reply grounded in that real event passes; an invented meeting fails.
+        assert!(!fabricates_schedule("You've got your PT check-in at 7:30.", &g));
+        assert!(fabricates_schedule("You've got a meeting at noon.", &g));
+        // After 19:30 the check-in has passed → empty grounding → strict again.
+        let spent = schedule_grounding_for(&doc, at(2026, 7, 14, 20, 0), "how's your day going?");
+        assert_eq!(spent.count, 0);
+        assert!(fabricates_schedule("You've still got your check-in and a meeting.", &spent));
+    }
+
+    // The fallback is honest and volunteers no invented specifics.
+    #[test]
+    fn ground_fabrication_fallback_invents_nothing() {
+        let empty = ScheduleGrounding::default();
+        let fallback = grounding_fallback_line();
+        assert!(!fabricates_schedule(&fallback, &empty), "fallback must be clean: {fallback}");
+        assert!(fallback.to_lowercase().contains("calendar"));
+    }
+
+    // The ALWAYS-ON context line names real events, or states the day is clear —
+    // and always forbids inventing. This is the root-cause fix: the calendar is
+    // now in the compose context even for non-read-shaped chatter.
+    #[test]
+    fn ground_schedule_context_line_states_the_truth() {
+        let doc = PlanDoc::parse("2026-W29", PLAN);
+        // Tue at 15:00 → names the real upcoming event, forbids invention.
+        let with = schedule_context_line(Some(&doc), at(2026, 7, 14, 15, 0));
+        assert!(with.contains("PT check-in"), "should name the real event:\n{with}");
+        assert!(with.to_lowercase().contains("do not invent") || with.to_lowercase().contains("do not"), "{with}");
+        // No plan at all → explicit empty-calendar truth.
+        let none = schedule_context_line(None, at(2026, 7, 14, 15, 0));
+        assert!(none.to_lowercase().contains("nothing on the calendar"), "{none}");
+        assert!(none.to_lowercase().contains("do not invent"), "{none}");
+        // A spent day (asked Thu 20:00, after the 09:00 dentist) → clear.
+        let spent = schedule_context_line(Some(&doc), at(2026, 7, 16, 20, 0));
+        assert!(spent.to_lowercase().contains("nothing on the calendar"), "{spent}");
     }
 }
