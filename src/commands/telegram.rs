@@ -724,8 +724,12 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     }
                     _ => None,
                 };
+                // Resolve the sender to a bound human NAME (never the raw numeric
+                // Telegram id a username-less person decodes to — task
+                // mirrored-telegram-sender). Unbound bare id → the neutral label.
+                let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
                 let entry =
-                    casa_feed::group_entry(&msg.sender, &msg.body, casa_feed::now_ms(), src_id);
+                    casa_feed::group_entry(&feed_sender, &msg.body, casa_feed::now_ms(), src_id);
                 if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
                     eprintln!(
                         "[{}] casa feed: failed to mirror inbound group message: {e}",
@@ -882,8 +886,12 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 }
                                 _ => None,
                             };
+                            // Same sender resolution as the text mirror above: a
+                            // spoken line must also show the human's NAME, never the
+                            // raw numeric id (task mirrored-telegram-sender).
+                            let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
                             let entry = casa_feed::group_entry(
-                                &msg.sender,
+                                &feed_sender,
                                 &spoken,
                                 casa_feed::now_ms(),
                                 src_id,
@@ -1779,6 +1787,53 @@ fn sender_is_confirmed_human(
             .map(|b| b.confirmed)
             .unwrap_or(false),
         Err(_) => false,
+    }
+}
+
+/// The neutral label shown for an inbound sender we could not resolve to a bound
+/// human but whose display handle is a bare numeric Telegram user id. A number is
+/// not a person, and the family conversation pane must never render one.
+pub const NEUTRAL_SENDER_LABEL: &str = "family member";
+
+/// Resolve the display NAME to write as the sender of a mirrored inbound GROUP
+/// message in the casa conversation pane (task `mirrored-telegram-sender`).
+///
+/// The live bug: a confirmed human with no public @username (Luca, bound by his
+/// numeric id `8905220378`) decodes at the listener boundary to that numeric id as
+/// `msg.sender` (see `telegram_sender::SenderIdentity::display` — username → id →
+/// "unknown"). The mirror wrote that raw number as the feed sender, so the pane
+/// showed `8905220378` where it must show `Luca`.
+///
+/// We resolve ONCE here, against the SAME agency bindings `resolve_auth_sender`
+/// and `HumansSource` read, trying the numeric id first then the @username: a bound
+/// human shows their stored `name`. When no binding claims the sender AND the raw
+/// handle is a bare numeric id, we return the neutral [`NEUTRAL_SENDER_LABEL`] —
+/// never the digits. Any other unbound label (a real @username) passes through
+/// unchanged. This mirrors `casa_feed`'s privacy rule: a chat/user id never reaches
+/// the feed.
+fn resolve_feed_sender(workgraph_dir: &Path, msg: &worksgood::notify::IncomingMessage) -> String {
+    use worksgood::agency::TelegramBindingMap;
+    let agency_dir = workgraph_dir.join("agency");
+    if let Ok(map) = TelegramBindingMap::load(&agency_dir) {
+        if let Some(b) = map.find_by_identity(msg.sender_id.as_deref(), Some(&msg.sender)) {
+            let name = b.name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    neutralize_raw_sender(&msg.sender)
+}
+
+/// Scrub a bare numeric Telegram user id to the neutral label, leaving a real
+/// display handle (@username / already-resolved name) untouched. The pure core of
+/// [`resolve_feed_sender`]'s fallback, so the unit test can drive it directly.
+fn neutralize_raw_sender(sender: &str) -> String {
+    let s = sender.trim();
+    if worksgood::agency::human_binding::is_numeric_id(s) {
+        NEUTRAL_SENDER_LABEL.to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -6557,6 +6612,73 @@ mod tests {
         map.add(TelegramBinding::new(user, agent, name, None, ts()))
             .unwrap();
         map.save(&agency_dir).unwrap();
+    }
+
+    /// Build a minimal inbound GROUP message carrying a display `sender` and an
+    /// optional numeric `sender_id` — the two fields `resolve_feed_sender` reads.
+    fn feed_msg(sender: &str, sender_id: Option<&str>) -> worksgood::notify::IncomingMessage {
+        worksgood::notify::IncomingMessage {
+            channel: "telegram".to_string(),
+            sender: sender.to_string(),
+            sender_id: sender_id.map(str::to_string),
+            sender_is_bot: false,
+            sent_at: Some(1_720_000_000),
+            body: "all good?".to_string(),
+            action_id: None,
+            reply_to: None,
+            message_id: Some("1".to_string()),
+            chat_id: Some("-100".to_string()),
+            chat_type: Some("supergroup".to_string()),
+            mention_usernames: Vec::new(),
+            reply_to_bot: None,
+            has_bot_command: false,
+            photo_file_id: None,
+            media_group_id: None,
+            voice_file_id: None,
+            voice_mime: None,
+        }
+    }
+
+    #[test]
+    fn neutralize_raw_sender_scrubs_bare_numeric_id_only() {
+        // A bare Telegram user id is never a person — scrub it to the neutral label.
+        assert_eq!(neutralize_raw_sender("8905220378"), "family member");
+        assert_eq!(neutralize_raw_sender("  8905220378 "), "family member");
+        // A real @username / display name is left exactly as written.
+        assert_eq!(neutralize_raw_sender("lucapinello"), "lucapinello");
+        assert_eq!(neutralize_raw_sender("Luca"), "Luca");
+        assert_eq!(neutralize_raw_sender(""), "");
+    }
+
+    #[test]
+    fn resolve_feed_sender_maps_numeric_id_to_bound_name() {
+        // The exact live failure (task mirrored-telegram-sender): Luca is bound by his
+        // numeric id and arrives with NO public @username, so the listener decodes his
+        // sender to the raw id "8905220378". The mirrored feed line must show "Luca".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        seed_unconfirmed_binding(dir, "8905220378", "human-luca", "Luca");
+        let msg = feed_msg("8905220378", Some("8905220378"));
+        assert_eq!(resolve_feed_sender(dir, &msg), "Luca");
+    }
+
+    #[test]
+    fn resolve_feed_sender_neutralizes_unbound_raw_id() {
+        // No binding claims this id → never leak the number; show the neutral label.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let msg = feed_msg("5550001111", Some("5550001111"));
+        assert_eq!(resolve_feed_sender(dir, &msg), "family member");
+    }
+
+    #[test]
+    fn resolve_feed_sender_passes_through_unbound_username() {
+        // An unbound sender that DID surface a real @username keeps that handle —
+        // only a bare numeric id is neutralized.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let msg = feed_msg("someone", None);
+        assert_eq!(resolve_feed_sender(dir, &msg), "someone");
     }
 
     /// Bug 1 — the merged R21×R10 inbound path. An unconfirmed binding exists
