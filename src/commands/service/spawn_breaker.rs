@@ -307,6 +307,68 @@ impl SpawnBreakerState {
     }
 }
 
+/// A point-in-time, self-describing snapshot of the dispatcher spawn breaker,
+/// published by the daemon into `CoordinatorState` every tick. `wg service
+/// status` renders THIS (the live state the daemon actually acted on) instead of
+/// independently re-loading the breaker file and re-deriving the phase with a
+/// separately-loaded config — which drifted and printed "closed (healthy)" while
+/// the daemon log showed the breaker OPEN (2026-07-19 status-lie post-mortem).
+///
+/// The snapshot is fully resolved (phase label + human summary already baked in)
+/// so the reader needs neither the breaker file nor the config to display it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnBreakerSnapshot {
+    /// Resolved phase label: "closed" | "OPEN" | "HALF-OPEN" | "disabled".
+    pub phase: String,
+    /// Whether the breaker is enabled (threshold > 0) in the daemon's config.
+    pub enabled: bool,
+    /// Consecutive dispatcher-wide spawn failures at snapshot time.
+    pub consecutive_failures: u32,
+    /// The trip threshold the daemon is actually using.
+    pub threshold: u32,
+    /// Seconds left on the cooldown before a half-open probe (0 when closed).
+    pub cooldown_remaining_secs: i64,
+    /// Backoff generation (exponential cooldown driver).
+    pub backoff_generation: u32,
+    /// Total times the breaker has opened (telemetry).
+    pub total_opens: u32,
+    /// RFC3339 time the breaker opened, if currently open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_at: Option<String>,
+    /// Human-readable one-line summary (matches the text status output).
+    pub summary: String,
+    /// When this snapshot was taken (RFC3339). Lets status show its freshness.
+    pub captured_at: String,
+}
+
+impl SpawnBreakerSnapshot {
+    /// Build a resolved snapshot from live breaker state + config at `now`.
+    pub fn capture(state: &SpawnBreakerState, now: DateTime<Utc>, cfg: &SpawnBreakerConfig) -> Self {
+        let phase = if !cfg.enabled() {
+            "disabled".to_string()
+        } else {
+            state.phase(now, cfg).label().to_string()
+        };
+        Self {
+            phase,
+            enabled: cfg.enabled(),
+            consecutive_failures: state.consecutive_failures,
+            threshold: cfg.threshold,
+            cooldown_remaining_secs: state.cooldown_remaining_secs(now, cfg),
+            backoff_generation: state.open_generation,
+            total_opens: state.total_opens,
+            opened_at: state.opened_at.clone(),
+            summary: state.status_line(now, cfg),
+            captured_at: now.to_rfc3339(),
+        }
+    }
+
+    /// Is the breaker open or half-open (i.e. spawns are being held/probed)?
+    pub fn is_managing(&self) -> bool {
+        self.phase == "OPEN" || self.phase == "HALF-OPEN"
+    }
+}
+
 /// The plain-language operator alert body for a tripped/re-tripped breaker.
 pub const OPERATOR_ALERT_TEXT: &str =
     "⚠️ The family team's task runner is stuck — it will retry itself shortly. \
@@ -478,6 +540,49 @@ mod tests {
         let path = SpawnBreakerState::path(dir.path());
         let loaded = SpawnBreakerState::load(&path);
         assert_eq!(loaded, SpawnBreakerState::default());
+    }
+
+    #[test]
+    fn snapshot_reflects_open_state_for_status() {
+        // FIX 4 (status-lie): a captured snapshot of an OPEN breaker must read
+        // OPEN — this is exactly what `wg service status` renders, so it can no
+        // longer print "closed (healthy)" while the daemon holds it open.
+        let c = cfg();
+        let mut s = SpawnBreakerState::default();
+        for i in 0..3 {
+            s.record_failure(at(i), &c);
+        }
+        let snap = SpawnBreakerSnapshot::capture(&s, at(2), &c);
+        assert_eq!(snap.phase, "OPEN");
+        assert!(snap.is_managing(), "an OPEN breaker is 'managing' spawns");
+        assert_eq!(snap.consecutive_failures, 3);
+        assert_eq!(snap.threshold, 3);
+        assert!(snap.summary.contains("OPEN"));
+
+        // A healthy breaker snapshots as closed/not-managing.
+        let healthy = SpawnBreakerSnapshot::capture(&SpawnBreakerState::default(), at(0), &c);
+        assert_eq!(healthy.phase, "closed");
+        assert!(!healthy.is_managing());
+        assert!(healthy.summary.contains("healthy"));
+
+        // A disabled breaker snapshots as disabled and never managing.
+        let disabled_cfg = SpawnBreakerConfig { threshold: 0, ..c };
+        let disabled = SpawnBreakerSnapshot::capture(&s, at(2), &disabled_cfg);
+        assert_eq!(disabled.phase, "disabled");
+        assert!(!disabled.is_managing());
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_json() {
+        let c = cfg();
+        let mut s = SpawnBreakerState::default();
+        for i in 0..3 {
+            s.record_failure(at(i), &c);
+        }
+        let snap = SpawnBreakerSnapshot::capture(&s, at(2), &c);
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SpawnBreakerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
     }
 
     #[test]

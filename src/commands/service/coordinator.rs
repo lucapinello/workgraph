@@ -4128,6 +4128,112 @@ fn record_spawn_failure(
     tripped
 }
 
+/// Whether a task should be quarantined given its consecutive spawn-failure
+/// count (AFTER the current failure) and the configured quarantine threshold.
+/// A `threshold` of 0 disables quarantine.
+fn should_quarantine(spawn_failures_after: u32, quarantine_threshold: u32) -> bool {
+    quarantine_threshold > 0 && spawn_failures_after >= quarantine_threshold
+}
+
+/// Number of failures from THIS tick that should feed the dispatcher-wide spawn
+/// breaker: total failures (`spawn_attempts - spawned`) minus failures that were
+/// attributed to poison tasks being quarantined. Quarantined-task failures are
+/// excluded so one poison task can never trip the global breaker and starve
+/// every healthy task behind it (2026-07-19 poison-starvation post-mortem).
+fn breaker_failures_excluding_poison(
+    spawn_attempts: usize,
+    spawned: usize,
+    poison_failures: usize,
+) -> usize {
+    spawn_attempts
+        .saturating_sub(spawned)
+        .saturating_sub(poison_failures)
+}
+
+/// Quarantine a poison task: PARK it (pause) so it leaves the ready set and is
+/// never re-selected — not even as the breaker's half-open probe — until an
+/// operator intervenes, and log the reason loudly. This is the per-task failure
+/// quarantine that keeps one un-spawnable task from starving the whole graph.
+/// Returns true if the task was newly parked.
+fn quarantine_poison_task(
+    graph_path: &Path,
+    task_id: &str,
+    failures: u32,
+    quarantine_threshold: u32,
+    last_error: &str,
+) -> bool {
+    let task_id_owned = task_id.to_string();
+    let last_error = last_error.to_string();
+    let mut parked = false;
+    let _ = modify_graph(graph_path, |graph| {
+        let Some(task) = graph.get_task_mut(&task_id_owned) else {
+            return false;
+        };
+        if task.paused {
+            return false; // already quarantined — don't re-log every tick
+        }
+        task.paused = true;
+        task.assigned = None;
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: Some("spawn-quarantine".to_string()),
+            user: None,
+            message: format!(
+                "QUARANTINED: {} consecutive spawn failures (threshold {}) — parking this \
+                 task so it stops thrashing and can no longer starve healthy tasks behind it \
+                 (it will not be re-selected, including as the spawn breaker's recovery probe). \
+                 Its failures are excluded from the dispatcher-wide breaker. Last error: {}. \
+                 Fix the underlying cause and `wg resume {}` to retry.",
+                failures, quarantine_threshold, last_error, task_id_owned,
+            ),
+        });
+        parked = true;
+        true
+    });
+    if parked {
+        eprintln!(
+            "[dispatcher] QUARANTINED poison task '{}' after {} spawn failures — parked; \
+             excluded from the global spawn breaker",
+            task_id, failures,
+        );
+    }
+    parked
+}
+
+/// Record a spawn failure and, if the task has now reached the quarantine
+/// threshold, park it loudly. Returns true when this failure is attributed to a
+/// poison (quarantined) task and must therefore be EXCLUDED from the
+/// dispatcher-wide spawn breaker's consecutive-failure count.
+fn record_spawn_failure_and_quarantine(
+    graph_path: &Path,
+    task_id: &str,
+    error: &str,
+    executor: &str,
+    exec_mode: Option<&str>,
+    max_spawn_failures: u32,
+    quarantine_threshold: u32,
+) -> bool {
+    record_spawn_failure(
+        graph_path,
+        task_id,
+        error,
+        executor,
+        exec_mode,
+        max_spawn_failures,
+    );
+    // Read the freshly-incremented count to decide quarantine.
+    let failures = load_graph(graph_path)
+        .ok()
+        .and_then(|g| g.get_task(task_id).map(|t| t.spawn_failures))
+        .unwrap_or(0);
+    if should_quarantine(failures, quarantine_threshold) {
+        quarantine_poison_task(graph_path, task_id, failures, quarantine_threshold, error);
+        true
+    } else {
+        false
+    }
+}
+
 /// Keep an agency satellite retryable when execution selection/readiness fails
 /// before claim. The Open->Waiting/Blocked mutation is the scheduling
 /// reservation: concurrent ticks holding the same stale ready snapshot cannot
@@ -4271,6 +4377,11 @@ fn spawn_agents_for_ready_tasks(
     // tick. `spawned` counts only successes, so `spawn_attempts - spawned` is the
     // failure count fed to the breaker after the loop.
     let mut spawn_attempts = 0usize;
+    // Failures this tick attributed to poison tasks that just hit the quarantine
+    // threshold. These are EXCLUDED from the dispatcher-wide breaker so one
+    // un-spawnable task can never trip it and starve everything behind it.
+    let mut poison_failures = 0usize;
+    let quarantine_threshold = config.coordinator.spawn_quarantine_threshold;
 
     for task in final_ready.iter() {
         if spawned >= slots_available {
@@ -4365,14 +4476,17 @@ fn spawn_agents_for_ready_tasks(
                 }
                 Err(e) => {
                     eprintln!("[dispatcher] Failed to spawn shell for {}: {}", task_id, e);
-                    record_spawn_failure(
+                    if record_spawn_failure_and_quarantine(
                         &gp,
                         &task_id,
                         &format!("{}", e),
                         "inline-shell",
                         task.exec_mode.as_deref(),
                         config.coordinator.max_spawn_failures,
-                    );
+                        quarantine_threshold,
+                    ) {
+                        poison_failures += 1;
+                    }
                 }
             }
             continue;
@@ -4417,15 +4531,18 @@ fn spawn_agents_for_ready_tasks(
                             "[dispatcher] Failed to spawn assignment for {}: {}",
                             task_id, e
                         );
-                        if !park_agency_execution_error(&gp, &task_id, &e) {
-                            record_spawn_failure(
+                        if !park_agency_execution_error(&gp, &task_id, &e)
+                            && record_spawn_failure_and_quarantine(
                                 &gp,
                                 &task_id,
                                 &format!("{}", e),
                                 "inline-assignment",
                                 task.exec_mode.as_deref(),
                                 config.coordinator.max_spawn_failures,
-                            );
+                                quarantine_threshold,
+                            )
+                        {
+                            poison_failures += 1;
                         }
                     }
                 }
@@ -4447,15 +4564,18 @@ fn spawn_agents_for_ready_tasks(
                     }
                     Err(e) => {
                         eprintln!("[dispatcher] Failed to spawn eval for {}: {}", task_id, e);
-                        if !park_agency_execution_error(&gp, &task_id, &e) {
-                            record_spawn_failure(
+                        if !park_agency_execution_error(&gp, &task_id, &e)
+                            && record_spawn_failure_and_quarantine(
                                 &gp,
                                 &task_id,
                                 &format!("{}", e),
                                 "inline-eval",
                                 task.exec_mode.as_deref(),
                                 config.coordinator.max_spawn_failures,
-                            );
+                                quarantine_threshold,
+                            )
+                        {
+                            poison_failures += 1;
                         }
                     }
                 }
@@ -4520,14 +4640,17 @@ fn spawn_agents_for_ready_tasks(
             Err(e) => {
                 eprintln!("[dispatcher] plan_spawn failed for {}: {}", task.id, e);
                 spawn_attempts += 1;
-                record_spawn_failure(
+                if record_spawn_failure_and_quarantine(
                     &gp,
                     &task.id,
                     &format!("plan_spawn: {}", e),
                     "unknown",
                     task.exec_mode.as_deref(),
                     config.coordinator.max_spawn_failures,
-                );
+                    quarantine_threshold,
+                ) {
+                    poison_failures += 1;
+                }
                 continue;
             }
         };
@@ -4562,14 +4685,17 @@ fn spawn_agents_for_ready_tasks(
             }
             Err(e) => {
                 eprintln!("[dispatcher] Failed to spawn for {}: {}", task.id, e);
-                record_spawn_failure(
+                if record_spawn_failure_and_quarantine(
                     &gp,
                     &task.id,
                     &format!("{}", e),
                     &effective_executor,
                     task.exec_mode.as_deref(),
                     config.coordinator.max_spawn_failures,
-                );
+                    quarantine_threshold,
+                ) {
+                    poison_failures += 1;
+                }
             }
         }
     }
@@ -4584,7 +4710,12 @@ fn spawn_agents_for_ready_tasks(
         if spawned > 0 {
             breaker.record_success(observe_now);
         } else {
-            let failures = spawn_attempts.saturating_sub(spawned);
+            // Exclude poison (quarantined) tasks: their failures are their own
+            // fault, not systemic, and must never open the dispatcher-wide
+            // breaker. A tick whose ONLY failures were poison tasks leaves the
+            // breaker untouched — neither success nor failure.
+            let failures =
+                breaker_failures_excluding_poison(spawn_attempts, spawned, poison_failures);
             for _ in 0..failures {
                 breaker.record_failure(observe_now, &breaker_cfg);
             }
@@ -7250,6 +7381,127 @@ mod tests {
         assert!(
             t.log.iter().any(|e| e.message.contains("evaluator review")),
             "Circuit breaker log should mention evaluator review"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 3: poison-task quarantine + global-breaker exclusion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_quarantine_threshold_semantics() {
+        // Disabled when threshold is 0.
+        assert!(!should_quarantine(100, 0));
+        // Below threshold: keep retrying.
+        assert!(!should_quarantine(2, 3));
+        // At/over threshold: quarantine.
+        assert!(should_quarantine(3, 3));
+        assert!(should_quarantine(9, 3));
+    }
+
+    #[test]
+    fn breaker_excludes_poison_failures_so_one_task_cannot_trip_it() {
+        // A tick where the ONLY spawn failures came from poison tasks being
+        // quarantined must feed ZERO failures to the dispatcher-wide breaker —
+        // one poison task can never trip the global breaker and starve the graph.
+        // 3 attempts, 0 spawned, all 3 poison → 0 breaker failures.
+        assert_eq!(breaker_failures_excluding_poison(3, 0, 3), 0);
+        // Mixed: 4 attempts, 1 spawned, 1 poison → 2 genuine (healthy) failures.
+        assert_eq!(breaker_failures_excluding_poison(4, 1, 1), 2);
+        // A real systemic outage (no poison) still feeds every failure.
+        assert_eq!(breaker_failures_excluding_poison(5, 0, 0), 5);
+        // Saturating: never underflows even with bogus counts.
+        assert_eq!(breaker_failures_excluding_poison(1, 5, 5), 0);
+    }
+
+    #[test]
+    fn quarantine_poison_task_parks_and_removes_from_ready() {
+        // A poison task that hit the quarantine threshold is PARKED (paused) so
+        // it leaves the ready set and can never be re-selected (not even as the
+        // breaker's half-open probe), with a loud, operator-actionable log.
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let gp = wg_dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        let mut task = Task::default();
+        task.id = ".evaluate-ancient-poison".to_string();
+        task.title = "poison satellite".to_string();
+        task.status = Status::Open;
+        task.spawn_failures = 3;
+        graph.add_node(Node::Task(task));
+        save_graph(&graph, &gp).unwrap();
+
+        // Before: the task is ready (open, unpaused, unblocked).
+        assert_eq!(
+            worksgood::query::ready_tasks(&load_graph(&gp).unwrap()).len(),
+            1
+        );
+
+        let parked = quarantine_poison_task(&gp, ".evaluate-ancient-poison", 3, 3, "spawn: boom");
+        assert!(parked, "first quarantine parks the task");
+
+        let g = load_graph(&gp).unwrap();
+        let t = g.get_task(".evaluate-ancient-poison").unwrap();
+        assert!(t.paused, "quarantined task is paused (parked)");
+        assert!(t.assigned.is_none());
+        assert!(
+            t.log.iter().any(|e| e.actor.as_deref() == Some("spawn-quarantine")
+                && e.message.contains("QUARANTINED")),
+            "a loud quarantine log entry is recorded"
+        );
+        // Parked → no longer ready, so it can't be re-selected or be the probe.
+        assert!(
+            worksgood::query::ready_tasks(&g).is_empty(),
+            "a quarantined task is removed from the ready set"
+        );
+
+        // Idempotent: re-quarantining an already-parked task is a no-op (no
+        // per-tick log spam).
+        let parked_again =
+            quarantine_poison_task(&gp, ".evaluate-ancient-poison", 4, 3, "spawn: boom");
+        assert!(!parked_again, "already-quarantined task is not re-parked");
+    }
+
+    #[test]
+    fn record_spawn_failure_and_quarantine_flags_poison_at_threshold() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let gp = wg_dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        let mut task = Task::default();
+        task.id = "poison".to_string();
+        task.status = Status::Open;
+        task.exec_mode = Some("shell".to_string());
+        graph.add_node(Node::Task(task));
+        save_graph(&graph, &gp).unwrap();
+
+        // Quarantine threshold 3, max_spawn_failures 5. Failures 1 and 2 are
+        // NOT poison (still healthy, still fed to the breaker).
+        for i in 1..=2 {
+            let poison = record_spawn_failure_and_quarantine(
+                &gp,
+                "poison",
+                &format!("err {i}"),
+                "claude",
+                Some("shell"),
+                5,
+                3,
+            );
+            assert!(!poison, "failure {i} is below quarantine threshold");
+            assert!(!load_graph(&gp).unwrap().get_task("poison").unwrap().paused);
+        }
+        // 3rd failure hits the quarantine threshold → poison + parked + excluded.
+        let poison = record_spawn_failure_and_quarantine(
+            &gp, "poison", "err 3", "claude", Some("shell"), 5, 3,
+        );
+        assert!(poison, "3rd failure crosses the quarantine threshold");
+        assert!(
+            load_graph(&gp).unwrap().get_task("poison").unwrap().paused,
+            "poison task parked at the quarantine threshold"
         );
     }
 
