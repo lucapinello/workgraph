@@ -29,9 +29,21 @@ name = "nex"
 path = "src/bin/nex.rs"
 
 [features]
-default = ["matrix-lite"]
+# `casa` is default-on for the Casa/Pinello integration fork build, and OFF for
+# an upstream (graphwork/wg) build. It gates the ~21 casa-only `src/notify/`
+# modules (family conversation, meal feedback, digest pacing, reminders, the
+# Telegram family listener) and the casa CLI subcommands (`wg feedback`,
+# `wg telegram feed-write | lifecycle | parity | ownership | …`). With the
+# feature off, `cargo build --no-default-features` compiles ZERO casa files —
+# the clean upstream shape — so a general engine fix touches only general files
+# and cherry-picks straight onto upstream. See docs/38 §4.
+default = ["matrix-lite", "casa"]
+casa = []
 matrix = ["dep:matrix-sdk"]
-matrix-lite = ["dep:urlencoding"]
+# `urlencoding` is now an unconditional dependency (the general web-search tool
+# uses it on every build), so matrix-lite is just the marker that compiles the
+# lite matrix module.
+matrix-lite = []
 telegram = ["dep:teloxide"]
 email = ["dep:lettre"]
 slack = []
@@ -98,7 +110,7 @@ rquest = { version = "3.0.0", features = ["json", "gzip", "brotli", "deflate", "
 matrix-sdk = { version = "0.16", features = ["e2e-encryption", "sqlite"], optional = true }
 
 # Lightweight Matrix integration (just HTTP, no E2EE/sqlite)
-urlencoding = { version = "2.1", optional = true }
+urlencoding = "2.1"
 
 # Optional Telegram integration
 teloxide = { version = "0.13", features = ["macros"], optional = true }

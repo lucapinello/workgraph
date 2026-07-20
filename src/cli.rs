@@ -2417,13 +2417,15 @@ pub enum Commands {
         command: MatrixCommands,
     },
 
-    /// Telegram integration commands
+    /// Telegram integration commands (casa family listener + subcommands)
+    #[cfg(feature = "casa")]
     Telegram {
         #[command(subcommand)]
         command: TelegramCommands,
     },
 
     /// Meal-feedback loop: ask how dinner was, record ratings, feed next week's plan
+    #[cfg(feature = "casa")]
     Feedback {
         #[command(subcommand)]
         command: FeedbackCommands,
@@ -6379,6 +6381,7 @@ pub enum MatrixCommands {
     Logout,
 }
 
+#[cfg(feature = "casa")]
 #[derive(Subcommand)]
 pub enum FeedbackCommands {
     /// Compose the (rate-limited) evening "how was dinner?" ask for tonight's
@@ -6430,6 +6433,7 @@ pub enum FeedbackCommands {
     },
 }
 
+#[cfg(feature = "casa")]
 #[derive(Subcommand)]
 pub enum TelegramCommands {
     /// Start the Telegram bot listener
@@ -7108,7 +7112,9 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Notify { .. } => "notify",
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         Commands::Matrix { .. } => "matrix",
+        #[cfg(feature = "casa")]
         Commands::Telegram { .. } => "telegram",
+        #[cfg(feature = "casa")]
         Commands::Feedback { .. } => "feedback",
         Commands::Chat { .. } => "chat",
         Commands::Endpoints { .. } | Commands::Endpoint { .. } => "endpoints",
@@ -7143,10 +7149,15 @@ pub fn command_name(cmd: &Commands) -> &'static str {
 
 /// Returns true if the command supports `--json` output.
 pub fn supports_json(cmd: &Commands) -> bool {
+    // Casa-only commands that support `--json`; gated so the pattern doesn't
+    // name variants absent from an upstream (no-casa) build.
+    #[cfg(feature = "casa")]
+    if matches!(cmd, Commands::Feedback { .. } | Commands::Telegram { .. }) {
+        return true;
+    }
     matches!(
         cmd,
         Commands::Ready
-            | Commands::Feedback { .. }
             | Commands::Discover { .. }
             | Commands::Blocked { .. }
             | Commands::WhyBlocked { .. }
@@ -7216,7 +7227,6 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Stats
             | Commands::Metrics { .. }
             | Commands::Chat { .. }
-            | Commands::Telegram { .. }
             | Commands::Endpoints { .. }
             | Commands::Endpoint { .. }
             | Commands::Models { .. }

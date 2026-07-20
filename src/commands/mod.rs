@@ -58,6 +58,7 @@ pub mod exec;
 pub mod exec_fed_cmd;
 pub mod fail;
 pub mod fed_node;
+#[cfg(feature = "casa")]
 pub mod feedback;
 pub mod forecast;
 pub mod func_apply;
@@ -138,6 +139,7 @@ pub mod stats;
 pub mod status;
 pub mod structure;
 pub mod sweep;
+#[cfg(feature = "casa")]
 pub mod telegram;
 pub mod tokens;
 pub mod trace;

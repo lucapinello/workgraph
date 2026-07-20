@@ -399,6 +399,7 @@ impl TelegramChannel {
     }
 }
 
+#[cfg(feature = "casa")]
 #[async_trait]
 impl super::telegram_photo::PhotoDownloader for TelegramChannel {
     async fn download(&self, file_id: &str, dest: &std::path::Path) -> Result<()> {
@@ -787,6 +788,113 @@ impl PollBackoffState {
 /// tagging it with `channel_tag` (the receiving bot's channel type). Returns
 /// `None` for updates that are neither a callback query nor a text message.
 ///
+// ── decode_update helpers ──────────────────────────────────────────────────
+// The raw-update parse feeds a few fields (sender identity, photo handle, group
+// @mention signals) that the CASA family listener enriches. Each helper has a
+// casa build that delegates to the casa notify module and a general build with
+// an inline/empty fallback, so `decode_update` stays a single code path and the
+// upstream (no-casa) build compiles with ZERO casa files. See docs/38 §4.
+
+/// Sender identity `(display, user_id, is_bot)` for a `callback_query`/`message`
+/// update. Casa uses the binding-aware `telegram_sender`; the general build
+/// parses the raw `from` object inline (username → id → "unknown").
+#[cfg(feature = "casa")]
+fn decode_sender_from_update(update: &serde_json::Value) -> (String, Option<String>, bool) {
+    let id = super::telegram_sender::extract_sender(update);
+    (id.display(), id.user_id, id.is_bot)
+}
+
+#[cfg(not(feature = "casa"))]
+fn decode_sender_from_update(update: &serde_json::Value) -> (String, Option<String>, bool) {
+    let from = update
+        .get("callback_query")
+        .and_then(|c| c.get("from"))
+        .or_else(|| update.get("message").and_then(|m| m.get("from")));
+    decode_sender_from_from(from)
+}
+
+/// Sender identity for a bare `message` object (the decoder already holds one).
+#[cfg(feature = "casa")]
+fn decode_sender_from_message(message: &serde_json::Value) -> (String, Option<String>, bool) {
+    let id = super::telegram_sender::identity_from_message(message);
+    (id.display(), id.user_id, id.is_bot)
+}
+
+#[cfg(not(feature = "casa"))]
+fn decode_sender_from_message(message: &serde_json::Value) -> (String, Option<String>, bool) {
+    decode_sender_from_from(message.get("from"))
+}
+
+/// General-build inline parse of a raw Telegram `from` object into
+/// `(display, user_id, is_bot)`, matching `telegram_sender::identity_from_from`.
+#[cfg(not(feature = "casa"))]
+fn decode_sender_from_from(from: Option<&serde_json::Value>) -> (String, Option<String>, bool) {
+    let from = match from {
+        Some(f) => f,
+        None => return ("unknown".to_string(), None, false),
+    };
+    let user_id = from.get("id").and_then(|i| i.as_i64()).map(|i| i.to_string());
+    let username = from
+        .get("username")
+        .and_then(|u| u.as_str())
+        .map(|u| u.trim().trim_start_matches('@').to_ascii_lowercase())
+        .filter(|u| !u.is_empty());
+    let is_bot = from.get("is_bot").and_then(|b| b.as_bool()).unwrap_or(false);
+    let display = username
+        .clone()
+        .or_else(|| user_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    (display, user_id, is_bot)
+}
+
+/// Largest photo `file_id` in a message. Casa drives the photo→shopping vision
+/// turn; the general build has no photo intake and always yields `None`.
+#[cfg(feature = "casa")]
+fn decode_photo_file_id(message: &serde_json::Value) -> Option<String> {
+    decode_photo_file_id(message)
+}
+
+#[cfg(not(feature = "casa"))]
+fn decode_photo_file_id(_message: &serde_json::Value) -> Option<String> {
+    None
+}
+
+/// @mention usernames in the message. Casa routes group family elections off
+/// these; the general build does no group routing and yields an empty list.
+#[cfg(feature = "casa")]
+fn decode_mention_usernames(body: &str, entities: &serde_json::Value) -> Vec<String> {
+    super::telegram_group::parse_mention_usernames(body, entities)
+}
+
+#[cfg(not(feature = "casa"))]
+fn decode_mention_usernames(_body: &str, _entities: &serde_json::Value) -> Vec<String> {
+    Vec::new()
+}
+
+/// Whether the message opens with a `/slash` bot-command entity. Casa uses this
+/// to separate commands from chatter; the general build yields `false`.
+#[cfg(feature = "casa")]
+fn decode_has_leading_bot_command(entities: &serde_json::Value) -> bool {
+    decode_has_leading_bot_command(entities)
+}
+
+#[cfg(not(feature = "casa"))]
+fn decode_has_leading_bot_command(_entities: &serde_json::Value) -> bool {
+    false
+}
+
+/// If this message replies to a bot's own message, that bot's @username. Casa
+/// routes the reply to the bot's agent; the general build yields `None`.
+#[cfg(feature = "casa")]
+fn decode_reply_to_bot(message: &serde_json::Value) -> Option<String> {
+    decode_reply_to_bot(message)
+}
+
+#[cfg(not(feature = "casa"))]
+fn decode_reply_to_bot(_message: &serde_json::Value) -> Option<String> {
+    None
+}
+
 /// Extracted from the poll loop so the single-bot and multi-bot pollers share
 /// exactly one decoder — the two must never diverge in how they parse a
 /// button press vs. a group @mention. Public so the `wg telegram decide`
@@ -797,8 +905,7 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
         // Sender identity (id + username + is_bot), read once at the boundary so
         // a button press from a human with no @username still resolves to their
         // binding rather than decoding to "unknown". See `telegram_sender`.
-        let identity = super::telegram_sender::extract_sender(update);
-        let sender = identity.display();
+        let (sender, sender_id, sender_is_bot) = decode_sender_from_update(update);
 
         let action_id = cb
             .get("data")
@@ -830,8 +937,8 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
         return Some(IncomingMessage {
             channel: channel_tag.to_string(),
             sender,
-            sender_id: identity.user_id,
-            sender_is_bot: identity.is_bot,
+            sender_id,
+            sender_is_bot,
             sent_at: cb
                 .get("message")
                 .and_then(|m| m.get("date"))
@@ -860,8 +967,7 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
         // `sender` is the display label (username → id → "unknown"); the numeric
         // id and bot flag ride alongside for binding resolution and the Fix #0
         // bot-loop guard. See `telegram_sender`.
-        let identity = super::telegram_sender::identity_from_message(message);
-        let sender = identity.display();
+        let (sender, sender_id, sender_is_bot) = decode_sender_from_message(message);
 
         // A photo message carries no `text`; its human-typed words (if any) ride
         // in `caption`. Treat the caption as the body so a captioned photo routes
@@ -879,7 +985,7 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
         // first. The last element is the largest; its `file_id` is the download
         // handle. A message without a `photo` array is text/other. See
         // `super::telegram_photo`.
-        let photo_file_id = super::telegram_photo::largest_photo_file_id(message);
+        let photo_file_id = decode_photo_file_id(message);
         let media_group_id = message
             .get("media_group_id")
             .and_then(|m| m.as_str())
@@ -920,20 +1026,20 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             .or_else(|| message.get("caption_entities"))
             .unwrap_or(&serde_json::Value::Null);
         let mention_usernames =
-            super::telegram_group::parse_mention_usernames(&body, entities);
+            decode_mention_usernames(&body, entities);
         // A genuine leading `/slash` command carries a `bot_command` entity at
         // offset 0 — the ONLY signal we treat as "this is a command". A bare `?`
         // or ordinary chatter has none. See `fix-command-leaks`.
-        let has_bot_command = super::telegram_group::has_leading_bot_command(entities);
+        let has_bot_command = decode_has_leading_bot_command(entities);
         // Reply-chain: if this replies to a bot's own message,
         // name that bot so the reply routes to its agent.
-        let reply_to_bot = super::telegram_group::reply_to_bot_username(message);
+        let reply_to_bot = decode_reply_to_bot(message);
 
         return Some(IncomingMessage {
             channel: channel_tag.to_string(),
             sender,
-            sender_id: identity.user_id,
-            sender_is_bot: identity.is_bot,
+            sender_id,
+            sender_is_bot,
             sent_at: message.get("date").and_then(|d| d.as_i64()),
             body,
             action_id: None,

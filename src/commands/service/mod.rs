@@ -1697,12 +1697,25 @@ fn project_root_for(dir: &Path) -> PathBuf {
 /// `episode` distinguishes separate open episodes so the digest store's
 /// exactly-once de-dupe doesn't swallow a re-open alert.
 fn emit_operator_alert(dir: &Path, logger: &DaemonLogger, episode: &str, text: &str) {
-    use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, Offer};
-
     // (1) Always loud in the log.
     logger.warn(text);
 
-    // (2) Best-effort DM through digest pacing.
+    // (2) Best-effort DM through the casa digest pacing layer. Upstream (no
+    //     casa) has no digest / Telegram-family stack, so the loud log above is
+    //     the whole alert.
+    #[cfg(feature = "casa")]
+    emit_operator_alert_dm(dir, logger, episode, text);
+    #[cfg(not(feature = "casa"))]
+    {
+        let _ = (dir, episode);
+    }
+}
+
+/// The casa digest-paced Telegram DM half of [`emit_operator_alert`].
+#[cfg(feature = "casa")]
+fn emit_operator_alert_dm(dir: &Path, logger: &DaemonLogger, episode: &str, text: &str) {
+    use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, Offer};
+
     let root = project_root_for(dir);
     let config = match worksgood::notify::config::NotifyConfig::load(Some(&root)) {
         Ok(Some(c)) => c,

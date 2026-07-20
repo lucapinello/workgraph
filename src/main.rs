@@ -3689,6 +3689,7 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
+        #[cfg(feature = "casa")]
         Commands::Feedback { command } => match command {
             FeedbackCommands::Ask {
                 dish,
@@ -3721,6 +3722,7 @@ fn main() -> Result<()> {
             }
         },
 
+        #[cfg(feature = "casa")]
         Commands::Telegram { command } => match command {
             TelegramCommands::Listen { chat_id } => {
                 commands::telegram::run_listen(&workgraph_dir, chat_id.as_deref())

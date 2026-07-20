@@ -26,11 +26,18 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
+// `NaiveDateTime` is used only by the casa operator-alert nudge builder below.
+#[cfg(feature = "casa")]
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use worksgood::atomic_file::write_atomic;
 use worksgood::config::Config;
+// The digest `Nudge` type is casa-only (the operator-alert DM rides the casa
+// digest pacing layer). The breaker itself is general; only the nudge builder
+// below is gated. See docs/38 §4.
+#[cfg(feature = "casa")]
 use worksgood::notify::daily_digest::{Nudge, NudgeKind};
 
 /// Resolved knobs for the breaker (read from [`Config`]).
@@ -324,6 +331,7 @@ running. It will keep trying; if this doesn't clear on its own, check the server
 /// `episode` should distinguish separate open episodes (e.g. the backoff
 /// generation) so a re-open is not deduped against the first open by the digest
 /// store's exactly-once `seen` set.
+#[cfg(feature = "casa")]
 pub fn operator_alert_nudge(
     recipient: impl Into<String>,
     episode: &str,
@@ -342,6 +350,7 @@ pub fn operator_alert_nudge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "casa")]
     use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, Offer, Urgency};
 
     fn cfg() -> SpawnBreakerConfig {
@@ -518,10 +527,12 @@ mod tests {
     // -- Alert emission: routes through digest pacing as time-critical --------
 
     // A fixed non-quiet-hours wall clock (10:00) for the alert tests.
+    #[cfg(feature = "casa")]
     fn alert_now() -> NaiveDateTime {
         at(0).naive_utc().date().and_hms_opt(10, 0, 0).unwrap()
     }
 
+    #[cfg(feature = "casa")]
     #[test]
     fn breaker_alert_emits_as_time_critical_standalone() {
         // Due now (10:00), outside quiet hours, under the standalone cap → a
@@ -539,6 +550,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "casa")]
     #[test]
     fn breaker_alert_reopen_has_distinct_id_so_it_is_not_deduped() {
         let now = alert_now();

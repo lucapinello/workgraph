@@ -4,39 +4,66 @@
 //! Matrix, Slack, email, SMS, webhooks, etc.). The [`NotificationRouter`] selects
 //! channels based on event type and supports escalation chains.
 
-pub mod casa_feed;
+// ── General (upstream) notify modules ──────────────────────────────────────
+// These ship in any wg build. Keep this list in sync with graphwork/wg.
 pub mod config;
-pub mod daily_digest;
 pub mod discord;
 pub mod dispatch;
 #[cfg(feature = "email")]
 pub mod email;
-pub mod errand;
-pub mod family_plan;
-pub mod fast_lane;
-pub mod grounding;
-pub mod lifecycle;
-pub mod meal_feedback;
-pub mod ownership;
-pub mod parity;
 #[cfg(feature = "matrix-lite")]
 pub mod matrix;
 pub mod push;
-pub mod reminder;
 pub mod slack;
 pub mod sms;
 pub mod telegram;
-pub mod telegram_conversation;
-pub mod telegram_dedupe;
-pub mod telegram_discussion;
-pub mod telegram_family_commands;
-pub mod telegram_group;
-pub mod telegram_pacing;
-pub mod telegram_photo;
-pub mod telegram_sender;
-pub mod telegram_standup;
 pub mod voice;
 pub mod webhook;
+
+// ── Casa-only notify modules (feature = "casa") ────────────────────────────
+// The family conversation / meal-feedback / digest / reminder / Telegram-family
+// stack. Gated so `cargo build --no-default-features` compiles ZERO casa files
+// (the clean upstream shape). Default-on for the integration fork. See docs/38 §4.
+#[cfg(feature = "casa")]
+pub mod casa_feed;
+#[cfg(feature = "casa")]
+pub mod daily_digest;
+#[cfg(feature = "casa")]
+pub mod errand;
+#[cfg(feature = "casa")]
+pub mod family_plan;
+#[cfg(feature = "casa")]
+pub mod fast_lane;
+#[cfg(feature = "casa")]
+pub mod grounding;
+#[cfg(feature = "casa")]
+pub mod lifecycle;
+#[cfg(feature = "casa")]
+pub mod meal_feedback;
+#[cfg(feature = "casa")]
+pub mod ownership;
+#[cfg(feature = "casa")]
+pub mod parity;
+#[cfg(feature = "casa")]
+pub mod reminder;
+#[cfg(feature = "casa")]
+pub mod telegram_conversation;
+#[cfg(feature = "casa")]
+pub mod telegram_dedupe;
+#[cfg(feature = "casa")]
+pub mod telegram_discussion;
+#[cfg(feature = "casa")]
+pub mod telegram_family_commands;
+#[cfg(feature = "casa")]
+pub mod telegram_group;
+#[cfg(feature = "casa")]
+pub mod telegram_pacing;
+#[cfg(feature = "casa")]
+pub mod telegram_photo;
+#[cfg(feature = "casa")]
+pub mod telegram_sender;
+#[cfg(feature = "casa")]
+pub mod telegram_standup;
 
 use std::fmt;
 use std::time::Duration;
