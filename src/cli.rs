@@ -9,7 +9,7 @@ use worksgood::nex_cli::NexArgs;
 #[command(disable_help_flag = true)]
 #[command(disable_help_subcommand = true)]
 pub struct Cli {
-    /// Path to the WG directory (default: .wg in current dir; legacy .workgraph accepted)
+    /// Path to the graph directory (default: .wg; legacy .workgraph accepted for compatibility)
     #[arg(long, global = true)]
     pub dir: Option<PathBuf>,
 
@@ -957,7 +957,7 @@ pub enum Commands {
     /// Check the graph for issues (cycles, orphan references)
     Check,
 
-    /// Diagnose the workgraph environment (host tools, auth, daemon state).
+    /// Diagnose the WorksGood environment (host tools, auth, daemon state).
     /// Exit code 0 = all green, 1 = warnings, 2 = errors.
     Doctor,
 
@@ -1192,6 +1192,10 @@ pub enum Commands {
 
     /// Show resource utilization - committed vs available capacity
     Resources,
+
+    /// Inspect disk admission and conservatively clean explicitly-owned caches
+    #[command(subcommand, name = "disk")]
+    Disk(DiskCommand),
 
     /// Show the critical path (longest dependency chain)
     CriticalPath,
@@ -1528,7 +1532,7 @@ pub enum Commands {
         command: SkillCommands,
     },
 
-    /// Install / inspect the wg-pi-plugin (pi coding-agent integration).
+    /// Install / inspect pi-worksgood (`@worksgood/pi`).
     ///
     /// Mirrors `wg skill install`. The three wiring points (`wg setup`,
     /// `wg profile use pi`, and the JIT `wg pi-handler` pre-flight) call this
@@ -1600,6 +1604,22 @@ pub enum Commands {
         /// Minutes without heartbeat before agent is considered stale (default: 5)
         #[arg(long, default_value = "5")]
         threshold: u64,
+    },
+
+    /// [Internal] Keep an agent heartbeat fresh while the generated wrapper
+    /// keeps this process's stdin guard pipe open.
+    #[command(name = "heartbeat-watch", hide = true)]
+    HeartbeatWatch {
+        /// Agent ID whose registry heartbeat is refreshed.
+        agent: String,
+
+        /// Seconds between registry heartbeat writes.
+        #[arg(long, default_value = "120")]
+        interval_seconds: u64,
+
+        /// PID of the wrapper process this watcher is allowed to refresh.
+        #[arg(long)]
+        supervised_pid: Option<u32>,
     },
 
     /// Manage task artifacts (produced outputs)
@@ -2157,7 +2177,7 @@ pub enum Commands {
 
     /// Detect and recover orphaned in-progress tasks with dead agents
     #[command(
-        after_help = "Sweep detects in-progress tasks whose assigned agent has died,\nbeen marked Dead, or is missing from the registry. It resets them\nto Open so the dispatcher can re-dispatch.\n\nWith --reap-targets, also removes cargo build artifacts from\nworktrees of agents that are no longer live (preserving source\nfiles and the worktree itself).\n\nThis is safe to run anytime — it is idempotent."
+        after_help = "Sweep detects in-progress tasks whose assigned agent has died,\nbeen marked Dead, or is missing from the registry. It resets them\nto Open so the dispatcher can re-dispatch.\n\nWith --reap-targets, also removes explicitly-owned Cargo target/tmp\npaths (including absolute /tmp paths) only after terminal owner/task,\nstale exact PID identity, lease, clean-worktree, artifact and open-file checks.\nUnknown directories and source worktrees are never removed.\n\nThis is safe to run anytime — it is idempotent."
     )]
     Sweep {
         /// Only report orphaned tasks, don't fix them
@@ -2336,6 +2356,10 @@ pub enum Commands {
 
     /// Interactive configuration wizard for first-time setup
     Setup {
+        /// Repair or migrate WorksGood-managed agent guides in this project
+        /// and ~/.claude/CLAUDE.md, preserving all user-authored surrounding text.
+        #[arg(long)]
+        repair_guides: bool,
         /// One of the named routes: openrouter, claude-cli, codex-cli, pi, local, nex-custom.
         /// Picks a complete, working config end-to-end (executor + tiers + login/profile wiring
         /// when applicable). Use with `--yes` for non-interactive setup.
@@ -2771,12 +2795,12 @@ pub enum Commands {
     },
 
     /// Bridge pi.dev (pi-coding-agent) output ↔ chat/<ref>/*.jsonl,
-    /// routed THROUGH the wg-pi-plugin (not prompt-munging).
+    /// routed through the WorksGood Pi integration (not prompt-munging).
     ///
     /// Peer of `wg opencode-handler` for the `pi` executor. Topology A
     /// spawns a long-lived `pi --mode rpc` (piped stdio ⇒ headless, no
     /// terminal takeover) and drives it over the JSONL RPC protocol;
-    /// Topology B spawns `node pi-plugin/host/wg-pi-host.mjs`. The
+    /// Topology B spawns `node worksgood-pi/host/wg-pi-host.mjs`. The
     /// transport is auto-selected from what's installed (`WG_PI_TOPOLOGY`
     /// forces `rpc`/`node`). Plain Pi chats omit provider/model overrides so
     /// Pi can use its own configured/default model; explicit `--model` routes
@@ -2871,6 +2895,22 @@ pub enum Commands {
 
         /// Source task ID (the task being placed)
         source_task_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DiskCommand {
+    /// Refresh and print the bounded disk-sentinel snapshot
+    Doctor {
+        /// Read the last daemon-produced snapshot without scanning
+        #[arg(long)]
+        cached: bool,
+    },
+    /// Reap stale explicitly-owned caches and compress retained terminal streams
+    Cleanup {
+        /// Apply cleanup; default is a non-mutating safety report
+        #[arg(long)]
+        execute: bool,
     },
 }
 
@@ -2980,20 +3020,20 @@ pub enum HtmlPublishCommands {
         rsync_flags: Option<String>,
 
         /// Title shown at the top of the rendered page. Wins over
-        /// `[project].title` / `[project].name` in `<workgraph_dir>/config.toml`
+        /// `[project].title` / `[project].name` in `<graph_dir>/config.toml`
         /// and overrides the default `hostname:/repo/path` source label for
         /// portable public exports.
         #[arg(long = "title")]
         title: Option<String>,
 
         /// One-line byline / tagline shown under the title. Wins over
-        /// `[project].byline` in `<workgraph_dir>/config.toml`.
+        /// `[project].byline` in `<graph_dir>/config.toml`.
         #[arg(long = "byline")]
         byline: Option<String>,
 
         /// Path to a markdown file rendered as the page abstract (relative
-        /// to `<workgraph_dir>` if not absolute). When unset, the renderer
-        /// falls back to `<workgraph_dir>/about.md`.
+        /// to `<graph_dir>` if not absolute). When unset, the renderer
+        /// falls back to `<graph_dir>/about.md`.
         #[arg(long = "abstract")]
         abstract_path: Option<String>,
     },
@@ -3656,7 +3696,7 @@ pub enum PilotCommands {
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// Where to keep the pilot's runtime state (node pid/url, minted identities).
-        /// Default: `<workgraph_dir>/pilot`.
+        /// Default: `<graph_dir>/pilot`.
         #[arg(long = "state-dir")]
         state_dir: Option<String>,
         /// Stand up the nodes + wiring but SKIP the live end-to-end check (faster; for a
@@ -3668,7 +3708,7 @@ pub enum PilotCommands {
     /// Show the pilot's current state — node URL/pid, minted identities, applied safe
     /// defaults — read from the state dir.
     Status {
-        /// The pilot state dir (default: `<workgraph_dir>/pilot`).
+        /// The pilot state dir (default: `<graph_dir>/pilot`).
         #[arg(long = "state-dir")]
         state_dir: Option<String>,
     },
@@ -3676,7 +3716,7 @@ pub enum PilotCommands {
     /// Tear down the pilot: stop the fed-node(s). Idempotent — a `down` with nothing
     /// running is a clean no-op. By default identities are KEPT (in `wg secret` custody).
     Down {
-        /// The pilot state dir (default: `<workgraph_dir>/pilot`).
+        /// The pilot state dir (default: `<graph_dir>/pilot`).
         #[arg(long = "state-dir")]
         state_dir: Option<String>,
         /// Also wipe the minted identities/keystore + graph state (the rehearsal cleanup).
@@ -5123,10 +5163,10 @@ pub enum SkillCommands {
 
 #[derive(Subcommand)]
 pub enum PiPluginCommands {
-    /// Install the wg-pi-plugin for the human `pi` console: materialize the
+    /// Install pi-worksgood for the human `pi` console: materialize the
     /// version-locked build and wire `~/.pi/agent/settings.json`. Idempotent.
     Install {
-        /// Point the settings entry at the live in-repo `pi-plugin/dist`
+        /// Point settings at the live in-repo `worksgood-pi/pi-worksgood`
         /// (dev inner-loop) instead of the embedded → cache copy.
         #[arg(long)]
         dev: bool,
@@ -5135,7 +5175,7 @@ pub enum PiPluginCommands {
     /// Print resolved source, cache path, compat version, and wired/drift state.
     Status,
 
-    /// Print the resolved `dist/index.js` path (scriptable).
+    /// Print the resolved `pi-worksgood/index.js` path (scriptable).
     Path,
 
     /// Print WG_PI_PLUGIN_COMPAT_VERSION (the plugin's runtime assertion reads this).
@@ -5498,6 +5538,18 @@ pub enum ChatCommands {
         chat: String,
         /// Message body. Pass quoted; reads stdin if `-`.
         message: String,
+    },
+
+    /// Switch one chat's model. Pi's plugin uses the hidden warm-writeback
+    /// flag after an in-process Ctrl-P or /model selection.
+    Model {
+        /// Chat reference: numeric ID, `.chat-N` task ID, or name.
+        chat: String,
+        /// Selected provider/model spec.
+        spec: String,
+        /// Internal: pi already switched in-process; persist without respawn.
+        #[arg(long = "warm-pi-writeback", hide = true)]
+        warm_pi_writeback: bool,
     },
 
     /// SIGTERM the live handler (chat entity stays in graph). Reversible
@@ -7134,6 +7186,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Workload => "workload",
         Commands::Worktree(_) => "worktree",
         Commands::Resources => "resources",
+        Commands::Disk(_) => "disk",
         Commands::CriticalPath => "critical-path",
         Commands::Analyze => "analyze",
         Commands::Archive { .. } => "archive",
@@ -7158,6 +7211,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Assign { .. } => "assign",
         Commands::Match { .. } => "match",
         Commands::Heartbeat { .. } => "heartbeat",
+        Commands::HeartbeatWatch { .. } => "heartbeat-watch",
         Commands::Checkpoint { .. } => "checkpoint",
         Commands::Artifact { .. } => "artifact",
         Commands::Context { .. } => "context",
@@ -7249,6 +7303,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Workload
             | Commands::Worktree(_)
             | Commands::Resources
+            | Commands::Disk(_)
             | Commands::CriticalPath
             | Commands::Analyze
             | Commands::Archive { .. }

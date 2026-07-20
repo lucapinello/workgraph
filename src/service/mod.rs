@@ -23,8 +23,10 @@ pub use executor::{
     ExecutorConfig, ExecutorRegistry, ExecutorSettings, PromptTemplate, TemplateVars,
 };
 pub use provider_health::{
-    PROVIDER_PAUSED_ALERT_TEXT, PROVIDER_RESUMED_ALERT_TEXT, ProviderErrorKind, ProviderHealth,
-    ProviderHealthStatus, classify_error, extract_provider_id,
+    AgentExecutionOutcome, CompletionRefusalCode, ExecutionOutcome, ExecutorFailure,
+    HealthRouteKey, PROVIDER_PAUSED_ALERT_TEXT, PROVIDER_RESUMED_ALERT_TEXT, ProviderErrorKind,
+    ProviderHealth, ProviderHealthStatus, classify_error, classify_execution_outcome,
+    completion_refusal_code, extract_provider_id, load_agent_outcome, record_done_outcome,
 };
 pub use registry::{AgentEntry, AgentRegistry, AgentStatus, LockedRegistry};
 
@@ -309,6 +311,27 @@ pub fn kill_descendants(root_pid: u32) {
     }
 }
 
+/// Read the kernel process-start identity from `/proc/<pid>/stat`.
+///
+/// Linux field 22 is the start time in clock ticks since boot. Unlike an
+/// epoch timestamp rounded to seconds, this token is precise enough for a
+/// heartbeat watcher to reject even rapid PID reuse.
+#[cfg(target_os = "linux")]
+pub fn read_proc_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 (comm) can contain spaces and parentheses; find the last ')'.
+    let comm_end = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[comm_end + 2..].split_whitespace().collect();
+    // starttime is field 22 overall; after stripping pid + comm (fields 1-2),
+    // the remaining fields start at field 3, so starttime is at index 19.
+    fields.get(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_proc_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// Read a process's start time from `/proc/<pid>/stat` as seconds since epoch.
 ///
 /// Returns `None` if the process doesn't exist, `/proc` is unavailable, or
@@ -316,14 +339,7 @@ pub fn kill_descendants(root_pid: u32) {
 /// at a given PID started much later than expected, the PID was recycled.
 #[cfg(target_os = "linux")]
 pub fn read_proc_start_time_secs(pid: u32) -> Option<i64> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    // Field 2 (comm) can contain spaces and parentheses; find the last ')'.
-    let comm_end = stat.rfind(')')?;
-    let fields: Vec<&str> = stat[comm_end + 2..].split_whitespace().collect();
-    // starttime is field 22 overall; after stripping pid + comm (fields 1-2),
-    // the remaining fields start at field 3, so starttime is at index 19.
-    let starttime_ticks: u64 = fields.get(19)?.parse().ok()?;
-
+    let starttime_ticks = read_proc_start_ticks(pid)?;
     let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
     if clk_tck == 0 {
         return None;

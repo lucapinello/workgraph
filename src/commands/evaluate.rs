@@ -4,16 +4,85 @@ use std::path::Path;
 use std::process::Command;
 
 use worksgood::agency::{
-    self, Evaluation, EvaluatorInput, FlipComparisonInput, FlipInferenceInput, eval_source,
-    load_all_evaluations_or_warn, load_role, load_tradeoff, record_evaluation,
-    record_evaluation_with_inference, render_evaluator_prompt, render_flip_comparison_prompt,
-    render_flip_inference_prompt, render_identity_prompt_rich, resolve_all_components_for_scope,
-    resolve_outcome,
+    self, Evaluation, EvaluatorInput, FlipComparisonInput, FlipInferenceInput,
+    bound_evaluator_artifact_diff, eval_source, load_all_evaluations_or_warn, load_role,
+    load_tradeoff, record_evaluation, record_evaluation_with_inference, render_evaluator_prompt,
+    render_flip_comparison_prompt, render_flip_inference_prompt, render_identity_prompt_rich,
+    resolve_all_components_for_scope, resolve_outcome,
 };
 use worksgood::config::Config;
 use worksgood::graph::{LogEntry, Status, TokenUsage};
 use worksgood::parser::load_graph;
 use worksgood::provenance;
+
+fn persisted_invocation_plan(
+    dir: &Path,
+    source_task_id: &str,
+    flip: bool,
+) -> Result<Option<worksgood::eval_lifecycle::AgencyDispatchPlan>> {
+    let agency_task_id = std::env::var("WG_AGENCY_TASK_ID").ok();
+    let expected_hash = std::env::var("WG_AGENCY_PLAN_HASH").ok();
+    match (agency_task_id, expected_hash) {
+        (None, None) => return Ok(None), // explicit manual invocation
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("incomplete persisted agency invocation identity")
+        }
+        (Some(agency_task_id), Some(expected_hash)) => {
+            let expected_task_id = if flip {
+                format!(".flip-{source_task_id}")
+            } else {
+                format!(".evaluate-{source_task_id}")
+            };
+            if agency_task_id != expected_task_id {
+                bail!(
+                    "agency invocation task mismatch: expected {}, received {}",
+                    expected_task_id,
+                    agency_task_id
+                );
+            }
+            let graph = load_graph(&super::graph_path(dir))?;
+            let task = graph.get_task(&agency_task_id).ok_or_else(|| {
+                anyhow::anyhow!("agency invocation task {} no longer exists", agency_task_id)
+            })?;
+            let plan = task.agency_dispatch.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agency invocation task {} has no persisted plan",
+                    agency_task_id
+                )
+            })?;
+            worksgood::eval_lifecycle::validate_plan(&plan)?;
+            if plan.plan_hash != expected_hash || plan.source_task != source_task_id {
+                bail!("persisted agency plan identity changed before invocation");
+            }
+            Ok(Some(plan))
+        }
+    }
+}
+
+fn persist_pipeline_verdict(
+    dir: &Path,
+    source_task_id: &str,
+    flip: bool,
+    evaluation: &Evaluation,
+) -> Result<()> {
+    let Some(plan) = persisted_invocation_plan(dir, source_task_id, flip)? else {
+        return Ok(());
+    };
+    let graph = load_graph(&super::graph_path(dir))?;
+    let source = graph.get_task_or_err(source_task_id)?;
+    let satellite = graph.get_task_or_err(&plan.task_id)?;
+    let stage = if flip {
+        // FLIP's durable verdict represents the completed two-call stage.
+        worksgood::eval_lifecycle::AgencyStage::FlipComparison
+    } else {
+        worksgood::eval_lifecycle::AgencyStage::Evaluate
+    };
+    let path = worksgood::eval_lifecycle::write_durable_verdict(
+        dir, source, satellite, stage, evaluation,
+    )?;
+    eprintln!("[eval-lifecycle] durable verdict: {}", path.display());
+    Ok(())
+}
 
 /// Extract the model from a task's spawn log entry.
 ///
@@ -34,10 +103,6 @@ fn extract_spawn_model(log: &[LogEntry]) -> Option<String> {
     }
     None
 }
-
-/// Maximum length (in bytes) for the artifact diff included in the evaluator prompt.
-/// Diffs exceeding this are truncated with a notice.
-const MAX_DIFF_BYTES: usize = 30_000;
 
 /// Compute a git diff of artifact files, diffing from the commit closest to
 /// `started_at` up to HEAD. Returns `None` if git is unavailable, there are no
@@ -83,21 +148,7 @@ fn compute_artifact_diff(artifacts: &[String], started_at: Option<&str>) -> Opti
         return None;
     }
 
-    // Truncate overly large diffs
-    if diff.len() > MAX_DIFF_BYTES {
-        let safe_end = diff.floor_char_boundary(MAX_DIFF_BYTES);
-        let truncated = &diff[..safe_end];
-        // Find the last newline to avoid cutting mid-line
-        let cut_point = truncated.rfind('\n').unwrap_or(safe_end);
-        Some(format!(
-            "{}\n\n... (diff truncated at {} bytes, total {} bytes)",
-            &diff[..cut_point],
-            cut_point,
-            diff.len()
-        ))
-    } else {
-        Some(diff)
-    }
+    Some(bound_evaluator_artifact_diff(&diff).into_owned())
 }
 
 /// Try to find the user message that originated a task's creation.
@@ -426,13 +477,25 @@ pub fn run(
 
     let prompt = render_evaluator_prompt(&evaluator_input);
 
-    // Determine the model to use via model routing
-    let model = evaluator_model
-        .map(std::string::ToString::to_string)
+    // Inline lifecycle invocation is pinned to the scaffolded plan. Manual
+    // `--evaluator-model` remains a separate invocation-scoped path.
+    let invocation_plan = persisted_invocation_plan(dir, task_id, false)?;
+    if invocation_plan.is_some() && evaluator_model.is_some() {
+        bail!("a scaffolded agency invocation cannot override its persisted route");
+    }
+    let planned_call = invocation_plan
+        .as_ref()
+        .map(|plan| {
+            worksgood::eval_lifecycle::call(plan, worksgood::eval_lifecycle::AgencyStage::Evaluate)
+        })
+        .transpose()?;
+    let model = planned_call
+        .map(|call| call.route.clone())
+        .or_else(|| evaluator_model.map(std::string::ToString::to_string))
         .unwrap_or_else(|| {
             config
                 .resolve_model_for_role(worksgood::config::DispatchRole::Evaluator)
-                .model
+                .spawn_model_spec()
         });
 
     // Resolve the task execution model early so dry-run can show it
@@ -465,9 +528,10 @@ pub fn run(
     // Step 6: Run lightweight LLM call for evaluation (replaces claude --print)
     println!("Evaluating task '{}' with model '{}'...", task_id, model);
 
-    // Eval calls can be slow with large task outputs — use a generous timeout.
-    // The triage_timeout is designed for short triage calls; evals need more.
-    let timeout_secs = config.agency.triage_timeout.unwrap_or(60).max(300);
+    // Eval calls can remain silent during long inference. Their independent
+    // hard deadline is deliberately not the registry heartbeat window (nor the
+    // short triage budget): a live supervisor still cannot run forever.
+    let timeout_secs = config.agency.inference_timeout_secs();
 
     // Retry LLM call up to 3 times if JSON extraction fails (transient format failures)
     let (eval_json, eval_token_usage) = {
@@ -475,7 +539,15 @@ pub fn run(
         let mut extracted = None;
         let mut token_usage = None;
         for attempt in 1..=3 {
-            let eval_result = if let Some(route) = evaluator_model {
+            let eval_result = if let Some(call) = planned_call {
+                worksgood::service::llm::run_lightweight_llm_call_for_plan(
+                    &config,
+                    worksgood::config::DispatchRole::Evaluator,
+                    call,
+                    &prompt,
+                    timeout_secs,
+                )
+            } else if let Some(route) = evaluator_model {
                 worksgood::service::llm::run_lightweight_llm_call_for_route(
                     &config,
                     worksgood::config::DispatchRole::Evaluator,
@@ -613,7 +685,10 @@ pub fn run(
         score: parsed.score,
         dimensions,
         notes: parsed.notes,
-        evaluator: format!("claude:{}", model),
+        // `model` is already the authoritative handler-first invocation route.
+        // Prefixing it with `claude:` falsely recorded live Pi evaluations as
+        // `claude:pi:...` even though no Claude process ran.
+        evaluator: model.clone(),
         timestamp,
         model: task_model.clone(),
         source: "llm".to_string(),
@@ -716,6 +791,11 @@ pub fn run(
             );
         }
     }
+
+    // Semantic evidence is durable before the satellite's wrapper can call
+    // `wg done`. A crash from here onward is reconciled without another model
+    // call.
+    persist_pipeline_verdict(dir, task_id, false, &evaluation)?;
 
     // Step 8.5: Persist token usage to the .evaluate-* task
     if let Some(ref usage) = eval_token_usage {
@@ -991,19 +1071,50 @@ pub fn run_flip(
         (config.resolve_model_for_role(role).model, "config")
     }
 
-    let (inference_model, inference_source) = resolve_flip_model(
-        &config,
-        worksgood::config::DispatchRole::FlipInference,
-        evaluator_model,
-        &task_model,
-    );
+    let invocation_plan = persisted_invocation_plan(dir, task_id, true)?;
+    if invocation_plan.is_some() && evaluator_model.is_some() {
+        bail!("a scaffolded FLIP invocation cannot override its persisted routes");
+    }
+    let planned_inference = invocation_plan
+        .as_ref()
+        .map(|plan| {
+            worksgood::eval_lifecycle::call(
+                plan,
+                worksgood::eval_lifecycle::AgencyStage::FlipInference,
+            )
+        })
+        .transpose()?;
+    let planned_comparison = invocation_plan
+        .as_ref()
+        .map(|plan| {
+            worksgood::eval_lifecycle::call(
+                plan,
+                worksgood::eval_lifecycle::AgencyStage::FlipComparison,
+            )
+        })
+        .transpose()?;
 
-    let (comparison_model, comparison_source) = resolve_flip_model(
-        &config,
-        worksgood::config::DispatchRole::FlipComparison,
-        evaluator_model,
-        &task_model,
-    );
+    let (inference_model, inference_source) = if let Some(call) = planned_inference {
+        (call.route.clone(), "persisted-plan")
+    } else {
+        resolve_flip_model(
+            &config,
+            worksgood::config::DispatchRole::FlipInference,
+            evaluator_model,
+            &task_model,
+        )
+    };
+
+    let (comparison_model, comparison_source) = if let Some(call) = planned_comparison {
+        (call.route.clone(), "persisted-plan")
+    } else {
+        resolve_flip_model(
+            &config,
+            worksgood::config::DispatchRole::FlipComparison,
+            evaluator_model,
+            &task_model,
+        )
+    };
 
     eprintln!(
         "FLIP models: inference='{}' ({}), comparison='{}' ({})",
@@ -1044,7 +1155,7 @@ pub fn run_flip(
         inference_model
     );
 
-    let flip_timeout = config.agency.triage_timeout.unwrap_or(60).max(300);
+    let flip_timeout = config.agency.inference_timeout_secs();
 
     // Retry LLM call up to 3 times if JSON extraction fails (transient format failures)
     let (inference_json, inference_token_usage) = {
@@ -1052,7 +1163,15 @@ pub fn run_flip(
         let mut extracted = None;
         let mut token_usage = None;
         for attempt in 1..=3 {
-            let inference_result = if let Some(route) = evaluator_model {
+            let inference_result = if let Some(call) = planned_inference {
+                worksgood::service::llm::run_lightweight_llm_call_for_plan(
+                    &config,
+                    worksgood::config::DispatchRole::FlipInference,
+                    call,
+                    &inference_prompt,
+                    flip_timeout,
+                )
+            } else if let Some(route) = evaluator_model {
                 worksgood::service::llm::run_lightweight_llm_call_for_route(
                     &config,
                     worksgood::config::DispatchRole::FlipInference,
@@ -1121,7 +1240,15 @@ pub fn run_flip(
         let mut extracted = None;
         let mut token_usage = None;
         for attempt in 1..=3 {
-            let comparison_result = if let Some(route) = evaluator_model {
+            let comparison_result = if let Some(call) = planned_comparison {
+                worksgood::service::llm::run_lightweight_llm_call_for_plan(
+                    &config,
+                    worksgood::config::DispatchRole::FlipComparison,
+                    call,
+                    &comparison_prompt,
+                    flip_timeout,
+                )
+            } else if let Some(route) = evaluator_model {
                 worksgood::service::llm::run_lightweight_llm_call_for_route(
                     &config,
                     worksgood::config::DispatchRole::FlipComparison,
@@ -1284,6 +1411,10 @@ pub fn run_flip(
             );
         }
     }
+
+    // Persist the completed two-call FLIP verdict before the wrapper can
+    // transition the satellite. A post-verdict crash is reconciliation-only.
+    persist_pipeline_verdict(dir, task_id, true, &evaluation)?;
 
     // Persist combined token usage from both FLIP phases to the .flip-* task
     let combined_usage = combine_token_usage(&[inference_token_usage, comparison_token_usage]);
@@ -1895,6 +2026,17 @@ fn check_eval_gate(
         return Ok(false);
     }
 
+    // Soft evaluation states are consumed centrally by the dispatcher after
+    // the durable verdict exists. Mutating the source here would race the
+    // satellite's own `wg done` and lose the exact consumed-verdict fence.
+    let source_is_soft_eval = worksgood::parser::load_graph(&super::graph_path(dir))
+        .ok()
+        .and_then(|graph| graph.get_task(task_id).map(|task| task.status))
+        .is_some_and(|status| matches!(status, Status::PendingEval | Status::FailedPendingEval));
+    if source_is_soft_eval {
+        return Ok(false);
+    }
+
     // Check if score is below threshold
     if evaluation.score >= threshold {
         return Ok(false); // Score is acceptable
@@ -1935,14 +2077,13 @@ fn check_eval_gate(
         }
     }
 
-    // Auto-rescue: evaluation-drives-remediation. Per the in-place-eval
-    // design (2026-04-27): when the eval gate fails, we DON'T spawn a
-    // fresh rescue task with a new agent identity. Instead we transition
-    // the SAME task back from PendingEval → Open, keeping `task.agent`
-    // (the persona hash) and the on-disk worktree intact, and let the
-    // dispatcher re-pick the same task on the next tick. The next agent
-    // sees the evaluator's notes via `previous_attempt_context` (gated
-    // by `task.rescue_count > 0` in spawn/execution.rs).
+    // Legacy direct-gate auto-rescue. Durable PendingEval/FailedPendingEval
+    // sources returned above and are consumed centrally by the dispatcher
+    // after verdict persistence. For a non-soft completed source evaluated
+    // through this older path, do not spawn a fresh task with a new identity:
+    // reopen the SAME task, retain `task.agent` and its on-disk worktree, and
+    // let the dispatcher re-pick it. The next agent sees evaluator notes via
+    // `previous_attempt_context` (gated by `task.rescue_count > 0`).
     //
     // Cascade-failure cap: each iteration increments `rescue_count`.
     // When the count reaches `coordinator.max_verify_failures` (alias
@@ -1991,11 +2132,10 @@ fn check_eval_gate(
             return Ok(true);
         }
 
-        // In-place iteration: PendingEval → Open, preserving `task.agent`
-        // identity hash and (transitively) the agent's worktree on disk
-        // (`is_safe_to_reap` requires Status::Done, so a non-terminal
-        // task keeps its worktree). Clear `task.assigned` so the
-        // dispatcher will re-pick this task on the next tick.
+        // In-place iteration: completed source → Open, preserving `task.agent`
+        // identity hash and (transitively) the agent's worktree on disk.
+        // Clear `task.assigned` so the dispatcher will re-pick this task on
+        // the next tick.
         let next_count = prior_rescue_count.saturating_add(1);
         let log_msg = format!(
             "Eval rescue {}/{}: score {:.2} below threshold {:.2}. \
@@ -2561,7 +2701,10 @@ mod tests {
         graph.add_node(Node::Task(Task {
             id: "t1".to_string(),
             title: "Test eval-gated task".to_string(),
-            status: Status::PendingEval,
+            // The durable PendingEval path is consumed centrally by the
+            // dispatcher. These tests exercise the legacy direct-gate path on
+            // a completed source so it cannot race verdict consumption.
+            status: Status::Done,
             agent: Some(agent_hash.to_string()),
             assigned: Some("agent-1".to_string()),
             tags: vec!["eval-gate".to_string()],
@@ -2602,10 +2745,39 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_eval_direct_gate_defers_to_dispatcher() {
+        let dir = tempdir().unwrap();
+        setup_eval_gate_fixture(dir.path(), "agent-hash", 0);
+        let path = super::super::graph_path(dir.path());
+        worksgood::parser::modify_graph(&path, |graph| {
+            graph.get_task_mut("t1").unwrap().status = Status::PendingEval;
+            true
+        })
+        .unwrap();
+
+        let rejected = check_eval_gate(
+            dir.path(),
+            "t1",
+            &["eval-gate".to_string()],
+            gate_deliverables_desc(),
+            &mk_failing_eval(0.2, "durable verdict must be consumed centrally"),
+            &cfg_with_eval_gate(0.7, 3),
+            true,
+        )
+        .unwrap();
+
+        assert!(!rejected);
+        let graph = load_graph(&path).unwrap();
+        let source = graph.get_task("t1").unwrap();
+        assert_eq!(source.status, Status::PendingEval);
+        assert_eq!(source.rescue_count, 0);
+    }
+
+    #[test]
     fn test_eval_fail_retries_in_place_with_same_agent() {
-        // Eval scores below threshold, rescue_count < max:
-        // task should transition PendingEval → Open with the SAME task.agent
-        // identity hash, rescue_count incremented, and NO new task created.
+        // Eval scores below threshold, rescue_count < max: the legacy direct
+        // gate should reopen the completed task with the SAME task.agent
+        // identity hash, increment rescue_count, and create NO new task.
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
         let agent_hash = "0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd";
@@ -2633,7 +2805,7 @@ mod tests {
         assert_eq!(
             task.status,
             Status::Open,
-            "in-place rescue: PendingEval → Open"
+            "in-place rescue: completed source → Open"
         );
         assert_eq!(
             task.agent.as_deref(),
@@ -2700,7 +2872,7 @@ mod tests {
         // evaluator's notes into the next agent's previous_attempt_context.
         // We exercise this end-to-end by:
         //   1. Writing an evaluation JSON to .wg/agency/evaluations/
-        //   2. Running check_eval_gate (which transitions task to Open and
+        //   2. Running check_eval_gate (which reopens the completed task and
         //      bumps rescue_count).
         //   3. Calling build_previous_attempt_context() and asserting the
         //      eval notes appear in the returned string.
@@ -2788,7 +2960,7 @@ mod tests {
             dir_path,
             "t1",
             &["eval-gate".to_string()],
-            None,
+            gate_deliverables_desc(),
             &eval,
             &config,
             true,

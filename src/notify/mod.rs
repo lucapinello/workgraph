@@ -97,7 +97,9 @@ pub struct Action {
 /// An incoming message from a human.
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
-    /// Channel type that received this message.
+    /// Channel type that received this message (e.g. `"telegram"` or
+    /// `"telegram:<bot_id>"`). Identifies which bot/channel the message
+    /// arrived on so a reply can be routed back through the same one.
     pub channel: String,
     /// Sender identifier (platform-specific). For Telegram this is the display
     /// label from [`telegram_sender::SenderIdentity::display`]: the @username

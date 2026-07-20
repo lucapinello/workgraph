@@ -710,6 +710,32 @@ fn rewrite_config_reset_argv(args: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Restore the conventional Unix CLI behavior for an output-only command.
+///
+/// Rust ignores SIGPIPE by default, which turns a closed downstream pipe into
+/// an `EPIPE`; the standard `println!` macros then panic while reporting that
+/// otherwise-routine condition. `wg show` is commonly piped into short readers
+/// such as `head`, so let the kernel terminate it quietly with SIGPIPE instead.
+/// This is deliberately scoped to `show`: long-lived service/network commands
+/// retain Rust's ignored-SIGPIPE behavior, and output failures other than a
+/// closed pipe are still reported normally.
+#[cfg(unix)]
+fn restore_default_sigpipe_for_show() -> Result<()> {
+    // SAFETY: installing SIG_DFL for SIGPIPE is an async-signal-safe libc
+    // operation. This runs on the main thread before `show` starts writing.
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    if previous == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to restore default SIGPIPE handling for wg show");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe_for_show() -> Result<()> {
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Handle subcommand-level help before clap parses (since we disable_help_flag globally)
     maybe_print_subcommand_help();
@@ -1598,6 +1624,7 @@ fn main() -> Result<()> {
         Commands::Aging => commands::aging::run(&workgraph_dir, cli.json),
         Commands::Forecast => commands::forecast::run(&workgraph_dir, cli.json),
         Commands::Workload => commands::workload::run(&workgraph_dir, cli.json),
+        Commands::Disk(command) => commands::disk::run(&workgraph_dir, command, cli.json),
         Commands::Worktree(sub) => match sub {
             cli::WorktreeCommand::List => commands::worktree_cmd::list(&workgraph_dir),
             cli::WorktreeCommand::Archive { agent_id, remove } => {
@@ -1675,7 +1702,10 @@ fn main() -> Result<()> {
                 commands::gc::run(&workgraph_dir, dry_run, include_done, older.as_deref())
             }
         }
-        Commands::Show { id } => commands::show::run(&workgraph_dir, &id, cli.json),
+        Commands::Show { id } => {
+            restore_default_sigpipe_for_show()?;
+            commands::show::run(&workgraph_dir, &id, cli.json)
+        }
         Commands::Trace { command } => match command {
             TraceCommands::Show {
                 id,
@@ -2132,6 +2162,17 @@ fn main() -> Result<()> {
                     ChatCommands::Send { chat, message } => {
                         commands::chat_cmd::run_send(&workgraph_dir, &chat, &message, cli.json)
                     }
+                    ChatCommands::Model {
+                        chat,
+                        spec,
+                        warm_pi_writeback,
+                    } => commands::chat_cmd::run_model(
+                        &workgraph_dir,
+                        &chat,
+                        &spec,
+                        warm_pi_writeback,
+                        cli.json,
+                    ),
                     ChatCommands::Stop { chat } => {
                         commands::chat_cmd::run_stop(&workgraph_dir, &chat, cli.json)
                     }
@@ -2444,6 +2485,13 @@ fn main() -> Result<()> {
             } else {
                 commands::heartbeat::run_check_agents(&workgraph_dir, threshold, cli.json)
             }
+        }
+        Commands::HeartbeatWatch {
+            agent,
+            interval_seconds,
+            supervised_pid,
+        } => {
+            commands::heartbeat::run_watch(&workgraph_dir, &agent, interval_seconds, supervised_pid)
         }
         Commands::Checkpoint {
             task,
@@ -3657,6 +3705,7 @@ fn main() -> Result<()> {
             ServerCommands::Connect { user } => commands::server::connect(user.as_deref()),
         },
         Commands::Setup {
+            repair_guides,
             route,
             provider,
             scope,
@@ -3671,6 +3720,7 @@ fn main() -> Result<()> {
             backend,
         } => {
             let args = commands::setup::SetupArgs {
+                repair_guides,
                 route,
                 provider,
                 scope,

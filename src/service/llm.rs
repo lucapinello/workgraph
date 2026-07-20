@@ -254,16 +254,29 @@ pub fn resolve_agency_dispatch(config: &Config, role: DispatchRole) -> Result<Ag
         "resolve_agency_dispatch is only valid for agency one-shot roles"
     );
 
-    let raw_spec = config
+    let raw_spec = if let Some(configured) = config
         .models
         .get_role(role)
-        .and_then(|c| c.model.clone())
-        .or_else(|| config.weak_tier_spec())
-        .ok_or_else(|| {
+        .and_then(|role_config| role_config.model.as_deref())
+    {
+        if execution_system_key(configured).is_ok() {
+            // A complete handler-first route is already authoritative. Do not
+            // decompose nested dialects such as nex:openrouter:… or pi:… .
+            configured.trim().to_string()
+        } else {
+            // Legacy generated profiles persisted `provider = "codex"` beside
+            // a bare `model = "gpt-…"`. Reconstruct that explicit selection
+            // once at the configuration boundary; callers persist/use only the
+            // canonical handler-first route from here onward.
+            config.resolve_model_for_role(role).spawn_model_spec()
+        }
+    } else {
+        config.weak_tier_spec().ok_or_else(|| {
             anyhow::anyhow!(
                 "error[WG-EXEC-UNSELECTED]: no explicit LLM route for agency role={role}; configure models.{role}.model or tiers.fast"
             )
-        })?;
+        })?
+    };
     execution_system_key(&raw_spec)
         .with_context(|| format!("invalid explicit agency route for role={role}: {raw_spec:?}"))?;
     Ok(agency_dispatch_for_spec(
@@ -294,6 +307,7 @@ pub fn review_native_creds_available(config: &Config) -> bool {
 fn call_dispatch_route(
     config: &Config,
     dispatch: &AgencyDispatch,
+    endpoint: Option<&str>,
     prompt: &str,
     timeout_secs: u64,
 ) -> Result<LlmCallResult> {
@@ -303,7 +317,7 @@ fn call_dispatch_route(
             call_codex_cli(&dispatch.model_id, dispatch.reasoning, prompt, timeout_secs)
         }
         ExecutorKind::Native => {
-            agency_native_call_for_spec(config, &dispatch.raw_spec, prompt, timeout_secs)
+            agency_native_call_for_spec(config, &dispatch.raw_spec, endpoint, prompt, timeout_secs)
         }
         ExecutorKind::Pi => call_pi_cli(
             config,
@@ -419,7 +433,7 @@ pub fn run_review_llm_call(
     };
 
     run_dispatch_with_same_system_fallback(config, DispatchRole::Reviewer, dispatch, |route| {
-        call_dispatch_route(config, route, prompt, timeout_secs)
+        call_dispatch_route(config, route, None, prompt, timeout_secs)
     })
 }
 
@@ -447,7 +461,7 @@ pub fn run_model_oneshot(
     let dispatch = agency_dispatch_for_spec(model_spec, None);
     execution_system_key(model_spec)?;
     run_dispatch_with_same_system_fallback(config, DispatchRole::TaskAgent, dispatch, |route| {
-        call_dispatch_route(config, route, prompt, timeout_secs)
+        call_dispatch_route(config, route, None, prompt, timeout_secs)
     })
 }
 
@@ -505,6 +519,7 @@ fn build_image_prompt(prompt: &str, image_paths: &[std::path::PathBuf]) -> Strin
 fn agency_native_call_for_spec(
     config: &Config,
     raw_spec: &str,
+    endpoint: Option<&str>,
     prompt: &str,
     timeout_secs: u64,
 ) -> Result<LlmCallResult> {
@@ -526,7 +541,7 @@ fn agency_native_call_for_spec(
             prompt,
             timeout_secs,
             None,
-            None,
+            endpoint,
         ),
         prov @ ("oai-compat" | "openai" | "openrouter" | "local") => call_openai_native(
             config,
@@ -535,7 +550,7 @@ fn agency_native_call_for_spec(
             prompt,
             timeout_secs,
             None,
-            None,
+            endpoint,
         ),
         other => anyhow::bail!("reviewer spec {raw_spec:?} provider {other:?} is not native HTTP"),
     }
@@ -613,7 +628,7 @@ pub fn run_lightweight_llm_call(
     };
 
     run_dispatch_with_same_system_fallback(config, role, dispatch, |route| {
-        call_dispatch_route(config, route, prompt, timeout_secs)
+        call_dispatch_route(config, route, None, prompt, timeout_secs)
     })
 }
 
@@ -633,8 +648,69 @@ pub fn run_lightweight_llm_call_for_route(
     })?;
     let dispatch = agency_dispatch_for_spec(route, config.resolve_reasoning_for_role(role));
     run_dispatch_with_same_system_fallback(config, role, dispatch, |candidate| {
-        call_dispatch_route(config, candidate, prompt, timeout_secs)
+        call_dispatch_route(config, candidate, None, prompt, timeout_secs)
     })
+}
+
+/// Execute one call from a persisted agency plan. Route, reasoning, endpoint,
+/// and fallback order come from the plan; ambient role routing and fallback
+/// configuration are deliberately ignored.
+pub fn run_lightweight_llm_call_for_plan(
+    config: &Config,
+    role: DispatchRole,
+    call: &crate::eval_lifecycle::AgencyCallPlan,
+    prompt: &str,
+    timeout_secs: u64,
+) -> Result<LlmCallResult> {
+    let actual_system = execution_system_key(&call.route)?;
+    if actual_system != call.system {
+        anyhow::bail!(
+            "error[WG-EXEC-AGENCY-SYSTEM-MISMATCH]: planned={} actual={}",
+            call.system,
+            actual_system
+        );
+    }
+    let mut routes = Vec::with_capacity(1 + call.fallbacks.len());
+    routes.push(call.route.clone());
+    routes.extend(call.fallbacks.iter().cloned());
+    let mut seen = HashSet::new();
+    routes.retain(|route| seen.insert(route.clone()));
+    for route in &routes {
+        if execution_system_key(route)? != call.system {
+            anyhow::bail!(
+                "error[WG-EXEC-FALLBACK-CROSS-SYSTEM]: planned primary={} candidate={route:?}",
+                call.system
+            );
+        }
+    }
+
+    let mut failures = Vec::new();
+    for route in routes {
+        let dispatch = agency_dispatch_for_spec(&route, call.reasoning);
+        match call_dispatch_route(
+            config,
+            &dispatch,
+            call.endpoint.as_deref(),
+            prompt,
+            timeout_secs,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(error) => failures.push(RouteAttemptFailure {
+                route,
+                handler: call.system.handler.clone(),
+                provider: call.system.provider.clone(),
+                failure: format!("{error:#}"),
+            }),
+        }
+    }
+    Err(ExecutionRouteFailure {
+        code: "WG-EXEC-ROUTE-FAILED",
+        role,
+        selected_route: call.route.clone(),
+        system: call.system.clone(),
+        attempts: failures,
+    }
+    .into())
 }
 
 /// Estimate cost in USD from token counts and registry pricing data.
@@ -1850,13 +1926,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_resolve_agency_dispatch_weak_tier_deepseek_with_key() {
-        // The two-tier setter wrote `--weak openrouter:deepseek/deepseek-chat`
-        // into tiers.fast. With an OpenRouter key present, agency one-shots
-        // route to that DeepSeek model via the native HTTP handler — NOT the
-        // old hardcoded claude:haiku. (Covers validation item 1.)
+        // The two-tier setter wrote the handler-first OpenRouter route into
+        // tiers.fast. With an OpenRouter key present, agency one-shots route to
+        // that DeepSeek model via the native HTTP handler — NOT the old
+        // hardcoded claude:haiku. (Covers validation item 1.)
         let _key = EnvGuard::set("OPENROUTER_API_KEY", Some("sk-or-test-deepseek"));
         let mut config = Config::default();
-        config.tiers.fast = Some("openrouter:deepseek/deepseek-chat".to_string());
+        config.tiers.fast = Some("nex:openrouter:deepseek/deepseek-chat".to_string());
 
         for role in ALL_AGENCY_ROLES {
             let dispatch = resolve_agency_dispatch(&config, role).unwrap();
@@ -1865,8 +1941,8 @@ mod tests {
                 ExecutorKind::Native,
                 "role {role:?} weak-tier deepseek must dispatch via the native HTTP handler",
             );
-            assert_eq!(dispatch.raw_spec, "openrouter:deepseek/deepseek-chat");
-            assert_eq!(dispatch.model_id, "deepseek/deepseek-chat");
+            assert_eq!(dispatch.raw_spec, "nex:openrouter:deepseek/deepseek-chat");
+            assert_eq!(dispatch.model_id, "openrouter:deepseek/deepseek-chat");
         }
     }
 
@@ -1878,7 +1954,7 @@ mod tests {
         let _o = EnvGuard::set("OPENROUTER_API_KEY", None);
         let _a = EnvGuard::set("OPENAI_API_KEY", None);
         let mut config = Config::default();
-        config.tiers.fast = Some("openrouter:deepseek/deepseek-chat".to_string());
+        config.tiers.fast = Some("nex:openrouter:deepseek/deepseek-chat".to_string());
         config
             .llm_endpoints
             .endpoints
@@ -1897,8 +1973,8 @@ mod tests {
 
         let dispatch = resolve_agency_dispatch(&config, DispatchRole::Evaluator).unwrap();
         assert_eq!(dispatch.handler, ExecutorKind::Native);
-        assert_eq!(dispatch.raw_spec, "openrouter:deepseek/deepseek-chat");
-        assert_eq!(dispatch.model_id, "deepseek/deepseek-chat");
+        assert_eq!(dispatch.raw_spec, "nex:openrouter:deepseek/deepseek-chat");
+        assert_eq!(dispatch.model_id, "openrouter:deepseek/deepseek-chat");
     }
 
     #[test]
@@ -1907,12 +1983,12 @@ mod tests {
         let _o = EnvGuard::set("OPENROUTER_API_KEY", None);
         let _a = EnvGuard::set("OPENAI_API_KEY", None);
         let mut config = Config::default();
-        config.tiers.fast = Some("openrouter:deepseek/deepseek-chat".to_string());
+        config.tiers.fast = Some("nex:openrouter:deepseek/deepseek-chat".to_string());
 
         for role in ALL_AGENCY_ROLES {
             let dispatch = resolve_agency_dispatch(&config, role).unwrap();
             assert_eq!(dispatch.handler, ExecutorKind::Native, "role={role}");
-            assert_eq!(dispatch.raw_spec, "openrouter:deepseek/deepseek-chat");
+            assert_eq!(dispatch.raw_spec, "nex:openrouter:deepseek/deepseek-chat");
         }
     }
 
@@ -1924,7 +2000,7 @@ mod tests {
         // tier default. (Covers validation item 2.)
         let _o = EnvGuard::set("OPENROUTER_API_KEY", None);
         let mut config = Config::default();
-        config.tiers.fast = Some("openrouter:deepseek/deepseek-chat".to_string());
+        config.tiers.fast = Some("nex:openrouter:deepseek/deepseek-chat".to_string());
         config
             .models
             .set_model(DispatchRole::Evaluator, "claude:sonnet");
@@ -1942,7 +2018,7 @@ mod tests {
         let assigner = resolve_agency_dispatch(&config, DispatchRole::Assigner).unwrap();
         assert_ne!(assigner.raw_spec, "claude:sonnet");
         assert_eq!(assigner.handler, ExecutorKind::Native);
-        assert_eq!(assigner.raw_spec, "openrouter:deepseek/deepseek-chat");
+        assert_eq!(assigner.raw_spec, "nex:openrouter:deepseek/deepseek-chat");
     }
 
     #[test]
@@ -1952,7 +2028,7 @@ mod tests {
         // codex self-authenticates, so it is not subject to the credential net.
         let _o = EnvGuard::set("OPENROUTER_API_KEY", None);
         let mut config = Config::default();
-        config.tiers.fast = Some("openrouter:deepseek/deepseek-chat".to_string());
+        config.tiers.fast = Some("nex:openrouter:deepseek/deepseek-chat".to_string());
         config
             .models
             .set_model(DispatchRole::Assigner, "codex:gpt-5.4-mini");
@@ -2184,6 +2260,85 @@ mod tests {
         assert_eq!(structured.system.handler, "pi");
         assert_eq!(structured.system.provider, "openai-codex");
         assert_eq!(structured.attempts.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn persisted_plan_invokes_exact_codex_pi_and_claude_handlers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for (name, script) in [
+            (
+                "codex",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$WG_TEST_CODEX_ARGS\"\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"codex-ok\"}}'\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
+            ),
+            (
+                "pi",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$WG_TEST_PI_ARGS\"\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"pi-ok\"}],\"usage\":{\"input\":1,\"output\":1,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":2,\"cost\":{\"total\":0.0}}}}'\n",
+            ),
+            (
+                "claude",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$WG_TEST_CLAUDE_ARGS\"\ncat >/dev/null\nprintf '%s\\n' '{\"result\":\"claude-ok\"}'\n",
+            ),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let _path = EnvGuard::set("PATH", Some(&format!("{}:{old_path}", bin.display())));
+        let codex_args = temp.path().join("codex.args");
+        let pi_args = temp.path().join("pi.args");
+        let claude_args = temp.path().join("claude.args");
+        let _codex = EnvGuard::set("WG_TEST_CODEX_ARGS", codex_args.to_str());
+        let _pi = EnvGuard::set("WG_TEST_PI_ARGS", pi_args.to_str());
+        let _claude = EnvGuard::set("WG_TEST_CLAUDE_ARGS", claude_args.to_str());
+
+        let mut config = Config::default();
+        config
+            .models
+            .set_model(DispatchRole::Evaluator, "claude:wrong-ambient");
+        for (route, expected) in [
+            ("codex:gpt-5.5", "codex-ok"),
+            ("pi:openai-codex:gpt-5.6-sol", "pi-ok"),
+            ("claude:haiku", "claude-ok"),
+        ] {
+            let call = crate::eval_lifecycle::AgencyCallPlan {
+                stage: crate::eval_lifecycle::AgencyStage::Evaluate,
+                route: route.into(),
+                endpoint: None,
+                reasoning: None,
+                system: execution_system_key(route).unwrap(),
+                source: crate::eval_lifecycle::DispatchSelectionSource::PersistedPlan,
+                fallbacks: vec![],
+            };
+            let result = run_lightweight_llm_call_for_plan(
+                &config,
+                DispatchRole::Evaluator,
+                &call,
+                "return exact handler",
+                10,
+            )
+            .unwrap();
+            assert_eq!(result.text, expected);
+        }
+        assert!(
+            std::fs::read_to_string(codex_args)
+                .unwrap()
+                .contains("--model gpt-5.5")
+        );
+        let pi_argv = std::fs::read_to_string(pi_args).unwrap();
+        assert!(pi_argv.contains("--provider openai-codex"));
+        assert!(pi_argv.contains("--model gpt-5.6-sol"));
+        assert!(
+            std::fs::read_to_string(claude_args)
+                .unwrap()
+                .contains("--model haiku")
+        );
     }
 
     #[cfg(unix)]

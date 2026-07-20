@@ -420,38 +420,21 @@ pub fn clear_tui_driver_sentinel(chat_dir: &Path) {
     }
 }
 
-/// True when a live `wg tui` sentinel is paired with a live session
-/// handler. This is the only state where the daemon supervisor should
-/// defer its own respawn: the TUI has claimed the surface and there is
-/// an actual handler generation available to receive input.
+/// True when a live `wg tui` process has claimed this chat surface.
 ///
-/// A live TUI process alone is not enough. If `.tui-driven` survives a
-/// failed PTY startup or a turns=0 EOF exit while `.handler.pid` is gone
-/// or stale, treating the marker as authoritative strands the chat with
-/// no handler. In that stale case this helper clears the sentinel and
-/// returns `None` so callers can respawn normally.
+/// The sentinel is written before the asynchronous PTY/tmux spawn so the
+/// daemon cannot race a duplicate handler into that short handoff window.
+/// Vendor CLIs such as Pi and Codex run directly in tmux and never acquire
+/// WG's `.handler.pid`, so requiring a lock here incorrectly erased their
+/// valid ownership. The TUI now clears the sentinel on every pane-spawn error
+/// and child-death path; PID identity checking still reaps dead/recycled
+/// markers (including the historical wedge shape).
 pub fn active_tui_driver_pid(chat_dir: &Path) -> Option<u32> {
     let tui = read_tui_driver_sentinel(chat_dir).ok().flatten()?;
-    // `tui.alive` is a bare `kill(pid, 0)` probe; also reject a PID that has
-    // been recycled to a foreign process (fix-wedge). Either way the sentinel
-    // is stale and the supervisor must respawn rather than defer forever.
     if !pid_is_live_ours(tui.pid) {
         clear_tui_driver_sentinel(chat_dir);
         return None;
     }
-
-    match read_holder(chat_dir) {
-        Ok(Some(holder)) if pid_is_live_ours(holder.pid) => {}
-        Ok(Some(_)) => {
-            clear_tui_driver_sentinel(chat_dir);
-            return None;
-        }
-        Ok(None) | Err(_) => {
-            clear_tui_driver_sentinel(chat_dir);
-            return None;
-        }
-    }
-
     Some(tui.pid)
 }
 
@@ -863,8 +846,11 @@ mod tests {
     /// purely a test-harness artifact. Waiting for `exec` to land removes the
     /// race without weakening the real identity/liveness checks.
     fn spawn_foreign_child() -> std::process::Child {
+        // `sleep 120` (not 30): the child must outlive the exec-wait below plus
+        // the rest of the test even on a badly starved runner. Every caller
+        // kills+waits it, so the long duration never lingers.
         let child = std::process::Command::new("sleep")
-            .arg("30")
+            .arg("120")
             .spawn()
             .expect("spawn sleep");
         #[cfg(target_os = "linux")]
@@ -875,11 +861,20 @@ mod tests {
                     .and_then(|id| id.split_whitespace().next().map(str::to_owned))
             };
             let mine_comm = comm_of(std::process::id()).unwrap_or_default();
-            // Poll until the child's comm is readable and differs from ours,
-            // i.e. `exec` has replaced the shared image. ~2s of 1ms polls is far
-            // longer than an `exec` takes even on a saturated runner; a genuine
-            // hang surfaces as the test's own assertion, not an infinite loop.
-            for _ in 0..2000 {
+            // Wait until the child's comm is readable and differs from ours,
+            // i.e. `exec` of `sleep` has replaced the still-shared parent image.
+            // This is bounded by a *wall-clock* deadline, not an iteration count:
+            // the earlier 2000×1ms budget could elapse in real time before a
+            // forked-but-unscheduled child ever ran its `exec` on a saturated CI
+            // runner, so the helper returned a child whose comm still shadowed
+            // the harness's — `pid_reused_by_foreign`'s "same executable as us"
+            // guard then read `false` and the foreignness assert flaked
+            // (graphwork/wg CI runs 29137074236, 29162578216). A 30s deadline is
+            // orders of magnitude longer than a real `exec` and well inside the
+            // child's 120s lifetime; exceeding it is a genuine environment fault,
+            // surfaced as a clear panic rather than a confusing downstream assert.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
                 match comm_of(pid) {
                     Some(their_comm)
                         if !their_comm.is_empty()
@@ -888,7 +883,15 @@ mod tests {
                     {
                         break;
                     }
-                    _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    _ => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "foreign child (pid {pid}) never completed `exec` within 30s: \
+                             comm still reads {:?} vs ours {mine_comm:?}",
+                            comm_of(pid)
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
                 }
             }
         }
@@ -1066,17 +1069,16 @@ mod tests {
     }
 
     #[test]
-    fn active_tui_driver_requires_live_handler_lock() {
+    fn active_tui_driver_covers_vendor_pty_without_handler_lock() {
         let dir = tempdir().unwrap();
         write_tui_driver_sentinel(dir.path(), std::process::id()).unwrap();
 
-        assert_eq!(active_tui_driver_pid(dir.path()), None);
+        assert_eq!(active_tui_driver_pid(dir.path()), Some(std::process::id()));
         assert!(
-            read_tui_driver_sentinel(dir.path()).unwrap().is_none(),
-            "stale sentinel should be cleared when no live handler lock exists"
+            read_tui_driver_sentinel(dir.path()).unwrap().is_some(),
+            "a live TUI-owned Pi/Codex pane has no WG handler lock; its claim must survive"
         );
 
-        write_tui_driver_sentinel(dir.path(), std::process::id()).unwrap();
         let _lock = SessionLock::acquire(dir.path(), HandlerKind::InteractiveNex).unwrap();
         assert_eq!(active_tui_driver_pid(dir.path()), Some(std::process::id()));
     }

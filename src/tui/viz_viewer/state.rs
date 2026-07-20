@@ -28,15 +28,24 @@ use edtui::{EditorEventHandler, EditorMode, EditorState};
 
 const CHAT_PTY_ACTIVITY_BUMP_DEBOUNCE: Duration = Duration::from_secs(5);
 
+/// TUI parse failures must not print fallback warnings into the alternate
+/// screen. Invalid route metadata is surfaced by the Config panel/bootstrap
+/// feedback instead; falling back here is graph-only and cannot select or
+/// launch a provider.
+fn load_tui_config(workgraph_dir: &Path) -> Config {
+    Config::load_merged(workgraph_dir).unwrap_or_default()
+}
+
 /// Construct a child `wg` command that is pinned to this TUI's graph.
 ///
 /// A TUI can itself be launched from a WG worker/chat. In that case the
 /// process inherits the parent's routing and identity variables. Letting a
-/// background command inherit those values means `current_dir(project_root)`
-/// is ignored in favor of the parent WG_DIR, so first-use chat bootstrap can
-/// mutate the live parent graph (historically even creating bare
-/// `.coordinator` ghosts). An explicit `--dir` plus an identity-free child
-/// environment is the hard subprocess boundary.
+/// explicit launcher command inherit those values means
+/// `current_dir(project_root)` is ignored in favor of the parent WG_DIR, so a
+/// user-confirmed New-chat action can mutate the live parent graph
+/// (historically even creating bare `.coordinator` ghosts). An explicit
+/// `--dir` plus an identity-free child environment is the hard subprocess
+/// boundary.
 fn isolated_wg_subprocess(program: &Path, workgraph_dir: &Path, args: &[String]) -> Command {
     let mut command = Command::new(program);
     command
@@ -937,6 +946,111 @@ impl LayoutMode {
     }
 }
 
+/// Desired inspector dock. `Auto` is the only variant responsive policy may
+/// resolve differently as the viewport changes; explicit choices are sticky.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InspectorDock {
+    #[default]
+    Auto,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl InspectorDock {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::Top => "Top",
+            Self::Bottom => "Bottom",
+        }
+    }
+
+    pub fn is_horizontal(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+}
+
+/// Desired inspector visibility mode, independent of responsive fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InspectorMode {
+    #[default]
+    Split,
+    Full,
+    Hidden,
+}
+
+/// Persisted desired layout. No viewport coordinates are stored: the current
+/// rectangle is always derived from this state and the current terminal size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LayoutPreference {
+    #[serde(default)]
+    pub dock: InspectorDock,
+    #[serde(default = "default_inspector_ratio")]
+    pub size_percent: u16,
+    #[serde(default)]
+    pub mode: InspectorMode,
+}
+
+const fn default_inspector_ratio() -> u16 {
+    67
+}
+
+impl Default for LayoutPreference {
+    fn default() -> Self {
+        Self {
+            dock: InspectorDock::Auto,
+            size_percent: default_inspector_ratio(),
+            mode: InspectorMode::Split,
+        }
+    }
+}
+
+impl LayoutPreference {
+    pub const MIN_PERCENT: u16 = 10;
+    pub const MAX_PERCENT: u16 = 90;
+
+    pub fn bounded(mut self) -> Self {
+        self.size_percent = self
+            .size_percent
+            .clamp(Self::MIN_PERCENT, Self::MAX_PERCENT);
+        self
+    }
+}
+
+/// Snapshot captured at pointer-down. A resize invalidates the snapshot and
+/// cancels the adjustment rather than interpreting stale coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutDragSnapshot {
+    pub dock: InspectorDock,
+    pub viewport: Rect,
+    pub start_column: u16,
+    pub start_row: u16,
+    pub start_percent: u16,
+    /// Complete desired-state snapshot used when SIGWINCH cancels a drag.
+    pub original: LayoutPreference,
+    /// Pointer-down alone is not a layout edit. This becomes true only after
+    /// movement on the dock's active axis.
+    pub moved: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutOverlayState {
+    /// Complete pre-modal desired state. Escape restores this verbatim.
+    pub original: LayoutPreference,
+    /// State currently rendered behind the overlay (live preview).
+    pub draft: LayoutPreference,
+    /// Focus is presentation state rather than a persisted preference, but is
+    /// still part of the user's pre-modal snapshot for reliable cancellation.
+    pub original_focus: FocusedPanel,
+    pub original_single_panel_view: SinglePanelView,
+}
+
 /// Responsive layout breakpoint determined by terminal width.
 ///
 /// Detected dynamically on each frame from `frame.area().width`:
@@ -1043,6 +1157,10 @@ pub enum InputMode {
     /// Scroll mode on the active chat PTY pane (Ctrl+] toggle).
     /// Inner PTY receives no input; arrow keys/PgUp/PgDn navigate scrollback.
     ScrollMode { task_id: String },
+    /// Visible keyboard-authoritative inspector layout editor. Reachable from
+    /// command mode only; while a PTY owns focus its printable keys continue
+    /// to go to the child.
+    Layout,
     /// Chat-exit confirmation: ask the user whether to leave chat tmux
     /// sessions running (resume next launch) or close them (kill the
     /// chat process, no resume). Triggered when the user requests quit
@@ -1083,6 +1201,8 @@ impl ExitPromptState {
 pub enum ConfirmAction {
     MarkDone(String), // task_id
     Retry(String),    // task_id
+    StopChat(ChatCloseContext),
+    ArchiveChat(ChatCloseContext),
 }
 
 /// What action the text prompt dialog is for.
@@ -1367,12 +1487,14 @@ pub struct AddNewExecutorChoice {
 
 /// The executor options offered in Add-new mode.
 ///
-/// Order is user-visible in the new-chat radio: `claude`, `codex`, `pi`,
-/// then the remaining executors. Pi is intentionally third (after Claude
-/// and Codex, before Nex) per fix-tui-new-chat-pi-executor — this makes the
-/// implemented Pi chat path reachable from the normal create-chat flow instead
-/// of only via `--executor pi` on the CLI.
+/// Pi is intentionally first: opening New Chat is an explicit create action,
+/// so it may recommend and preselect Pi without changing the graph, profile, or
+/// provider. Nothing is persisted until the user confirms creation.
 pub const ADD_NEW_EXECUTOR_CHOICES: &[AddNewExecutorChoice] = &[
+    AddNewExecutorChoice {
+        label: "pi",
+        internal_executor: "pi",
+    },
     AddNewExecutorChoice {
         label: "claude",
         internal_executor: "claude",
@@ -1380,10 +1502,6 @@ pub const ADD_NEW_EXECUTOR_CHOICES: &[AddNewExecutorChoice] = &[
     AddNewExecutorChoice {
         label: "codex",
         internal_executor: "codex",
-    },
-    AddNewExecutorChoice {
-        label: "pi",
-        internal_executor: "pi",
     },
     // External chat-capable CLIs prototyped after the established executors so
     // their addition does not shift the core indices the launcher tests pin
@@ -1947,41 +2065,192 @@ pub fn resolve_chat_pty_executor_and_model(
     )
 }
 
+fn load_coordinator_state_read_only(
+    workgraph_dir: &Path,
+    coordinator_id: u32,
+) -> Result<Option<crate::commands::service::CoordinatorState>> {
+    let primary = crate::commands::service::coordinator_state_path(workgraph_dir, coordinator_id);
+    let legacy = (coordinator_id == 0)
+        .then(|| crate::commands::service::coordinator_state_path_legacy(workgraph_dir));
+    for path in std::iter::once(primary).chain(legacy) {
+        match std::fs::read_to_string(&path) {
+            Ok(json) => {
+                let state = serde_json::from_str(&json).with_context(|| {
+                    format!(
+                        "chat .chat-{coordinator_id} has corrupt saved route metadata in {}; opening the TUI will not quarantine, rewrite, choose, or launch a fallback",
+                        path.display()
+                    )
+                })?;
+                return Ok(Some(state));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "chat .chat-{coordinator_id} route metadata unreadable at {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn load_all_coordinator_states_read_only(
+    workgraph_dir: &Path,
+) -> Vec<(u32, crate::commands::service::CoordinatorState)> {
+    let mut ids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(workgraph_dir.join("service")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(id) = name
+                .strip_prefix("coordinator-state-")
+                .and_then(|suffix| suffix.strip_suffix(".json"))
+                .and_then(|id| id.parse::<u32>().ok())
+            {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let mut states: Vec<_> = ids
+        .into_iter()
+        .filter_map(|id| {
+            load_coordinator_state_read_only(workgraph_dir, id)
+                .ok()
+                .flatten()
+                .map(|state| (id, state))
+        })
+        .collect();
+    if states.is_empty()
+        && let Ok(Some(state)) = load_coordinator_state_read_only(workgraph_dir, 0)
+    {
+        states.push((0, state));
+    }
+    states
+}
+
+fn chat_has_atomic_execution_identity(
+    workgraph_dir: &Path,
+    coordinator_id: u32,
+    task: &worksgood::graph::Task,
+) -> Result<()> {
+    // A custom command is already a complete, explicit execution identity.
+    if !task.command_argv.is_empty()
+        && (task.executor_preset_name.as_deref() == Some("command")
+            || (task.executor_preset_name.is_none() && task.model.is_none()))
+    {
+        return Ok(());
+    }
+
+    let state = load_coordinator_state_read_only(workgraph_dir, coordinator_id)?;
+    let executor = state
+        .as_ref()
+        .and_then(|state| state.executor_override.as_deref())
+        .or(task.executor_preset_name.as_deref())
+        .filter(|executor| !executor.trim().is_empty());
+    let model = state
+        .as_ref()
+        .and_then(|state| state.model_override.as_deref())
+        .or(task.model.as_deref())
+        .filter(|model| !model.trim().is_empty());
+
+    if executor.is_none() && model.is_none() {
+        anyhow::bail!(
+            "chat {} has no saved execution route; opening the TUI will not choose a fallback — use New chat or `wg chat set-executor {coordinator_id} ...`",
+            task.id
+        );
+    }
+    if model.is_some_and(|model| {
+        let model = model.trim();
+        model.is_empty()
+            || model
+                .split_once(':')
+                .is_some_and(|(_, model_id)| model_id.trim().is_empty())
+    }) {
+        anyhow::bail!(
+            "chat {} has corrupt saved route metadata; opening the TUI will not choose or launch a fallback",
+            task.id
+        );
+    }
+    Ok(())
+}
+
 fn resolve_chat_pty_executor_and_model_with_task(
     workgraph_dir: &std::path::Path,
     config: &Config,
     coordinator_id: u32,
     chat_task: Option<&worksgood::graph::Task>,
 ) -> (String, Option<String>) {
-    let coord_state =
-        crate::commands::service::CoordinatorState::load_for(workgraph_dir, coordinator_id);
-    let executor = coord_state
-        .as_ref()
-        .and_then(|s| s.executor_override.clone())
-        .or_else(|| {
-            chat_task
-                .as_ref()
-                .and_then(|task| task.executor_preset_name.clone())
-        })
-        .unwrap_or_else(|| config.coordinator.effective_executor());
-
-    let plain_pi_chat = executor == "pi"
-        && coord_state
-            .as_ref()
-            .and_then(|s| s.model_override.as_deref())
-            .is_none_or(|m| m.trim().is_empty())
-        && chat_task
-            .as_ref()
-            .is_some_and(|task| task.model.as_deref().is_none_or(|m| m.trim().is_empty()));
-    if plain_pi_chat {
-        return (executor, None);
+    // A persisted custom command is itself the atomic route. It must not
+    // inherit the project's Pi/Claude default (or stale CoordinatorState)
+    // merely because it has no executor_preset_name.
+    if chat_task.is_some_and(|task| {
+        !task.command_argv.is_empty()
+            && (task.executor_preset_name.as_deref() == Some("command")
+                || (task.executor_preset_name.is_none() && task.model.is_none()))
+    }) {
+        return ("command".to_string(), None);
     }
 
-    let model = coord_state
+    let coord_state =
+        crate::commands::service::CoordinatorState::load_for(workgraph_dir, coordinator_id);
+
+    // Select executor+model from ONE metadata generation. Mixing a stale
+    // CoordinatorState executor with a current global model can cross handlers
+    // (most dangerously `pi` + a Claude route). A coordinator override is a
+    // pair; otherwise the authoritative task pair wins; only metadata-less
+    // legacy tasks use the current config pair.
+    let (mut executor, model) = if let Some(state) = coord_state
         .as_ref()
-        .and_then(|s| s.model_override.clone())
-        .or_else(|| chat_task.as_ref().and_then(|task| task.model.clone()))
-        .or_else(|| config.coordinator.model.clone());
+        .filter(|state| state.executor_override.is_some() || state.model_override.is_some())
+    {
+        let model = state.model_override.clone();
+        let executor = state.executor_override.clone().unwrap_or_else(|| {
+            model
+                .as_deref()
+                .map(worksgood::dispatch::handler_for_model)
+                .map(|handler| handler.as_str().to_string())
+                .unwrap_or_else(|| config.coordinator.effective_executor())
+        });
+        (executor, model)
+    } else if let Some(task) =
+        chat_task.filter(|task| task.executor_preset_name.is_some() || task.model.is_some())
+    {
+        let model = task.model.clone();
+        let executor = task.executor_preset_name.clone().unwrap_or_else(|| {
+            model
+                .as_deref()
+                .map(worksgood::dispatch::handler_for_model)
+                .map(|handler| handler.as_str().to_string())
+                .unwrap_or_else(|| config.coordinator.effective_executor())
+        });
+        (executor, model)
+    } else {
+        (
+            config.coordinator.effective_executor(),
+            config.coordinator.model.clone(),
+        )
+    };
+
+    // Handler-qualified models are self-describing. Refuse the stale executor
+    // side of a mismatched pair by correcting it from the model's canonical
+    // handler; the model itself is never replaced from another source.
+    if let Some(model) = model.as_deref()
+        && model.contains(':')
+    {
+        let handler = worksgood::dispatch::handler_for_model(model)
+            .as_str()
+            .to_string();
+        let same = executor == handler
+            || matches!((executor.as_str(), handler.as_str()), ("nex", "native"));
+        if !same {
+            executor = handler;
+        }
+    }
     (executor, model)
 }
 
@@ -1991,8 +2260,8 @@ fn resolve_chat_pty_executor_and_model_with_task(
 /// required: without it, codex prompts the user to approve every shell
 /// command (including `wg status`), so chat agents driven from the wg
 /// TUI cannot inspect the graph or call `wg add`. The user already
-/// authorized the chat agent implicitly by opening the TUI from their
-/// own terminal — same posture as the claude path
+/// authorized the chat agent by explicitly creating/selecting this chat from
+/// their own terminal — same posture as the claude path
 /// (`--dangerously-skip-permissions`).
 ///
 /// `prior_session_id` selects the resume strategy:
@@ -2028,8 +2297,8 @@ pub fn build_codex_chat_pty_args(
     } else {
         Vec::new()
     };
-    // Always bypass approvals + sandbox: the user authorized the chat
-    // agent implicitly by opening the TUI. Without this, codex prompts
+    // Always bypass approvals + sandbox: the user authorized this chat through
+    // an explicit New-chat/create action. Without this, codex prompts
     // the user for every `wg` command the chat agent runs and the
     // agent cannot do its job. Mirrors the claude path's
     // `--dangerously-skip-permissions`.
@@ -2742,8 +3011,22 @@ impl LauncherState {
 /// What action a choice dialog will perform when an option is selected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChoiceDialogAction {
-    /// Remove/archive/stop a coordinator by its ID.
-    RemoveCoordinator(u32),
+    /// Identity-pinned close/lifecycle choices for one live chat.
+    CloseChat(ChatCloseContext),
+    /// Navigation/actions for the exact task named in the contextual row.
+    TaskContext(String),
+    /// Navigation/actions for the Workspace/system context.
+    WorkspaceContext,
+}
+
+/// Immutable identity shown in both stages of the live-chat Close flow.
+/// Capturing it when the modal opens prevents a later selection change or
+/// delayed graph refresh from acting on a different chat than the one named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatCloseContext {
+    pub identity: ActiveChatIdentity,
+    pub task_status: String,
+    pub connection: String,
 }
 
 /// State for a choice dialog with multiple selectable options.
@@ -3488,7 +3771,7 @@ fn save_chat_history_with_skip(
     messages: &[ChatMessage],
     skipped_count: usize,
 ) {
-    let config = Config::load_or_default(workgraph_dir);
+    let config = load_tui_config(workgraph_dir);
     if !config.tui.chat_history {
         return;
     }
@@ -3556,7 +3839,7 @@ fn load_persisted_chat_history_paginated(
     coordinator_id: u32,
     limit: usize,
 ) -> PaginatedChatHistory {
-    let config = Config::load_or_default(workgraph_dir);
+    let config = load_tui_config(workgraph_dir);
     if !config.tui.chat_history {
         return PaginatedChatHistory {
             messages: vec![],
@@ -3769,6 +4052,9 @@ fn load_persisted_chat_history(
 /// Persisted TUI state for focus restoration across restarts.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct PersistedTuiState {
+    /// Desired inspector layout. Coordinates are intentionally never persisted.
+    #[serde(default)]
+    layout: LayoutPreference,
     /// Which coordinator was focused when the TUI was last closed.
     #[serde(default)]
     active_coordinator_id: u32,
@@ -3793,17 +4079,34 @@ fn save_tui_state(
     tab: &RightPanelTab,
     open_tabs: &[String],
 ) {
+    // Tab-only callers must preserve an already-persisted layout preference.
+    let layout = load_tui_state(workgraph_dir)
+        .map(|state| state.layout)
+        .unwrap_or_default();
+    save_tui_state_with_layout(workgraph_dir, coordinator_id, tab, open_tabs, layout);
+}
+
+fn save_tui_state_with_layout(
+    workgraph_dir: &std::path::Path,
+    coordinator_id: u32,
+    tab: &RightPanelTab,
+    open_tabs: &[String],
+    layout: LayoutPreference,
+) {
     let active = worksgood::chat_id::format_chat_task_id(coordinator_id);
     let state = PersistedTuiState {
+        layout: layout.bounded(),
         active_coordinator_id: coordinator_id,
         right_panel_tab: format!("{:?}", tab),
         open_tabs: open_tabs.to_vec(),
         active,
     };
     if let Ok(json) = serde_json::to_string(&state) {
-        if std::fs::write(tui_state_path(workgraph_dir), &json).is_err() {
-            eprintln!("wg: warning: failed to persist TUI tab state");
-        }
+        // Best-effort state persistence must remain terminal-silent. The TUI
+        // owns stdout/stderr while ratatui is in the alternate screen; writing
+        // a warning there would desynchronize the physical and diff buffers.
+        let _ =
+            worksgood::atomic_file::write_atomic(&tui_state_path(workgraph_dir), json.as_bytes());
     }
 }
 
@@ -3974,6 +4277,11 @@ pub struct DashboardCoordinatorCard {
 #[derive(Clone, Debug)]
 pub struct PendingChatPtySpawn {
     pub task_id: String,
+    /// True when the authoritative graph proved the chat live and the
+    /// prioritized lane found an already-running tmux session. In this case
+    /// `bin`/`args` are never used to create a process: attach must fail closed
+    /// rather than falling back to a duplicate handler.
+    pub reattach: bool,
     pub bin: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -3983,6 +4291,48 @@ pub struct PendingChatPtySpawn {
     /// runs inside the named session and survives TUI exit. None falls
     /// back to plain `spawn_in` (used when tmux is not on PATH).
     pub tmux_session: Option<String>,
+}
+
+/// Canonical environment for every TUI-owned chat child. `WG_CHAT_ID` names
+/// the exact graph task while `WG_CHAT_REF` preserves the session-dir alias.
+fn chat_pty_env(
+    workgraph_dir: &std::path::Path,
+    task_id: &str,
+    chat_ref: &str,
+    executor: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("WG_DIR".to_string(), workgraph_dir.display().to_string()),
+        ("WG_CHAT_REF".to_string(), chat_ref.to_string()),
+        ("WG_CHAT_ID".to_string(), task_id.to_string()),
+        ("WG_EXECUTOR_TYPE".to_string(), executor.to_string()),
+        ("TERM".to_string(), "xterm-256color".to_string()),
+    ]
+}
+
+/// Immutable identity and atomic handler route for one selected chat surface.
+///
+/// The header, tab highlight, PTY lookup, and rendered terminal all key off the
+/// same coordinator id. Executor and model are captured from one authoritative
+/// metadata generation; a missing model means the selected handler's own
+/// default, never a model borrowed from unrelated global configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveChatIdentity {
+    pub coordinator_id: u32,
+    pub task_id: String,
+    pub label: String,
+    pub executor: Option<String>,
+    pub model: Option<String>,
+}
+
+/// State of the prioritized active-chat startup lane.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ChatStartupState {
+    #[default]
+    Loading,
+    Ready,
+    Empty,
+    Error(String),
 }
 
 /// Info recorded when a chat agent PTY process exits unexpectedly.
@@ -6854,6 +7204,12 @@ pub struct TaskCounts {
     pub done: usize,
     pub open: usize,
     pub in_progress: usize,
+    /// Open tasks whose dependencies are currently satisfied.
+    pub ready: usize,
+    /// Evaluation states are surfaced separately because they require action.
+    pub pending_eval: usize,
+    /// Every canonical chat task, including archived/terminal identities.
+    pub inspectable_chats: usize,
     pub failed: usize,
     pub blocked: usize,
     pub archived: usize,
@@ -7106,6 +7462,13 @@ pub struct VizApp {
     pub fullscreen_bottom_hover: bool,
     /// The tab bar area inside the right panel from the last render frame.
     pub last_tab_bar_area: Rect,
+    /// Exact controls rendered in the single contextual row. These are routed
+    /// before PTY/content capture, so every visible glyph is a real control.
+    pub last_context_picker_area: Rect,
+    pub last_context_prev_area: Rect,
+    pub last_context_next_area: Rect,
+    pub last_context_menu_area: Rect,
+    pub last_context_pulse_area: Rect,
     /// The iteration navigator widget area within the tab bar for mouse click handling.
     pub last_iteration_nav_area: Rect,
     /// The content area inside the right panel (below tab bar) from the last render frame.
@@ -7114,6 +7477,13 @@ pub struct VizApp {
     pub last_chat_input_area: Rect,
     /// The chat message history area from the last render frame (for click-to-focus).
     pub last_chat_message_area: Rect,
+    /// Pointer controls in the active-chat identity header. These live outside
+    /// the PTY hit region and are routed before terminal forwarding.
+    pub last_chat_prev_area: Rect,
+    pub last_chat_next_area: Rect,
+    pub last_chat_picker_area: Rect,
+    /// Full labeled Close… target in the live-chat identity header.
+    pub last_chat_close_area: Rect,
     /// The coordinator tab bar area from the last render frame (for click support).
     pub last_coordinator_bar_area: Rect,
     /// Per-tab hit areas for coordinator tab bar click testing.
@@ -7232,9 +7602,14 @@ pub struct VizApp {
     pub right_panel_percent: u16,
     /// HUD panel size preset (Normal = ~1/3, Expanded = ~2/3).
     pub hud_size: HudSize,
-    /// Layout mode for five-state cycle (1/3 → 1/2 → 2/3 → full → off).
+    /// Legacy presentation bracket retained for existing shortcuts/rendering.
+    /// `layout_preference` is the authoritative desired state.
     pub layout_mode: LayoutMode,
-    /// Current responsive breakpoint (recomputed each frame from terminal width).
+    /// Authoritative desired inspector state (dock, bounded ratio, mode).
+    pub layout_preference: LayoutPreference,
+    /// Visible command-mode layout editor, when open.
+    pub layout_overlay: Option<LayoutOverlayState>,
+    /// Current responsive breakpoint (updated with hysteresis from the viewport).
     pub responsive_breakpoint: ResponsiveBreakpoint,
     /// Hysteresis: whether inspector is currently laid out beside (right) rather than below.
     /// Used to prevent oscillation at the SIDE_MIN_WIDTH boundary.
@@ -7369,6 +7744,20 @@ pub struct VizApp {
     /// scrollback when the user opens a chat tab with multi-screen
     /// history (fix-pty-scrollback).
     pub pending_chat_pty_spawn: Option<PendingChatPtySpawn>,
+    /// Prioritized active-chat metadata state, rendered independently of the
+    /// full project snapshot.
+    pub chat_startup_state: ChatStartupState,
+    /// Identity and route coherent with `active_coordinator_id`. This is
+    /// replaced in the same state transition as chat selection; delayed PTY
+    /// or graph results are never allowed to rewrite it for a different id.
+    pub active_chat_identity: Option<ActiveChatIdentity>,
+    /// Fixed worker for tmux attach/new-session and PTY creation.
+    chat_pty_engine: Option<super::chat_startup::PtyEngine>,
+    /// Keystrokes accepted while an authoritative chat is connecting. Bounded
+    /// so startup cannot turn an unresponsive child into unbounded memory.
+    pub pending_chat_keys: VecDeque<crossterm::event::KeyEvent>,
+    first_chat_key_accepted: bool,
+    first_chat_key_echo_pending: bool,
 
     /// Per-coordinator death info: set when a chat agent PTY exits unexpectedly.
     /// Cleared by the user pressing R (retry), X (dismiss), or E (edit config).
@@ -7560,8 +7949,16 @@ pub struct VizApp {
     pub divider_drag_start_col: u16,
     /// The row where a horizontal divider drag started.
     pub divider_drag_start_row: u16,
+    /// Immutable geometry snapshot for a dock/divider adjustment.
+    pub layout_drag: Option<LayoutDragSnapshot>,
+    /// Current main viewport, refreshed by the renderer. Used to reject stale
+    /// pointer coordinates after SIGWINCH/phone rotation.
+    pub layout_viewport: Rect,
     /// Last mouse position during a graph-body drag-to-pan gesture (col, row).
     pub graph_pan_last: Option<(u16, u16)>,
+    /// True only between pointer-down/up when the press landed on empty graph
+    /// canvas and has not moved. Release selects Workspace without a modal.
+    pub workspace_click_pending: bool,
 
     /// Vertical scrollbar area for the graph pane (set each frame by renderer).
     pub last_graph_scrollbar_area: Rect,
@@ -7596,8 +7993,9 @@ pub struct VizApp {
     pub touch_echoes: Vec<TouchEcho>,
 
     // ── Keyboard enhancement ──
-    /// Whether the kitty keyboard protocol was successfully enabled.
-    /// When true, Shift+Enter is distinguishable from Enter.
+    /// Whether Kitty keyboard disambiguation was successfully negotiated over
+    /// a reliable outer transport. False under mosh even when TERM claims
+    /// support; only when true is Shift+Enter distinguishable from Enter.
     pub has_keyboard_enhancement: bool,
 
     pub editor_handler: EditorEventHandler,
@@ -7693,6 +8091,11 @@ pub struct VizApp {
     /// Versioned, bounded initial-load worker.  It is started only after the
     /// storage-independent first frame has been painted.
     bootstrap: Option<super::bootstrap::BootstrapEngine>,
+    /// Independent prioritized lane for persisted active-chat metadata and
+    /// authoritative route/tmux preparation.
+    chat_startup: Option<super::chat_startup::Engine>,
+    /// Nonblocking startup milestone reporter.
+    startup_reporter: Option<super::chat_startup::Reporter>,
     /// Bounded latest-wins CPU worker for all graph-sized presentation work.
     snapshot_engine: Option<super::snapshot_engine::SnapshotEngine>,
     /// Monotonic generation of the currently installed graph view.
@@ -7758,7 +8161,7 @@ impl VizApp {
         let graph_mtime = std::fs::metadata(workgraph_dir.join("graph.jsonl"))
             .and_then(|m| m.modified())
             .ok();
-        let config = Config::load_or_default(&workgraph_dir);
+        let config = load_tui_config(&workgraph_dir);
         let configured_show_keys = config.tui.show_keys;
         viz_options.edge_color = config.viz.edge_color.clone();
         let mut app = Self::build(
@@ -7781,6 +8184,363 @@ impl VizApp {
         app.rebuild_snapshot_indexes();
         app.visible_usage = app.compute_visible_token_usage();
         Ok(app.into_bootstrap_apply())
+    }
+
+    fn chat_identity_from_task(
+        coordinator_id: u32,
+        task: &worksgood::graph::Task,
+    ) -> ActiveChatIdentity {
+        let fallback_label = format!("Chat {coordinator_id}");
+        let title = task.title.trim();
+        let label =
+            if title.is_empty() || title == task.id || title.eq_ignore_ascii_case("coordinator") {
+                fallback_label
+            } else {
+                title.to_string()
+            };
+        ActiveChatIdentity {
+            coordinator_id,
+            task_id: task.id.clone(),
+            label,
+            executor: task
+                .executor_preset_name
+                .clone()
+                .or_else(|| (!task.command_argv.is_empty()).then(|| "command".to_string())),
+            model: task.model.clone(),
+        }
+    }
+
+    fn chat_identity_from_graph(&self, coordinator_id: u32) -> Option<ActiveChatIdentity> {
+        self.coherent_graph()?.tasks().find_map(|task| {
+            let task_cid = worksgood::chat_id::parse_chat_task_id(&task.id)
+                .or_else(|| (task.id == ".coordinator").then_some(0));
+            (task_cid == Some(coordinator_id)
+                && !task.tags.iter().any(|tag| tag == "archived")
+                && task
+                    .tags
+                    .iter()
+                    .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag)))
+            .then(|| Self::chat_identity_from_task(coordinator_id, task))
+        })
+    }
+
+    fn selected_chat_identity_or_placeholder(&self) -> Option<ActiveChatIdentity> {
+        let coordinator_id = self.active_coordinator_id;
+        if let Some(identity) = self
+            .active_chat_identity
+            .as_ref()
+            .filter(|identity| identity.coordinator_id == coordinator_id)
+        {
+            return Some(identity.clone());
+        }
+        if !self.active_tabs.contains(&coordinator_id) {
+            return None;
+        }
+        Some(ActiveChatIdentity {
+            coordinator_id,
+            task_id: worksgood::chat_id::format_chat_task_id(coordinator_id),
+            label: format!("Chat {coordinator_id}"),
+            executor: None,
+            model: None,
+        })
+    }
+
+    /// One immutable per-frame selection snapshot. Renderers use its task id
+    /// both for the identity header and the PTY lookup, preventing a delayed
+    /// result or rapid tab switch from producing a header/content mismatch.
+    pub fn active_chat_view_identity(&self) -> Option<ActiveChatIdentity> {
+        self.selected_chat_identity_or_placeholder()
+    }
+
+    /// Snapshot the exact currently-selected live chat for the Close… modal.
+    /// Terminal/archived tasks deliberately return `None`: they are task
+    /// Detail surfaces and must never expose live-agent lifecycle controls.
+    pub fn chat_close_context(&self, coordinator_id: u32) -> Option<ChatCloseContext> {
+        let graph = self.coherent_graph()?;
+        let task = graph.tasks().find(|task| {
+            let cid = worksgood::chat_id::parse_chat_task_id(&task.id)
+                .or_else(|| (task.id == ".coordinator").then_some(0));
+            cid == Some(coordinator_id)
+                && !task.status.is_terminal()
+                && !task.tags.iter().any(|tag| tag == "archived")
+        })?;
+        let identity = Self::chat_identity_from_task(coordinator_id, task);
+        let connection = if coordinator_id == self.active_coordinator_id {
+            self.active_chat_connection_label(&identity.task_id)
+        } else {
+            "background"
+        };
+        Some(ChatCloseContext {
+            task_status: task.status.to_string(),
+            connection: connection.to_string(),
+            identity,
+        })
+    }
+
+    pub fn active_chat_connection_label(&self, task_id: &str) -> &'static str {
+        match &self.chat_startup_state {
+            ChatStartupState::Loading => "loading",
+            ChatStartupState::Empty => "no selection",
+            ChatStartupState::Error(_) => "unavailable",
+            ChatStartupState::Ready if self.task_panes.contains_key(task_id) => "connected",
+            ChatStartupState::Ready
+                if self
+                    .pending_chat_pty_spawn
+                    .as_ref()
+                    .is_some_and(|pending| pending.task_id == task_id) =>
+            {
+                "connecting"
+            }
+            ChatStartupState::Ready if self.chat_pty_mode => "connecting",
+            ChatStartupState::Ready => "disconnected",
+        }
+    }
+
+    fn update_active_chat_route(&mut self, task_id: &str, executor: String, model: Option<String>) {
+        let coordinator_id = self.active_coordinator_id;
+        let mut identity = self
+            .selected_chat_identity_or_placeholder()
+            .unwrap_or_else(|| ActiveChatIdentity {
+                coordinator_id,
+                task_id: task_id.to_string(),
+                label: format!("Chat {coordinator_id}"),
+                executor: None,
+                model: None,
+            });
+        if identity.coordinator_id != coordinator_id || identity.task_id != task_id {
+            return;
+        }
+        identity.executor = Some(executor);
+        identity.model = model;
+        self.active_chat_identity = Some(identity);
+    }
+
+    /// Load only the authoritative active-chat lane. This deliberately skips
+    /// graph layout, stats, agent/log enrichment and persisted chat history.
+    /// The resulting closure is a small state swap on the terminal thread.
+    pub(super) fn load_chat_startup(workgraph_dir: PathBuf) -> Result<BootstrapApply> {
+        // Read the tiny persisted selector first. In the normal resume case it
+        // lets the scanner stop at the one authoritative task instead of
+        // parsing the complete graph or waiting for layout/enrichment.
+        let state_path = tui_state_path(&workgraph_dir);
+        let persisted = match std::fs::read_to_string(&state_path) {
+            Ok(data) => Some(
+                serde_json::from_str::<PersistedTuiState>(&data).with_context(|| {
+                    format!(
+                        "active chat metadata is corrupt: {} (remove it or press r after repair)",
+                        state_path.display()
+                    )
+                })?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("active chat metadata unreadable: {}", state_path.display())
+                });
+            }
+        };
+        let requested = persisted.as_ref().map(|state| state.active_coordinator_id);
+        let saved_layout = persisted
+            .as_ref()
+            .map(|state| state.layout)
+            .unwrap_or_default();
+
+        // graph.jsonl is atomically replaced, so this streaming read sees one
+        // coherent file generation. Parse only chat candidates; with a saved
+        // active id, return as soon as its exact task is found. This keeps full
+        // graph construction, edge indexing, layout and history off the chat
+        // startup dependency chain.
+        let graph_path = workgraph_dir.join("graph.jsonl");
+        let file = std::fs::File::open(&graph_path).with_context(|| {
+            format!(
+                "active chat metadata unavailable: {} could not be opened",
+                graph_path.display()
+            )
+        })?;
+        let mut selected: Option<(u32, worksgood::graph::Task)> = None;
+        for (line_index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.with_context(|| {
+                format!(
+                    "active chat metadata unreadable at {}:{}",
+                    graph_path.display(),
+                    line_index + 1
+                )
+            })?;
+            let candidate = if let Some(active) = requested {
+                line.contains(&format!(".chat-{active}"))
+                    || line.contains(&format!(".coordinator-{active}"))
+                    || (active == 0 && line.contains(".coordinator"))
+            } else {
+                line.contains("chat-loop") || line.contains("coordinator-loop")
+            };
+            if !candidate {
+                continue;
+            }
+            let node: worksgood::graph::Node = serde_json::from_str(&line).with_context(|| {
+                format!(
+                    "active chat metadata is corrupt at {}:{}",
+                    graph_path.display(),
+                    line_index + 1
+                )
+            })?;
+            let worksgood::graph::Node::Task(task) = node else {
+                continue;
+            };
+            if !task
+                .tags
+                .iter()
+                .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag))
+            {
+                continue;
+            }
+            let Some(cid) = worksgood::chat_id::parse_chat_task_id(&task.id)
+                .or_else(|| (task.id == ".coordinator").then_some(0))
+            else {
+                continue;
+            };
+            if requested.is_some_and(|active| active != cid) {
+                continue;
+            }
+            let live = !task.status.is_terminal() && !task.tags.iter().any(|tag| tag == "archived");
+            if !live {
+                if requested == Some(cid) {
+                    anyhow::bail!(
+                        "saved active chat .chat-{cid} is no longer live; choose a live tab or remove {}",
+                        state_path.display()
+                    );
+                }
+                continue;
+            }
+            if requested.is_some() {
+                selected = Some((cid, task));
+                break;
+            }
+            if selected
+                .as_ref()
+                .is_none_or(|(selected_cid, _)| cid < *selected_cid)
+            {
+                selected = Some((cid, task));
+            }
+        }
+
+        let Some((active, task)) = selected else {
+            if let Some(active) = requested {
+                anyhow::bail!(
+                    "saved active chat .chat-{active} no longer exists; choose a live tab or remove {}",
+                    state_path.display()
+                );
+            }
+            return Ok(Box::new(|app| {
+                app.chat_startup_state = ChatStartupState::Empty;
+                app.active_chat_identity = None;
+                app.active_tabs.clear();
+                app.cached_chat_tab_entries.clear();
+            }));
+        };
+
+        // Route validation precedes every write/reattach operation. A missing
+        // or corrupt legacy route is not permission to consult the active
+        // profile (or silently pick Claude/Pi); bootstrap remains graph-only.
+        chat_has_atomic_execution_identity(&workgraph_dir, active, &task)?;
+
+        let task_id = task.id.clone();
+        let mut active_graph = worksgood::graph::WorkGraph::new();
+        active_graph.add_node(worksgood::graph::Node::Task(task.clone()));
+        let graph = Arc::new(active_graph);
+        let mut loader = Self::build(
+            workgraph_dir.clone(),
+            VizOptions::default(),
+            Some(false),
+            None,
+            true,
+            Config::default(),
+            None,
+            false,
+        );
+        loader.published_graph = Some(graph.clone());
+        loader.active_coordinator_id = active;
+        loader.active_tabs = vec![active];
+        loader.active_chat_identity = Some(Self::chat_identity_from_task(active, &task));
+        loader.refresh_chat_tab_caches(&graph);
+
+        let project_root = workgraph_dir
+            .parent()
+            .unwrap_or(&workgraph_dir)
+            .to_path_buf();
+        let chat_ref = worksgood::chat_id::format_chat_session_ref(active);
+        let tmux_session =
+            worksgood::chat_id::prepare_chat_tmux_session_for_id(&workgraph_dir, active);
+        let existing_tmux = crate::tui::pty_pane::tmux_available()
+            && crate::tui::pty_pane::tmux_has_session(&tmux_session);
+
+        if existing_tmux {
+            // Claim the already-running pane for this TUI before publication.
+            // Without the same sentinel used by the normal spawn path, a
+            // concurrently-starting daemon can conclude the chat is
+            // unattended and respawn/replace the handler while we attach.
+            let chat_dir = worksgood::chat::chat_dir_for_ref(&workgraph_dir, &chat_ref);
+            std::fs::create_dir_all(&chat_dir).with_context(|| {
+                format!(
+                    "failed to prepare active chat directory {}",
+                    chat_dir.display()
+                )
+            })?;
+            worksgood::session_lock::write_tui_driver_sentinel(&chat_dir, std::process::id())
+                .with_context(|| {
+                    format!(
+                        "failed to claim existing chat pane {} before reattach",
+                        tmux_session
+                    )
+                })?;
+            loader.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
+                task_id,
+                reattach: true,
+                // Ignored by spawn_via_tmux when the session exists. Keeping a
+                // non-handler sentinel makes accidental fallback fail closed.
+                bin: "false".to_string(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cwd: Some(project_root),
+                executor: task
+                    .executor_preset_name
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                tmux_session: Some(tmux_session),
+            });
+            loader.chat_pty_mode = true;
+            loader.chat_pty_forwards_stdin = true;
+            loader.focused_panel = FocusedPanel::RightPanel;
+        } else {
+            // A new process requires an atomic authoritative route. All config,
+            // coordinator-state, session registration and tmux discovery remain
+            // on this worker; `maybe_auto_enable_chat_pty` only leaves a plan.
+            loader.maybe_auto_enable_chat_pty();
+        }
+
+        let entries = loader.cached_chat_tab_entries;
+        let id_set = loader.cached_coordinator_id_set;
+        let tabs = loader.active_tabs;
+        let pending = loader.pending_chat_pty_spawn;
+        let pty_mode = loader.chat_pty_mode;
+        let observer = loader.chat_pty_observer;
+        let forwards = loader.chat_pty_forwards_stdin;
+        let focused = loader.focused_panel;
+        let identity = loader.active_chat_identity;
+        Ok(Box::new(move |app| {
+            app.set_layout_preference(saved_layout);
+            app.active_coordinator_id = active;
+            app.active_tabs = tabs;
+            app.cached_chat_tab_entries = entries;
+            app.cached_coordinator_id_set = id_set;
+            app.pending_chat_pty_spawn = pending;
+            app.chat_pty_mode = pty_mode;
+            app.chat_pty_observer = observer;
+            app.chat_pty_forwards_stdin = forwards;
+            app.focused_panel = focused;
+            app.right_panel_tab = RightPanelTab::Chat;
+            app.chat_startup_state = ChatStartupState::Ready;
+            app.active_chat_identity = identity;
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7861,10 +8621,19 @@ impl VizApp {
             fullscreen_top_hover: false,
             fullscreen_bottom_hover: false,
             last_tab_bar_area: Rect::default(),
+            last_context_picker_area: Rect::default(),
+            last_context_prev_area: Rect::default(),
+            last_context_next_area: Rect::default(),
+            last_context_menu_area: Rect::default(),
+            last_context_pulse_area: Rect::default(),
             last_iteration_nav_area: Rect::default(),
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
             last_chat_message_area: Rect::default(),
+            last_chat_prev_area: Rect::default(),
+            last_chat_next_area: Rect::default(),
+            last_chat_picker_area: Rect::default(),
+            last_chat_close_area: Rect::default(),
             last_coordinator_bar_area: Rect::default(),
             coordinator_tab_hits: Vec::new(),
             coordinator_plus_hit: CoordinatorPlusHit::default(),
@@ -7913,6 +8682,20 @@ impl VizApp {
                 .panel_percent(),
             hud_size: HudSize::Normal,
             layout_mode: LayoutMode::from_config_str(&config.tui.default_inspector_size),
+            layout_preference: LayoutPreference {
+                dock: InspectorDock::Auto,
+                size_percent: LayoutMode::from_config_str(&config.tui.default_inspector_size)
+                    .panel_percent()
+                    .clamp(LayoutPreference::MIN_PERCENT, LayoutPreference::MAX_PERCENT),
+                mode: if LayoutMode::from_config_str(&config.tui.default_inspector_size)
+                    == LayoutMode::FullInspector
+                {
+                    InspectorMode::Full
+                } else {
+                    InspectorMode::Split
+                },
+            },
+            layout_overlay: None,
             responsive_breakpoint: ResponsiveBreakpoint::Full,
             inspector_is_beside: true,
             single_panel_view: SinglePanelView::Graph,
@@ -7953,6 +8736,12 @@ impl VizApp {
             last_chat_pty_activity_bump: None,
             chat_pty_forwards_stdin: false,
             pending_chat_pty_spawn: None,
+            chat_startup_state: ChatStartupState::Loading,
+            active_chat_identity: None,
+            chat_pty_engine: None,
+            pending_chat_keys: VecDeque::new(),
+            first_chat_key_accepted: false,
+            first_chat_key_echo_pending: false,
             chat_agent_death: HashMap::new(),
             chat_last_spawn_info: HashMap::new(),
             agent_monitor: AgentMonitorState::default(),
@@ -8009,7 +8798,10 @@ impl VizApp {
             divider_drag_start_pct: 0,
             divider_drag_start_col: 0,
             divider_drag_start_row: 0,
+            layout_drag: None,
+            layout_viewport: Rect::default(),
             graph_pan_last: None,
+            workspace_click_pending: false,
             last_graph_scrollbar_area: Rect::default(),
             last_panel_scrollbar_area: Rect::default(),
             graph_hscroll_activity: None,
@@ -8048,11 +8840,24 @@ impl VizApp {
             async_fs: super::async_fs::AsyncFs::new_unstarted(),
             auxiliary: super::auxiliary::Lane::new(),
             bootstrap: None,
+            chat_startup: None,
+            startup_reporter: None,
             snapshot_engine: None,
             snapshot_generation: 0,
             bootstrap_complete: load_storage,
         };
         if !load_storage {
+            // The storage-independent shell must publish an explicit neutral
+            // graph state on its very first frame. An empty line buffer makes
+            // the graph pane visually blank, so a real tmux/PTY observer has
+            // no proof that rendering happened before bootstrap storage
+            // returns. This placeholder is replaced atomically by the first
+            // BootstrapApply and never participates in task indexes.
+            app.lines = vec!["0 tasks".to_string()];
+            app.plain_lines = app.lines.clone();
+            app.search_lines = app.lines.clone();
+            app.max_line_width = app.lines[0].len();
+            app.scroll.content_height = 1;
             return app;
         }
         // Load graph once for both viz and stats on startup. This is the
@@ -8066,6 +8871,11 @@ impl VizApp {
             app.load_viz_from_graph(&graph);
             app.load_stats_from_graph(&graph);
             app.refresh_chat_tab_caches(&graph);
+            // Full bootstrap owns an authoritative complete graph. Publish it
+            // before startup housekeeping; otherwise coherent_graph() is None
+            // and orphan sweep interprets every persistent chat tmux pane as
+            // orphaned (the restart resurrection failure).
+            app.published_graph = Some(Arc::new(graph.clone()));
             app.async_fs.seed_graph(graph, graph_mtime);
         } else {
             app.lines = vec!["(error loading graph)".to_string()];
@@ -8073,11 +8883,15 @@ impl VizApp {
             app.search_lines = app.lines.clone();
             app.max_line_width = app.lines[0].len();
         }
-        // Restore TUI focus state from previous session (before ensure_user_coordinator
-        // so that the user's last-focused coordinator is preserved).
+        // Restore TUI focus state from previous session. Destructive tmux
+        // housekeeping is allowed only when this bootstrap successfully
+        // published a complete authoritative graph; a transient parse/open
+        // failure must never mean "zero live chats" and sweep every pane.
         app.restore_tui_state();
-        app.ensure_user_coordinator();
-        app.sync_active_tabs_from_graph();
+        if app.published_graph.is_some() {
+            app.maintain_existing_chat_sessions();
+            app.sync_active_tabs_from_graph();
+        }
         app.load_agent_monitor();
         app.check_coordinator_status();
         app.update_service_health();
@@ -8130,6 +8944,7 @@ impl VizApp {
         let cached_coordinator_id_set = std::mem::take(&mut self.cached_coordinator_id_set);
         let active_coordinator_id = self.active_coordinator_id;
         let active_tabs = std::mem::take(&mut self.active_tabs);
+        let active_chat_identity = self.active_chat_identity.take();
         self.chat.enforce_history_projection();
         let chat_messages = std::mem::take(&mut self.chat.messages);
         let chat_history = (
@@ -8193,11 +9008,25 @@ impl VizApp {
             app.fuzzy_match_index_by_line = fuzzy_match_index_by_line;
             app.task_snapshots = task_snapshots;
             app.sort_status_map = sort_status_map;
-            app.cached_chat_tab_entries = cached_chat_tab_entries;
+            if matches!(app.chat_startup_state, ChatStartupState::Ready) {
+                // Full bootstrap may fill the non-active tab list, but it must
+                // never move focus away from the independently verified active
+                // chat or replace its executor/model generation.
+                let prioritized_active = app.active_coordinator_id;
+                app.cached_chat_tab_entries = cached_chat_tab_entries;
+                app.cached_coordinator_id_set = cached_coordinator_id_set;
+                app.active_tabs = active_tabs;
+                if !app.active_tabs.contains(&prioritized_active) {
+                    app.active_tabs.push(prioritized_active);
+                }
+            } else {
+                app.cached_chat_tab_entries = cached_chat_tab_entries;
+                app.cached_coordinator_id_set = cached_coordinator_id_set;
+                app.active_coordinator_id = active_coordinator_id;
+                app.active_tabs = active_tabs;
+                app.active_chat_identity = active_chat_identity;
+            }
             app.cached_user_board_entries = cached_user_board_entries;
-            app.cached_coordinator_id_set = cached_coordinator_id_set;
-            app.active_coordinator_id = active_coordinator_id;
-            app.active_tabs = active_tabs;
             app.chat.messages = chat_messages;
             app.chat.enforce_history_projection();
             app.chat.outbox_cursor = chat_history.0;
@@ -8245,6 +9074,13 @@ impl VizApp {
             return;
         }
         self.async_fs.start();
+        let reporter = super::chat_startup::Reporter::new();
+        reporter.record("first_frame", None);
+        self.startup_reporter = Some(reporter);
+        self.chat_pty_engine = Some(super::chat_startup::PtyEngine::new());
+        let mut chat_startup = super::chat_startup::Engine::new();
+        chat_startup.request(self.workgraph_dir.clone());
+        self.chat_startup = Some(chat_startup);
         self.snapshot_engine = Some(super::snapshot_engine::SnapshotEngine::new());
         let args = super::bootstrap::BootstrapArgs {
             workgraph_dir: self.workgraph_dir.clone(),
@@ -8266,6 +9102,35 @@ impl VizApp {
     /// Accept at most one background result.  Generation checks happen in
     /// the broker; applying a coherent snapshot is an O(1) state swap.  Small
     /// interaction state owned by the UI survives a slow bootstrap.
+    fn poll_chat_startup(&mut self) -> bool {
+        let Some(engine) = self.chat_startup.as_mut() else {
+            return false;
+        };
+        let Some(result) = engine.try_result() else {
+            return false;
+        };
+        match result {
+            Ok(apply) => {
+                apply(self);
+                // An authoritative Empty result is a stable, non-mutating UI
+                // state. Chat creation is intentionally reachable only from
+                // the explicit New-chat controls; bootstrap never resolves a
+                // route, writes graph/session state, or starts a provider.
+                if let Some(reporter) = self.startup_reporter.as_ref() {
+                    let detail = format!(".chat-{}", self.active_coordinator_id);
+                    reporter.record("active_chat_metadata_ready", Some(&detail));
+                }
+            }
+            Err(message) => {
+                self.chat_startup_state = ChatStartupState::Error(message.clone());
+                if let Some(reporter) = self.startup_reporter.as_ref() {
+                    reporter.record("active_chat_metadata_error", Some(&message));
+                }
+            }
+        }
+        true
+    }
+
     fn poll_bootstrap(&mut self) -> bool {
         let Some(engine) = self.bootstrap.as_mut() else {
             return false;
@@ -8291,6 +9156,51 @@ impl VizApp {
 
     pub fn bootstrap_feedback(&self) -> Option<String> {
         self.bootstrap.as_ref().and_then(|b| b.feedback())
+    }
+
+    pub fn record_first_chat_key_accepted(&mut self) {
+        if self.first_chat_key_accepted {
+            return;
+        }
+        self.first_chat_key_accepted = true;
+        self.first_chat_key_echo_pending = true;
+        if let Some(reporter) = self.startup_reporter.as_ref() {
+            reporter.record("first_keystroke_accepted", None);
+        }
+    }
+
+    pub fn record_first_chat_key_echoed(&mut self) {
+        if !self.first_chat_key_echo_pending {
+            return;
+        }
+        self.first_chat_key_echo_pending = false;
+        if let Some(reporter) = self.startup_reporter.as_ref() {
+            reporter.record("first_keystroke_echoed", None);
+        }
+    }
+
+    pub fn chat_is_connecting(&self) -> bool {
+        if matches!(self.chat_startup_state, ChatStartupState::Loading) {
+            return true;
+        }
+        if !matches!(self.chat_startup_state, ChatStartupState::Ready) || !self.chat_pty_mode {
+            return false;
+        }
+        let task_id = worksgood::chat_id::format_chat_task_id(self.active_coordinator_id);
+        !self.task_panes.contains_key(&task_id)
+            && (self.pending_chat_pty_spawn.is_some()
+                || self
+                    .chat_pty_engine
+                    .as_ref()
+                    .is_some_and(super::chat_startup::PtyEngine::in_flight))
+    }
+
+    pub fn retry_chat_startup(&mut self) {
+        self.chat_startup_state = ChatStartupState::Loading;
+        self.pending_chat_keys.clear();
+        let mut engine = super::chat_startup::Engine::new();
+        engine.request(self.workgraph_dir.clone());
+        self.chat_startup = Some(engine);
     }
 
     fn graph_view_key(&self) -> GraphViewKey {
@@ -8570,6 +9480,11 @@ impl VizApp {
         self.cached_chat_tab_entries = std::mem::take(&mut snapshot.cached_chat_tab_entries);
         self.cached_user_board_entries = std::mem::take(&mut snapshot.cached_user_board_entries);
         self.cached_coordinator_id_set = std::mem::take(&mut snapshot.cached_coordinator_id_set);
+        let newly_published_chat = self.pending_new_chat_focus.filter(|cid| {
+            self.cached_coordinator_id_set.contains_key(cid)
+                && *cid == self.active_coordinator_id
+                && !self.closed_tabs.contains(cid)
+        });
         for toast in std::mem::take(&mut snapshot.toasts) {
             self.push_toast(toast.message, toast.severity);
         }
@@ -8617,6 +9532,18 @@ impl VizApp {
         if let Some(engine) = self.snapshot_engine.as_mut() {
             engine.retire(old);
         }
+        if let Some(cid) = newly_published_chat {
+            self.pending_new_chat_focus = None;
+            self.active_chat_identity = self.chat_identity_from_graph(cid);
+            if !self
+                .task_panes
+                .contains_key(&worksgood::chat_id::format_chat_task_id(cid))
+                && self.pending_chat_pty_spawn.is_none()
+            {
+                self.maybe_auto_enable_chat_pty();
+            }
+        }
+        self.retry_chat_startup_if_authoritative_chat_appeared();
     }
 
     fn poll_graph_snapshot(&mut self) -> bool {
@@ -9200,15 +10127,10 @@ impl VizApp {
             },
             None => return,
         };
-        if let Some(cid) = worksgood::chat_id::parse_chat_task_id(&selected_id) {
-            if cid != self.active_coordinator_id {
-                self.switch_coordinator(cid);
-                // Only switch to Chat tab when actually changing coordinators.
-                self.right_panel_tab = RightPanelTab::Chat;
-            }
-        } else if selected_id == ".coordinator" && self.active_coordinator_id != 0 {
-            self.switch_coordinator(0);
-            self.right_panel_tab = RightPanelTab::Chat;
+        if worksgood::chat_id::parse_chat_task_id(&selected_id).is_some()
+            || selected_id == ".coordinator"
+        {
+            self.open_chat_task_or_detail(&selected_id);
         } else if worksgood::graph::is_user_board(&selected_id) {
             // Switch to Messages tab for user board tasks.
             self.right_panel_tab = RightPanelTab::Messages;
@@ -9894,6 +10816,16 @@ impl VizApp {
 
         for task in graph.tasks() {
             counts.total += 1;
+            if task
+                .tags
+                .iter()
+                .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag))
+            {
+                counts.inspectable_chats += 1;
+            }
+            if matches!(task.status, Status::PendingEval | Status::FailedPendingEval) {
+                counts.pending_eval += 1;
+            }
             // Active states (InProgress, PendingValidation, PendingEval) are
             // counted as "in_progress" so the HUD's "X running" matches the
             // tasks viz highlights yellow. See `Status::is_active`.
@@ -10105,6 +11037,7 @@ impl VizApp {
             0
         };
 
+        counts.ready = worksgood::query::ready_tasks(graph).len();
         self.task_snapshots = Arc::new(new_snapshots);
         self.task_counts = counts;
         self.total_usage = total_usage;
@@ -10215,6 +11148,14 @@ impl VizApp {
     /// Returns `true` if any work was done (graph reloaded, service polled, etc.).
     pub fn maybe_refresh(&mut self) -> bool {
         let auxiliary_changed = self.poll_auxiliary_snapshots();
+        // Chat metadata and PTY completion have priority over every unrelated
+        // full-project snapshot. Poll both even while bootstrap is loading.
+        if self.poll_chat_startup() {
+            return true;
+        }
+        if self.poll_chat_pty_spawn() {
+            return true;
+        }
         if self.poll_bootstrap() {
             return true;
         }
@@ -10237,6 +11178,8 @@ impl VizApp {
         // cached-stat values reflect the worker's most recent results
         // without ever blocking on disk. (See `async_fs.rs`.)
         let async_changes = self.async_fs.drain_responses();
+        self.async_fs
+            .request_disk_snapshot(self.workgraph_dir.clone());
         if async_changes.graph
             && self.graph_reload_pending
             && let Some((graph, graph_mtime)) = self.async_fs.cached_graph()
@@ -10463,15 +11406,17 @@ impl VizApp {
         // indicators stay fresh even when the reload is slow.
         self.last_refresh_display = chrono::Local::now().format("%H:%M:%S").to_string();
 
-        // Update coordinator status and poll for new chat messages on every refresh tick.
-        if self.chat.awaiting_response() || self.right_panel_tab == RightPanelTab::Chat {
-            self.request_chat_refresh();
-        }
-
-        // Poll service health every ~2 seconds for responsive agent count updates.
-        if self.service_health.last_poll.elapsed() >= std::time::Duration::from_secs(2) {
-            self.request_service_snapshot();
-        }
+        // Poll service health before chat when both are due. The auxiliary lane has a
+        // one-slot queue, so always submitting Chat first can prevent Service from ever
+        // entering the lane while the Chat tab is active. Chat is still attempted on the
+        // same tick and, while Service is pending, coalescing leaves the next queue slot
+        // available for it.
+        let chat_refresh_due =
+            self.chat.awaiting_response() || self.right_panel_tab == RightPanelTab::Chat;
+        let service_snapshot_due = self.service_health.last_poll.elapsed()
+            >= std::time::Duration::from_secs(2)
+            || self.time_counters.last_refresh.elapsed() >= std::time::Duration::from_secs(10);
+        self.request_periodic_auxiliary_snapshots(chat_refresh_due, service_snapshot_due);
 
         // Auto-refresh config panel when config.toml changes on disk,
         // but only when the user is not actively editing.
@@ -10486,10 +11431,6 @@ impl VizApp {
             if current_mtime != self.config_panel.last_config_mtime {
                 self.request_config_panel();
             }
-        }
-
-        if self.time_counters.last_refresh.elapsed() >= std::time::Duration::from_secs(10) {
-            self.request_service_snapshot();
         }
 
         // --- Heavy data refresh (graph-dependent) ---
@@ -11116,7 +12057,7 @@ impl VizApp {
                 .and_then(|s| s.parse::<u32>().ok());
             if let Some(cid) = coord_id {
                 let coord_state = CoordinatorState::load_for(&self.workgraph_dir, cid);
-                let config = Config::load_or_default(&self.workgraph_dir);
+                let config = load_tui_config(&self.workgraph_dir);
                 let executor = coord_state
                     .as_ref()
                     .and_then(|s| s.executor_override.clone())
@@ -13109,10 +14050,19 @@ impl VizApp {
             fullscreen_top_hover: false,
             fullscreen_bottom_hover: false,
             last_tab_bar_area: Rect::default(),
+            last_context_picker_area: Rect::default(),
+            last_context_prev_area: Rect::default(),
+            last_context_next_area: Rect::default(),
+            last_context_menu_area: Rect::default(),
+            last_context_pulse_area: Rect::default(),
             last_iteration_nav_area: Rect::default(),
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
             last_chat_message_area: Rect::default(),
+            last_chat_prev_area: Rect::default(),
+            last_chat_next_area: Rect::default(),
+            last_chat_picker_area: Rect::default(),
+            last_chat_close_area: Rect::default(),
             last_coordinator_bar_area: Rect::default(),
             coordinator_tab_hits: Vec::new(),
             coordinator_plus_hit: CoordinatorPlusHit::default(),
@@ -13160,6 +14110,12 @@ impl VizApp {
             right_panel_percent: 35,
             hud_size: HudSize::Normal,
             layout_mode: LayoutMode::ThirdInspector,
+            layout_preference: LayoutPreference {
+                dock: InspectorDock::Auto,
+                size_percent: 35,
+                mode: InspectorMode::Split,
+            },
+            layout_overlay: None,
             responsive_breakpoint: ResponsiveBreakpoint::Full,
             inspector_is_beside: true,
             single_panel_view: SinglePanelView::Graph,
@@ -13200,6 +14156,12 @@ impl VizApp {
             last_chat_pty_activity_bump: None,
             chat_pty_forwards_stdin: false,
             pending_chat_pty_spawn: None,
+            chat_startup_state: ChatStartupState::Ready,
+            active_chat_identity: None,
+            chat_pty_engine: None,
+            pending_chat_keys: VecDeque::new(),
+            first_chat_key_accepted: false,
+            first_chat_key_echo_pending: false,
             chat_agent_death: HashMap::new(),
             chat_last_spawn_info: HashMap::new(),
             agent_monitor: AgentMonitorState::default(),
@@ -13248,7 +14210,10 @@ impl VizApp {
             divider_drag_start_pct: 0,
             divider_drag_start_col: 0,
             divider_drag_start_row: 0,
+            layout_drag: None,
+            layout_viewport: Rect::default(),
             graph_pan_last: None,
+            workspace_click_pending: false,
             last_graph_scrollbar_area: Rect::default(),
             last_panel_scrollbar_area: Rect::default(),
             graph_hscroll_activity: None,
@@ -13295,6 +14260,8 @@ impl VizApp {
             async_fs: super::async_fs::AsyncFs::new(),
             auxiliary: super::auxiliary::Lane::new(),
             bootstrap: None,
+            chat_startup: None,
+            startup_reporter: None,
             snapshot_engine: None,
             snapshot_generation: 0,
             bootstrap_complete: true,
@@ -13310,6 +14277,134 @@ impl VizApp {
     }
 
     // ── Multi-panel methods ──
+
+    /// Apply desired state to the legacy presentation fields used by existing
+    /// panel code. The bounded split ratio is retained across Full/Hidden.
+    pub fn set_layout_preference(&mut self, preference: LayoutPreference) {
+        self.layout_preference = preference.bounded();
+        self.right_panel_percent = self.layout_preference.size_percent;
+        match self.layout_preference.mode {
+            InspectorMode::Split => {
+                self.layout_mode = Self::layout_mode_for_percent(self.right_panel_percent);
+                self.right_panel_visible = true;
+            }
+            InspectorMode::Full => {
+                self.layout_mode = LayoutMode::FullInspector;
+                self.right_panel_visible = true;
+                self.focused_panel = FocusedPanel::RightPanel;
+            }
+            InspectorMode::Hidden => {
+                self.layout_mode = LayoutMode::Off;
+                self.right_panel_visible = false;
+                self.focused_panel = FocusedPanel::Graph;
+            }
+        }
+    }
+
+    /// Cancel a coordinate-based adjustment and restore its pointer-down
+    /// desired state. Used by both the Resize event path and the renderer's
+    /// viewport guard so a queued stale Drag can never jump the divider.
+    pub fn cancel_layout_drag(&mut self) {
+        if let Some(snapshot) = self.layout_drag.take() {
+            self.set_layout_preference(snapshot.original);
+        }
+        if matches!(
+            self.scrollbar_drag,
+            Some(ScrollbarDragTarget::Divider) | Some(ScrollbarDragTarget::HorizontalDivider)
+        ) {
+            self.scrollbar_drag = None;
+        }
+    }
+
+    pub fn open_layout_overlay(&mut self) {
+        self.layout_overlay = Some(LayoutOverlayState {
+            original: self.layout_preference,
+            draft: self.layout_preference,
+            original_focus: self.focused_panel,
+            original_single_panel_view: self.single_panel_view,
+        });
+        self.input_mode = InputMode::Layout;
+    }
+
+    /// Update the visible modal draft and immediately derive the pane geometry
+    /// from it. Nothing is persisted until Enter, so Escape can still restore
+    /// the complete pre-modal snapshot after any number of live previews.
+    pub fn preview_layout_overlay(&mut self, draft: LayoutPreference) {
+        let draft = draft.bounded();
+        if let Some(overlay) = self.layout_overlay.as_mut() {
+            overlay.draft = draft;
+            self.set_layout_preference(draft);
+        }
+    }
+
+    pub fn cancel_layout_overlay(&mut self) {
+        if let Some(overlay) = self.layout_overlay.take() {
+            self.set_layout_preference(overlay.original);
+            self.focused_panel = overlay.original_focus;
+            self.single_panel_view = overlay.original_single_panel_view;
+        }
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn apply_layout_overlay(&mut self) {
+        if let Some(overlay) = self.layout_overlay.take() {
+            // The live preview already applied the draft. Re-apply it here so
+            // this method also remains correct for programmatic callers.
+            self.set_layout_preference(overlay.draft);
+            self.persist_tab_state();
+        }
+        self.input_mode = InputMode::Normal;
+    }
+
+    /// Responsive breakpoints have hysteresis at the compact boundary so a
+    /// one-cell resize cannot repeatedly flip split/single-panel layout.
+    pub fn update_responsive_breakpoint(&mut self, width: u16, height: u16) {
+        const COMPACT_ENTER_WIDTH: u16 = 50;
+        const COMPACT_LEAVE_WIDTH: u16 = 56;
+        const COMPACT_ENTER_HEIGHT: u16 = 12;
+        const COMPACT_LEAVE_HEIGHT: u16 = 14;
+
+        self.responsive_breakpoint = if self.responsive_breakpoint == ResponsiveBreakpoint::Compact
+        {
+            if width < COMPACT_LEAVE_WIDTH || height < COMPACT_LEAVE_HEIGHT {
+                ResponsiveBreakpoint::Compact
+            } else if width <= 80 {
+                ResponsiveBreakpoint::Narrow
+            } else {
+                ResponsiveBreakpoint::Full
+            }
+        } else if width < COMPACT_ENTER_WIDTH || height < COMPACT_ENTER_HEIGHT {
+            ResponsiveBreakpoint::Compact
+        } else if width <= 80 {
+            ResponsiveBreakpoint::Narrow
+        } else {
+            ResponsiveBreakpoint::Full
+        };
+    }
+
+    /// Resolve Auto with independent enter/leave widths. Explicit docks are
+    /// returned verbatim and never overwritten by responsive policy.
+    pub fn resolved_inspector_dock(&mut self, width: u16) -> InspectorDock {
+        match self.layout_preference.dock {
+            InspectorDock::Auto => {
+                let beside = if self.inspector_is_beside {
+                    width >= 100
+                } else {
+                    width >= 120
+                };
+                self.inspector_is_beside = beside;
+                if beside {
+                    InspectorDock::Right
+                } else {
+                    InspectorDock::Bottom
+                }
+            }
+            dock => {
+                self.inspector_is_beside = dock.is_horizontal();
+                dock
+            }
+        }
+    }
 
     /// Toggle focus between Graph and RightPanel.
     /// In compact mode, switches the single-panel view instead.
@@ -13379,14 +14474,16 @@ impl VizApp {
     /// Toggle right panel visibility.
     /// If in a non-split layout mode, resets to ThirdInspector mode first.
     pub fn toggle_right_panel(&mut self) {
-        if !self.layout_mode.has_graph() || !self.layout_mode.has_inspector() {
-            // Reset to default split mode, then apply the toggle.
-            self.layout_mode = LayoutMode::TwoThirdsInspector;
-        }
-        self.right_panel_visible = !self.right_panel_visible;
-        if !self.right_panel_visible {
-            self.focused_panel = FocusedPanel::Graph;
-        }
+        let mode = if self.layout_preference.mode == InspectorMode::Hidden {
+            InspectorMode::Split
+        } else {
+            InspectorMode::Hidden
+        };
+        self.set_layout_preference(LayoutPreference {
+            mode,
+            ..self.layout_preference
+        });
+        self.persist_tab_state();
     }
 
     /// Cycle HUD panel size between Normal (~1/3) and Expanded (~2/3).
@@ -13422,25 +14519,37 @@ impl VizApp {
             | LayoutMode::TwoThirdsInspector => {
                 self.right_panel_visible = true;
                 self.right_panel_percent = mode.panel_percent();
+                self.layout_preference.size_percent = self
+                    .right_panel_percent
+                    .clamp(LayoutPreference::MIN_PERCENT, LayoutPreference::MAX_PERCENT);
+                self.layout_preference.mode = InspectorMode::Split;
             }
             LayoutMode::FullInspector => {
                 self.right_panel_visible = true;
+                self.layout_preference.mode = InspectorMode::Full;
                 // Focus the right panel since it's the only visible content.
                 self.focused_panel = FocusedPanel::RightPanel;
             }
             LayoutMode::Off => {
                 self.right_panel_visible = false;
+                self.layout_preference.mode = InspectorMode::Hidden;
                 self.focused_panel = FocusedPanel::Graph;
             }
         }
+        self.persist_tab_state();
     }
 
     /// Restore the last normal split mode from FullInspector or Off.
     pub fn restore_from_extreme(&mut self) {
-        let mode = self.last_split_mode;
-        self.layout_mode = mode;
+        let percent = self
+            .last_split_percent
+            .clamp(LayoutPreference::MIN_PERCENT, LayoutPreference::MAX_PERCENT);
+        self.layout_preference.size_percent = percent;
+        self.layout_preference.mode = InspectorMode::Split;
+        self.layout_mode = Self::layout_mode_for_percent(percent);
         self.right_panel_visible = true;
-        self.right_panel_percent = self.last_split_percent;
+        self.right_panel_percent = percent;
+        self.persist_tab_state();
     }
 
     /// Cycle inspector view forward: closed → Chat → Detail → ... → CoordLog → closed.
@@ -13500,50 +14609,68 @@ impl VizApp {
         }
     }
 
-    /// Grow the viz (right) pane by 5% of panel_percent, transitioning to Off at max.
-    /// Steps: 5 → 10 → ... → 95 → 100 → Off (closes panel, full viz).
+    /// Grow the inspector by 5%. Split ratio remains bounded; Full and Hidden
+    /// are distinct desired modes rather than sentinel coordinates.
     pub fn grow_viz_pane(&mut self) {
-        if !self.right_panel_visible || self.layout_mode == LayoutMode::Off {
-            // Open panel at minimum size first
-            self.right_panel_visible = true;
-            self.layout_mode = LayoutMode::ThirdInspector;
-            self.right_panel_percent = 5;
-            return;
-        }
-        if self.right_panel_percent >= 100 {
-            // At maximum → transition to Off (full viz)
-            self.apply_layout_mode(LayoutMode::Off);
-        } else {
-            let new_pct = (self.right_panel_percent + 5).min(100);
-            let new_mode = Self::layout_mode_for_percent(new_pct);
-            // Save split state before entering FullInspector.
-            if self.layout_mode.is_normal_split() && !new_mode.is_normal_split() {
-                self.last_split_mode = self.layout_mode;
-                self.last_split_percent = self.right_panel_percent;
+        let next = match self.layout_preference.mode {
+            InspectorMode::Hidden => LayoutPreference {
+                mode: InspectorMode::Split,
+                size_percent: LayoutPreference::MIN_PERCENT,
+                ..self.layout_preference
+            },
+            InspectorMode::Full => LayoutPreference {
+                mode: InspectorMode::Hidden,
+                ..self.layout_preference
+            },
+            InspectorMode::Split
+                if self.layout_preference.size_percent >= LayoutPreference::MAX_PERCENT =>
+            {
+                LayoutPreference {
+                    mode: InspectorMode::Full,
+                    ..self.layout_preference
+                }
             }
-            self.right_panel_percent = new_pct;
-            self.layout_mode = new_mode;
-        }
+            InspectorMode::Split => LayoutPreference {
+                size_percent: (self.layout_preference.size_percent + 5)
+                    .min(LayoutPreference::MAX_PERCENT),
+                ..self.layout_preference
+            },
+        };
+        self.set_layout_preference(next);
+        self.persist_tab_state();
     }
 
-    /// Shrink the viz (right) pane by 5%, transitioning to Off at min.
-    /// Steps: 100 → 95 → ... → 10 → 5 → Off (closes panel, full viz).
+    /// Shrink the inspector by 5%, with Hidden below the bounded minimum.
     pub fn shrink_viz_pane(&mut self) {
-        if !self.right_panel_visible || self.layout_mode == LayoutMode::Off {
-            // Open panel at max size first
-            self.right_panel_visible = true;
-            self.layout_mode = LayoutMode::FullInspector;
-            self.right_panel_percent = 100;
-            self.focused_panel = FocusedPanel::RightPanel;
-            return;
-        }
-        if self.right_panel_percent <= 5 {
-            // At minimum → transition to Off (full viz)
-            self.apply_layout_mode(LayoutMode::Off);
-        } else {
-            self.right_panel_percent = self.right_panel_percent.saturating_sub(5).max(5);
-            self.layout_mode = Self::layout_mode_for_percent(self.right_panel_percent);
-        }
+        let next = match self.layout_preference.mode {
+            InspectorMode::Hidden => LayoutPreference {
+                mode: InspectorMode::Full,
+                ..self.layout_preference
+            },
+            InspectorMode::Full => LayoutPreference {
+                mode: InspectorMode::Split,
+                size_percent: LayoutPreference::MAX_PERCENT,
+                ..self.layout_preference
+            },
+            InspectorMode::Split
+                if self.layout_preference.size_percent <= LayoutPreference::MIN_PERCENT =>
+            {
+                LayoutPreference {
+                    mode: InspectorMode::Hidden,
+                    ..self.layout_preference
+                }
+            }
+            InspectorMode::Split => LayoutPreference {
+                size_percent: self
+                    .layout_preference
+                    .size_percent
+                    .saturating_sub(5)
+                    .max(LayoutPreference::MIN_PERCENT),
+                ..self.layout_preference
+            },
+        };
+        self.set_layout_preference(next);
+        self.persist_tab_state();
     }
 
     /// Map a percentage to the nearest LayoutMode bracket.
@@ -13593,10 +14720,28 @@ impl VizApp {
                 .parent()
                 .unwrap_or(&workgraph_dir)
                 .to_path_buf();
-            // Re-exec the running binary, not an unrelated/stale `wg` from
-            // PATH. This also keeps the TUI and its background commands on the
-            // same wire/storage version after an upgrade.
-            let wg_binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wg"));
+            // Re-exec the exact running image, not an unrelated/stale `wg`
+            // from PATH and not current_exe()'s display pathname. On Linux an
+            // atomic cargo-install/package upgrade leaves a live TUI whose
+            // current_exe is `<installed path> (deleted)`; `/proc/self/exe`
+            // remains the authoritative executable handle to those exact
+            // bytes. This keeps the TUI and background command on one
+            // wire/storage version even while the installed name changes.
+            let wg_binary = match worksgood::self_exe::direct_reexec_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = tx.send(CommandResult {
+                        success: false,
+                        output: format!(
+                            "Could not resolve the running WG executable ({}): {error}",
+                            worksgood::self_exe::display_identity()
+                        ),
+                        effect,
+                    });
+                    return;
+                }
+            };
+            let wg_identity = worksgood::self_exe::display_identity();
             std::thread::spawn(move || {
                 let result = isolated_wg_subprocess(&wg_binary, &workgraph_dir, &args)
                     .current_dir(&project_root)
@@ -13612,7 +14757,15 @@ impl VizApp {
                         };
                         (o.status.success(), combined)
                     }
-                    Err(e) => (false, format!("Failed to run wg: {}", e)),
+                    Err(error) => (
+                        false,
+                        format!(
+                            "Failed to execute current WG image via {} (running identity {}): {}",
+                            wg_binary.display(),
+                            wg_identity,
+                            error
+                        ),
+                    ),
                 };
                 let _ = tx.send(CommandResult {
                     success,
@@ -13755,7 +14908,17 @@ impl VizApp {
                         } else {
                             self.push_toast("New chat created".to_string(), ToastSeverity::Info);
                         }
+                        // This selector is the input to the prioritized retry
+                        // below, so commit it synchronously and atomically. A
+                        // deferred write could still point at the prior tab and
+                        // produce a false corrupt-metadata startup error.
                         self.persist_tab_state();
+                        // The create IPC is authoritative and graph persistence
+                        // completed before its response. Re-run the prioritized
+                        // active-chat lane now that tui-state points at the new
+                        // id; this resolves/spawns the saved route even when the
+                        // slower graph snapshot publication is still lagging.
+                        self.retry_chat_startup();
                     } else {
                         // Reset the in-flight flag so the user can fix
                         // their selection and retry without reopening
@@ -13776,6 +14939,13 @@ impl VizApp {
                             // "Failed provisioning ... renders an error
                             // state in the tab, not silent drop").
                             l.last_error = Some(err.clone());
+                        } else {
+                            // First-use auto-create has no launcher pane. Keep
+                            // the failure visible/actionable instead of leaving
+                            // startup in an endless Loading shell.
+                            self.chat_startup_state = ChatStartupState::Error(format!(
+                                "first chat could not be created: {err}; configure a route and press r"
+                            ));
                         }
                         self.push_toast(
                             format!("Failed to create chat: {}", err),
@@ -13885,9 +15055,31 @@ impl VizApp {
                 }
                 CommandEffect::StopCoordinator(cid) => {
                     if result.success {
+                        // `wg chat stop` terminates the daemon-owned handler and
+                        // resets the graph task to Open/resumable.  A TUI-owned
+                        // PTY is outside that daemon registry, so tear down the
+                        // identity-matching pane here as well; otherwise the
+                        // modal would claim "Stop" while the attached process
+                        // kept running.  Detach the now-stopped tab so no dead
+                        // composer is left on screen.
+                        let task_id = worksgood::chat_id::format_chat_task_id(cid);
+                        let chat_ref = format!("chat-{cid}");
+                        let chat_dir =
+                            worksgood::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
+                        worksgood::session_lock::clear_tui_driver_sentinel(&chat_dir);
+                        if let Some(mut pane) = self.task_panes.remove(&task_id) {
+                            pane.kill_underlying_session();
+                        } else {
+                            worksgood::chat_id::kill_chat_tmux_session_for_id(
+                                &self.workgraph_dir,
+                                cid,
+                            );
+                        }
+                        self.close_tab(cid);
                         self.force_refresh();
+                        self.persist_tab_state();
                         self.push_toast(
-                            format!("Stopped coordinator {}", cid),
+                            format!("Stopped chat agent {cid}; task remains resumable"),
                             ToastSeverity::Info,
                         );
                     } else {
@@ -14001,14 +15193,12 @@ impl VizApp {
 
     /// Refresh dashboard state from agent monitor data + coordinator state.
     pub fn load_dashboard(&mut self) {
-        use crate::commands::service::CoordinatorState;
-
         // ── Coordinator cards (one per coordinator) ──
         // Use fresh registry active_count for agents_alive instead of stale
         // CoordinatorState.agents_alive (which is only updated at tick boundaries).
         let fresh_alive =
             worksgood::AgentRegistry::load_or_warn(&self.workgraph_dir).active_count();
-        let all_states = CoordinatorState::load_all(&self.workgraph_dir);
+        let all_states = load_all_coordinator_states_read_only(&self.workgraph_dir);
         self.dashboard.coordinator_cards = if all_states.is_empty() {
             vec![DashboardCoordinatorCard {
                 id: 0,
@@ -14796,9 +15986,7 @@ impl VizApp {
     /// Poll service health: read state files to determine health level,
     /// stuck tasks, and recent errors.
     pub fn update_service_health(&mut self) {
-        use crate::commands::service::{
-            CoordinatorState, ServiceState, is_service_alive, log_file_path,
-        };
+        use crate::commands::service::{ServiceState, is_service_alive, log_file_path};
 
         let dir = self.workgraph_dir.clone();
         let dir = &dir;
@@ -14858,7 +16046,10 @@ impl VizApp {
         });
 
         // Load coordinator state (coordinator 0 = dispatch state)
-        let coord = CoordinatorState::load_or_default_for(dir, 0);
+        let coord = load_coordinator_state_read_only(dir, 0)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         self.service_health.paused = coord.paused;
         self.service_health.agents_max = coord.max_agents;
 
@@ -15083,9 +16274,12 @@ impl VizApp {
         let ops_path = self.workgraph_dir.join("log").join("operations.jsonl");
         self.vitals.last_event_time = std::fs::metadata(&ops_path).and_then(|m| m.modified()).ok();
 
-        // Coordinator last tick: parse from coordinator-state
-        use crate::commands::service::CoordinatorState;
-        let coord = CoordinatorState::load_or_default_for(&self.workgraph_dir, 0);
+        // Coordinator last tick: parse coordinator-state without quarantining
+        // malformed chat route metadata during a graph-only TUI open.
+        let coord = load_coordinator_state_read_only(&self.workgraph_dir, 0)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         self.vitals.coord_last_tick = coord.last_tick.as_ref().and_then(|ts| {
             chrono::DateTime::parse_from_rfc3339(ts).ok().map(|dt| {
                 SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64)
@@ -15280,7 +16474,7 @@ impl VizApp {
 
         // Also pre-load persisted chat for all other known coordinators so
         // switch_coordinator doesn't lose history. Use pagination for these too.
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         let page_size = bounded_chat_page_size(
             self.history_depth_override
                 .unwrap_or(config.tui.chat_page_size),
@@ -15312,7 +16506,7 @@ impl VizApp {
 
     /// Load chat history for a specific coordinator into self.chat (paginated).
     fn load_chat_history_for_coordinator(&mut self, coordinator_id: u32) {
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         let page_size = bounded_chat_page_size(
             self.history_depth_override
                 .unwrap_or(config.tui.chat_page_size),
@@ -15397,8 +16591,33 @@ impl VizApp {
                 .unwrap_or(false);
     }
 
+    /// Whether shutdown has an actual live chat selection worth persisting.
+    ///
+    /// Empty/terminal-only graphs deliberately have no synthetic chat zero.
+    /// Avoid writing `chat-history-0.jsonl` or `tui-state.json` merely because
+    /// the user opened and closed the graph-only TUI.
+    fn has_chat_state_to_persist(&self) -> bool {
+        if self.active_chat_identity.is_some() {
+            return true;
+        }
+        if matches!(
+            self.chat_startup_state,
+            ChatStartupState::Empty | ChatStartupState::Error(_)
+        ) {
+            return false;
+        }
+        self.active_coordinator_id != 0
+            || !self.active_tabs.is_empty()
+            || !self.cached_chat_tab_entries.is_empty()
+            || !self.chat.messages.is_empty()
+            || !self.coordinator_chats.is_empty()
+    }
+
     /// Save all coordinator chat states to disk (called on TUI exit).
     pub fn save_all_chat_state(&self) {
+        if !self.has_chat_state_to_persist() {
+            return;
+        }
         // Save only projections that reach the persisted tail. Older
         // replacement pages have an unloaded suffix and must remain read-only.
         if self.chat.projection_reaches_history_tail() {
@@ -15419,13 +16638,14 @@ impl VizApp {
                 );
             }
         }
-        // Save TUI focus state.
+        // Save TUI focus + layout desired state.
         let open_tabs = self.open_tab_labels_for_persistence();
-        save_tui_state(
+        save_tui_state_with_layout(
             &self.workgraph_dir,
             self.active_coordinator_id,
             &self.right_panel_tab,
             &open_tabs,
+            self.layout_preference,
         );
     }
 
@@ -15434,6 +16654,9 @@ impl VizApp {
     /// is copied from in-memory caches before the worker starts; the caller
     /// waits only for the supplied bound and then proceeds.
     pub fn save_all_chat_state_bounded(&self, timeout: Duration) {
+        if !self.has_chat_state_to_persist() {
+            return;
+        }
         let workgraph_dir = self.workgraph_dir.clone();
         let active_coordinator_id = self.active_coordinator_id;
         let active_history = self
@@ -15447,6 +16670,7 @@ impl VizApp {
             .map(|(id, state)| (*id, state.messages.clone(), state.skipped_history_count))
             .collect();
         let right_panel_tab = self.right_panel_tab;
+        let layout_preference = self.layout_preference;
         let open_tabs: Vec<String> = self
             .active_tabs
             .iter()
@@ -15473,11 +16697,12 @@ impl VizApp {
                 for (id, messages, skipped) in coordinator_histories {
                     save_chat_history_with_skip(&workgraph_dir, id, &messages, skipped);
                 }
-                save_tui_state(
+                save_tui_state_with_layout(
                     &workgraph_dir,
                     active_coordinator_id,
                     &right_panel_tab,
                     &open_tabs,
+                    layout_preference,
                 );
                 let _ = done_tx.try_send(());
             })
@@ -15488,17 +16713,21 @@ impl VizApp {
     }
 
     /// Persist the current tab list and active tab to tui-state.json.
-    /// Best-effort: failure logs a warning but doesn't block operation.
+    ///
+    /// This deliberately stays synchronous: selector writes are tiny, and
+    /// enqueueing them on the coalescing auxiliary lane allowed an older tab
+    /// switch to land after a newer one (or after process exit). The atomic
+    /// writer keeps concurrent readers from observing partial JSON while this
+    /// call preserves the user's exact last selection.
     pub fn persist_tab_state(&mut self) {
         let open_tabs = self.open_tab_labels_for_persistence();
-        let workgraph_dir = self.workgraph_dir.clone();
-        let cid = self.active_coordinator_id;
-        let tab = self.right_panel_tab;
-        self.auxiliary
-            .request(super::auxiliary::Kind::Persistence, move || {
-                save_tui_state(&workgraph_dir, cid, &tab, &open_tabs);
-                Box::new(|_| {})
-            });
+        save_tui_state_with_layout(
+            &self.workgraph_dir,
+            self.active_coordinator_id,
+            &self.right_panel_tab,
+            &open_tabs,
+            self.layout_preference,
+        );
     }
 
     fn open_tab_labels_for_persistence(&self) -> Vec<String> {
@@ -15535,7 +16764,7 @@ impl VizApp {
             return false;
         }
 
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         let page_size = bounded_chat_page_size(
             self.history_depth_override
                 .unwrap_or(config.tui.chat_page_size),
@@ -16003,7 +17232,11 @@ impl VizApp {
                 &request_id,
                 attachments,
             ) {
-                eprintln!("[tui] direct inbox write failed for {}: {}", request_id, e);
+                self.chat.pending_request_ids.remove(&request_id);
+                self.push_toast(
+                    format!("Could not send chat request {request_id}: {e}"),
+                    ToastSeverity::Error,
+                );
             }
             // No exec_command + no CommandEffect::ChatResponse — the
             // response arrives by `poll_chat_messages` tailing the
@@ -16052,7 +17285,10 @@ impl VizApp {
             let chat_ref = worksgood::chat_id::format_chat_session_ref(self.active_coordinator_id);
             let chat_dir = worksgood::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
             if let Err(e) = worksgood::session_lock::request_release(&chat_dir) {
-                eprintln!("[tui] failed to write release marker for takeover: {}", e);
+                self.push_toast(
+                    format!("Could not request chat takeover: {e}"),
+                    ToastSeverity::Warning,
+                );
             } else {
                 self.chat_pty_takeover_pending_since = Some(std::time::Instant::now());
             }
@@ -16285,6 +17521,14 @@ impl VizApp {
     /// this result by one or more refresh ticks, so this eagerly seeds every
     /// focus surface that the chat tab renderer and key router consult.
     fn focus_newly_created_chat(&mut self, cid: u32) {
+        self.chat_startup_state = ChatStartupState::Ready;
+        self.active_chat_identity = Some(ActiveChatIdentity {
+            coordinator_id: cid,
+            task_id: worksgood::chat_id::format_chat_task_id(cid),
+            label: format!("Chat {cid}"),
+            executor: None,
+            model: None,
+        });
         self.pending_new_chat_focus = Some(cid);
         self.closed_tabs.remove(&cid);
         if !self.active_tabs.contains(&cid) {
@@ -16301,9 +17545,122 @@ impl VizApp {
         self.rebuild_active_tab_entries_from_cache();
     }
 
-    /// Switch to a different coordinator session.
-    /// Saves the current chat state to the coordinator_chats map and loads the target.
+    /// Switch to a live coordinator session and attach/start its PTY when
+    /// authoritative metadata permits.
     pub fn switch_coordinator(&mut self, target_id: u32) {
+        self.switch_coordinator_with_pty(target_id, true);
+    }
+
+    pub fn chat_is_live(&self, coordinator_id: u32) -> bool {
+        self.coherent_graph().is_some_and(|graph| {
+            graph.tasks().any(|task| {
+                let cid = worksgood::chat_id::parse_chat_task_id(&task.id)
+                    .or_else(|| (task.id == ".coordinator").then_some(0));
+                cid == Some(coordinator_id)
+                    && !task.status.is_terminal()
+                    && !task.tags.iter().any(|tag| tag == "archived")
+            })
+        })
+    }
+
+    /// Apply the one semantic navigation rule shared by the chooser, chat
+    /// prev/next controls, tab clicks, and graph task rows. Only an
+    /// authoritative nonterminal, non-archived chat owns the interactive Chat
+    /// surface. Every terminal/abandoned/archived chat is an ordinary task and
+    /// therefore opens canonical Detail instead of a disconnected composer.
+    pub fn open_coordinator_target(&mut self, target_id: u32) {
+        let task = self.coherent_graph().and_then(|graph| {
+            graph.tasks().find_map(|task| {
+                let cid = worksgood::chat_id::parse_chat_task_id(&task.id)
+                    .or_else(|| (task.id == ".coordinator").then_some(0));
+                (cid == Some(target_id)).then(|| task.clone())
+            })
+        });
+        let Some(task) = task else {
+            // Freshly-created chats can be selected before the graph snapshot
+            // catches up. Preserve that existing live-create path.
+            self.switch_coordinator(target_id);
+            self.right_panel_tab = RightPanelTab::Chat;
+            self.right_panel_visible = true;
+            self.focused_panel = FocusedPanel::RightPanel;
+            return;
+        };
+        self.open_chat_task_or_detail(&task.id);
+    }
+
+    pub fn open_chat_task_or_detail(&mut self, task_id: &str) {
+        let task = self
+            .coherent_graph()
+            .and_then(|graph| graph.tasks().find(|task| task.id == task_id).cloned());
+        let Some(task) = task else {
+            self.open_task_detail(task_id);
+            return;
+        };
+        let live = !task.status.is_terminal() && !task.tags.iter().any(|tag| tag == "archived");
+        if live {
+            let cid = worksgood::chat_id::parse_chat_task_id(&task.id)
+                .or_else(|| (task.id == ".coordinator").then_some(0));
+            if let Some(cid) = cid {
+                // Selecting a live tab is also an explicit resurrection
+                // request. Clear a prior death panel before switch_coordinator
+                // queues the saved route; otherwise render suppresses the new
+                // pending spawn forever and the click silently stays dead.
+                self.chat_agent_death.remove(&cid);
+                // Chooser/task-row navigation can reopen a previously hidden
+                // live chat. Make that tab membership explicit before the
+                // switch; otherwise lifecycle Close on the reopened chat sees
+                // an empty tab list and navigation state drifts from the
+                // visible identity.
+                self.closed_tabs.remove(&cid);
+                if !self.active_tabs.contains(&cid) {
+                    self.active_tabs.push(cid);
+                }
+                self.switch_coordinator(cid);
+                self.right_panel_tab = RightPanelTab::Chat;
+                self.right_panel_visible = true;
+                self.focused_panel = FocusedPanel::RightPanel;
+                return;
+            }
+        }
+        self.open_task_detail(&task.id);
+    }
+
+    fn open_task_detail(&mut self, task_id: &str) {
+        if self
+            .pending_chat_pty_spawn
+            .as_ref()
+            .is_some_and(|pending| pending.task_id == task_id)
+        {
+            self.pending_chat_pty_spawn = None;
+        }
+        if self
+            .active_chat_identity
+            .as_ref()
+            .is_some_and(|identity| identity.task_id == task_id)
+        {
+            self.chat_pty_mode = false;
+            self.chat_pty_forwards_stdin = false;
+        }
+        if matches!(
+            self.input_mode,
+            InputMode::ChatInput | InputMode::MessageInput | InputMode::ScrollMode { .. }
+        ) {
+            self.input_mode = InputMode::Normal;
+            self.inspector_sub_focus = InspectorSubFocus::ChatHistory;
+        }
+        self.hud_pin = None;
+        if let Some(idx) = self.task_order.iter().position(|id| id == task_id) {
+            self.selected_task_idx = Some(idx);
+            self.scroll_to_selected_task();
+        }
+        self.right_panel_visible = true;
+        self.right_panel_tab = RightPanelTab::Detail;
+        self.focused_panel = FocusedPanel::RightPanel;
+        self.request_hud_detail_for_task(task_id);
+    }
+
+    /// Saves the current chat state to the coordinator_chats map and loads the target.
+    fn switch_coordinator_with_pty(&mut self, target_id: u32, allow_pty: bool) {
         if self
             .pending_new_chat_focus
             .is_some_and(|pending| pending != target_id)
@@ -16311,6 +17668,27 @@ impl VizApp {
             self.pending_new_chat_focus = None;
         }
         if target_id == self.active_coordinator_id {
+            if !allow_pty {
+                self.pending_chat_pty_spawn = None;
+                self.chat_pty_mode = false;
+                self.chat_pty_forwards_stdin = false;
+            }
+            if self
+                .active_chat_identity
+                .as_ref()
+                .is_none_or(|identity| identity.coordinator_id != target_id)
+            {
+                self.active_chat_identity = self.chat_identity_from_graph(target_id);
+            }
+            if allow_pty
+                && self.chat_is_live(target_id)
+                && !self
+                    .task_panes
+                    .contains_key(&worksgood::chat_id::format_chat_task_id(target_id))
+                && self.pending_chat_pty_spawn.is_none()
+            {
+                self.maybe_auto_enable_chat_pty();
+            }
             return;
         }
         // Save dismissed flag into the outgoing chat state
@@ -16339,15 +17717,32 @@ impl VizApp {
         self.chat_input_dismissed = self.chat.chat_input_dismissed;
 
         self.active_coordinator_id = target_id;
+        self.active_chat_identity = self.chat_identity_from_graph(target_id).or_else(|| {
+            Some(ActiveChatIdentity {
+                coordinator_id: target_id,
+                task_id: worksgood::chat_id::format_chat_task_id(target_id),
+                label: format!("Chat {target_id}"),
+                executor: None,
+                model: None,
+            })
+        });
+        self.chat_startup_state = ChatStartupState::Ready;
         self.persist_tab_state();
         if needs_history_snapshot {
             self.request_initial_chat_history();
         }
 
-        // Auto-enter PTY mode when switching to a native-executor
-        // coordinator (Step 1 of nex-as-everything). Harmless no-op for
-        // claude/codex coordinators — those keep the file-tailing path.
-        self.maybe_auto_enable_chat_pty();
+        if allow_pty {
+            // Route resolution/spawn is permitted only for an authoritative
+            // live task. Picker/history selection of terminal chats uses the
+            // other branch and cannot resurrect a handler.
+            self.maybe_auto_enable_chat_pty();
+        } else {
+            self.pending_chat_pty_spawn = None;
+            self.chat_pty_mode = false;
+            self.chat_pty_forwards_stdin = false;
+            self.focused_panel = FocusedPanel::RightPanel;
+        }
 
         // Sync: highlight the corresponding coordinator task in the graph.
         let coord_task_id = if target_id == 0 {
@@ -16373,6 +17768,7 @@ impl VizApp {
             Some(s) => s,
             None => return,
         };
+        self.set_layout_preference(state.layout);
         let known_ids = self.list_coordinator_ids();
         if known_ids.contains(&state.active_coordinator_id) {
             self.active_coordinator_id = state.active_coordinator_id;
@@ -16438,7 +17834,7 @@ impl VizApp {
     /// vendor CLI isn't on PATH or the spawn fails. Ctrl+O still toggles
     /// manually. Idempotent: no-op when a live pane already exists.
     pub fn maybe_auto_enable_chat_pty(&mut self) {
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         // Per-chat overrides win over the global default. Without this
         // step the TUI was spawning the global `[dispatcher].executor`
         // binary (typically `claude`) for every chat tab, ignoring the
@@ -16454,6 +17850,7 @@ impl VizApp {
             self.active_coordinator_id,
             chat_task.as_ref(),
         );
+        self.update_active_chat_route(&task_id, executor.clone(), chat_model.clone());
         let chat_endpoint = crate::commands::service::CoordinatorState::load_for(
             &self.workgraph_dir,
             self.active_coordinator_id,
@@ -16487,12 +17884,10 @@ impl VizApp {
             ) {
                 Ok(prepared) => Some(prepared),
                 Err(e) => {
-                    eprintln!(
-                        "[tui] Pi chat {} storage could not be prepared: {e}. \
-                         The pane was not opened; retry after `wg service reload` \
-                         or create a new chat.",
+                    self.chat_startup_state = ChatStartupState::Error(format!(
+                        "Pi chat {} storage could not be prepared: {e}; retry after `wg service reload` or create a new chat",
                         self.active_coordinator_id
-                    );
+                    ));
                     self.chat_pty_mode = false;
                     self.chat_pty_forwards_stdin = false;
                     return;
@@ -16560,10 +17955,18 @@ impl VizApp {
         }
         self.task_panes.remove(&task_id);
 
-        let self_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "wg".to_string());
+        // This string may be handed through tmux before it is executed, so a
+        // Linux `/proc/self/exe` path would incorrectly mean tmux at that
+        // point. Pin this TUI PID's kernel-owned executable link instead.
+        let self_exe = match worksgood::self_exe::handoff_reexec_path() {
+            Ok(path) => path.display().to_string(),
+            Err(error) => {
+                self.chat_startup_state = ChatStartupState::Error(format!(
+                    "could not resolve the running WG executable for chat startup: {error}; no PATH fallback was attempted"
+                ));
+                return;
+            }
+        };
 
         // Resolve (binary, args, observer_mode) per executor. Observer
         // mode (lock-tailing) only applies to native today because the
@@ -16591,7 +17994,10 @@ impl VizApp {
         if let Err(e) =
             worksgood::session_lock::write_tui_driver_sentinel(&chat_dir, std::process::id())
         {
-            eprintln!("[tui] failed to write TUI driver sentinel: {}", e);
+            self.push_toast(
+                format!("Could not claim the chat terminal: {e}"),
+                ToastSeverity::Warning,
+            );
         }
         if observer_mode {
             let _ = worksgood::session_lock::request_release(&chat_dir);
@@ -16610,7 +18016,8 @@ impl VizApp {
         // directly in the persistent pane instead of routing through an
         // LLM preset adapter.
         if let Some(task) = chat_task_metadata.as_ref()
-            && task.executor_preset_name.is_none()
+            && (task.executor_preset_name.is_none()
+                || task.executor_preset_name.as_deref() == Some("command"))
             && !task.command_argv.is_empty()
         {
             let bin = task.command_argv[0].clone();
@@ -16628,38 +18035,27 @@ impl VizApp {
                     )
                 });
             self.chat_pty_observer = false;
-            let mut env: Vec<(String, String)> = vec![
-                (
-                    "WG_DIR".to_string(),
-                    self.workgraph_dir.display().to_string(),
-                ),
-                ("WG_CHAT_REF".to_string(), chat_ref.clone()),
-                ("WG_EXECUTOR_TYPE".to_string(), "command".to_string()),
-                ("TERM".to_string(), "xterm-256color".to_string()),
-            ];
+            let mut env = chat_pty_env(&self.workgraph_dir, &task_id, &chat_ref, "command");
             if let Some(ref m) = chat_model {
                 env.push(("WG_MODEL".to_string(), m.clone()));
             }
-            let project_root = self
-                .workgraph_dir
-                .parent()
-                .unwrap_or(&self.workgraph_dir)
-                .to_path_buf();
-            let project_tag = project_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("project");
             let tmux_session = if crate::tui::pty_pane::tmux_available() {
-                Some(worksgood::chat_id::chat_tmux_session_name(
-                    project_tag,
-                    &chat_ref,
+                Some(worksgood::chat_id::prepare_chat_tmux_session_for_id(
+                    &self.workgraph_dir,
+                    self.active_coordinator_id,
                 ))
             } else {
-                warn_chat_tmux_missing_once();
+                if warn_chat_tmux_missing_once() {
+                    self.push_toast(
+                        "tmux is not installed; this chat will not survive TUI exit".to_string(),
+                        ToastSeverity::Warning,
+                    );
+                }
                 None
             };
             self.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
                 task_id,
+                reattach: false,
                 bin,
                 args: args_owned,
                 env,
@@ -16859,12 +18255,10 @@ impl VizApp {
                         chat_model.as_deref().is_some_and(|m| !m.trim().is_empty());
                     let marg = crate::commands::pi_handler::pi_model_arg(chat_model.as_deref());
                     if explicit_model && marg.is_none() {
-                        eprintln!(
-                            "[tui] pi chat pane: could not resolve a \
-                                 provider/model from {:?}; refusing to spawn \
-                                 explicit model",
+                        self.chat_startup_state = ChatStartupState::Error(format!(
+                            "could not resolve a Pi provider/model from {:?}; refusing to spawn the explicit model",
                             chat_model
-                        );
+                        ));
                         return;
                     }
                     let session_dir = prepared_pi_session
@@ -16888,7 +18282,23 @@ impl VizApp {
                         "--session-dir".to_string(),
                         session_dir.display().to_string(),
                     ]);
-                    ("pi".to_string(), args, Some(project_root))
+                    // `wg chat create` preflights the interactive Pi binary
+                    // transactionally. Resolve it again to an absolute path at
+                    // the actual PTY edge so tmux/non-login PATH drift cannot
+                    // turn a genuine missing Pi into an anonymous ENOENT.
+                    let pi_binary = worksgood::executor_discovery::discover()
+                        .into_iter()
+                        .find(|info| info.name == "pi" && info.available)
+                        .and_then(|info| info.binary_path);
+                    let Some(pi_binary) = pi_binary else {
+                        worksgood::session_lock::clear_tui_driver_sentinel(&chat_dir);
+                        self.chat_startup_state = ChatStartupState::Error(
+                            "interactive Pi executable `pi` is no longer available on PATH; no fallback executor was attempted; install Pi and press r to retry"
+                                .to_string(),
+                        );
+                        return;
+                    };
+                    (pi_binary.display().to_string(), args, Some(project_root))
                 }
                 "octomind" => {
                     // alt-screen, verified), so tmux scrollback works without
@@ -16930,10 +18340,10 @@ impl VizApp {
                     ) {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!(
-                                "[tui] failed to write dexto agent config in {}: {e}",
-                                chat_dir.display()
-                            );
+                            worksgood::session_lock::clear_tui_driver_sentinel(&chat_dir);
+                            self.chat_startup_state = ChatStartupState::Error(format!(
+                                "could not prepare Dexto chat: {e}; press r to retry"
+                            ));
                             return;
                         }
                     };
@@ -16945,28 +18355,19 @@ impl VizApp {
                     ("dexto".to_string(), args, Some(project_root))
                 }
                 _ => {
-                    // Unknown executor — leave file-tailing path in charge.
+                    // Unknown/custom executors use the file-backed chat view;
+                    // there is no embedded vendor PTY for the TUI to own.
+                    worksgood::session_lock::clear_tui_driver_sentinel(&chat_dir);
                     return;
                 }
             };
         self.chat_pty_observer = observer_mode && executor == "native";
 
-        let mut env: Vec<(String, String)> = vec![
-            (
-                "WG_DIR".to_string(),
-                self.workgraph_dir.display().to_string(),
-            ),
-            ("WG_CHAT_REF".to_string(), chat_ref.clone()),
-            // Override inherited WG_EXECUTOR_TYPE so spawn-task
-            // dispatches the same executor the TUI chose from config.
-            ("WG_EXECUTOR_TYPE".to_string(), executor.clone()),
-            // Vendor CLIs (claude in particular) expect a real-looking
-            // TERM. portable-pty doesn't set one by default; inheriting
-            // the wg-tui parent's TERM works but passing an explicit
-            // xterm-256color avoids oddities when WG_TUI runs under a
-            // minimal terminal like linux console or dumb.
-            ("TERM".to_string(), "xterm-256color".to_string()),
-        ];
+        // Override inherited WG_EXECUTOR_TYPE so spawn-task dispatches the
+        // same executor the TUI chose. Also bind both canonical chat identity
+        // and session alias; Pi's plugin uses only these explicit variables to
+        // decide whether model selection is persistence-eligible.
+        let mut env = chat_pty_env(&self.workgraph_dir, &task_id, &chat_ref, &executor);
         // Propagate the resolved per-chat model so any nested
         // `wg spawn-task` invocation (e.g. native's `wg nex` re-execing)
         // honors it instead of falling back to `[dispatcher].model`.
@@ -16977,23 +18378,19 @@ impl VizApp {
         // tmux-wrap the chat process when tmux is on PATH so it
         // survives TUI exit (the persistence design — see
         // docs/design/chat-agent-persistence.md). Falls back to plain
-        // spawn with a one-time stderr warning when tmux is missing.
-        let project_root = self
-            .workgraph_dir
-            .parent()
-            .unwrap_or(&self.workgraph_dir)
-            .to_path_buf();
-        let project_tag = project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project");
+        // spawn with a one-time in-pane warning when tmux is missing.
         let tmux_session = if crate::tui::pty_pane::tmux_available() {
-            Some(worksgood::chat_id::chat_tmux_session_name(
-                project_tag,
-                &chat_ref,
+            Some(worksgood::chat_id::prepare_chat_tmux_session_for_id(
+                &self.workgraph_dir,
+                self.active_coordinator_id,
             ))
         } else {
-            warn_chat_tmux_missing_once();
+            if warn_chat_tmux_missing_once() {
+                self.push_toast(
+                    "tmux is not installed; this chat will not survive TUI exit".to_string(),
+                    ToastSeverity::Warning,
+                );
+            }
             None
         };
 
@@ -17009,6 +18406,7 @@ impl VizApp {
         // duplicates (fix-pty-scrollback).
         self.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
             task_id,
+            reattach: false,
             bin,
             args: args_owned,
             env,
@@ -17033,6 +18431,94 @@ impl VizApp {
     /// zero (e.g. before the first frame populates layout). Returns
     /// true iff a new pane was successfully spawned.
     pub fn consume_pending_chat_pty_spawn(&mut self, rows: u16, cols: u16) -> bool {
+        if rows == 0 || cols == 0 {
+            return false;
+        }
+        let Some(pending) = self.pending_chat_pty_spawn.take() else {
+            return false;
+        };
+        let Some(engine) = self.chat_pty_engine.as_mut() else {
+            self.pending_chat_pty_spawn = Some(pending);
+            return false;
+        };
+        if !engine.request(pending.clone(), rows, cols) {
+            self.pending_chat_pty_spawn = Some(pending);
+            return false;
+        }
+        true
+    }
+
+    fn poll_chat_pty_spawn(&mut self) -> bool {
+        let Some(engine) = self.chat_pty_engine.as_mut() else {
+            return false;
+        };
+        let Some(result) = engine.try_result() else {
+            return false;
+        };
+        let pending = result.pending;
+        let pending_cid = worksgood::chat_id::parse_chat_task_id(&pending.task_id)
+            .or_else(|| (pending.task_id == ".coordinator").then_some(0));
+        let still_active = pending_cid == Some(self.active_coordinator_id);
+        match result.value {
+            Ok(mut pane) => {
+                if executor_uses_child_scroll_keys(&pending.executor) {
+                    pane.set_child_scroll_keys(true);
+                }
+                let spawn_cmd = format!("{} {}", pending.bin, pending.args.join(" "));
+                if let Some(cid) = pending_cid {
+                    self.chat_last_spawn_info
+                        .insert(cid, (pending.executor.clone(), spawn_cmd));
+                }
+                // A tab switch can race a slow tmux attach. Publish the old
+                // pane for later use, but never flush startup text into a chat
+                // that is no longer active. The queued keys stay ordered for
+                // the subsequently requested active pane.
+                if still_active {
+                    for key in self.pending_chat_keys.drain(..) {
+                        let _ = pane.send_key(key);
+                    }
+                }
+                self.task_panes.insert(pending.task_id, pane);
+                if still_active {
+                    self.chat_pty_mode = true;
+                    self.chat_pty_forwards_stdin = true;
+                    if let Some(reporter) = self.startup_reporter.as_ref() {
+                        reporter.record(
+                            if pending.reattach {
+                                "pane_attached"
+                            } else {
+                                "pane_spawned"
+                            },
+                            Some(&pending.executor),
+                        );
+                    }
+                }
+                true
+            }
+            Err(error) => {
+                if let Some(cid) = pending_cid {
+                    let chat_ref = worksgood::chat_id::format_chat_session_ref(cid);
+                    let chat_dir =
+                        worksgood::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
+                    worksgood::session_lock::clear_tui_driver_sentinel(&chat_dir);
+                }
+                if still_active {
+                    self.chat_pty_mode = false;
+                    self.chat_pty_forwards_stdin = false;
+                    self.chat_startup_state = ChatStartupState::Error(format!(
+                        "chat pane failed to attach/start: {error}; press r to retry"
+                    ));
+                    if let Some(reporter) = self.startup_reporter.as_ref() {
+                        reporter.record("pane_error", Some(&error));
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn spawn_pending_chat_pty_blocking(&mut self, rows: u16, cols: u16) -> bool {
         if rows == 0 || cols == 0 {
             return false;
         }
@@ -17068,10 +18554,9 @@ impl VizApp {
             ) {
                 Ok(pane) => Ok(pane),
                 Err(e) => {
-                    eprintln!(
-                        "[tui] tmux-wrapped chat spawn failed ({}): falling back to \
-                         direct spawn (chat will not persist across TUI exit)",
-                        e
+                    self.push_toast(
+                        format!("tmux chat spawn failed ({e}); using a non-persistent direct pane"),
+                        ToastSeverity::Warning,
                     );
                     crate::tui::pty_pane::PtyPane::spawn_in(
                         &pending.bin,
@@ -17131,11 +18616,12 @@ impl VizApp {
                         worksgood::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
                     worksgood::session_lock::clear_tui_driver_sentinel(&chat_dir);
                 }
-                eprintln!(
-                    "[tui] auto-enable chat PTY for executor '{}' failed ({}): \
-                     falling back to file-tailing. \
-                     Is the `{}` binary on PATH?",
-                    pending.executor, e, pending.bin
+                self.push_toast(
+                    format!(
+                        "Could not open the '{}' chat terminal ({e}); is `{}` on PATH? Using file history instead",
+                        pending.executor, pending.bin
+                    ),
+                    ToastSeverity::Error,
                 );
                 self.chat_pty_mode = false;
                 self.chat_pty_forwards_stdin = false;
@@ -17144,37 +18630,20 @@ impl VizApp {
         }
     }
 
-    /// On TUI startup, auto-create a coordinator labeled with the current
-    /// WG_USER identity if none exists for that user. This ensures each user
-    /// gets their own chat agent managing their own agent budget.
     /// Tear down any `wg-chat-*` tmux session for THIS project whose
     /// backing chat task is no longer alive in the graph. Runs once
     /// at TUI startup. No-op when tmux isn't installed.
     ///
-    /// Only matches sessions whose project tag equals the current
-    /// project root's basename — so two different projects' TUIs can
-    /// run side-by-side without sweeping each other's sessions.
+    /// Only matches sessions whose project tag includes the current graph's
+    /// canonical-path digest, so even equal-basename projects can run
+    /// side-by-side without sweeping each other's sessions.
     /// Project-namespaced prefix matching every `wg-chat-*` tmux session
     /// for THIS project (`wg-chat-<project>-`). Used by orphan-sweep,
     /// settings-sync, and the chat-exit prompt to scope tmux operations
     /// to this project so co-running TUIs in sibling projects don't
     /// touch each other's sessions.
     fn chat_tmux_session_prefix(&self) -> String {
-        let project_root = self
-            .workgraph_dir
-            .parent()
-            .unwrap_or(&self.workgraph_dir)
-            .to_path_buf();
-        let project_tag = project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project")
-            .to_string();
-        format!(
-            "{}{}-",
-            worksgood::chat_id::CHAT_TMUX_SESSION_PREFIX,
-            project_tag.replace([':', '.'], "-")
-        )
+        worksgood::chat_id::chat_tmux_session_prefix_for_dir(&self.workgraph_dir)
     }
 
     /// Re-assert wg's desired tmux session options across every chat
@@ -17193,17 +18662,6 @@ impl VizApp {
         if !crate::tui::pty_pane::tmux_available() {
             return;
         }
-        let project_root = self
-            .workgraph_dir
-            .parent()
-            .unwrap_or(&self.workgraph_dir)
-            .to_path_buf();
-        let project_tag = project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project")
-            .to_string();
-
         // Build the set of live chat refs from the graph: `chat-N` for
         // every non-archived/non-abandoned task with the chat-loop tag.
         let live_refs: std::collections::HashSet<String> = self
@@ -17223,103 +18681,80 @@ impl VizApp {
             })
             .unwrap_or_default();
 
-        // Enumerate all wg-chat-* sessions and kill the ones whose chat
-        // ref isn't in `live_refs`.
-        let prefix = format!(
-            "{}{}-",
-            worksgood::chat_id::CHAT_TMUX_SESSION_PREFIX,
-            project_tag.replace([':', '.'], "-")
-        );
+        // Migrate only legacy sessions whose WG_DIR proves ownership by this
+        // graph, then enumerate the path-unique namespace. An ambiguous
+        // basename-only session is never swept or attached.
+        for chat_ref in &live_refs {
+            if let Some(cid) = chat_ref
+                .strip_prefix("chat-")
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                worksgood::chat_id::prepare_chat_tmux_session_for_id(&self.workgraph_dir, cid);
+            }
+        }
+        let prefix = self.chat_tmux_session_prefix();
         let sessions = crate::tui::pty_pane::tmux_list_sessions_with_prefix(&prefix);
         for session in &sessions {
-            let Some(chat_ref) = worksgood::chat_id::parse_chat_tmux_session(session, &project_tag)
+            let Some(chat_ref) =
+                worksgood::chat_id::parse_chat_tmux_session_for_dir(session, &self.workgraph_dir)
             else {
                 continue;
             };
             if !live_refs.contains(&chat_ref) {
-                eprintln!(
-                    "[wg-tui] sweeping orphan chat tmux session: {} (no live task)",
-                    session
-                );
                 crate::tui::pty_pane::tmux_kill_session(session);
             }
         }
     }
 
-    pub fn ensure_user_coordinator(&mut self) {
-        // Orphan-sweep tmux chat sessions whose backing task is gone
-        // before any chat-tab spawn might reattach to one. Cheap (one
-        // `tmux list-sessions` shell-out + a graph load) and the only
-        // way we don't accumulate `wg-chat-*` sessions across runs of
-        // `wg chat delete` / archive-while-tui-was-down. See design
-        // doc Lifecycle invariants.
-        self.sweep_orphan_chat_tmux_sessions();
-
-        // Re-assert wg's desired tmux options on every surviving chat
-        // session. Catches sessions created by a prior wg version (or
-        // a prior wg with different defaults), and corrects any drift
-        // from manual user edits. See `sync_chat_session_settings` in
-        // pty_pane for the centralized list of options wg owns.
-        self.sync_chat_tmux_settings();
-
-        let user = worksgood::current_user();
-        // Don't auto-create for the fallback "unknown" identity
-        if user == "unknown" {
+    /// Maintain persistent tmux ownership only when the authoritative graph
+    /// contains at least one live chat. Empty and terminal-only graphs are a
+    /// strictly read-only TUI bootstrap: opening them must not kill an orphan
+    /// pane, rewrite tmux settings, choose a user route, or create a chat.
+    pub fn maintain_existing_chat_sessions(&mut self) {
+        let graph = self.coherent_graph();
+        let live_chats: Vec<(u32, String)> = graph
+            .as_ref()
+            .map(|g| {
+                g.tasks()
+                    .filter(|task| {
+                        task.tags
+                            .iter()
+                            .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag))
+                    })
+                    .filter(|task| !task.status.is_terminal())
+                    .filter(|task| !task.tags.iter().any(|tag| tag == "archived"))
+                    .filter_map(|task| {
+                        let cid = worksgood::chat_id::parse_chat_task_id(&task.id)
+                            .or_else(|| (task.id == ".coordinator").then_some(0))?;
+                        chat_has_atomic_execution_identity(&self.workgraph_dir, cid, task)
+                            .is_ok()
+                            .then(|| (cid, task.title.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if live_chats.is_empty() {
             return;
         }
 
-        let expected_title = format!("Chat: {}", user);
-        let legacy_expected_title = format!("Coordinator: {}", user);
+        // Existing live chats keep the established persistence/control-plane
+        // behavior: clean graph-proven orphans and normalize surviving panes.
+        self.sweep_orphan_chat_tmux_sessions();
+        self.sync_chat_tmux_settings();
 
-        // Load the graph to check chat task titles directly.
-        // list_coordinator_ids_and_labels() returns display labels like ".chat-N"
-        // which don't match the "Chat: {user}" title format.
-        let graph = self.coherent_graph();
-
-        // Find a non-archived chat task whose title matches (new or legacy)
-        let existing_coord: Option<u32> = graph.as_ref().and_then(|g| {
-            g.tasks()
-                .filter(|t| {
-                    t.tags
-                        .iter()
-                        .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag))
-                })
-                .filter(|t| !matches!(t.status, worksgood::graph::Status::Abandoned))
-                .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
-                .filter(|t| t.title == expected_title || t.title == legacy_expected_title)
-                .filter_map(|t| {
-                    worksgood::chat_id::parse_chat_task_id(&t.id).or_else(|| {
-                        if t.id == ".coordinator" {
-                            Some(0)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .next()
-        });
-
-        if existing_coord.is_none() {
-            // No chat for this user — check if ANY chat agents exist
-            let any_exist = graph.as_ref().is_some_and(|g| {
-                g.tasks().any(|t| {
-                    t.tags
-                        .iter()
-                        .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag))
-                        && !matches!(t.status, worksgood::graph::Status::Abandoned)
-                        && !t.tags.iter().any(|tag| tag == "archived")
-                })
-            });
-            if !any_exist {
-                // No coordinators at all — create one for first-use experience
-                self.create_coordinator(Some(user.clone()));
-            }
-            // If other coordinators exist but none for this user, don't auto-create.
-            // The user can use the plus (+) key to add one manually.
+        let user = worksgood::current_user();
+        if user == "unknown" {
+            return;
         }
+        let expected_title = format!("Chat: {user}");
+        let legacy_expected_title = format!("Coordinator: {user}");
+        let existing_coord = live_chats
+            .into_iter()
+            .find(|(_, title)| title == &expected_title || title == &legacy_expected_title)
+            .map(|(cid, _)| cid);
 
-        // Only switch to the user's coordinator if no valid focus was restored
-        // from tui-state.json (i.e., still on the default coordinator 0).
+        // Only switch to the user's existing chat if no valid focus was
+        // restored. This is selection, never creation or route resolution.
         if self.active_coordinator_id == 0
             && let Some(cid) = existing_coord
         {
@@ -17342,7 +18777,7 @@ impl VizApp {
         }
         self.last_launcher_open = Some(now);
 
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         let max = config.coordinator.max_coordinators;
         let alive = self.live_chat_count();
         if alive >= max {
@@ -17446,7 +18881,7 @@ impl VizApp {
             }
         };
 
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         let max = config.coordinator.max_coordinators;
         let alive = self.live_chat_count();
         if alive >= max {
@@ -17549,7 +18984,7 @@ impl VizApp {
 
     /// Create a coordinator with defaults (Shift+Plus shortcut, skips picker).
     pub fn create_coordinator_with_defaults(&mut self) {
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         let max = config.coordinator.max_coordinators;
         let alive = self.live_chat_count();
         if alive >= max {
@@ -17564,48 +18999,49 @@ impl VizApp {
 
     /// Open the coordinator picker overlay.
     pub fn open_coordinator_picker(&mut self) {
-        let graph = self.coherent_graph();
-
-        let ids_and_labels = self.list_coordinator_ids_and_labels();
-        let mut entries: Vec<(u32, String, String, bool)> = Vec::new();
-
-        for (cid, label) in &ids_and_labels {
-            // Prefer .chat-N (new), fall back to .coordinator-N or bare .coordinator (legacy)
-            let task_id = if let Some(ref g) = graph {
-                let new_id = worksgood::chat_id::format_chat_task_id(*cid);
-                if g.get_task(&new_id).is_some() {
-                    new_id
-                } else if *cid == 0 && g.get_task(".coordinator").is_some() {
-                    ".coordinator".to_string()
-                } else {
-                    format!(".coordinator-{}", cid)
-                }
-            } else if *cid == 0 {
-                ".coordinator".to_string()
-            } else {
-                worksgood::chat_id::format_chat_task_id(*cid)
-            };
-
-            let (status_desc, is_alive) = if let Some(ref g) = graph {
-                if let Some(task) = g.get_task(&task_id) {
-                    let alive = matches!(task.status, Status::InProgress);
-                    let status_str = format!("{:?}", task.status).to_lowercase();
-                    let name = task.title.clone();
-                    let desc = if name != task_id {
-                        format!("{} ({})", name, status_str)
-                    } else {
-                        status_str
-                    };
-                    (desc, alive)
-                } else {
-                    ("no task".to_string(), false)
-                }
-            } else {
-                ("unknown".to_string(), false)
-            };
-
-            entries.push((*cid, label.clone(), status_desc, is_alive));
-        }
+        let mut entries: Vec<(u32, String, String, bool)> = self
+            .coherent_graph()
+            .map(|graph| {
+                graph
+                    .tasks()
+                    .filter(|task| {
+                        task.tags
+                            .iter()
+                            .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag))
+                    })
+                    .filter_map(|task| {
+                        let cid = worksgood::chat_id::parse_chat_task_id(&task.id)
+                            .or_else(|| (task.id == ".coordinator").then_some(0))?;
+                        let archived = task.tags.iter().any(|tag| tag == "archived");
+                        let alive = !task.status.is_terminal() && !archived;
+                        let mut status = format!("{:?}", task.status).to_lowercase();
+                        if archived {
+                            status.push_str("/archived");
+                        }
+                        let recency = task
+                            .last_interaction_at
+                            .as_deref()
+                            .or(task.completed_at.as_deref())
+                            .or(task.started_at.as_deref())
+                            .unwrap_or("unknown");
+                        let route = match (&task.executor_preset_name, &task.model) {
+                            (Some(executor), Some(model)) => format!("{executor}/{model}"),
+                            (Some(executor), None) => executor.clone(),
+                            (None, Some(model)) => model.clone(),
+                            (None, None) if !task.command_argv.is_empty() => "command".to_string(),
+                            _ => "route unknown".to_string(),
+                        };
+                        Some((
+                            cid,
+                            task.id.clone(),
+                            format!("{} • {status} • {recency} • {route}", task.title),
+                            alive,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by_key(|(cid, _, _, _)| *cid);
 
         let current_idx = entries
             .iter()
@@ -17794,24 +19230,12 @@ impl VizApp {
         if !crate::tui::pty_pane::tmux_available() {
             return Vec::new();
         }
-        let project_root = self
-            .workgraph_dir
-            .parent()
-            .unwrap_or(&self.workgraph_dir)
-            .to_path_buf();
-        let project_tag = project_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project")
-            .to_string();
-        let prefix = format!(
-            "{}{}-",
-            worksgood::chat_id::CHAT_TMUX_SESSION_PREFIX,
-            project_tag.replace([':', '.'], "-")
-        );
+        let prefix = self.chat_tmux_session_prefix();
         crate::tui::pty_pane::tmux_list_sessions_with_prefix(&prefix)
             .into_iter()
-            .filter_map(|s| worksgood::chat_id::parse_chat_tmux_session(&s, &project_tag))
+            .filter_map(|s| {
+                worksgood::chat_id::parse_chat_tmux_session_for_dir(&s, &self.workgraph_dir)
+            })
             .filter_map(|cref| {
                 cref.strip_prefix("chat-")
                     .and_then(|n| n.parse::<u32>().ok())
@@ -18124,6 +19548,48 @@ impl VizApp {
             .collect()
     }
 
+    /// Cycle every canonical chat task, not only live tabs. Pointer and
+    /// command-mode prev/next therefore apply the same semantic rule as the
+    /// chooser: live targets open Chat, while terminal/abandoned/archived
+    /// targets open their exact task Detail without resurrection.
+    pub fn cycle_active_chat(&mut self, delta: i32) {
+        let mut targets: Vec<(u32, String)> = self
+            .coherent_graph()
+            .map(|graph| {
+                graph
+                    .tasks()
+                    .filter(|task| {
+                        task.tags
+                            .iter()
+                            .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag))
+                    })
+                    .filter_map(|task| {
+                        let cid = worksgood::chat_id::parse_chat_task_id(&task.id)
+                            .or_else(|| (task.id == ".coordinator").then_some(0))?;
+                        Some((cid, task.id.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        targets.sort_by_key(|(cid, _)| *cid);
+        targets.dedup_by_key(|(cid, _)| *cid);
+        if targets.is_empty() {
+            return;
+        }
+        let next = if let Some(pos) = targets
+            .iter()
+            .position(|(cid, _)| *cid == self.active_coordinator_id)
+        {
+            (pos as i32 + delta).rem_euclid(targets.len() as i32) as usize
+        } else if delta < 0 {
+            targets.len() - 1
+        } else {
+            0
+        };
+        let task_id = targets[next].1.clone();
+        self.open_chat_task_or_detail(&task_id);
+    }
+
     /// Scroll the chat tab bar by `delta` entries (positive = right, negative
     /// = left). Used by the click handlers on the ◀/▶ overflow arrows. The
     /// renderer clamps the offset and may re-adjust if the active tab is no
@@ -18139,6 +19605,34 @@ impl VizApp {
         let new_off =
             (self.chat_tab_scroll_offset as i32 + delta).clamp(0, max_offset as i32) as usize;
         self.chat_tab_scroll_offset = new_off;
+    }
+
+    /// If an explicit New-chat action publishes a chat after the prioritized
+    /// metadata lane reported an empty graph, start a fresh authoritative
+    /// resolution as soon as a later graph publication observes that task.
+    fn retry_chat_startup_if_authoritative_chat_appeared(&mut self) {
+        let authoritative_chat_appeared = matches!(self.chat_startup_state, ChatStartupState::Empty)
+                // `Empty` also represents an intentional Hide/detach of the
+                // last tab. Closed tabs are explicit user state and must not
+                // be resurrected by the explicit-create publication retry.
+                && self.closed_tabs.is_empty()
+                && self.coherent_graph().is_some_and(|graph| {
+                    graph.tasks().any(|task| {
+                        !task.status.is_terminal()
+                            && !task.tags.iter().any(|tag| tag == "archived")
+                            && task
+                                .tags
+                                .iter()
+                                .any(|tag| worksgood::chat_id::is_chat_loop_tag(tag))
+                            && (worksgood::chat_id::parse_chat_task_id(&task.id).is_some()
+                                || task.id == ".coordinator")
+                    })
+                });
+        if authoritative_chat_appeared {
+            // Changes Empty -> Loading immediately, so repeated graph refreshes
+            // cannot churn metadata generations while the worker is in flight.
+            self.retry_chat_startup();
+        }
     }
 
     /// Sync active_tabs with the current graph state:
@@ -18199,6 +19693,32 @@ impl VizApp {
         // `.coordinator-N` ids keep their muted-gray treatment in the tab bar.
         self.cached_coordinator_id_set = current;
         self.rebuild_active_tab_entries_from_cache();
+        if self
+            .active_chat_identity
+            .as_ref()
+            .is_none_or(|identity| identity.coordinator_id != self.active_coordinator_id)
+        {
+            self.active_chat_identity = self.chat_identity_from_graph(self.active_coordinator_id);
+        }
+
+        // Creation acknowledgement can beat graph publication. Once the exact
+        // pending chat appears in an authoritative graph, resolve its saved
+        // route and queue the PTY. Without this edge, first-use auto-create
+        // produced a visible tab that stayed permanently in file/NAV mode.
+        if pending_seen_in_graph
+            && self.chat_is_live(self.active_coordinator_id)
+            && !self
+                .task_panes
+                .contains_key(&worksgood::chat_id::format_chat_task_id(
+                    self.active_coordinator_id,
+                ))
+            && self.pending_chat_pty_spawn.is_none()
+        {
+            self.active_chat_identity = self.chat_identity_from_graph(self.active_coordinator_id);
+            self.maybe_auto_enable_chat_pty();
+        }
+
+        self.retry_chat_startup_if_authoritative_chat_appeared();
     }
 
     /// Close a tab: remove from active_tabs without touching the underlying
@@ -18213,8 +19733,14 @@ impl VizApp {
             if let Some(&next) = self.active_tabs.first() {
                 self.switch_coordinator(next);
             } else {
-                // No tabs left — set to 0 (empty/welcome state)
+                // Detach the tab without killing/abandoning its process. With
+                // no canonical selection, PTY input must stop and the empty
+                // state must say so explicitly rather than showing chat-0.
                 self.active_coordinator_id = 0;
+                self.active_chat_identity = None;
+                self.chat_startup_state = ChatStartupState::Empty;
+                self.chat_pty_mode = false;
+                self.chat_pty_forwards_stdin = false;
             }
         }
         self.rebuild_active_tab_entries_from_cache();
@@ -18692,7 +20218,7 @@ impl VizApp {
     }
 
     fn load_coordinator_runtime(&mut self) {
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         let cid = self.active_coordinator_id;
         let state =
             worksgood::service::chat_compactor::ChatCompactorState::load(&self.workgraph_dir, cid);
@@ -18775,6 +20301,21 @@ impl VizApp {
                     }
                 })
             });
+    }
+
+    /// Schedule periodic auxiliary snapshots in starvation-safe order.
+    ///
+    /// Service goes first when both snapshots are due because Chat is requested on every
+    /// refresh while its tab is active. Both requests are still attempted: if Service fills
+    /// the queue, Chat can enter as soon as the worker starts Service; if it cannot, the next
+    /// tick coalesces the pending Service request and gives Chat another chance.
+    fn request_periodic_auxiliary_snapshots(&mut self, chat_due: bool, service_due: bool) {
+        if service_due {
+            self.request_service_snapshot();
+        }
+        if chat_due {
+            self.request_chat_refresh();
+        }
     }
 
     pub fn request_chat_refresh(&mut self) {
@@ -19029,7 +20570,7 @@ impl VizApp {
     /// Apply completed auxiliary snapshots. Completion closures are bounded
     /// state swaps and identity checks; all storage work already finished on
     /// the worker.
-    fn poll_auxiliary_snapshots(&mut self) -> bool {
+    pub(super) fn poll_auxiliary_snapshots(&mut self) -> bool {
         let completed = self.auxiliary.drain();
         let changed = !completed.is_empty();
         for apply in completed {
@@ -19078,7 +20619,7 @@ impl VizApp {
 
     /// Load configuration from disk and populate config panel entries.
     pub fn load_config_panel(&mut self) {
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         self.config_panel.endpoint_names = config
             .llm_endpoints
             .endpoints
@@ -19906,7 +21447,7 @@ impl VizApp {
             match worksgood::config::Config::load_with_sources(&self.workgraph_dir) {
                 Ok(pair) => pair,
                 Err(_) => {
-                    let cfg = worksgood::config::Config::load_or_default(&self.workgraph_dir);
+                    let cfg = load_tui_config(&self.workgraph_dir);
                     (cfg, std::collections::BTreeMap::new())
                 }
             };
@@ -20219,7 +21760,15 @@ impl VizApp {
             SettingsEntryKind::Profile { name, .. } => name.clone(),
             _ => return,
         };
-        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("wg"));
+        let exe = match worksgood::self_exe::direct_reexec_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.settings_panel.last_error = Some(format!(
+                    "Could not resolve the running WG executable: {error}"
+                ));
+                return;
+            }
+        };
         let result = std::process::Command::new(&exe)
             .arg("profile")
             .arg("use")
@@ -20237,8 +21786,11 @@ impl VizApp {
                     Some(format!("profile use {} failed: {}", name, stderr.trim()));
             }
             Err(e) => {
-                self.settings_panel.last_error =
-                    Some(format!("Failed to run wg profile use: {}", e));
+                self.settings_panel.last_error = Some(format!(
+                    "Failed to execute WG profile command via {}: {}",
+                    exe.display(),
+                    e
+                ));
             }
         }
     }
@@ -20260,7 +21812,15 @@ impl VizApp {
     /// Shells out via `std::process::Command` — the canonical CLI is the
     /// single source of truth for what "lint" means (design doc §7.2).
     pub fn run_settings_lint(&mut self) {
-        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("wg"));
+        let exe = match worksgood::self_exe::direct_reexec_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.settings_panel.last_error = Some(format!(
+                    "Could not resolve the running WG executable: {error}"
+                ));
+                return;
+            }
+        };
         let result = std::process::Command::new(&exe)
             .args(["config", "lint", "--merged"])
             .current_dir(&self.workgraph_dir)
@@ -20329,7 +21889,7 @@ impl VizApp {
 
         self.config_panel.entries[idx].value = new_value.clone();
 
-        let mut config = Config::load_or_default(&self.workgraph_dir);
+        let mut config = load_tui_config(&self.workgraph_dir);
         let key = self.config_panel.entries[idx].key.clone();
         match key.as_str() {
             "coordinator.max_agents" => {
@@ -20667,7 +22227,7 @@ impl VizApp {
                 && let Some(idx_str) = rest.strip_suffix(".remove")
                 && let Ok(ep_idx) = idx_str.parse::<usize>()
             {
-                let mut config = Config::load_or_default(&self.workgraph_dir);
+                let mut config = load_tui_config(&self.workgraph_dir);
                 if ep_idx < config.llm_endpoints.endpoints.len() {
                     config.llm_endpoints.endpoints.remove(ep_idx);
                     let _ = config.save(&self.workgraph_dir);
@@ -20684,7 +22244,7 @@ impl VizApp {
                 && let Some(idx_str) = rest.strip_suffix(".is_default")
                 && let Ok(ep_idx) = idx_str.parse::<usize>()
             {
-                let mut config = Config::load_or_default(&self.workgraph_dir);
+                let mut config = load_tui_config(&self.workgraph_dir);
                 for (i, ep) in config.llm_endpoints.endpoints.iter_mut().enumerate() {
                     ep.is_default = i == ep_idx;
                 }
@@ -20747,7 +22307,7 @@ impl VizApp {
         };
         self.config_panel.entries[idx].value = new_val.to_string();
 
-        let mut config = Config::load_or_default(&self.workgraph_dir);
+        let mut config = load_tui_config(&self.workgraph_dir);
         match key.as_str() {
             "agency.auto_evaluate" => config.agency.auto_evaluate = new_val == "on",
             "agency.auto_assign" => config.agency.auto_assign = new_val == "on",
@@ -20786,7 +22346,7 @@ impl VizApp {
             );
             return;
         }
-        let mut config = Config::load_or_default(&self.workgraph_dir);
+        let mut config = load_tui_config(&self.workgraph_dir);
         let provider = if fields.provider.is_empty() {
             "anthropic".to_string()
         } else {
@@ -20886,7 +22446,7 @@ impl VizApp {
         let Some(ep_idx) = ep_idx else {
             return;
         };
-        let config = Config::load_or_default(&self.workgraph_dir);
+        let config = load_tui_config(&self.workgraph_dir);
         let Some(ep) = config.llm_endpoints.endpoints.get(ep_idx) else {
             return;
         };
@@ -21361,19 +22921,13 @@ fn find_all_archives(
     entries
 }
 
-/// Print the "tmux missing → no chat persistence" warning at most once
-/// per process. Without the once-guard, every chat tab the user opens
-/// in this TUI session would re-emit the same banner.
-fn warn_chat_tmux_missing_once() {
+/// Request the in-pane "tmux missing → no chat persistence" warning at most
+/// once per process. Without the guard, every opened chat tab would enqueue
+/// the same toast.
+fn warn_chat_tmux_missing_once() -> bool {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "[wg-tui] tmux not installed — chat agents will NOT survive TUI exit. \
-             Install tmux for codex/claude resume integrity. \
-             (See docs/design/chat-agent-persistence.md.)"
-        );
-    }
+    !WARNED.swap(true, Ordering::Relaxed)
 }
 
 /// Deterministic session UUID for a coordinator, derived from CWD + session name.
@@ -23918,9 +25472,10 @@ mod remap_panel_tests {
     #[test]
     fn grow_viz_pane_increases_by_5_percent() {
         let mut app = build_test_app();
-        app.right_panel_visible = true;
-        app.layout_mode = LayoutMode::ThirdInspector;
-        app.right_panel_percent = 10;
+        app.set_layout_preference(LayoutPreference {
+            size_percent: 10,
+            ..LayoutPreference::default()
+        });
 
         app.grow_viz_pane();
         assert_eq!(app.right_panel_percent, 15);
@@ -23932,47 +25487,51 @@ mod remap_panel_tests {
     #[test]
     fn grow_viz_pane_reaches_full_screen() {
         let mut app = build_test_app();
-        app.right_panel_visible = true;
-        app.layout_mode = LayoutMode::ThirdInspector;
-        app.right_panel_percent = 95;
+        app.set_layout_preference(LayoutPreference {
+            size_percent: LayoutPreference::MAX_PERCENT,
+            ..LayoutPreference::default()
+        });
 
         app.grow_viz_pane();
-        assert_eq!(app.right_panel_percent, 100);
+        assert_eq!(app.right_panel_percent, LayoutPreference::MAX_PERCENT);
         assert_eq!(app.layout_mode, LayoutMode::FullInspector);
+        assert_eq!(app.layout_preference.mode, InspectorMode::Full);
     }
 
     #[test]
     fn grow_viz_pane_from_full_transitions_to_off() {
         let mut app = build_test_app();
-        app.right_panel_visible = true;
-        app.layout_mode = LayoutMode::FullInspector;
-        app.right_panel_percent = 100;
+        app.set_layout_preference(LayoutPreference {
+            mode: InspectorMode::Full,
+            ..LayoutPreference::default()
+        });
 
-        // At 100% → transitions to Off (no wrap)
         app.grow_viz_pane();
         assert!(!app.right_panel_visible);
         assert_eq!(app.layout_mode, LayoutMode::Off);
+        assert_eq!(app.layout_preference.mode, InspectorMode::Hidden);
     }
 
     #[test]
     fn grow_viz_pane_full_roundtrip() {
         let mut app = build_test_app();
-        app.right_panel_visible = false;
-        app.layout_mode = LayoutMode::Off;
+        app.set_layout_preference(LayoutPreference {
+            mode: InspectorMode::Hidden,
+            ..LayoutPreference::default()
+        });
 
-        // First press opens at 5%
+        // Hidden opens at the bounded minimum.
         app.grow_viz_pane();
-        assert_eq!(app.right_panel_percent, 5);
+        assert_eq!(app.right_panel_percent, LayoutPreference::MIN_PERCENT);
         assert!(app.right_panel_visible);
 
-        // 19 more presses: 10, 15, 20, ..., 100
-        for expected in (10..=100).step_by(5) {
+        for expected in (15..=90).step_by(5) {
             app.grow_viz_pane();
             assert_eq!(app.right_panel_percent, expected);
         }
+        app.grow_viz_pane();
         assert_eq!(app.layout_mode, LayoutMode::FullInspector);
 
-        // One more transitions to Off (no wrap)
         app.grow_viz_pane();
         assert!(!app.right_panel_visible);
         assert_eq!(app.layout_mode, LayoutMode::Off);
@@ -23981,13 +25540,15 @@ mod remap_panel_tests {
     #[test]
     fn grow_viz_pane_opens_panel_when_closed() {
         let mut app = build_test_app();
-        app.right_panel_visible = false;
-        app.layout_mode = LayoutMode::Off;
+        app.set_layout_preference(LayoutPreference {
+            mode: InspectorMode::Hidden,
+            ..LayoutPreference::default()
+        });
 
         app.grow_viz_pane();
 
         assert!(app.right_panel_visible);
-        assert_eq!(app.right_panel_percent, 5);
+        assert_eq!(app.right_panel_percent, LayoutPreference::MIN_PERCENT);
     }
 
     // ── Shrink viz pane ──
@@ -23995,9 +25556,10 @@ mod remap_panel_tests {
     #[test]
     fn shrink_viz_pane_decreases_by_5_percent() {
         let mut app = build_test_app();
-        app.right_panel_visible = true;
-        app.layout_mode = LayoutMode::TwoThirdsInspector;
-        app.right_panel_percent = 70;
+        app.set_layout_preference(LayoutPreference {
+            size_percent: 70,
+            ..LayoutPreference::default()
+        });
 
         app.shrink_viz_pane();
         assert_eq!(app.right_panel_percent, 65);
@@ -24009,26 +25571,30 @@ mod remap_panel_tests {
     #[test]
     fn shrink_viz_pane_from_min_transitions_to_off() {
         let mut app = build_test_app();
-        app.right_panel_visible = true;
-        app.layout_mode = LayoutMode::ThirdInspector;
-        app.right_panel_percent = 5;
+        app.set_layout_preference(LayoutPreference {
+            size_percent: LayoutPreference::MIN_PERCENT,
+            ..LayoutPreference::default()
+        });
 
-        // At min (5%) → transitions to Off (no wrap)
         app.shrink_viz_pane();
         assert!(!app.right_panel_visible);
         assert_eq!(app.layout_mode, LayoutMode::Off);
+        assert_eq!(app.layout_preference.mode, InspectorMode::Hidden);
     }
 
     #[test]
     fn shrink_viz_pane_opens_panel_when_closed() {
         let mut app = build_test_app();
-        app.right_panel_visible = false;
-        app.layout_mode = LayoutMode::Off;
+        app.set_layout_preference(LayoutPreference {
+            mode: InspectorMode::Hidden,
+            ..LayoutPreference::default()
+        });
 
         app.shrink_viz_pane();
 
         assert!(app.right_panel_visible);
-        assert_eq!(app.right_panel_percent, 100);
+        assert_eq!(app.layout_mode, LayoutMode::FullInspector);
+        assert_eq!(app.layout_preference.mode, InspectorMode::Full);
     }
 
     // ── SlideAnimation ──
@@ -24433,6 +25999,78 @@ mod service_health_tests {
     fn no_degraded_label() {
         let h = ServiceHealthState::default();
         assert!(!h.label.contains("DEGRADED"));
+    }
+}
+
+#[cfg(test)]
+mod periodic_auxiliary_scheduler_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn periodic_service_snapshot_wins_saturated_slot_without_starving_chat() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let mut app = VizApp::build(
+            wg_dir,
+            VizOptions::default(),
+            Some(false),
+            None,
+            false,
+            Config::default(),
+            None,
+            false,
+        );
+
+        // Hold the worker on a running job so its one queue slot cannot be
+        // consumed between the two periodic submissions. This makes the old
+        // Chat-before-Service starvation ordering deterministic: only the
+        // first request can enter the saturated lane.
+        let blocker_started = Arc::new(AtomicBool::new(false));
+        let release_blocker = Arc::new(AtomicBool::new(false));
+        let worker_started = blocker_started.clone();
+        let worker_release = release_blocker.clone();
+        assert!(
+            app.auxiliary
+                .request(super::super::auxiliary::Kind::Config, move || {
+                    worker_started.store(true, Ordering::Release);
+                    while !worker_release.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Box::new(|_| {})
+                })
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !blocker_started.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(blocker_started.load(Ordering::Acquire));
+
+        app.request_periodic_auxiliary_snapshots(true, true);
+        assert!(
+            app.auxiliary
+                .is_pending(super::super::auxiliary::Kind::Service),
+            "Service must get the bounded queue slot when Chat and Service are both due"
+        );
+        assert!(
+            !app.auxiliary
+                .is_pending(super::super::auxiliary::Kind::Chat),
+            "the saturated one-slot queue should reject the second request"
+        );
+
+        release_blocker.store(true, Ordering::Release);
+        app.wait_for_auxiliary_snapshot();
+
+        // Service priority must not disable chat refreshes: on a chat-only
+        // tick, Chat still enters and completes through the same lane.
+        app.request_periodic_auxiliary_snapshots(true, false);
+        assert!(
+            app.auxiliary
+                .is_pending(super::super::auxiliary::Kind::Chat)
+        );
+        app.wait_for_auxiliary_snapshot();
     }
 }
 
@@ -29836,7 +31474,7 @@ mod launcher_redesign_tests {
         // it must NOT be included in the launch args.
         let mut state = make_state();
         state.mode = LauncherMode::AddNew;
-        state.add_executor_idx = 0; // claude
+        state.add_executor_idx = exec_idx("claude");
         state.add_model = "claude:sonnet".into();
         state.add_endpoint = "https://stale.example".into();
         let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
@@ -29907,9 +31545,9 @@ mod launcher_redesign_tests {
         assert_eq!(
             labels,
             vec![
+                "pi",
                 "claude",
                 "codex",
-                "pi",
                 "opencode",
                 "nex",
                 "octomind",
@@ -30839,7 +32477,7 @@ mod launcher_model_autocomplete_tests {
         // claude executor should float the anthropic model above an
         // openrouter one on an empty query (boost on tie).
         let state = model_state(
-            0, // claude
+            exec_idx("claude"),
             vec![
                 sug("minimax/minimax-m3", "openrouter", "curated"),
                 sug("anthropic/claude-opus-4-6", "anthropic", "frontier"),
@@ -31532,7 +33170,7 @@ mod chat_pty_executor_resolution_tests {
         // Chat 0 was created with codex + codex:gpt-5.
         write_state(wg_dir, 0, Some("codex"), Some("codex:gpt-5"));
 
-        let config = Config::load_or_default(wg_dir);
+        let config = load_tui_config(wg_dir);
         let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 0);
 
         assert_eq!(
@@ -31559,13 +33197,39 @@ mod chat_pty_executor_resolution_tests {
         .unwrap();
         // No CoordinatorState file written for chat 0.
 
-        let config = Config::load_or_default(wg_dir);
+        let config = load_tui_config(wg_dir);
         let expected_executor = config.coordinator.effective_executor();
         let expected_model = config.coordinator.model.clone();
         let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 0);
 
         assert_eq!(executor, expected_executor, "effective default executor");
         assert_eq!(model, expected_model, "effective default model");
+    }
+
+    #[test]
+    fn custom_command_chat_route_never_inherits_global_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            b"[coordinator]\nexecutor = \"pi\"\nmodel = \"pi:openrouter:example/model\"\n",
+        )
+        .unwrap();
+        let mut graph = worksgood::graph::WorkGraph::new();
+        graph.add_node(worksgood::graph::Node::Task(worksgood::graph::Task {
+            id: ".chat-0".to_string(),
+            title: "Chat: custom".to_string(),
+            status: worksgood::graph::Status::InProgress,
+            tags: vec![worksgood::chat_id::CHAT_LOOP_TAG.to_string()],
+            command_argv: vec!["bash".to_string(), "-lc".to_string(), "cat".to_string()],
+            ..Default::default()
+        }));
+        worksgood::parser::save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
+
+        let config = load_tui_config(wg_dir);
+        let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 0);
+        assert_eq!(executor, "command");
+        assert_eq!(model, None);
     }
 
     /// Mixed overrides: only model is per-chat, executor defaults
@@ -31581,7 +33245,7 @@ mod chat_pty_executor_resolution_tests {
         .unwrap();
         write_state(wg_dir, 1, None, Some("claude:sonnet"));
 
-        let config = Config::load_or_default(wg_dir);
+        let config = load_tui_config(wg_dir);
         let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 1);
 
         assert_eq!(executor, "claude");
@@ -31599,7 +33263,7 @@ mod chat_pty_executor_resolution_tests {
         .unwrap();
         write_chat_task(wg_dir, 2, Some("pi"), None);
 
-        let config = Config::load_or_default(wg_dir);
+        let config = load_tui_config(wg_dir);
         let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 2);
 
         assert_eq!(executor, "pi");
@@ -31620,7 +33284,7 @@ mod chat_pty_executor_resolution_tests {
         .unwrap();
         write_chat_task(wg_dir, 3, Some("pi"), None);
 
-        let config = Config::load_or_default(wg_dir);
+        let config = load_tui_config(wg_dir);
         let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 3);
 
         assert_eq!(executor, "pi");
@@ -31641,7 +33305,7 @@ mod chat_pty_executor_resolution_tests {
         .unwrap();
         write_chat_task(wg_dir, 4, Some("pi"), Some("pi:lunaroute:glm-5.2-nvfp4"));
 
-        let config = Config::load_or_default(wg_dir);
+        let config = load_tui_config(wg_dir);
         let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 4);
 
         assert_eq!(executor, "pi");
@@ -31714,8 +33378,8 @@ mod build_codex_chat_pty_args_tests {
     /// `--dangerously-bypass-approvals-and-sandbox`. Without it codex
     /// prompts the user to approve every shell command (`wg status`,
     /// `wg add`, etc.) and the chat agent cannot do its job. The user
-    /// authorized the chat agent implicitly by opening the TUI from
-    /// their own terminal — same posture as the claude path's
+    /// authorized the chat agent through an explicit New-chat/create action
+    /// from their own terminal — same posture as the claude path's
     /// `--dangerously-skip-permissions`.
     #[test]
     fn fresh_session_includes_bypass_flag() {
@@ -32022,10 +33686,228 @@ is_default = true
 }
 
 #[cfg(test)]
+mod prioritized_chat_startup_tests {
+    use super::*;
+    use worksgood::graph::{Node, Status, WorkGraph};
+    use worksgood::parser::save_graph;
+    use worksgood::test_helpers::make_task_with_status;
+
+    fn write_chat_graph(dir: &Path, id: &str, executor: &str, model: Option<&str>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut graph = WorkGraph::new();
+        let mut task = make_task_with_status(id, "Chat fixture", Status::InProgress);
+        task.tags = vec!["chat-loop".to_string()];
+        task.executor_preset_name = Some(executor.to_string());
+        task.model = model.map(str::to_string);
+        task.command_argv = worksgood::chat_command::argv_for_preset(executor, model, None, "wg");
+        graph.add_node(Node::Task(task));
+        save_graph(&graph, dir.join("graph.jsonl")).unwrap();
+    }
+
+    #[test]
+    fn authoritative_empty_chat_startup_is_stable_and_non_persistent() {
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(".wg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("graph.jsonl"), "").unwrap();
+        let apply = VizApp::load_chat_startup(dir.clone()).unwrap();
+        let mut app = VizApp::new(dir.clone(), VizOptions::default(), Some(false), None, true);
+
+        apply(&mut app);
+        assert_eq!(app.chat_startup_state, ChatStartupState::Empty);
+        assert!(app.active_chat_identity.is_none());
+        assert!(app.active_tabs.is_empty());
+        assert!(app.pending_chat_pty_spawn.is_none());
+        assert!(!app.has_chat_state_to_persist());
+
+        app.maintain_existing_chat_sessions();
+        app.save_all_chat_state();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("graph.jsonl")).unwrap(),
+            ""
+        );
+        assert!(!dir.join("tui-state.json").exists());
+        assert!(!dir.join("chat-history-0.jsonl").exists());
+        assert!(!dir.join("chat").exists());
+    }
+
+    #[test]
+    fn missing_or_corrupt_route_fails_before_session_or_process_mutation() {
+        for (model, malformed_state) in [
+            (None, false),
+            (Some("pi:"), false),
+            (Some("pi:openrouter:z-ai/glm-5.2"), true),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let dir = project.path().join(".wg");
+            write_chat_graph(&dir, ".chat-0", "", model);
+            if malformed_state {
+                std::fs::create_dir_all(dir.join("service")).unwrap();
+                std::fs::write(dir.join("service/coordinator-state-0.json"), "{broken").unwrap();
+            }
+            let graph_before = std::fs::read(dir.join("graph.jsonl")).unwrap();
+            let state_before = std::fs::read(dir.join("service/coordinator-state-0.json")).ok();
+
+            let error = match VizApp::load_chat_startup(dir.clone()) {
+                Ok(_) => panic!("invalid route must not produce a spawn plan"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("no saved execution route")
+                    || error.to_string().contains("corrupt saved route metadata"),
+                "{error:#}"
+            );
+            assert_eq!(
+                std::fs::read(dir.join("graph.jsonl")).unwrap(),
+                graph_before
+            );
+            assert_eq!(
+                std::fs::read(dir.join("service/coordinator-state-0.json")).ok(),
+                state_before,
+                "bootstrap must not quarantine or rewrite malformed route state"
+            );
+            assert!(!dir.join("chat").exists());
+            assert!(!dir.join("sessions.json").exists());
+        }
+    }
+
+    #[test]
+    fn corrupt_active_metadata_fails_closed_without_a_spawn_plan() {
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(".wg");
+        write_chat_graph(&dir, ".chat-0", "pi", Some("pi:openrouter:z-ai/glm-5.2"));
+        std::fs::write(dir.join("tui-state.json"), "{not-json").unwrap();
+
+        let error = match VizApp::load_chat_startup(dir) {
+            Ok(_) => panic!("corrupt metadata must not produce a spawn plan"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("active chat metadata is corrupt")
+        );
+    }
+
+    #[test]
+    fn deleted_saved_chat_is_not_relaunched_as_chat_zero() {
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(".wg");
+        write_chat_graph(&dir, ".chat-1", "command", None);
+        std::fs::write(
+            dir.join("tui-state.json"),
+            r#"{"active_coordinator_id":0,"right_panel_tab":"Chat","open_tabs":[".chat-0"],"active":".chat-0"}"#,
+        )
+        .unwrap();
+
+        let error = match VizApp::load_chat_startup(dir) {
+            Ok(_) => panic!("a deleted saved chat must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(".chat-0 no longer exists"));
+    }
+
+    #[test]
+    fn new_pi_chat_plan_keeps_exact_atomic_pi_route() {
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(".wg");
+        write_chat_graph(&dir, ".chat-0", "pi", Some("pi:openrouter:z-ai/glm-5.2"));
+        std::fs::write(
+            dir.join("tui-state.json"),
+            r#"{"active_coordinator_id":0,"right_panel_tab":"Chat","open_tabs":[".chat-0"],"active":".chat-0"}"#,
+        )
+        .unwrap();
+
+        let apply = VizApp::load_chat_startup(dir.clone()).unwrap();
+        let mut app = VizApp::new(dir, VizOptions::default(), Some(false), None, true);
+        apply(&mut app);
+        let identity = app
+            .active_chat_view_identity()
+            .expect("selected Pi identity");
+        assert_eq!(identity.coordinator_id, 0);
+        assert_eq!(identity.task_id, ".chat-0");
+        assert_eq!(identity.executor.as_deref(), Some("pi"));
+        assert_eq!(
+            identity.model.as_deref(),
+            Some("pi:openrouter:z-ai/glm-5.2")
+        );
+
+        let pending = app.pending_chat_pty_spawn.expect("Pi plan");
+        assert_eq!(pending.executor, "pi");
+        assert_eq!(
+            std::path::Path::new(&pending.bin)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("pi"),
+            "Pi discovery may resolve an absolute executable path"
+        );
+        assert!(
+            pending
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--provider", "openrouter"])
+        );
+        assert!(
+            pending
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--model", "z-ai/glm-5.2"])
+        );
+        assert!(!pending.args.iter().any(|arg| arg.contains("claude")));
+    }
+
+    #[test]
+    fn selecting_dead_live_chat_resurrects_saved_route() {
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(".wg");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut graph = WorkGraph::new();
+        let mut task = make_task_with_status(".chat-4", "Saved Pi", Status::InProgress);
+        task.tags = vec!["chat-loop".to_string()];
+        task.executor_preset_name = Some("pi".to_string());
+        task.model = Some("pi:openai-codex:gpt-5.6-sol".to_string());
+        task.command_argv =
+            worksgood::chat_command::argv_for_preset("pi", task.model.as_deref(), None, "wg");
+        graph.add_node(Node::Task(task));
+        save_graph(&graph, dir.join("graph.jsonl")).unwrap();
+
+        let mut app = VizApp::new(dir, VizOptions::default(), Some(false), None, true);
+        app.published_graph = Some(Arc::new(graph));
+        app.active_coordinator_id = 4;
+        app.active_tabs = vec![4];
+        app.chat_startup_state = ChatStartupState::Ready;
+        app.pending_chat_pty_spawn = None;
+        app.chat_agent_death.insert(
+            4,
+            ChatAgentDeathInfo {
+                exit_status: "exit 1".to_string(),
+                executor: "pi".to_string(),
+                spawn_cmd: "pi --session-id chat-4".to_string(),
+            },
+        );
+
+        app.open_chat_task_or_detail(".chat-4");
+
+        assert!(!app.chat_agent_death.contains_key(&4));
+        let pending = app
+            .pending_chat_pty_spawn
+            .as_ref()
+            .expect("selecting a dead live tab must queue resurrection");
+        assert_eq!(pending.executor, "pi");
+        assert!(
+            pending
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--session-id", "chat-4"])
+        );
+    }
+}
+
+#[cfg(test)]
 mod chat_pty_deferred_spawn_tests {
     //! `maybe_auto_enable_chat_pty` defers the actual `PtyPane::spawn`
-    //! to the chat-tab render path so the child process opens its PTY
-    //! at the real `msg_area` dimensions instead of a hardcoded 24×80.
+    //! until the chat-tab render path supplies real dimensions, then a fixed
+    //! background lane opens the PTY without blocking render/input.
     //! Without this, the first frame's resize fired a SIGWINCH that the
     //! vendor CLI honored by clear-screen + reprint — pushing
     //! wrap-mismatched copies of recent content into vt100 scrollback,
@@ -32047,6 +33929,44 @@ mod chat_pty_deferred_spawn_tests {
             annotation_map: HashMap::new(),
         };
         VizApp::from_viz_output_for_test(&viz)
+    }
+
+    fn enable_pty_lane(app: &mut VizApp) {
+        app.chat_pty_engine = Some(super::super::chat_startup::PtyEngine::new());
+    }
+
+    fn wait_for_pane(app: &mut VizApp, task_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            app.poll_chat_pty_spawn();
+            if app.task_panes.contains_key(task_id) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("background PTY lane did not publish {task_id}");
+    }
+
+    #[test]
+    fn pi_chat_pty_env_carries_exact_canonical_identity() {
+        let env = chat_pty_env(
+            std::path::Path::new("/project/.wg"),
+            ".chat-12",
+            "chat-12",
+            "pi",
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "WG_CHAT_ID" && v == ".chat-12")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "WG_CHAT_REF" && v == "chat-12")
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "WG_EXECUTOR_TYPE" && v == "pi")
+        );
     }
 
     /// `consume_pending_chat_pty_spawn` is a no-op when no spawn is
@@ -32071,6 +33991,7 @@ mod chat_pty_deferred_spawn_tests {
         let mut app = empty_app();
         app.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
             task_id: ".chat-1".to_string(),
+            reattach: false,
             bin: "/bin/false".to_string(),
             args: vec![],
             env: vec![],
@@ -32098,8 +34019,10 @@ mod chat_pty_deferred_spawn_tests {
     #[test]
     fn consume_with_real_dims_spawns_at_those_dims() {
         let mut app = empty_app();
+        enable_pty_lane(&mut app);
         app.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
             task_id: ".chat-test".to_string(),
+            reattach: false,
             bin: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "sleep 60".to_string()],
             env: vec![],
@@ -32110,8 +34033,9 @@ mod chat_pty_deferred_spawn_tests {
         let rows = 30u16;
         let cols = 120u16;
         let spawned = app.consume_pending_chat_pty_spawn(rows, cols);
-        assert!(spawned, "spawn should succeed with /bin/sh -c sleep");
+        assert!(spawned, "spawn should queue with /bin/sh -c sleep");
         assert!(app.pending_chat_pty_spawn.is_none());
+        wait_for_pane(&mut app, ".chat-test");
         let pane = app
             .task_panes
             .get(".chat-test")
@@ -32128,8 +34052,10 @@ mod chat_pty_deferred_spawn_tests {
     #[test]
     fn consume_records_spawn_info_on_success() {
         let mut app = empty_app();
+        enable_pty_lane(&mut app);
         app.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
             task_id: ".chat-5".to_string(),
+            reattach: false,
             bin: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "sleep 60".to_string()],
             env: vec![],
@@ -32139,6 +34065,7 @@ mod chat_pty_deferred_spawn_tests {
         });
         let spawned = app.consume_pending_chat_pty_spawn(24, 80);
         assert!(spawned);
+        wait_for_pane(&mut app, ".chat-5");
         let info = app
             .chat_last_spawn_info
             .get(&5)
@@ -32233,6 +34160,68 @@ mod chat_agent_death_tests {
             "death info for cid=1 must not affect cid=0"
         );
         assert!(app.chat_agent_death.contains_key(&1));
+    }
+}
+
+#[cfg(test)]
+mod chat_lifecycle_completion_tests {
+    use super::*;
+    use crate::commands::viz::VizOutput;
+
+    fn empty_app() -> VizApp {
+        let viz = VizOutput {
+            text: String::new(),
+            node_line_map: HashMap::new(),
+            task_order: Vec::new(),
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
+        };
+        VizApp::from_viz_output_for_test(&viz)
+    }
+
+    #[test]
+    fn archive_completion_without_local_pane_is_idempotent() {
+        let unique = format!(
+            "wg-tui-archive-no-pane-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(unique);
+        let workgraph_dir = root.join(".wg");
+        std::fs::create_dir_all(&workgraph_dir).expect("create isolated workgraph dir");
+
+        let mut app = empty_app();
+        app.workgraph_dir = workgraph_dir;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.cmd_tx = tx;
+        app.cmd_rx = rx;
+        let cid = 987_654_321;
+        let task_id = worksgood::chat_id::format_chat_task_id(cid);
+        assert!(!app.task_panes.contains_key(&task_id));
+        app.cmd_tx
+            .send(CommandResult {
+                success: true,
+                output: String::new(),
+                effect: CommandEffect::ArchiveCoordinator(cid),
+            })
+            .expect("inject archive completion");
+
+        assert!(app.drain_commands(), "archive completion should be drained");
+        assert!(!app.task_panes.contains_key(&task_id));
+        assert!(
+            app.toasts
+                .iter()
+                .any(|toast| toast.message == format!("Archived coordinator {cid}")),
+            "successful no-pane archive should complete normally"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

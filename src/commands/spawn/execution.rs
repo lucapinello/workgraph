@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use worksgood::agency;
@@ -133,6 +133,11 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
     let resolved_executor_name = plan.executor.as_str();
     let resolved_model_for_spawn = Some(plan.model.raw.clone());
     let resolved_reasoning = explicit_reasoning.or(task.reasoning).or(plan.reasoning);
+    // One opaque run identity ties the spawned route, completion outcome, and
+    // dead-agent triage together. Unlike PID/timestamps, it cannot collide on
+    // a fast restart or PID reuse.
+    let spawn_run_id = uuid::Uuid::new_v4().to_string();
+    let health_route = worksgood::service::HealthRouteKey::from_spawn_plan(&plan);
 
     // Only allow spawning on tasks that are Open or Blocked
     match task.status {
@@ -355,6 +360,25 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
         .unwrap_or_else(|| m.clone());
     }
 
+    // Fail-safe direct-spawn admission. The dispatcher performs the same
+    // class-specific check so it can skip builds and continue evaluators, but
+    // this closes the race for `wg spawn` and for disk pressure that changes
+    // between scheduling and process creation.
+    let build_class = worksgood::disk_sentinel::classify_task(task);
+    if build_class.is_build_capable() {
+        let (level, reason, _) = worksgood::disk_sentinel::current_admission(
+            dir,
+            &config.coordinator.resource_management,
+        );
+        if level.blocks_builds() {
+            anyhow::bail!(
+                "build admission {:?}: {} (LLM-only evaluation and graph operations remain eligible)",
+                level,
+                reason
+            );
+        }
+    }
+
     // Load agent registry with lock for concurrent safety.
     // The lock is held until save() to prevent two concurrent spawns from
     // reading the same next_agent_id and overwriting each other's registration.
@@ -363,6 +387,29 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
 
     // We need to know the agent ID before spawning to set up the output directory
     let temp_agent_id = format!("agent-{}", locked_registry.next_agent_id);
+
+    if build_class.is_heavy() {
+        let active_heavy = locked_registry
+            .all()
+            .filter(|agent| {
+                agent.is_live(
+                    config
+                        .coordinator
+                        .resource_management
+                        .disk_agent_heartbeat_seconds,
+                ) && graph
+                    .get_task(&agent.task_id)
+                    .is_some_and(|task| worksgood::disk_sentinel::classify_task(task).is_heavy())
+            })
+            .count();
+        if active_heavy >= config.coordinator.resource_management.max_build_agents {
+            anyhow::bail!(
+                "build-heavy admission budget full ({}/{})",
+                active_heavy,
+                config.coordinator.resource_management.max_build_agents
+            );
+        }
+    }
     let output_dir = agent_output_dir(dir, &temp_agent_id);
     fs::create_dir_all(&output_dir).with_context(|| {
         format!(
@@ -443,6 +490,47 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
     };
 
     vars.in_worktree = worktree_info.is_some();
+
+    let owned_target_path = if build_class.is_build_capable() {
+        worksgood::disk_sentinel::target_path_for_agent(
+            &config.coordinator.resource_management,
+            worktree_info.as_ref().map(|wt| wt.path.as_path()),
+            &temp_agent_id,
+        )
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                worktree_info
+                    .as_ref()
+                    .map(|wt| wt.path.join(&path))
+                    .or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(&path)))
+                    .unwrap_or(path)
+            }
+        })
+    } else {
+        None
+    };
+    if let Some(path) = owned_target_path.as_ref() {
+        fs::create_dir_all(path)
+            .with_context(|| format!("Failed to create owned Cargo target {}", path.display()))?;
+    }
+    let owned_tmp_path = if build_class.is_build_capable() {
+        let root = config
+            .coordinator
+            .resource_management
+            .build_tmp_root
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        Some(root.join(format!("wg-cargo-tmp-{temp_agent_id}")))
+    } else {
+        None
+    };
+    if let Some(path) = owned_tmp_path.as_ref() {
+        fs::create_dir_all(path)
+            .with_context(|| format!("Failed to create owned build scratch {}", path.display()))?;
+    }
 
     // Apply templates to executor settings (with effective model in vars)
     let mut settings = executor_config.apply_templates(&vars);
@@ -655,6 +743,7 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
     // Add task ID and agent ID to environment
     cmd.env("WG_TASK_ID", task_id);
     if let Some(chat_id) = worksgood::chat_id::parse_chat_task_id(task_id) {
+        cmd.env("WG_CHAT_ID", task_id);
         cmd.env(
             "WG_CHAT_REF",
             worksgood::chat_id::format_chat_session_ref(chat_id),
@@ -674,6 +763,7 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
             .as_secs()
             .to_string(),
     );
+    cmd.env("WG_SPAWN_RUN_ID", &spawn_run_id);
     // Propagate user identity to spawned agents
     cmd.env("WG_USER", worksgood::current_user());
     if let Some(ref m) = effective_model {
@@ -730,10 +820,16 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
         // Signal to Claude Code (and other tools) that this session is already
         // inside a managed worktree — do not create a competing one.
         cmd.env("WG_WORKTREE_ACTIVE", "1");
-        // Isolate cargo target directory to prevent file lock contention between agents
-        cmd.env("CARGO_TARGET_DIR", wt.path.join("target"));
     } else if let Some(ref wd) = settings.working_dir {
         cmd.current_dir(wd);
+    }
+    if let Some(path) = owned_target_path.as_ref() {
+        // Isolate Cargo and make the exact absolute/temporary path explicit in
+        // the ownership registry after the child PID identity is available.
+        cmd.env("CARGO_TARGET_DIR", path);
+    }
+    if let Some(path) = owned_tmp_path.as_ref() {
+        cmd.env("TMPDIR", path);
     }
 
     // Wrapper script handles output redirect internally
@@ -921,6 +1017,65 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
     if let Some(ref wt) = worktree_info {
         locked_registry.set_worktree_path(&agent_id, &wt.path);
     }
+    // Persist every build-capable worker's exact owned paths before allowing
+    // the spawn to become an invisible cache producer. Ownership includes the
+    // task, agent, exact PID start identity, mount and lease; names alone are
+    // never used by cleanup.
+    let lease_seconds = config
+        .coordinator
+        .resource_management
+        .owned_cache_lease_seconds;
+    let worktree_path = worktree_info.as_ref().map(|wt| wt.path.as_path());
+    let mut ownership_error = None;
+    if let Some(path) = owned_target_path.as_ref() {
+        let cache = worksgood::disk_sentinel::make_owned_cache(
+            path,
+            worksgood::disk_sentinel::CacheKind::CargoTarget,
+            task_id,
+            &agent_id,
+            pid,
+            worktree_path,
+            lease_seconds,
+        );
+        if let Err(error) = worksgood::disk_sentinel::register_owned_cache(dir, cache) {
+            ownership_error = Some(error);
+        }
+    }
+    if ownership_error.is_none()
+        && let Some(path) = owned_tmp_path.as_ref()
+    {
+        let cache = worksgood::disk_sentinel::make_owned_cache(
+            path,
+            worksgood::disk_sentinel::CacheKind::CargoInstallScratch,
+            task_id,
+            &agent_id,
+            pid,
+            worktree_path,
+            lease_seconds,
+        );
+        if let Err(error) = worksgood::disk_sentinel::register_owned_cache(dir, cache) {
+            ownership_error = Some(error);
+        }
+    }
+    if let Some(error) = ownership_error {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        let task_id_rollback = task_id.to_string();
+        let _ = modify_graph(&graph_path, |graph| {
+            if let Some(task) = graph.get_task_mut(&task_id_rollback) {
+                task.status = Status::Open;
+                task.started_at = None;
+                task.assigned = None;
+                true
+            } else {
+                false
+            }
+        });
+        return Err(error.context("failed to persist build-cache ownership; killed spawned worker"));
+    }
+
     // save() consumes the LockedRegistry, releasing the lock after write.
     if let Err(save_err) = locked_registry.save() {
         // Registry save failed — kill the orphaned process to prevent invisible agents
@@ -956,12 +1111,21 @@ pub(crate) fn spawn_agent_inner_with_reasoning(
         "model": &effective_model,
         "reasoning": resolved_reasoning.map(|r| r.as_str()),
         "started_at": Utc::now().to_rfc3339(),
+        "run_id": &spawn_run_id,
+        "health_route": &health_route,
         "timeout_secs": effective_timeout_secs,
     });
     if let Some(ref wt) = worktree_info {
         metadata["worktree_path"] = serde_json::json!(wt.path.to_string_lossy());
         metadata["worktree_branch"] = serde_json::json!(&wt.branch);
     }
+    metadata["owned_cache_paths"] = serde_json::json!(
+        [owned_target_path.as_ref(), owned_tmp_path.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    );
     fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?)?;
 
     Ok(SpawnResult {
@@ -2088,7 +2252,12 @@ if [ $EXIT_CODE -ne 0 ]; then
         echo "" >> "$OUTPUT_FILE"
         echo "[wrapper] Session not resumable, starting fresh session" >> "$OUTPUT_FILE"
         wg log "$TASK_ID" "session not resumable, falling back to fresh session" 2>/dev/null || true
-        {fallback_run_command}
+        # The heartbeat guard writer belongs only to this wrapper. Close it
+        # around the fallback executor exactly as for the primary executor, so
+        # wrapper death produces immediate EOF even while the fallback lives.
+        {{
+            {fallback_run_command}
+        }} {{HEARTBEAT_GUARD_FD}}>&-
         EXIT_CODE=$?
     fi
 fi
@@ -2117,19 +2286,21 @@ unset CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH
 {timeout_note}
 {debug_env_vars}
 {stream_init}
-# Background heartbeat loop — keeps registry heartbeat fresh while agent runs.
-# Without this, agents running longer than heartbeat_timeout get reaped as dead.
-(while kill -0 $$ 2>/dev/null; do
-    sleep 120
-    wg heartbeat "$WG_AGENT_ID" 2>/dev/null || true
-done) &
+# Guarded heartbeat watcher — keeps registry heartbeat fresh while this wrapper
+# owns the anonymous pipe's write descriptor. The executor runs with that
+# descriptor closed, so even an untrappable wrapper death produces immediate
+# EOF and the watcher exits instead of orphaning a `sleep 120` subprocess.
+exec {{HEARTBEAT_GUARD_FD}}> >(wg heartbeat-watch "$WG_AGENT_ID" --supervised-pid "$$" 2>/dev/null)
 HEARTBEAT_PID=$!
 
-# Run the agent command
-{run_command}
+# Run the agent command without inheriting the heartbeat guard writer.
+{{
+    {run_command}
+}} {{HEARTBEAT_GUARD_FD}}>&-
 EXIT_CODE=$?
 {session_fallback_block}
-# Stop the heartbeat loop
+# Stop the heartbeat watcher and close its guard on normal completion.
+exec {{HEARTBEAT_GUARD_FD}}>&-
 kill $HEARTBEAT_PID 2>/dev/null; wait $HEARTBEAT_PID 2>/dev/null
 {stream_result}
 
@@ -2196,7 +2367,7 @@ fi
 # --- Worktree Cleanup (merge-back is handled by wg done) ---
 # The merge-back squash is now performed inline by `wg done` while the agent is
 # still alive, so it can react to conflicts. This wrapper only handles the
-# cleanup marker for the coordinator sweep.
+# cleanup marker for the explicit worktree cleanup surface.
 if [ -n "$WG_WORKTREE_PATH" ] && [ -n "$WG_BRANCH" ] && [ -n "$WG_PROJECT_ROOT" ]; then
     CURRENT_DIR_REAL=$(pwd -P 2>/dev/null || pwd)
     WORKTREE_PATH_REAL=$(cd "$WG_WORKTREE_PATH" 2>/dev/null && pwd -P || printf '%s' "$WG_WORKTREE_PATH")
@@ -2213,18 +2384,11 @@ if [ -n "$WG_WORKTREE_PATH" ] && [ -n "$WG_BRANCH" ] && [ -n "$WG_PROJECT_ROOT" 
     # the happy path, but the wrapper is a safety net for cases where the agent
     # crashed or was killed before reaching wg done).
     touch "$WG_WORKTREE_PATH/.wg-cleanup-pending" 2>/dev/null || true
-    echo "[wrapper] Task finished with status '$TASK_STATUS_FINAL' — marked worktree $WG_WORKTREE_PATH for sweep (coordinator will reap; override with: wg worktree archive $WG_AGENT_ID --remove)" >> "$OUTPUT_FILE"
+    echo "[wrapper] Task finished with status '$TASK_STATUS_FINAL' — marked worktree $WG_WORKTREE_PATH for explicit cleanup (inspect/remove with: wg worktree archive $WG_AGENT_ID --remove)" >> "$OUTPUT_FILE"
 
-    # Reap build artifacts: target/ is huge (~16G/agent for cargo workspaces).
-    # Cargo will rebuild on `wg retry`, and successful tasks have their
-    # worktree fully removed by the coordinator sweep anyway. Doing this
-    # here covers the failed/abandoned/blocked-on-merge cases where the
-    # worktree itself is preserved by retention policy.
-    if [ -d "$WG_WORKTREE_PATH/target" ]; then
-        rm -rf "$WG_WORKTREE_PATH/target" 2>/dev/null \
-            && echo "[wrapper] Reaped target/ from $WG_WORKTREE_PATH" >> "$OUTPUT_FILE" \
-            || echo "[wrapper] WARNING: failed to reap target/ from $WG_WORKTREE_PATH" >> "$OUTPUT_FILE"
-    fi
+    # Build caches are never removed here. The owned-cache sentinel waits for
+    # terminal owner/task state, stale exact PID identity, lease expiry, a clean
+    # worktree, no registered artifacts, and no open files.
     fi
 fi
 
@@ -4879,6 +5043,14 @@ mod tests {
             script.contains("claude --print < prompt.txt"),
             "Wrapper should contain the fallback command"
         );
+        let fallback = script
+            .split("Session not resumable, starting fresh session")
+            .nth(1)
+            .expect("fallback block");
+        assert!(
+            fallback.contains("} {HEARTBEAT_GUARD_FD}>&-"),
+            "fallback executor must not inherit the heartbeat guard writer"
+        );
     }
 
     #[test]
@@ -4901,6 +5073,20 @@ mod tests {
         assert!(
             !script.contains("Session not resumable"),
             "Wrapper should NOT contain session fallback when no fallback provided"
+        );
+        assert!(
+            script.contains("exec {HEARTBEAT_GUARD_FD}> >(wg heartbeat-watch \"$WG_AGENT_ID\""),
+            "wrapper must launch the pipe-guarded heartbeat watcher"
+        );
+        assert!(
+            script.matches("{HEARTBEAT_GUARD_FD}>&-").count() >= 2,
+            "executor must close the guard writer and wrapper must close it on completion"
+        );
+        assert!(
+            !script
+                .lines()
+                .any(|line| line.trim_start().starts_with("sleep 120")),
+            "wrapper must not generate the orphan-prone heartbeat sleep command"
         );
     }
 }

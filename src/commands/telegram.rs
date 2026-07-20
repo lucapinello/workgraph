@@ -1594,7 +1594,10 @@ fn try_confirm_binding(workgraph_dir: &Path, sender: &str, body: &str) -> Option
             return None;
         }
     };
-    let name = apply_confirmation(&mut bindings, sender, body, chrono::Utc::now())?;
+    // `sender` is the already-resolved binding key (numeric id or @handle).
+    // Passing it as both id and username satisfies Erik's `matches_sender`
+    // contract for either key kind (numeric matches on id, handle on username).
+    let name = apply_confirmation(&mut bindings, sender, Some(sender), body, chrono::Utc::now())?;
     if let Err(e) = bindings.save(&agency_dir) {
         eprintln!("Failed to persist Telegram binding confirmation: {e}");
         return None;
@@ -1828,6 +1831,11 @@ fn classify_inbound_message(
         workgraph_dir,
         channel_type,
         sender,
+        // `sender` is the already-resolved binding key (numeric id or @handle).
+        // Passing it as both id and username reproduces the old exact-key
+        // `find_by_user` match under Erik's `find_by_sender(id, username)`:
+        // a numeric key matches on id, a handle key matches on username.
+        Some(sender),
         body,
     ) {
         InboundReplyOutcome::Recorded(task_id) => Some(task_id),
@@ -7014,7 +7022,7 @@ mod tests {
         // benign NotParkedReply — NOT a security Rejected — carrying the persona
         // DISPLAY NAME ("Otto"), never the raw agent id/hash. That name is what
         // the listener logs, so tailing the log never reads as a refusal.
-        match route_inbound_reply(dir, "telegram:otto", "luca-1", "otto, are you there?") {
+        match route_inbound_reply(dir, "telegram:otto", "luca-1", Some("luca-1"), "otto, are you there?") {
             InboundReplyOutcome::NotParkedReply { persona } => {
                 assert_eq!(persona, "Otto", "logs the persona display name, not a hash");
                 let line = fallthrough_log_line(&persona);

@@ -4,7 +4,7 @@
 //! agent behavior, executor settings, and project defaults.
 //!
 //! Sensitive credentials (like Matrix login) are stored separately in
-//! `~/.config/workgraph/matrix.toml` to avoid accidentally committing secrets.
+//! `~/.config/worksgood/matrix.toml` to avoid accidentally committing secrets.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -592,9 +592,9 @@ impl Default for OpenRouterConfig {
 /// ```toml
 /// [auth]
 /// # Preferred: point at a file, leave the token out of git.
-/// claude_code_oauth_token_file = "~/.config/workgraph/oauth-token"
+/// claude_code_oauth_token_file = "~/.config/worksgood/oauth-token"
 ///
-/// # Or inline (discouraged — keep `.workgraph/config.toml` out of VCS
+/// # Or inline (discouraged — keep `.wg/config.toml` out of VCS
 /// # if you use this form):
 /// # claude_code_oauth_token = "sk-ant-oat01-…"
 /// ```
@@ -608,7 +608,7 @@ impl Default for OpenRouterConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthConfig {
     /// Inline OAuth token (`sk-ant-oat01-…`). Discouraged because the file
-    /// ends up on disk in `.workgraph/config.toml`; prefer `_file` below.
+    /// ends up on disk in `.wg/config.toml`; prefer `_file` below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_oauth_token: Option<String>,
 
@@ -1823,7 +1823,14 @@ pub fn execution_system_key(raw_route: &str) -> anyhow::Result<ExecutionSystemKe
             }
             "anthropic-cli".to_string()
         }
-        crate::dispatch::ExecutorKind::Codex => "openai-codex-cli".to_string(),
+        crate::dispatch::ExecutorKind::Codex => {
+            if !route.to_ascii_lowercase().starts_with("codex:") {
+                anyhow::bail!(
+                    "route {route:?} does not explicitly identify the codex execution system"
+                );
+            }
+            "openai-codex-cli".to_string()
+        }
         crate::dispatch::ExecutorKind::Pi => {
             let inner = route
                 .strip_prefix("pi:")
@@ -1839,6 +1846,12 @@ pub fn execution_system_key(raw_route: &str) -> anyhow::Result<ExecutionSystemKe
             provider.to_ascii_lowercase()
         }
         crate::dispatch::ExecutorKind::Native => {
+            let lower = route.to_ascii_lowercase();
+            if !lower.starts_with("nex:") && !lower.starts_with("native:") {
+                anyhow::bail!(
+                    "route {route:?} does not explicitly identify the nex execution system"
+                );
+            }
             let inner = strip_native_handler_prefix(route);
             parse_model_spec(inner)
                 .provider
@@ -3642,9 +3655,21 @@ pub struct AgencyConfig {
     #[serde(default)]
     pub auto_triage: bool,
 
-    /// Timeout in seconds for triage calls (default: 30)
+    /// Timeout in seconds for triage calls (default: 30).
+    ///
+    /// This remains separate from one-shot model inference: a short triage
+    /// budget must not become the evaluator/FLIP/assignment hard deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triage_timeout: Option<u64>,
+
+    /// Hard timeout in seconds for evaluator, FLIP, and assignment inference.
+    ///
+    /// Heartbeats prove that the supervising inline process is alive; they do
+    /// not waive this independent deadline. `None` preserves compatibility
+    /// with an explicitly configured historical `triage_timeout`, otherwise
+    /// the default is 15 minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_timeout: Option<u64>,
 
     /// Maximum bytes to read from agent output log for triage (default: 50000)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3813,6 +3838,19 @@ pub struct AgencyConfig {
     pub gate_confidence_threshold: f64,
 }
 
+impl AgencyConfig {
+    /// Independent hard deadline for one-shot agency inference.
+    pub fn inference_timeout_secs(&self) -> u64 {
+        self.inference_timeout
+            .map(|seconds| seconds.max(1))
+            // Historical configs used triage_timeout for both paths and eval
+            // clamped it to five minutes. Preserve that explicit setting while
+            // giving unconfigured inference a genuinely independent budget.
+            .or_else(|| self.triage_timeout.map(|seconds| seconds.max(300)))
+            .unwrap_or(900)
+    }
+}
+
 impl Default for AgencyConfig {
     fn default() -> Self {
         Self {
@@ -3829,6 +3867,7 @@ impl Default for AgencyConfig {
             retention_heuristics: None,
             auto_triage: false,
             triage_timeout: None,
+            inference_timeout: None,
             triage_max_log_bytes: None,
             exploration_interval: default_exploration_interval(),
             cache_population_threshold: default_cache_population_threshold(),
@@ -3887,9 +3926,17 @@ pub struct AgentConfig {
     #[serde(default)]
     pub max_tasks: Option<u32>,
 
-    /// Heartbeat timeout in minutes (for detecting dead agents)
+    /// Heartbeat timeout in minutes (for detecting dead agents).
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout: u64,
+
+    /// Optional exact heartbeat timeout in seconds.
+    ///
+    /// Production configuration normally uses `heartbeat_timeout` in minutes;
+    /// this precision override supports short supervised calls and accelerated
+    /// liveness checks without changing the long-standing field's units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_timeout_seconds: Option<u64>,
 
     /// Grace period in seconds before the reaper acts on a dead PID.
     /// Agents started less than this many seconds ago are not reaped,
@@ -4246,6 +4293,54 @@ pub struct ResourceManagementConfig {
     /// Set to 0 to disable automatic pruning. Default: 3600 (1 hour).
     #[serde(default = "default_recovery_prune_interval")]
     pub recovery_prune_interval: u64,
+
+    /// Enable periodic disk observation and build-class admission control.
+    #[serde(default = "default_disk_sentinel_enabled")]
+    pub disk_sentinel_enabled: bool,
+    /// Additional target/tmp paths whose backing mounts must have headroom.
+    #[serde(default)]
+    pub disk_paths: Vec<String>,
+    /// Optional root for isolated `wg-target-<agent>` Cargo targets. Absolute
+    /// paths are supported and explicitly registered for later cleanup.
+    #[serde(default)]
+    pub cargo_target_root: Option<String>,
+    /// Optional root for per-agent Cargo-install/tmp scratch directories.
+    #[serde(default)]
+    pub build_tmp_root: Option<String>,
+    #[serde(default = "default_disk_warning_bytes")]
+    pub disk_warning_bytes: u64,
+    #[serde(default = "default_disk_pause_build_bytes")]
+    pub disk_pause_build_bytes: u64,
+    #[serde(default = "default_disk_hard_refuse_bytes")]
+    pub disk_hard_refuse_bytes: u64,
+    #[serde(default = "default_disk_warning_percent")]
+    pub disk_warning_percent: f64,
+    #[serde(default = "default_disk_pause_build_percent")]
+    pub disk_pause_build_percent: f64,
+    #[serde(default = "default_disk_hard_refuse_percent")]
+    pub disk_hard_refuse_percent: f64,
+    #[serde(default = "default_disk_resume_hysteresis_bytes")]
+    pub disk_resume_hysteresis_bytes: u64,
+    #[serde(default = "default_disk_resume_hysteresis_percent")]
+    pub disk_resume_hysteresis_percent: f64,
+    /// Concurrent build-heavy tasks have a separate budget from ordinary
+    /// agents. One serial validator is the safe default.
+    #[serde(default = "default_max_build_agents")]
+    pub max_build_agents: usize,
+    #[serde(default = "default_estimated_build_bytes")]
+    pub estimated_build_bytes: u64,
+    #[serde(default = "default_disk_scan_interval_seconds")]
+    pub disk_scan_interval_seconds: u64,
+    #[serde(default = "default_disk_scan_max_entries")]
+    pub disk_scan_max_entries: usize,
+    #[serde(default = "default_owned_cache_lease_seconds")]
+    pub owned_cache_lease_seconds: u64,
+    #[serde(default = "default_disk_agent_heartbeat_seconds")]
+    pub disk_agent_heartbeat_seconds: u64,
+    #[serde(default = "default_compress_terminal_streams")]
+    pub compress_terminal_streams: bool,
+    #[serde(default = "default_stream_retention_days")]
+    pub stream_retention_days: u64,
 }
 
 fn default_max_incomplete_retries() -> u32 {
@@ -4461,6 +4556,58 @@ fn default_recovery_prune_interval() -> u64 {
     3600 // 1 hour in seconds
 }
 
+fn default_disk_sentinel_enabled() -> bool {
+    true
+}
+fn default_disk_warning_bytes() -> u64 {
+    64 * 1024 * 1024 * 1024
+}
+fn default_disk_pause_build_bytes() -> u64 {
+    32 * 1024 * 1024 * 1024
+}
+fn default_disk_hard_refuse_bytes() -> u64 {
+    16 * 1024 * 1024 * 1024
+}
+fn default_disk_warning_percent() -> f64 {
+    12.0
+}
+fn default_disk_pause_build_percent() -> f64 {
+    8.0
+}
+fn default_disk_hard_refuse_percent() -> f64 {
+    4.0
+}
+fn default_disk_resume_hysteresis_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024
+}
+fn default_disk_resume_hysteresis_percent() -> f64 {
+    2.0
+}
+fn default_max_build_agents() -> usize {
+    1
+}
+fn default_estimated_build_bytes() -> u64 {
+    16 * 1024 * 1024 * 1024
+}
+fn default_disk_scan_interval_seconds() -> u64 {
+    30
+}
+fn default_disk_scan_max_entries() -> usize {
+    200_000
+}
+fn default_owned_cache_lease_seconds() -> u64 {
+    300
+}
+fn default_disk_agent_heartbeat_seconds() -> u64 {
+    300
+}
+fn default_compress_terminal_streams() -> bool {
+    true
+}
+fn default_stream_retention_days() -> u64 {
+    7
+}
+
 impl Default for ResourceManagementConfig {
     fn default() -> Self {
         Self {
@@ -4470,6 +4617,26 @@ impl Default for ResourceManagementConfig {
             cleanup_job_queue: default_cleanup_job_queue(),
             cleanup_queue_size: default_cleanup_queue_size(),
             recovery_prune_interval: default_recovery_prune_interval(),
+            disk_sentinel_enabled: default_disk_sentinel_enabled(),
+            disk_paths: Vec::new(),
+            cargo_target_root: None,
+            build_tmp_root: None,
+            disk_warning_bytes: default_disk_warning_bytes(),
+            disk_pause_build_bytes: default_disk_pause_build_bytes(),
+            disk_hard_refuse_bytes: default_disk_hard_refuse_bytes(),
+            disk_warning_percent: default_disk_warning_percent(),
+            disk_pause_build_percent: default_disk_pause_build_percent(),
+            disk_hard_refuse_percent: default_disk_hard_refuse_percent(),
+            disk_resume_hysteresis_bytes: default_disk_resume_hysteresis_bytes(),
+            disk_resume_hysteresis_percent: default_disk_resume_hysteresis_percent(),
+            max_build_agents: default_max_build_agents(),
+            estimated_build_bytes: default_estimated_build_bytes(),
+            disk_scan_interval_seconds: default_disk_scan_interval_seconds(),
+            disk_scan_max_entries: default_disk_scan_max_entries(),
+            owned_cache_lease_seconds: default_owned_cache_lease_seconds(),
+            disk_agent_heartbeat_seconds: default_disk_agent_heartbeat_seconds(),
+            compress_terminal_streams: default_compress_terminal_streams(),
+            stream_retention_days: default_stream_retention_days(),
         }
     }
 }
@@ -4576,6 +4743,15 @@ fn default_reaper_grace_seconds() -> u64 {
     30
 }
 
+impl AgentConfig {
+    /// Effective dead-agent heartbeat window in seconds.
+    pub fn heartbeat_timeout_secs(&self) -> u64 {
+        self.heartbeat_timeout_seconds
+            .unwrap_or_else(|| self.heartbeat_timeout.saturating_mul(60))
+            .max(1)
+    }
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -4584,13 +4760,14 @@ impl Default for AgentConfig {
             interval: default_interval(),
             max_tasks: None,
             heartbeat_timeout: default_heartbeat_timeout(),
+            heartbeat_timeout_seconds: None,
             reaper_grace_seconds: default_reaper_grace_seconds(),
         }
     }
 }
 
 /// Matrix configuration for notifications and collaboration
-/// Stored in ~/.config/workgraph/matrix.toml (user's global config, not in repo)
+/// Stored in ~/.config/worksgood/matrix.toml (user's global config, not in repo)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MatrixConfig {
     /// Matrix homeserver URL (e.g., "https://matrix.org")
@@ -4619,17 +4796,34 @@ impl MatrixConfig {
     pub fn config_path() -> anyhow::Result<PathBuf> {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not determine config directory. Expected ~/.config on Linux, ~/Library/Application Support on macOS, or %APPDATA% on Windows."))?;
+        Ok(config_dir.join("worksgood").join("matrix.toml"))
+    }
+
+    /// Return the pre-WorksGood path accepted for read compatibility only.
+    fn legacy_config_path() -> anyhow::Result<PathBuf> {
+        let config_dir = dirs::config_dir().ok_or_else(|| {
+            anyhow::anyhow!("Could not determine the platform configuration directory")
+        })?;
         Ok(config_dir.join("workgraph").join("matrix.toml"))
     }
 
-    /// Load Matrix configuration from ~/.config/workgraph/matrix.toml
+    /// Load Matrix configuration from ~/.config/worksgood/matrix.toml.
     /// Returns default (empty) config if file doesn't exist
     pub fn load() -> anyhow::Result<Self> {
-        let config_path = Self::config_path()?;
-
-        if !config_path.exists() {
+        let canonical = Self::config_path()?;
+        let legacy = Self::legacy_config_path()?;
+        let config_path = if canonical.exists() {
+            canonical
+        } else if legacy.exists() {
+            eprintln!(
+                "warning: using legacy Matrix config at {}; move it to {} (create the parent directory first)",
+                legacy.display(),
+                canonical.display()
+            );
+            legacy
+        } else {
             return Ok(Self::default());
-        }
+        };
 
         let content = fs::read_to_string(&config_path)
             .map_err(|e| anyhow::anyhow!("Failed to read Matrix config: {}", e))?;
@@ -4640,7 +4834,7 @@ impl MatrixConfig {
         Ok(config)
     }
 
-    /// Save Matrix configuration to ~/.config/workgraph/matrix.toml
+    /// Save Matrix configuration to ~/.config/worksgood/matrix.toml
     pub fn save(&self) -> anyhow::Result<()> {
         let config_path = Self::config_path()?;
 
@@ -4952,7 +5146,7 @@ fn record_sources(
 impl Config {
     /// Return the global WG directory.
     ///
-    /// Resolution order matches `main.rs::resolve_workgraph_dir`:
+    /// Resolution order for canonical machine-global state:
     /// 0. `$WG_GLOBAL_DIR` if set — an explicit override used to point WG's
     ///    global config + active-profile lookup at a specific directory.
     ///    This is the single chokepoint both `global_config_path()` and
@@ -4961,13 +5155,11 @@ impl Config {
     ///    profiles/) in one shot. Tests use it to stay independent of the
     ///    developer machine's `~/.wg` (e.g. an active `opencode` profile),
     ///    without perturbing `HOME` for sibling tests that shell out to git.
-    /// 1. `~/.wg` if it exists (modern, written by `wg init`).
-    /// 2. `~/.workgraph` if it exists (legacy).
-    /// 3. `~/.wg` (default — new installs get the modern name).
+    /// 1. `~/.wg` (canonical for every new write).
     ///
-    /// Without this mirroring, `wg init --global` writes to `~/.wg/config.toml`
-    /// but `Config::load_global()` reads `~/.workgraph/config.toml`, silently
-    /// dropping every global key.
+    /// The old global config is handled separately by
+    /// [`Config::global_config_read_path`], so a compatibility read can never
+    /// silently turn into another write at the retired location.
     pub fn global_dir() -> anyhow::Result<PathBuf> {
         if let Some(dir) = std::env::var_os("WG_GLOBAL_DIR") {
             let dir = PathBuf::from(dir);
@@ -4977,15 +5169,32 @@ impl Config {
         }
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-        let modern = home.join(".wg");
-        if modern.is_dir() {
-            return Ok(modern);
+        Ok(home.join(".wg"))
+    }
+
+    fn global_config_read_path() -> anyhow::Result<PathBuf> {
+        let canonical = Self::global_config_path()?;
+        // An explicit test/operator override is authoritative. Never escape it
+        // to a legacy file under the ambient HOME.
+        if canonical.exists() || std::env::var_os("WG_GLOBAL_DIR").is_some() {
+            return Ok(canonical);
         }
-        let legacy = home.join(".workgraph");
-        if legacy.is_dir() {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+        let legacy = home.join(".workgraph").join("config.toml");
+        if legacy.exists() {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "warning: reading legacy WorksGood global config at {}; migrate it to {} (for example, stop wg services and move the file)",
+                    legacy.display(),
+                    canonical.display()
+                );
+            }
             return Ok(legacy);
         }
-        Ok(modern)
+        Ok(canonical)
     }
 
     /// Return the global config file path.
@@ -4996,7 +5205,7 @@ impl Config {
     /// Load global configuration from ~/.wg/config.toml.
     /// Returns None if the file doesn't exist, Err on parse failure.
     pub fn load_global() -> anyhow::Result<Option<Self>> {
-        let global_path = Self::global_config_path()?;
+        let global_path = Self::global_config_read_path()?;
         if !global_path.exists() {
             return Ok(None);
         }
@@ -5050,7 +5259,7 @@ impl Config {
     /// their canonical form before merging, so callers always see the canonical
     /// keys regardless of which file used the legacy name.
     pub fn load_merged_toml_value(workgraph_dir: &Path) -> anyhow::Result<toml::Value> {
-        let global_path = Self::global_config_path()?;
+        let global_path = Self::global_config_read_path()?;
         let local_path = workgraph_dir.join("config.toml");
         let mut global_val = Self::load_toml_value(&global_path)?;
         let mut local_val = Self::load_toml_value(&local_path)?;
@@ -5074,7 +5283,7 @@ impl Config {
     /// Load merged configuration: global config deep-merged with local config.
     /// Local keys override global keys. Missing files are treated as empty.
     pub fn load_merged(workgraph_dir: &Path) -> anyhow::Result<Self> {
-        let global_path = Self::global_config_path()?;
+        let global_path = Self::global_config_read_path()?;
         let local_path = workgraph_dir.join("config.toml");
 
         let mut global_val = Self::load_toml_value(&global_path)?;
@@ -5693,7 +5902,7 @@ impl Config {
     pub fn load_with_sources(
         workgraph_dir: &Path,
     ) -> anyhow::Result<(Self, BTreeMap<String, ConfigSource>)> {
-        let global_path = Self::global_config_path()?;
+        let global_path = Self::global_config_read_path()?;
         let local_path = workgraph_dir.join("config.toml");
 
         let mut global_val = Self::load_toml_value(&global_path)?;
@@ -6918,9 +7127,16 @@ model = "claude:haiku"
         let path = Config::global_config_path().unwrap();
         let s = path.to_string_lossy();
         assert!(
-            s.ends_with(".wg/config.toml") || s.ends_with(".workgraph/config.toml"),
-            "expected canonical .wg/config.toml or legacy fallback, got {s}"
+            s.ends_with(".wg/config.toml"),
+            "expected canonical .wg/config.toml, got {s}"
         );
+    }
+
+    #[test]
+    fn matrix_config_path_uses_worksgood_namespace() {
+        let path = MatrixConfig::config_path().expect("platform config directory");
+        assert!(path.ends_with(Path::new("worksgood").join("matrix.toml")));
+        assert!(!path.to_string_lossy().contains("workgraph"));
     }
 
     #[test]
@@ -7918,7 +8134,7 @@ model = "claude:haiku"
             url: None,
             model: None,
             api_key: None,
-            api_key_file: Some("~/.config/workgraph/openai.key".to_string()),
+            api_key_file: Some("~/.config/worksgood/openai.key".to_string()),
             api_key_env: None,
             api_key_ref: None,
             is_default: false,
@@ -10855,6 +11071,12 @@ model = "codex:gpt-5.5"
             let key = execution_system_key(route).unwrap();
             assert_eq!(key.handler, handler, "route={route}");
             assert_eq!(key.provider, provider, "route={route}");
+        }
+        for ambiguous in ["gpt-5.5", "openrouter:z-ai/glm-5.2", "z-ai/glm-5.2"] {
+            assert!(
+                execution_system_key(ambiguous).is_err(),
+                "ambiguous route unexpectedly selected a system: {ambiguous}"
+            );
         }
     }
 

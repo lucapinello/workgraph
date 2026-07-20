@@ -1,7 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
+use std::io::Read;
 use std::path::Path;
-use worksgood::service::AgentRegistry;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+use worksgood::service::{AgentRegistry, is_process_alive, read_proc_start_ticks};
 
 /// Update an agent's last_heartbeat timestamp
 ///
@@ -16,6 +19,150 @@ pub fn run_agent(dir: &Path, agent_id: &str) -> Result<()> {
 
     println!("Agent heartbeat recorded for '{}' at {}", agent_id, now);
     Ok(())
+}
+
+/// Run heartbeat callbacks while `guard` remains open.
+///
+/// Generated wrappers connect `guard` to an anonymous pipe whose only writer
+/// belongs to the wrapper shell. The executor command runs with that writer
+/// file descriptor explicitly closed. Normal wrapper completion kills this
+/// watcher; an untrappable wrapper death closes the pipe in the kernel, wakes
+/// the reader immediately, and lets the watcher exit instead of leaving a
+/// `sleep 120` orphan behind.
+fn run_guarded_heartbeat<R, F>(mut guard: R, interval: Duration, mut heartbeat: F) -> Result<()>
+where
+    R: Read + Send + 'static,
+    F: FnMut() -> bool,
+{
+    if interval.is_zero() {
+        anyhow::bail!("heartbeat interval must be greater than zero");
+    }
+
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        // No data is written to the guard. Reading until EOF is deliberate:
+        // EOF is delivered by the kernel as soon as the wrapper's only write
+        // descriptor closes, including when the wrapper is SIGKILLed.
+        let _ = std::io::copy(&mut guard, &mut std::io::sink());
+        let _ = closed_tx.send(());
+    });
+
+    let guard_closed = loop {
+        match closed_rx.recv_timeout(interval) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break true,
+            Err(RecvTimeoutError::Timeout) => {
+                // A false callback means the supervised PID/registry identity
+                // no longer matches. Stop instead of letting a stale helper
+                // refresh a recycled PID or replacement agent forever.
+                if !heartbeat() {
+                    break false;
+                }
+            }
+        }
+    };
+
+    // Join only after kernel EOF. On an identity mismatch the command must be
+    // able to exit even if a wrong/recycled process still holds the pipe; the
+    // detached reader thread dies with this short-lived helper process.
+    if guard_closed {
+        let _ = reader.join();
+    }
+    Ok(())
+}
+
+/// Refresh a heartbeat only when the registry row still names the exact
+/// supervised wrapper process. `Ok(false)` is a permanent identity/status
+/// mismatch and tells the watcher to stop; I/O/lock errors are retryable.
+fn refresh_supervised_heartbeat(
+    dir: &Path,
+    agent_id: &str,
+    supervised_pid: u32,
+    expected_start_ticks: Option<u64>,
+) -> Result<bool> {
+    if !is_process_alive(supervised_pid) {
+        return Ok(false);
+    }
+    if let Some(expected) = expected_start_ticks
+        && read_proc_start_ticks(supervised_pid) != Some(expected)
+    {
+        return Ok(false);
+    }
+
+    let mut registry = AgentRegistry::load_locked(dir)?;
+    let Some(agent) = registry.get_agent(agent_id) else {
+        anyhow::bail!("agent registration not visible yet: {agent_id}");
+    };
+    if agent.pid != supervised_pid || !agent.is_alive() {
+        return Ok(false);
+    }
+    if !registry.heartbeat(agent_id) {
+        return Ok(false);
+    }
+    registry.save()?;
+    Ok(true)
+}
+
+/// Watch the generated wrapper's stdin guard and refresh its agent heartbeat.
+///
+/// This is an internal command used only by generated `run.sh` wrappers. A
+/// transient heartbeat failure is non-fatal; the next cadence retries while
+/// the wrapper and its exact process identity are still alive.
+pub fn run_watch(
+    dir: &Path,
+    agent_id: &str,
+    interval_seconds: u64,
+    supervised_pid: Option<u32>,
+) -> Result<()> {
+    if !is_agent_id(agent_id) {
+        anyhow::bail!("heartbeat watcher requires an agent ID, got '{agent_id}'");
+    }
+    // Compatibility for wrappers generated before --supervised-pid existed.
+    // Every newly generated wrapper passes its PID explicitly.
+    let supervised_pid = match supervised_pid {
+        Some(pid) => pid,
+        #[cfg(unix)]
+        None => {
+            // In an old process-substitution wrapper the watcher's parent is
+            // the wrapper shell. This avoids a registration-before-spawn race.
+            unsafe { libc::getppid() as u32 }
+        }
+        #[cfg(not(unix))]
+        None => {
+            // Windows has no libc::getppid fallback. Briefly wait for the
+            // daemon's spawn-then-register handoff used by historical wrappers.
+            let mut found = None;
+            for _ in 0..40 {
+                found = AgentRegistry::load(dir)
+                    .ok()
+                    .and_then(|registry| registry.get_agent(agent_id).map(|agent| agent.pid));
+                if found.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            found
+                .ok_or_else(|| anyhow::anyhow!("agent registration not visible yet: {agent_id}"))?
+        }
+    };
+    if supervised_pid == 0 {
+        anyhow::bail!("heartbeat watcher requires a non-zero supervised PID");
+    }
+
+    // Capture the exact kernel identity while the wrapper is known to exist.
+    // Comparing this token on every beat defeats rapid PID reuse; on platforms
+    // without /proc, the registry PID + process existence checks remain the
+    // conservative fallback.
+    let expected_start_ticks = read_proc_start_ticks(supervised_pid);
+    let dir = dir.to_path_buf();
+    let agent_id = agent_id.to_string();
+    run_guarded_heartbeat(
+        std::io::stdin(),
+        Duration::from_secs(interval_seconds),
+        move || {
+            refresh_supervised_heartbeat(&dir, &agent_id, supervised_pid, expected_start_ticks)
+                .unwrap_or(true)
+        },
+    )
 }
 
 /// Check if the given ID is an agent ID (starts with "agent-")
@@ -186,6 +333,9 @@ pub fn run_check_agents(dir: &Path, threshold_minutes: u64, json: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc as test_mpsc};
+    use std::time::Instant;
     use tempfile::TempDir;
     use worksgood::graph::WorkGraph;
     use worksgood::parser::save_graph;
@@ -203,6 +353,139 @@ mod tests {
         registry.save(temp_dir.path()).unwrap();
 
         temp_dir
+    }
+
+    struct ChannelGuard(test_mpsc::Receiver<()>);
+
+    impl Read for ChannelGuard {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.recv() {
+                Ok(()) if !buf.is_empty() => {
+                    buf[0] = 0;
+                    Ok(1)
+                }
+                Ok(()) => Ok(0),
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_heartbeat_keeps_cadence_and_stops_promptly_on_eof() {
+        let (guard_tx, guard_rx) = test_mpsc::channel();
+        let beats = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&beats);
+        let closer_observed = Arc::clone(&beats);
+        let closer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while closer_observed.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            drop(guard_tx);
+        });
+
+        let started = Instant::now();
+        run_guarded_heartbeat(ChannelGuard(guard_rx), Duration::from_millis(15), || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .unwrap();
+        closer.join().unwrap();
+
+        assert!(
+            beats.load(Ordering::SeqCst) >= 3,
+            "watcher did not preserve periodic heartbeat cadence"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "guard EOF did not stop heartbeat watcher promptly"
+        );
+    }
+
+    #[test]
+    fn guarded_heartbeat_closed_before_start_emits_no_heartbeat() {
+        let (guard_tx, guard_rx) = test_mpsc::channel();
+        drop(guard_tx);
+        let mut beats = 0;
+        run_guarded_heartbeat(ChannelGuard(guard_rx), Duration::from_millis(10), || {
+            beats += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(beats, 0);
+    }
+
+    #[test]
+    fn guarded_heartbeat_stops_when_supervision_fails() {
+        let (guard_tx, guard_rx) = test_mpsc::channel();
+        let started = Instant::now();
+        let mut calls = 0;
+        run_guarded_heartbeat(ChannelGuard(guard_rx), Duration::from_millis(10), || {
+            calls += 1;
+            false
+        })
+        .unwrap();
+        drop(guard_tx);
+        assert_eq!(calls, 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn supervised_heartbeat_rejects_pid_and_project_collisions() {
+        let owned = TempDir::new().unwrap();
+        let sibling = TempDir::new().unwrap();
+        for dir in [owned.path(), sibling.path()] {
+            save_graph(&WorkGraph::new(), &dir.join("graph.jsonl")).unwrap();
+        }
+
+        let pid = std::process::id();
+        let expected_ticks = read_proc_start_ticks(pid);
+        let mut owned_registry = AgentRegistry::new();
+        owned_registry.register_agent(pid, "owned-task", "codex", "/tmp/owned.log");
+        owned_registry.save(owned.path()).unwrap();
+
+        let mut sibling_registry = AgentRegistry::new();
+        sibling_registry.register_agent(
+            pid.saturating_add(1),
+            "other-task",
+            "codex",
+            "/tmp/other.log",
+        );
+        sibling_registry.save(sibling.path()).unwrap();
+        let sibling_before = AgentRegistry::load(sibling.path())
+            .unwrap()
+            .get_agent("agent-1")
+            .unwrap()
+            .last_heartbeat
+            .clone();
+
+        assert!(
+            refresh_supervised_heartbeat(owned.path(), "agent-1", pid, expected_ticks).unwrap()
+        );
+        assert!(
+            !refresh_supervised_heartbeat(sibling.path(), "agent-1", pid, expected_ticks).unwrap()
+        );
+        assert_eq!(
+            AgentRegistry::load(sibling.path())
+                .unwrap()
+                .get_agent("agent-1")
+                .unwrap()
+                .last_heartbeat,
+            sibling_before,
+            "an explicit sibling graph collision must not be refreshed"
+        );
+
+        #[cfg(target_os = "linux")]
+        assert!(
+            !refresh_supervised_heartbeat(
+                owned.path(),
+                "agent-1",
+                pid,
+                expected_ticks.map(|ticks| ticks.saturating_add(1)),
+            )
+            .unwrap(),
+            "a stale PID identity must stop the watcher"
+        );
     }
 
     #[test]

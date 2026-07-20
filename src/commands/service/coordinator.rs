@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use worksgood::agency;
@@ -17,8 +17,8 @@ use worksgood::agency::{
 use worksgood::chat;
 use worksgood::config::{Config, DispatchRole};
 use worksgood::graph::{
-    FailureClass, LogEntry, Node, PRIORITY_DEFAULT, PRIORITY_IDLE, PRIORITY_NORMAL, Priority,
-    Status, Task, WaitCondition, WaitSpec, boost_priority, evaluate_all_cycle_failure_restarts,
+    LogEntry, Node, PRIORITY_DEFAULT, PRIORITY_IDLE, PRIORITY_NORMAL, Priority, Status, Task,
+    WaitCondition, WaitSpec, boost_priority, evaluate_all_cycle_failure_restarts,
     evaluate_all_cycle_iterations,
 };
 use worksgood::messages;
@@ -157,6 +157,25 @@ fn is_daemon_managed(task: &worksgood::graph::Task) -> bool {
     task.tags
         .iter()
         .any(|tag| DAEMON_MANAGED_TAGS.contains(&tag.as_str()))
+}
+
+fn build_admission_denial(
+    task: &Task,
+    builds_blocked: bool,
+    active_build_heavy: usize,
+    max_build_agents: usize,
+    disk_reason: &str,
+) -> Option<String> {
+    let class = worksgood::disk_sentinel::classify_task(task);
+    if class.is_build_capable() && builds_blocked {
+        return Some(format!("build admission paused: {disk_reason}"));
+    }
+    if class.is_heavy() && active_build_heavy >= max_build_agents {
+        return Some(format!(
+            "build-heavy budget full ({active_build_heavy}/{max_build_agents})"
+        ));
+    }
+    None
 }
 
 /// Check whether any tasks are ready. Returns `None` with an early `TickResult`
@@ -885,280 +904,9 @@ fn migrate_pending_validation_tasks(graph: &mut worksgood::graph::WorkGraph) -> 
     !migrated.is_empty()
 }
 
-/// Resolve `PendingEval` tasks whose `.evaluate-X` scaffolding has finished.
-///
-/// The lifecycle is:
-/// ```text
-/// open → in-progress → pending-eval ─┬─ eval pass → done
-///                                    └─ eval fail → failed (auto-rescue may spawn replacement)
-/// ```
-///
-/// When a `PendingEval` task's matching `.evaluate-X` is terminal AND the
-/// task itself wasn't already flipped to Failed by `check_eval_gate`, this
-/// phase promotes it to Done so dependents unblock.
-///
-/// If the evaluator never scored above threshold, `check_eval_gate` is
-/// responsible for `run_eval_reject` (PendingEval → Failed) and creating a
-/// rescue. This phase only handles the success case.
-///
-/// Returns true if any task was promoted.
-fn resolve_pending_eval_tasks(graph: &mut worksgood::graph::WorkGraph) -> bool {
-    let promotable: Vec<String> = graph
-        .tasks()
-        .filter(|t| t.status == Status::PendingEval)
-        .filter_map(|t| {
-            let eval_id = format!(".evaluate-{}", t.id);
-            let eval_status = graph.get_task(&eval_id).map(|et| et.status);
-            match eval_status {
-                // `.evaluate-X` exists and is terminal → eval ran. If it
-                // would have rejected, the source would already be Failed
-                // (handled by check_eval_gate). Since we still see it in
-                // PendingEval, the eval passed → promote to Done.
-                Some(s) if s.is_terminal() => Some(t.id.clone()),
-                // `.evaluate-X` missing entirely → eval never got scheduled
-                // (auto_evaluate disabled, paused, etc.). Promote so the task
-                // doesn't sit stuck forever.
-                None => Some(t.id.clone()),
-                // Eval is still in flight (Open / InProgress / Waiting / etc.)
-                // → keep waiting.
-                _ => None,
-            }
-        })
-        .collect();
-
-    if promotable.is_empty() {
-        return false;
-    }
-
-    for id in &promotable {
-        if let Some(task) = graph.get_task_mut(id) {
-            task.status = Status::Done;
-            if task.completed_at.is_none() {
-                task.completed_at = Some(chrono::Utc::now().to_rfc3339());
-            }
-            task.log.push(worksgood::graph::LogEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                actor: None,
-                user: Some(worksgood::current_user()),
-                message: "PendingEval → Done (evaluator passed; downstream unblocks)".to_string(),
-            });
-            eprintln!(
-                "[dispatcher] PendingEval resolved: '{}' → Done (eval passed)",
-                id
-            );
-        }
-    }
-    true
-}
-
-/// Resolve `FailedPendingEval` tasks: agent exited without `wg done`,
-/// dispatcher invokes `.evaluate-X` to assess the output, and this function
-/// promotes to `Done` (rescued) or demotes to `Failed` (terminal) based on the score.
-///
-/// Lifecycle:
-/// ```text
-/// in-progress (agent-exit-nonzero) → failed-pending-eval
-///   ├─ eval score ≥ threshold → done (rescued=true)
-///   └─ eval score < threshold OR no usable score after 2 attempts → failed (terminal)
-/// ```
-///
-/// Fork 6: if `.evaluate-X` terminates without a usable score, retry once
-/// (meta_eval_attempts < 2). On second failure, source → Failed (fail-closed).
-///
-/// Returns true if any task was modified.
-fn resolve_failed_pending_eval_tasks(
-    dir: &Path,
-    graph: &mut worksgood::graph::WorkGraph,
-    config: &Config,
-) -> bool {
-    let threshold = config.agency.eval_gate_threshold.unwrap_or(0.7);
-    let max_meta_attempts = config.agency.gate_max_attempts; // default 2
-
-    let evals_dir = dir.join("agency").join("evaluations");
-
-    // Collect decisions first (immutable reads), then apply mutations separately
-    // to avoid dual mutable borrow of graph.
-    struct Decision {
-        source_id: String,
-        eval_id: String,
-        action: EvalAction,
-    }
-    enum EvalAction {
-        Rescue(f64),
-        Reject(f64),
-        RetryEval(u32),       // new meta_eval_attempts value
-        TerminalNoScore(u32), // meta_eval_attempts value that triggered exhaustion
-    }
-
-    let candidates: Vec<Decision> = graph
-        .tasks()
-        .filter(|t| t.status == Status::FailedPendingEval)
-        .filter_map(|t| {
-            let source_id = t.id.clone();
-            let eval_id = format!(".evaluate-{}", source_id);
-            let eval_status = graph.get_task(&eval_id).map(|et| et.status);
-
-            match eval_status {
-                // Eval still in flight → keep waiting
-                None
-                | Some(
-                    Status::Open
-                    | Status::InProgress
-                    | Status::Waiting
-                    | Status::PendingEval
-                    | Status::FailedPendingEval
-                    | Status::PendingValidation,
-                ) => return None,
-                Some(s) if !s.is_terminal() => return None,
-                _ => {}
-            }
-
-            // Eval is terminal — determine action
-            let evals = worksgood::agency::load_all_evaluations_or_warn(&evals_dir);
-            let usable_score = evals
-                .iter()
-                .filter(|e| {
-                    e.task_id == source_id
-                        && e.source != worksgood::agency::eval_source::FLIP
-                        && e.source != "system"
-                })
-                .max_by(|a, b| a.timestamp.cmp(&b.timestamp))
-                .map(|e| e.score);
-
-            let action = match usable_score {
-                Some(score) if score >= threshold => EvalAction::Rescue(score),
-                Some(score) => EvalAction::Reject(score),
-                None => {
-                    let new_attempts = t.meta_eval_attempts + 1;
-                    if new_attempts >= max_meta_attempts {
-                        EvalAction::TerminalNoScore(new_attempts)
-                    } else {
-                        EvalAction::RetryEval(new_attempts)
-                    }
-                }
-            };
-
-            Some(Decision {
-                source_id,
-                eval_id,
-                action,
-            })
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return false;
-    }
-
-    // Apply mutations (may need two separate mutable borrows per iteration,
-    // but they target different task IDs so we do them sequentially).
-    let mut modified = false;
-
-    for decision in &candidates {
-        let source_id = &decision.source_id;
-        let eval_id = &decision.eval_id;
-        let now = Utc::now().to_rfc3339();
-
-        match &decision.action {
-            EvalAction::Rescue(score) => {
-                if let Some(task) = graph.get_task_mut(source_id) {
-                    task.status = Status::Done;
-                    task.rescued = true;
-                    task.completed_at = Some(now.clone());
-                    task.log.push(LogEntry {
-                        timestamp: now,
-                        actor: None,
-                        user: Some(worksgood::current_user()),
-                        message: format!(
-                            "FailedPendingEval → Done (rescued by eval: score={:.2} ≥ threshold={:.2})",
-                            score, threshold
-                        ),
-                    });
-                    eprintln!(
-                        "[dispatcher] Rescued task '{}': eval score {:.2} ≥ {:.2} → Done",
-                        source_id, score, threshold
-                    );
-                    modified = true;
-                }
-            }
-            EvalAction::Reject(score) => {
-                if let Some(task) = graph.get_task_mut(source_id) {
-                    task.status = Status::Failed;
-                    task.failure_reason = Some(format!(
-                        "eval rescue rejected: score={:.2} < threshold={:.2}",
-                        score, threshold
-                    ));
-                    task.failure_class = Some(FailureClass::AgentExitNonzero);
-                    task.log.push(LogEntry {
-                        timestamp: now,
-                        actor: None,
-                        user: Some(worksgood::current_user()),
-                        message: format!(
-                            "FailedPendingEval → Failed (eval rejected: score={:.2} < threshold={:.2})",
-                            score, threshold
-                        ),
-                    });
-                    eprintln!(
-                        "[dispatcher] Task '{}' eval-rejected: score {:.2} < {:.2} → Failed",
-                        source_id, score, threshold
-                    );
-                    modified = true;
-                }
-            }
-            EvalAction::TerminalNoScore(attempts) => {
-                if let Some(task) = graph.get_task_mut(source_id) {
-                    task.meta_eval_attempts = *attempts;
-                    task.status = Status::Failed;
-                    task.failure_reason = Some(format!(
-                        "rescue eval unavailable after {} attempts; falling back to terminal failure",
-                        max_meta_attempts
-                    ));
-                    task.log.push(LogEntry {
-                        timestamp: now,
-                        actor: None,
-                        user: Some(worksgood::current_user()),
-                        message: format!(
-                            "FailedPendingEval → Failed (rescue eval unavailable after {} attempts)",
-                            max_meta_attempts
-                        ),
-                    });
-                    eprintln!(
-                        "[dispatcher] Task '{}' rescue eval exhausted ({} attempts) → Failed",
-                        source_id, max_meta_attempts
-                    );
-                    modified = true;
-                }
-            }
-            EvalAction::RetryEval(attempts) => {
-                // Update source task's meta_eval_attempts first
-                if let Some(task) = graph.get_task_mut(source_id) {
-                    task.meta_eval_attempts = *attempts;
-                }
-                // Re-open .evaluate-X for another attempt (separate mutable borrow)
-                if let Some(eval_task) = graph.get_task_mut(eval_id) {
-                    eval_task.status = Status::Open;
-                    eval_task.assigned = None;
-                    eval_task.log.push(LogEntry {
-                        timestamp: now,
-                        actor: None,
-                        user: Some(worksgood::current_user()),
-                        message: format!(
-                            "Rescue eval retry attempt {} (no usable score from previous run)",
-                            attempts
-                        ),
-                    });
-                    eprintln!(
-                        "[dispatcher] Rescue eval retry {} for task '{}'",
-                        attempts, source_id
-                    );
-                }
-                modified = true;
-            }
-        }
-    }
-
-    modified
-}
+// PendingEval and FailedPendingEval resolution is verdict-required and lives in
+// `eval_lifecycle::reconcile_durable_verdicts`; terminal/missing satellites are
+// never interpreted as semantic success.
 
 fn unblock_stuck_tasks(graph: &mut worksgood::graph::WorkGraph, _dir: &Path) -> bool {
     let mut modified = false;
@@ -2028,6 +1776,8 @@ fn build_auto_assign_tasks(
                     rescue_count: 0,
                     rescued: false,
                     meta_eval_attempts: 0,
+                    agency_dispatch: None,
+                    evaluation_lifecycle: None,
                     spawn_failures: 0,
                     dispatch_count: 0,
                     tier: None,
@@ -2427,6 +2177,8 @@ fn build_flip_verification_tasks(
             rescue_count: 0,
             rescued: false,
             meta_eval_attempts: 0,
+            agency_dispatch: None,
+            evaluation_lifecycle: None,
             spawn_failures: 0,
             dispatch_count: 0,
             tier: None,
@@ -2707,6 +2459,8 @@ fn build_separate_verify_tasks(
             rescue_count: 0,
             rescued: false,
             meta_eval_attempts: 0,
+            agency_dispatch: None,
+            evaluation_lifecycle: None,
             spawn_failures: 0,
             dispatch_count: 0,
             tier: None,
@@ -2919,6 +2673,8 @@ fn build_auto_evolve_task(
         rescue_count: 0,
         rescued: false,
         meta_eval_attempts: 0,
+        agency_dispatch: None,
+        evaluation_lifecycle: None,
         spawn_failures: 0,
         dispatch_count: 0,
         tier: None,
@@ -3134,6 +2890,8 @@ fn build_auto_create_task(
         rescue_count: 0,
         rescued: false,
         meta_eval_attempts: 0,
+        agency_dispatch: None,
+        evaluation_lifecycle: None,
         spawn_failures: 0,
         dispatch_count: 0,
         tier: None,
@@ -3245,95 +3003,193 @@ fn build_inline_eval_script(
     escaped_eval_id: &str,
     escaped_output: &str,
     special_agent_id: Option<&str>,
+    wg_cmd: &str,
+    escaped_agent_id: &str,
+    heartbeat_interval_seconds: u64,
 ) -> String {
-    if let Some(sa_id) = special_agent_id {
-        let escaped_sa_id = sa_id.replace('\'', "'\\''");
-        format!(
-            r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
+    let (success_record, failure_record) = special_agent_id.map_or_else(
+        || (String::new(), String::new()),
+        |sa_id| {
+            let escaped_sa_id = sa_id.replace('\'', "'\\''");
+            (
+                format!(
+                    "    {wg_cmd} evaluate record --task '{escaped_eval_id}' --score 1.0 --source system --notes \"Inline evaluation completed successfully (agent: {escaped_sa_id})\" 2>> '{escaped_output}' || true\n"
+                ),
+                format!(
+                    "        {wg_cmd} evaluate record --task '{escaped_eval_id}' --score 0.0 --source system --notes \"Inline evaluation failed with exit code $EXIT_CODE (agent: {escaped_sa_id})\" 2>> '{escaped_output}' || true\n"
+                ),
+            )
+        },
+    );
+
+    format!(
+        r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
 _WG_STDERR=$(mktemp)
-{eval_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
+# The watcher owns no timer subprocess. Its stdin is an anonymous guard pipe
+# whose sole writer belongs to this wrapper; the inference child explicitly
+# closes the writer so wrapper death (including SIGKILL) produces immediate EOF.
+exec {{INLINE_HEARTBEAT_GUARD_FD}}> >({wg_cmd} heartbeat-watch '{escaped_agent_id}' --interval-seconds {heartbeat_interval_seconds} --supervised-pid "$$" 2>> '{escaped_output}')
+INLINE_HEARTBEAT_PID=$!
+_WG_STOP_INLINE_HEARTBEAT() {{
+    exec {{INLINE_HEARTBEAT_GUARD_FD}}>&- 2>/dev/null || true
+    if [ -n "${{INLINE_HEARTBEAT_PID:-}}" ]; then
+        kill "$INLINE_HEARTBEAT_PID" 2>/dev/null || true
+        wait "$INLINE_HEARTBEAT_PID" 2>/dev/null || true
+        INLINE_HEARTBEAT_PID=
+    fi
+}}
+trap '_WG_STOP_INLINE_HEARTBEAT' EXIT
+trap '_WG_STOP_INLINE_HEARTBEAT; trap - EXIT; exit 143' TERM INT HUP
+{{
+    {eval_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
+}} {{INLINE_HEARTBEAT_GUARD_FD}}>&-
 EXIT_CODE=$?
+_WG_STOP_INLINE_HEARTBEAT
+trap - EXIT TERM INT HUP
 cat "$_WG_STDERR" >> '{escaped_output}'
 if [ $EXIT_CODE -eq 0 ]; then
     rm -f "$_WG_STDERR"
-    wg evaluate record --task '{escaped_eval_id}' --score 1.0 --source system --notes "Inline evaluation completed successfully (agent: {escaped_sa_id})" 2>> '{escaped_output}' || true
-    wg done '{escaped_eval_id}' 2>> '{escaped_output}'
+{success_record}    {wg_cmd} done '{escaped_eval_id}' 2>> '{escaped_output}'
 else
     _WG_ROUTE_FAILURE=0
     grep -q 'error\[WG-EXEC-' "$_WG_STDERR" 2>/dev/null && _WG_ROUTE_FAILURE=1
     _WG_STDERR_TAIL=$(tail -n 20 "$_WG_STDERR" 2>/dev/null | head -c 2000 || true)
     _WG_STDERR_FULL=$(tail -n 100 "$_WG_STDERR" 2>/dev/null || true)
     rm -f "$_WG_STDERR"
-    wg log '{escaped_eval_id}' "Eval stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
+    {wg_cmd} log '{escaped_eval_id}' "Eval stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
     if [ $_WG_ROUTE_FAILURE -eq 1 ]; then
-        wg wait '{escaped_eval_id}' --until 'timer:1m' --checkpoint 'LLM execution route unavailable; retry without recording a semantic verdict' 2>> '{escaped_output}'
+        {wg_cmd} wait '{escaped_eval_id}' --until 'timer:1m' --checkpoint 'LLM execution route unavailable; retry without recording a semantic verdict' 2>> '{escaped_output}'
     else
-        wg evaluate record --task '{escaped_eval_id}' --score 0.0 --source system --notes "Inline evaluation failed with exit code $EXIT_CODE (agent: {escaped_sa_id})" 2>> '{escaped_output}' || true
-        REASON=$(printf 'wg evaluate exited with code %s\n---\n%s' "$EXIT_CODE" "$_WG_STDERR_TAIL")
-        wg fail '{escaped_eval_id}' --reason "$REASON" 2>> '{escaped_output}'
+{failure_record}        REASON=$(printf 'wg evaluate exited with code %s\n---\n%s' "$EXIT_CODE" "$_WG_STDERR_TAIL")
+        {wg_cmd} fail '{escaped_eval_id}' --reason "$REASON" 2>> '{escaped_output}'
     fi
 fi
 exit $EXIT_CODE"#,
-        )
-    } else {
-        format!(
-            r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
-_WG_STDERR=$(mktemp)
-{eval_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
-EXIT_CODE=$?
-cat "$_WG_STDERR" >> '{escaped_output}'
-if [ $EXIT_CODE -eq 0 ]; then
-    rm -f "$_WG_STDERR"
-    wg done '{escaped_eval_id}' 2>> '{escaped_output}'
-else
-    _WG_ROUTE_FAILURE=0
-    grep -q 'error\[WG-EXEC-' "$_WG_STDERR" 2>/dev/null && _WG_ROUTE_FAILURE=1
-    _WG_STDERR_TAIL=$(tail -n 20 "$_WG_STDERR" 2>/dev/null | head -c 2000 || true)
-    _WG_STDERR_FULL=$(tail -n 100 "$_WG_STDERR" 2>/dev/null || true)
-    rm -f "$_WG_STDERR"
-    wg log '{escaped_eval_id}' "Eval stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
-    if [ $_WG_ROUTE_FAILURE -eq 1 ]; then
-        wg wait '{escaped_eval_id}' --until 'timer:1m' --checkpoint 'LLM execution route unavailable; retry without recording a semantic verdict' 2>> '{escaped_output}'
-    else
-        REASON=$(printf 'wg evaluate exited with code %s\n---\n%s' "$EXIT_CODE" "$_WG_STDERR_TAIL")
-        wg fail '{escaped_eval_id}' --reason "$REASON" 2>> '{escaped_output}'
-    fi
-fi
-exit $EXIT_CODE"#,
-        )
+    )
+}
+
+fn persisted_agency_plan(
+    dir: &Path,
+    eval_task_id: &str,
+) -> Result<worksgood::eval_lifecycle::AgencyDispatchPlan> {
+    let graph_path = graph_path(dir);
+    let graph = worksgood::parser::load_graph(&graph_path)?;
+    let satellite = graph
+        .get_task(eval_task_id)
+        .ok_or_else(|| anyhow::anyhow!("Eval task '{}' not found", eval_task_id))?;
+    if let Some(plan) = satellite.agency_dispatch.as_ref() {
+        worksgood::eval_lifecycle::validate_plan(plan)?;
+        return Ok(plan.clone());
     }
+    let source_id = eval_task_id
+        .strip_prefix(".flip-")
+        .or_else(|| eval_task_id.strip_prefix(".evaluate-"))
+        .ok_or_else(|| anyhow::anyhow!("invalid evaluation satellite id {eval_task_id:?}"))?;
+    let source = graph
+        .get_task(source_id)
+        .ok_or_else(|| anyhow::anyhow!("evaluation source {source_id:?} not found"))?;
+    let migrated = worksgood::eval_lifecycle::migrate_legacy_plan(source, satellite)?;
+    let expected_model = satellite.model.clone();
+    let expected_provider = satellite.provider.clone();
+    let migrated_clone = migrated.clone();
+    let mut installed = false;
+    modify_graph(&graph_path, |fresh| {
+        let Some(task) = fresh.get_task_mut(eval_task_id) else {
+            return false;
+        };
+        if task.agency_dispatch.is_some()
+            || task.model != expected_model
+            || task.provider != expected_provider
+        {
+            return false;
+        }
+        task.model = Some(migrated_clone.calls[0].route.clone());
+        task.provider = Some(migrated_clone.calls[0].system.handler.clone());
+        task.agency_dispatch = Some(migrated_clone.clone());
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: Some("eval-lifecycle-repair".to_string()),
+            user: None,
+            message: format!(
+                "Installed lossless historical agency plan {} (route={})",
+                migrated_clone.plan_hash, migrated_clone.calls[0].route
+            ),
+        });
+        installed = true;
+        true
+    })?;
+    if !installed {
+        let fresh = worksgood::parser::load_graph(&graph_path)?;
+        let plan = fresh
+            .get_task(eval_task_id)
+            .and_then(|task| task.agency_dispatch.clone())
+            .ok_or_else(|| anyhow::anyhow!("agency plan changed concurrently; retry"))?;
+        worksgood::eval_lifecycle::validate_plan(&plan)?;
+        return Ok(plan);
+    }
+    Ok(migrated)
+}
+
+fn inline_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Absolute, graph-pinned command prefix for every recursive WG invocation in
+/// an inline wrapper. Resolving this once at spawn prevents PATH collisions and
+/// an inherited sibling project's cwd/WG_DIR from redirecting heartbeats or
+/// lifecycle transitions.
+fn authoritative_inline_wg_command(dir: &Path) -> Result<String> {
+    let exe = std::env::current_exe().context("resolve authoritative WG executable")?;
+    if !exe.is_absolute() {
+        anyhow::bail!(
+            "authoritative WG executable is not absolute: {}",
+            exe.display()
+        );
+    }
+    let graph_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    Ok(format!(
+        "{} --dir {}",
+        inline_shell_quote(&exe.to_string_lossy()),
+        inline_shell_quote(&graph_dir.to_string_lossy())
+    ))
+}
+
+fn qualify_inline_wg_exec(exec: &str, wg_cmd: &str) -> Option<String> {
+    exec.strip_prefix("wg ")
+        .map(|arguments| format!("{wg_cmd} {arguments}"))
+}
+
+/// Keep at least three beats inside the configured reaper window. The exact
+/// seconds override makes this production primitive accelerated-testable while
+/// the ordinary default remains the long-standing five-minute window.
+fn inline_heartbeat_interval_seconds(config: &Config) -> u64 {
+    (config.agent.heartbeat_timeout_secs() / 3).clamp(1, 120)
 }
 
 fn spawn_eval_inline(
     dir: &Path,
     eval_task_id: &str,
-    evaluator_model: Option<&str>,
+    _compatibility_model: Option<&str>,
 ) -> Result<(String, u32)> {
     use std::process::{Command, Stdio};
 
-    // Resolve the invocation/role route before creating artifacts or claiming
-    // the agency task. An unavailable execution route is retryable scheduling
-    // state, not a spawn failure or semantic evaluator verdict.
+    // Persisted stage-aware plans are invocation authority across scaffold,
+    // restart and retry. Only lossless historical rows are migrated.
     let config = Config::load_or_default(dir);
-    let eval_role = if eval_task_id.starts_with(".flip-") {
-        DispatchRole::FlipInference
-    } else {
-        DispatchRole::Evaluator
-    };
-    let (eval_executor, eval_recorded_model) = if let Some(route) = evaluator_model {
-        worksgood::config::execution_system_key(route)
-            .with_context(|| format!("invalid invocation-scoped evaluator route {route:?}"))?;
-        (
-            worksgood::dispatch::handler_for_model(route)
-                .as_str()
-                .to_string(),
-            route.to_string(),
-        )
-    } else {
-        let dispatch = worksgood::service::llm::resolve_agency_dispatch(&config, eval_role)
-            .context("agency evaluator execution route is not selected")?;
-        (dispatch.handler.as_str().to_string(), dispatch.raw_spec)
-    };
+    let wg_cmd = authoritative_inline_wg_command(dir)?;
+    let heartbeat_interval_seconds = inline_heartbeat_interval_seconds(&config);
+    let plan = persisted_agency_plan(dir, eval_task_id)?;
+    let primary = plan
+        .calls
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("agency plan contains no calls"))?;
+    let eval_executor = primary.system.handler.clone();
+    let eval_recorded_model = plan
+        .calls
+        .iter()
+        .map(|call| call.route.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ");
 
     let graph_path = graph_path(dir);
 
@@ -3350,6 +3206,7 @@ fn spawn_eval_inline(
     let output_file_str = output_file.to_string_lossy().to_string();
 
     let escaped_eval_id = eval_task_id.replace('\'', "'\\''");
+    let escaped_agent_id = agent_id.replace('\'', "'\\''");
     let escaped_output = output_file_str.replace('\'', "'\\''");
 
     // Atomically claim the task and extract needed fields.
@@ -3360,9 +3217,7 @@ fn spawn_eval_inline(
     let mut eval_task_agent: Option<String> = None;
     let mut claim_error: Option<String> = None;
     let agent_id_clone = agent_id.clone();
-    let eval_model_msg = evaluator_model
-        .map(|m| format!(" --model {}", m))
-        .unwrap_or_default();
+    let eval_model_msg = format!(" --agency-plan {}", plan.plan_hash);
 
     modify_graph(&graph_path, |graph| {
         let task = match graph.get_task_mut(eval_task_id) {
@@ -3383,7 +3238,58 @@ fn spawn_eval_inline(
 
         eval_task_exec = task.exec.clone();
         eval_task_agent = task.agent.clone();
+        if task
+            .agency_dispatch
+            .as_ref()
+            .map(|current| current.plan_hash.as_str())
+            != Some(plan.plan_hash.as_str())
+        {
+            claim_error = Some(format!(
+                "Eval task '{}' plan changed before claim",
+                eval_task_id
+            ));
+            return false;
+        }
 
+        let lifecycle = task.evaluation_lifecycle.get_or_insert_with(|| {
+            worksgood::eval_lifecycle::EvaluationLifecycle {
+                schema: worksgood::eval_lifecycle::EVAL_LIFECYCLE_SCHEMA,
+                pipeline_id: plan.pipeline_id.clone(),
+                source_attempt: plan.source_attempt,
+                route_generation: 0,
+                schedule_attempts: 0,
+                transport_attempts: 0,
+                semantic_attempts: 0,
+                execution_state: worksgood::eval_lifecycle::EvaluationExecutionState::Ready,
+                linked_flip_verdict: None,
+                linked_eval_verdict: None,
+                consumed_verdict: None,
+                repair_version: 0,
+            }
+        });
+        if lifecycle.pipeline_id != plan.pipeline_id {
+            lifecycle.execution_state =
+                worksgood::eval_lifecycle::EvaluationExecutionState::Blocked;
+            task.status = Status::Blocked;
+            task.failure_reason = Some(format!(
+                "evaluation pipeline changed: task={} plan={}",
+                lifecycle.pipeline_id, plan.pipeline_id
+            ));
+            claim_error = Some(format!(
+                "error[WG-EXEC-AGENCY-PLAN-MISMATCH]: '{}' lifecycle does not match its plan",
+                eval_task_id
+            ));
+            return true;
+        }
+        if let Err(error) = lifecycle.reserve_transport_attempt() {
+            task.status = Status::Blocked;
+            task.failure_reason = Some(format!(
+                "evaluation execution retry exhausted for plan {} after {} claimed attempt(s)",
+                plan.plan_hash, lifecycle.transport_attempts
+            ));
+            claim_error = Some(format!("{error:#}: task={eval_task_id}"));
+            return true;
+        }
         task.status = Status::InProgress;
         task.started_at = Some(Utc::now().to_rfc3339());
         task.assigned = Some(agent_id_clone.clone());
@@ -3407,18 +3313,24 @@ fn spawn_eval_inline(
     // Fall back to reconstructing from task ID for backward compatibility.
     let source_task_id = eval_task_id
         .strip_prefix(".evaluate-")
+        .or_else(|| eval_task_id.strip_prefix(".flip-"))
         .or_else(|| eval_task_id.strip_prefix("evaluate-"))
         .unwrap_or(eval_task_id);
-    let eval_cmd = if let Some(ref exec) = eval_task_exec
+    let base_eval_cmd = if let Some(ref exec) = eval_task_exec
         && exec.starts_with("wg evaluate")
     {
-        exec.to_string()
+        qualify_inline_wg_exec(exec, &wg_cmd)
+            .ok_or_else(|| anyhow::anyhow!("invalid inline eval command: {exec:?}"))?
     } else {
         format!(
-            "wg evaluate run '{}'",
+            "{wg_cmd} evaluate run '{}'",
             source_task_id.replace('\'', "'\\''")
         )
     };
+    let escaped_plan_hash = plan.plan_hash.replace('\'', "'\\''");
+    let eval_cmd = format!(
+        "WG_AGENCY_TASK_ID='{escaped_eval_id}' WG_AGENCY_PLAN_HASH='{escaped_plan_hash}' {base_eval_cmd}"
+    );
 
     // Resolve the special agent (evaluator) hash for performance recording.
     // After the inline eval completes, we record an Evaluation against this
@@ -3447,6 +3359,9 @@ fn spawn_eval_inline(
         &escaped_eval_id,
         &escaped_output,
         special_agent_verified.as_deref(),
+        &wg_cmd,
+        &escaped_agent_id,
+        heartbeat_interval_seconds,
     );
 
     // Route resolution happened before the claim so registry metadata and the
@@ -3529,7 +3444,7 @@ fn spawn_eval_inline(
         eval_task_id,
         &eval_executor,
         &output_file_str,
-        Some(evaluator_model.unwrap_or(&eval_recorded_model)),
+        Some(&eval_recorded_model),
     );
     locked_registry
         .save()
@@ -3546,6 +3461,8 @@ fn spawn_assign_inline(dir: &Path, assign_task_id: &str) -> Result<(String, u32)
     // Preflight before any claim/artifact mutation. Built-in Claude catalog
     // defaults do not authorize an assignment call.
     let assign_config = Config::load_or_default(dir);
+    let wg_cmd = authoritative_inline_wg_command(dir)?;
+    let heartbeat_interval_seconds = inline_heartbeat_interval_seconds(&assign_config);
     let assign_dispatch =
         worksgood::service::llm::resolve_agency_dispatch(&assign_config, DispatchRole::Assigner)
             .context("agency assigner execution route is not selected")?;
@@ -3568,6 +3485,7 @@ fn spawn_assign_inline(dir: &Path, assign_task_id: &str) -> Result<(String, u32)
     let output_file_str = output_file.to_string_lossy().to_string();
 
     let escaped_assign_id = assign_task_id.replace('\'', "'\\''");
+    let escaped_agent_id = agent_id.replace('\'', "'\\''");
     let escaped_output = output_file_str.replace('\'', "'\\''");
 
     // Atomically claim the task and extract needed fields.
@@ -3625,10 +3543,11 @@ fn spawn_assign_inline(dir: &Path, assign_task_id: &str) -> Result<(String, u32)
     let assign_cmd = if let Some(ref exec) = assign_task_exec
         && exec.starts_with("wg assign")
     {
-        exec.to_string()
+        qualify_inline_wg_exec(exec, &wg_cmd)
+            .ok_or_else(|| anyhow::anyhow!("invalid inline assignment command: {exec:?}"))?
     } else {
         format!(
-            "wg assign '{}' --auto",
+            "{wg_cmd} assign '{}' --auto",
             source_task_id.replace('\'', "'\\''")
         )
     };
@@ -3637,24 +3556,40 @@ fn spawn_assign_inline(dir: &Path, assign_task_id: &str) -> Result<(String, u32)
     let script = format!(
         r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
 _WG_STDERR=$(mktemp)
-{assign_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
+exec {{INLINE_HEARTBEAT_GUARD_FD}}> >({wg_cmd} heartbeat-watch '{escaped_agent_id}' --interval-seconds {heartbeat_interval_seconds} --supervised-pid "$$" 2>> '{escaped_output}')
+INLINE_HEARTBEAT_PID=$!
+_WG_STOP_INLINE_HEARTBEAT() {{
+    exec {{INLINE_HEARTBEAT_GUARD_FD}}>&- 2>/dev/null || true
+    if [ -n "${{INLINE_HEARTBEAT_PID:-}}" ]; then
+        kill "$INLINE_HEARTBEAT_PID" 2>/dev/null || true
+        wait "$INLINE_HEARTBEAT_PID" 2>/dev/null || true
+        INLINE_HEARTBEAT_PID=
+    fi
+}}
+trap '_WG_STOP_INLINE_HEARTBEAT' EXIT
+trap '_WG_STOP_INLINE_HEARTBEAT; trap - EXIT; exit 143' TERM INT HUP
+{{
+    {assign_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
+}} {{INLINE_HEARTBEAT_GUARD_FD}}>&-
 EXIT_CODE=$?
+_WG_STOP_INLINE_HEARTBEAT
+trap - EXIT TERM INT HUP
 cat "$_WG_STDERR" >> '{escaped_output}'
 if [ $EXIT_CODE -eq 0 ]; then
     rm -f "$_WG_STDERR"
-    wg done '{escaped_assign_id}' 2>> '{escaped_output}'
+    {wg_cmd} done '{escaped_assign_id}' 2>> '{escaped_output}'
 else
     _WG_ROUTE_FAILURE=0
     grep -q 'error\[WG-EXEC-' "$_WG_STDERR" 2>/dev/null && _WG_ROUTE_FAILURE=1
     _WG_STDERR_TAIL=$(tail -n 20 "$_WG_STDERR" 2>/dev/null | head -c 2000 || true)
     _WG_STDERR_FULL=$(tail -n 100 "$_WG_STDERR" 2>/dev/null || true)
     rm -f "$_WG_STDERR"
-    wg log '{escaped_assign_id}' "Assign stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
+    {wg_cmd} log '{escaped_assign_id}' "Assign stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
     if [ $_WG_ROUTE_FAILURE -eq 1 ]; then
-        wg wait '{escaped_assign_id}' --until 'timer:1m' --checkpoint 'LLM execution route unavailable; retry without recording a semantic verdict' 2>> '{escaped_output}'
+        {wg_cmd} wait '{escaped_assign_id}' --until 'timer:1m' --checkpoint 'LLM execution route unavailable; retry without recording a semantic verdict' 2>> '{escaped_output}'
     else
         REASON=$(printf 'wg assign exited with code %s\n---\n%s' "$EXIT_CODE" "$_WG_STDERR_TAIL")
-        wg fail '{escaped_assign_id}' --reason "$REASON" 2>> '{escaped_output}'
+        {wg_cmd} fail '{escaped_assign_id}' --reason "$REASON" 2>> '{escaped_output}'
     fi
 fi
 exit $EXIT_CODE"#,
@@ -3753,9 +3688,58 @@ fn spawn_shell_inline(dir: &Path, task_id: &str) -> Result<(String, u32)> {
     use std::process::{Command, Stdio};
 
     let graph_path = graph_path(dir);
+    let config = Config::load_or_default(dir);
+    let graph = load_graph(&graph_path).context("Failed to load graph for shell admission")?;
+    let task = graph
+        .get_task(task_id)
+        .ok_or_else(|| anyhow::anyhow!("Shell task '{}' not found", task_id))?;
+    let build_class = worksgood::disk_sentinel::classify_task(task);
+    if build_class.is_build_capable() {
+        let (level, reason, _) = worksgood::disk_sentinel::current_admission(
+            dir,
+            &config.coordinator.resource_management,
+        );
+        if level.blocks_builds() {
+            anyhow::bail!("build admission {:?}: {}", level, reason);
+        }
+    }
 
     let mut locked_registry = AgentRegistry::load_locked(dir)?;
     let agent_id = format!("agent-{}", locked_registry.next_agent_id);
+    let target_path = if build_class.is_build_capable() {
+        Some(
+            config
+                .coordinator
+                .resource_management
+                .cargo_target_root
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| dir.join("service").join("disk").join("build-targets"))
+                .join(format!("wg-target-{agent_id}")),
+        )
+    } else {
+        None
+    };
+    if let Some(path) = target_path.as_ref() {
+        fs::create_dir_all(path)?;
+    }
+    let tmp_path = if build_class.is_build_capable() {
+        Some(
+            config
+                .coordinator
+                .resource_management
+                .build_tmp_root
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(format!("wg-cargo-tmp-{agent_id}")),
+        )
+    } else {
+        None
+    };
+    if let Some(path) = tmp_path.as_ref() {
+        fs::create_dir_all(path)?;
+    }
 
     let output_dir = dir.join("agents").join(&agent_id);
     fs::create_dir_all(&output_dir)
@@ -3819,6 +3803,12 @@ exit $EXIT_CODE"#,
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    if let Some(path) = target_path.as_ref() {
+        cmd.env("CARGO_TARGET_DIR", path);
+    }
+    if let Some(path) = tmp_path.as_ref() {
+        cmd.env("TMPDIR", path);
+    }
 
     #[cfg(unix)]
     {
@@ -3859,6 +3849,34 @@ exit $EXIT_CODE"#,
     let pid = child.id();
 
     locked_registry.register_agent_with_model(pid, task_id, "shell", &output_file_str, None);
+    for (path, kind) in [
+        (
+            target_path.as_ref(),
+            worksgood::disk_sentinel::CacheKind::CargoTarget,
+        ),
+        (
+            tmp_path.as_ref(),
+            worksgood::disk_sentinel::CacheKind::CargoInstallScratch,
+        ),
+    ] {
+        let Some(path) = path else { continue };
+        let cache = worksgood::disk_sentinel::make_owned_cache(
+            path,
+            kind,
+            task_id,
+            &agent_id,
+            pid,
+            None,
+            config
+                .coordinator
+                .resource_management
+                .owned_cache_lease_seconds,
+        );
+        if let Err(error) = worksgood::disk_sentinel::register_owned_cache(dir, cache) {
+            let _ = kill_process_graceful(pid, 1);
+            anyhow::bail!("failed to persist shell build-cache ownership: {error:#}");
+        }
+    }
     locked_registry
         .save()
         .context("Failed to save agent registry after shell spawn")?;
@@ -4272,15 +4290,15 @@ fn record_spawn_failure_and_quarantine(
 }
 
 /// Keep an agency satellite retryable when execution selection/readiness fails
-/// before claim. This is deliberately separate from the spawn circuit breaker:
-/// no semantic attempt happened, so no spawn/failure budget is consumed.
+/// before claim. The Open->Waiting/Blocked mutation is the scheduling
+/// reservation: concurrent ticks holding the same stale ready snapshot cannot
+/// both increment the generation counter. No semantic budget is consumed.
 fn park_agency_execution_error(graph_path: &Path, task_id: &str, error: &anyhow::Error) -> bool {
     let diagnostic = format!("{error:#}");
     if !diagnostic.contains("error[WG-EXEC-") {
         return false;
     }
 
-    let resume_after = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
     let task_id = task_id.to_string();
     let _ = modify_graph(graph_path, |graph| {
         let Some(task) = graph.get_task_mut(&task_id) else {
@@ -4289,17 +4307,58 @@ fn park_agency_execution_error(graph_path: &Path, task_id: &str, error: &anyhow:
         if task.status != Status::Open {
             return false;
         }
-        task.status = Status::Waiting;
+        let Some(plan) = task.agency_dispatch.clone() else {
+            // An ambiguous legacy row has no safe generation to retry.
+            task.status = Status::Blocked;
+            task.failure_reason = Some(diagnostic.clone());
+            task.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: Some("agency-execution".to_string()),
+                user: None,
+                message: format!("Lifecycle route repair required: {diagnostic}"),
+            });
+            return true;
+        };
+        let lifecycle = task.evaluation_lifecycle.get_or_insert_with(|| {
+            worksgood::eval_lifecycle::EvaluationLifecycle {
+                schema: worksgood::eval_lifecycle::EVAL_LIFECYCLE_SCHEMA,
+                pipeline_id: plan.pipeline_id.clone(),
+                source_attempt: plan.source_attempt,
+                route_generation: 0,
+                schedule_attempts: 0,
+                transport_attempts: 0,
+                semantic_attempts: 0,
+                execution_state: worksgood::eval_lifecycle::EvaluationExecutionState::Ready,
+                linked_flip_verdict: None,
+                linked_eval_verdict: None,
+                consumed_verdict: None,
+                repair_version: 0,
+            }
+        });
+        lifecycle.schedule_attempts = lifecycle.schedule_attempts.saturating_add(1);
+        let attempts = lifecycle.schedule_attempts;
+        let limit = worksgood::eval_lifecycle::MAX_EXECUTION_ATTEMPTS_PER_ROUTE_GENERATION;
         task.assigned = None;
-        task.wait_condition = Some(WaitSpec::All(vec![WaitCondition::Timer {
-            resume_after: resume_after.clone(),
-        }]));
+        task.failure_reason = Some(diagnostic.clone());
+        if attempts >= limit {
+            task.status = Status::Blocked;
+            task.wait_condition = None;
+            lifecycle.execution_state =
+                worksgood::eval_lifecycle::EvaluationExecutionState::Blocked;
+        } else {
+            let delay_minutes = i64::from(1u32 << attempts.saturating_sub(1).min(5));
+            let resume_after = (Utc::now() + chrono::Duration::minutes(delay_minutes)).to_rfc3339();
+            task.status = Status::Waiting;
+            task.wait_condition = Some(WaitSpec::All(vec![WaitCondition::Timer { resume_after }]));
+            lifecycle.execution_state =
+                worksgood::eval_lifecycle::EvaluationExecutionState::Waiting;
+        }
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: Some("agency-execution".to_string()),
             user: None,
             message: format!(
-                "Execution route unavailable; retrying without a semantic verdict: {diagnostic}"
+                "Execution route unavailable; scheduling attempt {attempts}/{limit}; no semantic verdict: {diagnostic}"
             ),
         });
         true
@@ -4310,7 +4369,7 @@ fn park_agency_execution_error(graph_path: &Path, task_id: &str, error: &anyhow:
 fn spawn_agents_for_ready_tasks(
     dir: &Path,
     graph: &worksgood::graph::WorkGraph,
-    executor: &str,
+    _executor: &str,
     config: &Config,
     default_model: Option<&str>,
     slots_available: usize,
@@ -4321,6 +4380,14 @@ fn spawn_agents_for_ready_tasks(
     let agents_dir = dir.join("agency").join("cache/agents");
     let gp = graph_path(dir);
     let mut spawned = 0;
+    let disk_snapshot = worksgood::disk_sentinel::load_snapshot(dir).ok().flatten();
+    let builds_blocked = disk_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.level.blocks_builds());
+    let mut active_build_heavy = disk_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.active_build_heavy)
+        .unwrap_or(0);
     // Memoize loaded WCC-profile configs by name for this tick so a component
     // of N profiled tasks loads each profile file at most once.
     let mut profile_cache = worksgood::dispatch::ProfileCache::new();
@@ -4420,6 +4487,27 @@ fn spawn_agents_for_ready_tasks(
             }
         }
 
+        // Resource admission is class-specific: low disk pauses only tasks
+        // that can create build caches. Agency evaluation/assignment and graph
+        // operations continue through the same ready queue.
+        let build_class = worksgood::disk_sentinel::classify_task(task);
+        if let Some(reason) = build_admission_denial(
+            task,
+            builds_blocked,
+            active_build_heavy,
+            config.coordinator.resource_management.max_build_agents,
+            disk_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.reason.as_str())
+                .unwrap_or("disk sentinel has no healthy snapshot"),
+        ) {
+            eprintln!(
+                "[dispatcher] Deferring '{}' while ordinary/evaluator tasks remain eligible: {}",
+                task.id, reason
+            );
+            continue;
+        }
+
         // Shell-mode tasks run inline: fork `wg exec --shell` directly instead
         // of going through the full agent spawn path. Must be checked before the
         // auto_assign gate because shell tasks are intentionally excluded from
@@ -4437,6 +4525,9 @@ fn spawn_agents_for_ready_tasks(
                 Ok((agent_id, pid)) => {
                     eprintln!("[dispatcher] Spawned shell {} (PID {})", agent_id, pid);
                     spawned += 1;
+                    if build_class.is_heavy() {
+                        active_build_heavy += 1;
+                    }
                 }
                 Err(e) => {
                     eprintln!("[dispatcher] Failed to spawn shell for {}: {}", task_id, e);
@@ -4643,6 +4734,9 @@ fn spawn_agents_for_ready_tasks(
                 eprintln!("[dispatcher] Spawned {} (PID {})", agent_id, pid);
                 record_dispatch(&gp, &task.id);
                 spawned += 1;
+                if build_class.is_heavy() {
+                    active_build_heavy += 1;
+                }
             }
             Err(e) => {
                 eprintln!("[dispatcher] Failed to spawn for {}: {}", task.id, e);
@@ -4914,44 +5008,67 @@ pub fn coordinator_tick(
     // — whichever fired first would mark the event sent, silently starving the
     // other. Single-owner (the listener) removes that split-brain race.
 
+    // Periodic disk work is outside the TUI/render path and writes a bounded,
+    // cached snapshot consumed by status surfaces. Cleanup consults only the
+    // explicit ownership registry; unknown directories are never candidates.
+    let disk_was_due = worksgood::disk_sentinel::load_snapshot(dir)
+        .ok()
+        .flatten()
+        .and_then(|snapshot| chrono::DateTime::parse_from_rfc3339(&snapshot.generated_at).ok())
+        .map(|generated| {
+            (Utc::now() - generated.with_timezone(&Utc)).num_seconds()
+                >= config
+                    .coordinator
+                    .resource_management
+                    .disk_scan_interval_seconds as i64
+        })
+        .unwrap_or(true);
+    match worksgood::disk_sentinel::refresh_if_due(dir, &config.coordinator.resource_management) {
+        Ok(Some(snapshot)) if snapshot.level != worksgood::disk_sentinel::DiskLevel::Healthy => {
+            eprintln!(
+                "[dispatcher] Disk sentinel {:?}: {}",
+                snapshot.level, snapshot.reason
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("[dispatcher] Disk sentinel warning: {error:#}"),
+    }
+    if disk_was_due {
+        match worksgood::disk_sentinel::cleanup_owned(
+            dir,
+            &config.coordinator.resource_management,
+            true,
+        ) {
+            Ok(report)
+                if report.reaped > 0
+                    || report.compressed_files > 0
+                    || report.deduplicated_files > 0 =>
+            {
+                eprintln!(
+                    "[dispatcher] Disk cleanup: reaped {} owned target(s), freed {} bytes; compressed {} stream(s), saved {} bytes; deduplicated {}, saved {} bytes",
+                    report.reaped,
+                    report.bytes_freed,
+                    report.compressed_files,
+                    report.compression_bytes_saved,
+                    report.deduplicated_files,
+                    report.deduplication_bytes_saved
+                )
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("[dispatcher] Disk cleanup warning: {error:#}"),
+        }
+    }
+
     // Phase 1: Clean up dead agents and count alive ones
     let alive_count = match cleanup_and_count_alive(dir, &graph_path, max_agents)? {
         Ok(count) => count,
         Err(early_result) => return Ok(early_result),
     };
 
-    // Phase 1.2: Atomic worktree sweep.
-    //
-    // Agent wrappers drop `.wg-cleanup-pending` markers at exit (after the
-    // merge-back section runs). Here we reap every marked worktree whose
-    // owning agent is not live AND whose task is terminal. This is the
-    // coordinator-side half of the two-phase atomic-cleanup protocol; it
-    // makes the removal idempotent and crash-safe (a coordinator restart
-    // mid-removal just re-runs on the next tick).
-    match super::worktree::sweep_cleanup_pending_worktrees(dir) {
-        Ok(0) => {}
-        Ok(n) => eprintln!(
-            "[dispatcher] Worktree sweep: removed {} cleanup-pending worktree(s)",
-            n
-        ),
-        Err(e) => eprintln!("[dispatcher] Worktree sweep warning: {}", e),
-    }
-
-    // Phase 1.2b: Target-dir reaper safety net.
-    //
-    // The agent wrapper reaps `target/` inline at exit, but kill -9, host OOM,
-    // or a failed wrapper invocation can leave ~16G of cargo build artifacts
-    // sitting in the worktree even though the agent is dead. This catches
-    // those cases. The retention policy still preserves the worktree itself
-    // for `wg retry`-in-place; we only delete the build cache.
-    match super::worktree::reap_dead_target_dirs(dir) {
-        Ok((0, _)) => {}
-        Ok((n, bytes)) => eprintln!(
-            "[dispatcher] Target-dir reap: cleared {} target/ dir(s), freed {} bytes",
-            n, bytes
-        ),
-        Err(e) => eprintln!("[dispatcher] Target-dir reap warning: {}", e),
-    }
+    // Worktrees are source-bearing recovery state and are never removed by
+    // the periodic sentinel. Cleanup-pending markers remain an explicit
+    // operator/worktree-GC surface. Build targets (including external paths)
+    // are handled only through the ownership registry above.
 
     // Phase 1.3: Zero-output agent detection — kill agents that have been alive
     // for 5+ minutes with zero bytes in stream files (API call never returned).
@@ -4980,6 +5097,33 @@ pub fn coordinator_tick(
 
     let slots_available = max_agents.saturating_sub(alive_count);
 
+    // Verdict files are immutable evidence. Read them before taking the graph
+    // writer lock, then link/consume them in the one atomic graph transaction.
+    let legacy_migration = worksgood::eval_lifecycle::migrate_unambiguous_legacy_verdicts(dir);
+    if let Ok(count) = legacy_migration.as_ref()
+        && *count > 0
+    {
+        eprintln!(
+            "[dispatcher] linked {} unambiguous historical evaluation verdict(s)",
+            count
+        );
+    }
+    let (durable_eval_verdicts, eval_evidence_usable) = match legacy_migration {
+        Err(error) => {
+            eprintln!("[dispatcher] eval lifecycle evidence unavailable (fail-closed): {error:#}");
+            (Vec::new(), false)
+        }
+        Ok(_) => match worksgood::eval_lifecycle::load_durable_verdicts(dir) {
+            Ok(verdicts) => (verdicts, true),
+            Err(error) => {
+                eprintln!(
+                    "[dispatcher] eval lifecycle evidence unavailable (fail-closed): {error:#}"
+                );
+                (Vec::new(), false)
+            }
+        },
+    };
+
     // Phases 2.5–2.9: Graph maintenance (atomic load-modify-save).
     //
     // Each phase group uses `modify_graph` to hold the file lock across the
@@ -4997,19 +5141,28 @@ pub fn coordinator_tick(
         // they would have run `wg reject` already."
         modified |= migrate_pending_validation_tasks(graph);
 
-        // Phase 2.46: PendingEval resolution.
-        // Tasks the agent reported done land in PendingEval until `.evaluate-X`
-        // scores them. When the evaluator finished and DIDN'T reject the task
-        // (check_eval_gate would have already flipped it to Failed and spawned
-        // a rescue), promote PendingEval → Done so downstream dependents
-        // unblock. See docs in src/commands/done.rs::pick_done_target_status.
-        modified |= resolve_pending_eval_tasks(graph);
-
-        // Phase 2.47: FailedPendingEval resolution.
-        // Tasks that exited without calling `wg done` enter FailedPendingEval;
-        // the dispatcher runs `.evaluate-X` to assess whether the output is
-        // acceptable. Score ≥ threshold → rescued to Done; otherwise → Failed.
-        modified |= resolve_failed_pending_eval_tasks(dir, graph, &config);
+        // Phases 2.46–2.47: route-stable evaluation lifecycle repair and
+        // verdict-required parent resolution. A terminal/missing evaluator is
+        // never treated as a score. Historical pre-claim Codex rows are
+        // normalized once; ambiguous provider-only rows park for an operator.
+        if eval_evidence_usable {
+            modified |= worksgood::eval_lifecycle::repair_historical_rows(graph);
+            modified |= worksgood::eval_lifecycle::reconcile_durable_verdicts(
+                graph,
+                &durable_eval_verdicts,
+                config.agency.eval_gate_threshold.unwrap_or(0.7),
+                config.agency.auto_rescue_on_eval_fail,
+                config.coordinator.max_verify_failures,
+                |task| {
+                    config.agency.eval_gate_all
+                        || task
+                            .description
+                            .as_deref()
+                            .map(crate::commands::deliverables::parse_deliverables)
+                            .is_some_and(|deliverables| !deliverables.is_empty())
+                },
+            );
+        }
 
         // Phase 2.5: Cycle iteration — reactivate cycles where all members are Done.
         {
@@ -5465,6 +5618,9 @@ mod tests {
             ".flip-my-source",
             "/tmp/out.log",
             Some("agent-hash-deadbeef"),
+            "wg",
+            "agent-1",
+            1,
         );
 
         // Success branch: must use --task / --score, NOT positional.
@@ -5495,6 +5651,50 @@ mod tests {
     }
 
     #[test]
+    fn inline_eval_script_uses_managed_process_bound_heartbeat() {
+        let script = build_inline_eval_script(
+            "wg evaluate run my-source",
+            ".evaluate-my-source",
+            "/tmp/out.log",
+            None,
+            "'/opt/wg/bin/wg' --dir '/srv/project/.wg'",
+            "agent-41",
+            2,
+        );
+        assert!(script.contains(
+            "'/opt/wg/bin/wg' --dir '/srv/project/.wg' heartbeat-watch 'agent-41' --interval-seconds 2 --supervised-pid \"$$\""
+        ));
+        assert!(script.contains("} {INLINE_HEARTBEAT_GUARD_FD}>&-"));
+        assert!(script.contains("trap '_WG_STOP_INLINE_HEARTBEAT' EXIT"));
+        assert!(script.contains("kill \"$INLINE_HEARTBEAT_PID\""));
+        assert!(script.contains("wait \"$INLINE_HEARTBEAT_PID\""));
+    }
+
+    #[test]
+    fn inline_runtime_is_absolute_graph_pinned_and_accelerated() {
+        let dir = tempdir().unwrap();
+        let command = authoritative_inline_wg_command(dir.path()).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert!(command.contains(&exe.to_string_lossy().to_string()));
+        assert!(
+            command.contains(
+                &dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+        assert!(command.contains(" --dir "));
+
+        let mut config = Config::default();
+        config.agent.heartbeat_timeout_seconds = Some(6);
+        assert_eq!(inline_heartbeat_interval_seconds(&config), 2);
+        config.agency.inference_timeout = Some(4);
+        assert_eq!(config.agency.inference_timeout_secs(), 4);
+    }
+
+    #[test]
     fn test_inline_eval_script_without_special_agent_skips_record() {
         // When there is no resolved special agent, the script must NOT
         // emit a `wg evaluate record` line at all (success or failure branch).
@@ -5503,6 +5703,9 @@ mod tests {
             "evaluate-my-source",
             "/tmp/out.log",
             None,
+            "wg",
+            "agent-1",
+            1,
         );
 
         assert!(
@@ -5521,6 +5724,9 @@ mod tests {
             ".evaluate-my-source",
             "/tmp/out.log",
             Some("agent-hash-deadbeef"),
+            "wg",
+            "agent-1",
+            1,
         );
 
         assert!(script.contains("grep -q 'error\\[WG-EXEC-'"));
@@ -5544,12 +5750,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let graph_path = dir.path().join("graph.jsonl");
         let mut graph = WorkGraph::new();
+        let source = Task {
+            id: "source".into(),
+            title: "Source".into(),
+            status: Status::PendingEval,
+            ..Task::default()
+        };
+        let mut config = Config::default();
+        config.tiers.fast = Some("pi:openrouter:test/evaluator".to_string());
+        let plan = worksgood::eval_lifecycle::build_plan(
+            &config,
+            &source,
+            ".evaluate-source",
+            worksgood::eval_lifecycle::DispatchSelectionSource::ScaffoldConfig,
+        )
+        .unwrap();
         let task = Task {
             id: ".evaluate-source".into(),
             title: "Evaluate source".into(),
             status: Status::Open,
+            agency_dispatch: Some(plan),
             ..Task::default()
         };
+        graph.add_node(Node::Task(source));
         graph.add_node(Node::Task(task));
         save_graph(&graph, &graph_path).unwrap();
 
@@ -7085,6 +7308,7 @@ mod tests {
 
         // Config with FLIP verification threshold + agency pipeline enabled
         let mut config = Config::default();
+        config.tiers.fast = Some("claude:haiku".to_string());
         config.agency.flip_verification_threshold = Some(0.6);
         config.agency.auto_assign = true;
         config.agency.auto_evaluate = true;
@@ -8040,6 +8264,113 @@ mod tests {
             !is_daemon_managed(&regular),
             "regular tasks must remain spawnable by the dispatcher"
         );
+    }
+
+    #[test]
+    fn concurrent_preclaim_route_parking_reserves_once() {
+        let dir = tempdir().unwrap();
+        let path = graph_path(dir.path());
+        let source = Task {
+            id: "source".to_string(),
+            title: "source".to_string(),
+            status: Status::FailedPendingEval,
+            ..Task::default()
+        };
+        let mut config = Config::default();
+        config.models.evaluator = Some(worksgood::config::RoleModelConfig {
+            provider: None,
+            model: Some("codex:gpt-5.5".to_string()),
+            tier: None,
+            endpoint: None,
+            reasoning: None,
+        });
+        let plan = worksgood::eval_lifecycle::build_plan(
+            &config,
+            &source,
+            ".evaluate-source",
+            worksgood::eval_lifecycle::DispatchSelectionSource::ScaffoldConfig,
+        )
+        .unwrap();
+        let satellite = Task {
+            id: ".evaluate-source".to_string(),
+            title: "eval".to_string(),
+            status: Status::Open,
+            agency_dispatch: Some(plan),
+            ..Task::default()
+        };
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(source));
+        graph.add_node(Node::Task(satellite));
+        save_graph(&graph, &path).unwrap();
+
+        let first_path = path.clone();
+        let second_path = path.clone();
+        let first = std::thread::spawn(move || {
+            park_agency_execution_error(
+                &first_path,
+                ".evaluate-source",
+                &anyhow::anyhow!("error[WG-EXEC-TEST]: unavailable"),
+            )
+        });
+        let second = std::thread::spawn(move || {
+            park_agency_execution_error(
+                &second_path,
+                ".evaluate-source",
+                &anyhow::anyhow!("error[WG-EXEC-TEST]: unavailable"),
+            )
+        });
+        let _ = (first.join().unwrap(), second.join().unwrap());
+
+        let graph = worksgood::parser::load_graph(&path).unwrap();
+        let task = graph.get_task(".evaluate-source").unwrap();
+        assert_eq!(task.status, Status::Waiting);
+        assert_eq!(
+            task.evaluation_lifecycle
+                .as_ref()
+                .unwrap()
+                .schedule_attempts,
+            1,
+            "the Open→Waiting CAS must make a stale second tick a no-op"
+        );
+        assert_eq!(task.spawn_failures, 0);
+    }
+
+    #[test]
+    fn four_build_requests_serialize_while_pi_terra_evaluation_is_eligible() {
+        let builds: Vec<Task> = (0..4)
+            .map(|index| Task {
+                id: format!("build-{index}"),
+                title: "cargo test full suite".into(),
+                ..Default::default()
+            })
+            .collect();
+        let evaluator = Task {
+            id: ".evaluate-build-0".into(),
+            title: "Pi Terra evaluation".into(),
+            exec_mode: Some("full".into()),
+            ..Default::default()
+        };
+
+        let mut active_heavy = 0;
+        let mut admitted = Vec::new();
+        for task in builds.iter().chain(std::iter::once(&evaluator)) {
+            if build_admission_denial(task, false, active_heavy, 1, "healthy").is_none() {
+                admitted.push(task.id.clone());
+                if worksgood::disk_sentinel::classify_task(task).is_heavy() {
+                    active_heavy += 1;
+                }
+            }
+        }
+        assert_eq!(admitted, vec!["build-0", ".evaluate-build-0"]);
+
+        // Under pause all four Cargo requests defer, but the evaluator still
+        // clears the class-specific gate rather than being stranded.
+        assert!(
+            builds
+                .iter()
+                .all(|task| build_admission_denial(task, true, 0, 1, "low space").is_some())
+        );
+        assert!(build_admission_denial(&evaluator, true, 1, 1, "low space").is_none());
     }
 
     #[test]

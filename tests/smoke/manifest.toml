@@ -147,6 +147,15 @@ description = "Pins fix-last-interaction: typing and sending in a real wg tui ch
 timeout_seconds = 45
 
 [[scenario]]
+name = "tui_chat_service_health_restart"
+script = "scenarios/tui_chat_service_health_restart.sh"
+owners = [
+    "fix-tui-service",
+]
+description = "Pins fix-tui-service through the real tmux/PTY human flow: keep the TUI on its continuously-refreshing Chat tab, stop the daemon until the visible badge/vitals show DOWN, restart it externally, and require both HUD surfaces to recover live without a tab/TUI restart while the credential-free cat chat remains responsive."
+timeout_seconds = 45
+
+[[scenario]]
 name = "tui_pi_chat_pty_embedded"
 script = "scenarios/tui_pi_chat_pty_embedded.sh"
 owners = [
@@ -170,8 +179,19 @@ name = "tui_chat_composer_newlines_pty"
 script = "scenarios/tui_chat_composer_newlines_pty.sh"
 owners = [
     "bug-wg-tui",
+    "fix-periodic-plain",
+    "fix-tui-first",
 ]
-description = "Pins bug-wg-tui: drives the real wg tui chat composer through a PTY that positively answers the Kitty keyboard-enhancement query, sends CSI-u Shift+Enter plus Ctrl+J, asserts neither chord submits early, then presses plain Enter and verifies exactly one persisted chat message contains the embedded newlines. Credential-free cat chat; no live LLM endpoint required."
+description = "Pins bug-wg-tui, fix-periodic-plain, and fix-tui-first's non-mosh half: drives the real wg tui native chat composer through a PTY that observes the nonblocking direct Kitty keyboard-enhancement request, sends CSI-u Shift+Enter plus Ctrl+J, asserts neither chord submits early, then presses plain Enter and verifies exactly one persisted chat message contains the embedded newlines. Credential-free cat chat; no live LLM endpoint required."
+timeout_seconds = 45
+
+[[scenario]]
+name = "tui_chat_mosh_plain_enter_pty"
+script = "scenarios/tui_chat_mosh_plain_enter_pty.sh"
+owners = [
+    "fix-periodic-plain",
+]
+description = "Pins fix-periodic-plain through the real wg tui PTY boundary with MOSH_SERVER_PID/MOSH_IP and Kitty-capable TERM: asserts no Kitty query/push/set crosses mosh, drives the native composer, preserves Ctrl+J multiline input, sends 12 literal plain CR Enter presses, then models the observed transport corruption with 12 CSI-u Shift+Enter events for that physical key. Every payload must submit exactly once/in order with no newline or late duplicate; trace records both parsed forms plus chat_input_route=native_composer. Credential-free cat chat; no live LLM endpoint required."
 timeout_seconds = 45
 
 [[scenario]]
@@ -852,6 +872,15 @@ description = "Evaluator one-shot roles configured with Claude registry/OpenRout
 timeout_seconds = 60
 
 [[scenario]]
+name = "evaluator_artifact_diff_prompt"
+script = "scenarios/evaluator_artifact_diff_prompt.sh"
+owners = [
+    "review-and-land",
+]
+description = "Production-path regression for the Codex evaluator artifact-diff timeout incident. Drives a real git-backed task through `wg evaluate run --dry-run --evaluator-model codex:gpt-5.6-luna` and asserts the exact route identity plus bounded (30KB), relevant artifact-diff evidence in an explicitly untrusted, collision-free prompt boundary. The payload contains the first candidate closing delimiter and an instruction-like line, proving it cannot escape the evidence boundary. Credential-free: dry-run builds the real evaluator prompt without invoking an LLM."
+timeout_seconds = 30
+
+[[scenario]]
 name = "model_fable_routes_to_claude_cli"
 script = "scenarios/model_fable_routes_to_claude_cli.sh"
 owners = [
@@ -888,6 +917,15 @@ owners = [
     "smoke-gate-is",
 ]
 description = "Pins wg-done-silent: when an agent's worktree branch has 0 commits ahead of main but staged-but-uncommitted tracked files, `wg done` MUST refuse with non-zero exit + actionable error naming the file. Regression history: codex agent for create-agents-md ran `git add AGENTS.md && wg done`, saw zero error, AGENTS.md never landed on main; the work was silently dropped because attempt_worktree_merge's `commit_count == 0` short-circuit returned NoCommits without checking the porcelain. Drives a real git worktree + staged file, asserts (a) wg done exits non-zero, (b) error names the staged file, (c) the file is NOT on main, (d) the task is NOT marked done. No LLM credentials needed; pure git + graph assertions."
+timeout_seconds = 30
+
+[[scenario]]
+name = "wg_done_preserves_squash_attribution"
+script = "scenarios/wg_done_preserves_squash_attribution.sh"
+owners = [
+    "repair-luca-core",
+]
+description = "Pins the non-destructive Luca attribution repair through the real `wg done` worktree flow: a two-commit branch with Luca as the oldest author, Erik as the integration author, and blank-line-separated source co-author lines must squash with Luca as author plus exactly one Erik and Claude Co-authored-by trailer. Both files must land; the primary author must not be duplicated as a trailer. Credential-free, pure git + graph flow."
 timeout_seconds = 30
 
 [[scenario]]
@@ -937,8 +975,9 @@ name = "wg_init_writes_lockstep_agent_guides"
 script = "scenarios/wg_init_writes_lockstep_agent_guides.sh"
 owners = [
     "fix-wg-init-2",
+    "remove-workgraph-branding",
 ]
-description = "Pins fix-wg-init-2: every fresh `wg init` route must write both CLAUDE.md and AGENTS.md to the project root from the same layer-2 template, so Claude Code / Claude CLI and Codex sessions receive byte-identical project-specific context that delegates the universal role contract to `wg agent-guide`. No LLM endpoint needed."
+description = "Pins fix-wg-init-2 and remove-workgraph-branding: every fresh `wg init` route writes byte-identical, version-delimited WorksGood project guides with no stale branding; `wg setup --repair-guides` upgrades legacy managed regions in project and global guides without changing surrounding user bytes and is byte-idempotent. No LLM endpoint needed."
 timeout_seconds = 30
 
 [[scenario]]
@@ -1480,6 +1519,7 @@ name = "tui_first_frame_slow_storage"
 script = "scenarios/tui_first_frame_slow_storage.sh"
 owners = [
     "implement-nonblocking-tui",
+    "fix-tui-first",
 ]
 description = "Real tmux/PTY human-flow gate: with the bootstrap storage worker delayed by 1, 3, and 5 seconds, the neutral TUI shell paints before storage completes, the help key is acknowledged during the read, one thresholded phase-aware slow-storage slot appears and clears, the graph snapshot eventually lands, and quit remains bounded."
 timeout_seconds = 90
@@ -1499,6 +1539,7 @@ script = "scenarios/tui_large_graph_continuous_mutation.sh"
 owners = [
     "move-large-graph",
     "validate-fully-async",
+    "fix-tui-first",
 ]
 description = "Real tmux/PTY large-graph gate: load a 10k-task/50k-edge graph, atomically replace it at 20Hz while driving help/search keys, assert bounded key acknowledgement and RSS, preserve the live search draft, and prove the newest generation converges without stale rollback."
 timeout_seconds = 90
@@ -1656,7 +1697,7 @@ script = "scenarios/pi_plugin_load_contract.sh"
 owners = [
     "pi-plugin-impl-smoke",
 ]
-description = "Pins the plugin-first pi package contract: the built @worksgood/wg-pi-plugin registers the full wg tool family, /wg and /wg-model commands, session_start/model_select/session_shutdown hooks, and model_select write-back to CoordinatorState.model_override, without passive turn_end ready-task UI hooks or widget rendering; the host selftest verifies the plugin bundle loads through the Topology-B Node host. The smoke instantiates the plugin in fake rpc/tui/print mode contexts so registration remains mode-independent."
+description = "Pins the plugin-first pi package contract: the built @worksgood/pi registers the full wg tool family, /wg and /wg-model commands, session_start/model_select/session_shutdown hooks, and model_select write-back to CoordinatorState.model_override, without passive turn_end ready-task UI hooks or widget rendering; the host selftest verifies the plugin bundle loads through the Topology-B Node host. The smoke instantiates the plugin in fake rpc/tui/print mode contexts so registration remains mode-independent."
 timeout_seconds = 180
 
 [[scenario]]
@@ -1712,8 +1753,9 @@ name = "tui_new_chat_launcher_pi_executor"
 script = "scenarios/tui_new_chat_launcher_pi_executor.sh"
 owners = [
     "fix-tui-new-chat-pi-executor",
+    "make-pi-the",
 ]
-description = "Pins fix-tui-new-chat-pi-executor: the wg tui new-chat launcher (+) MUST visibly include a `pi` executor radio option, ordered third (after claude and codex, before nex/opencode). Selecting pi + entering model openrouter/z-ai/glm-5.2 creates a .chat-N task with executor resolving to pi and model preserving the OpenRouter route. Drives a real wg tui inside tmux; metadata assertions suffice (no live model call). Fails if the Pi option is absent or ordered incorrectly."
+description = "Pins Pi-first explicit creation: the real tmux-driven New Chat launcher shows Pi first, preselected, and labeled recommended/open source; opening it alone creates no graph row. Confirming Pi plus an exact handler-first model creates one .chat-N row resolving to Pi and preserves the route."
 timeout_seconds = 90
 
 [[scenario]]
@@ -1749,7 +1791,7 @@ script = "scenarios/pi_plugin_install_hermetic.sh"
 owners = [
     "implement-pi-plugin",
 ]
-description = "Pins implement-pi-plugin: the `ensure-pi-plugin` install primitive + hermetic `pi -e <cache>/dist/index.js -ne` load. Credential-free core (pure `wg` binary): `wg pi-plugin compat-version` prints the embedded version; `wg pi-plugin install` (WG_PI_PLUGIN_FORCE_CACHE=1, isolated HOME/XDG_CACHE_HOME) materializes the embedded bundle into ${XDG_CACHE_HOME}/wg/pi-plugin/<compat>/ with a `.wg-ok` integrity stamp and writes the ~/.pi/agent/settings.json extensions entry; a second install is byte-identical (idempotent); a corrupted cache (truncated index.js + missing .wg-ok) is detected as not-ready and self-healed by re-materializing the embedded truth. Live (only when a `pi` binary is present, still credential-free because the extension loads at pi startup before any model connection): a MISMATCHED WG_PI_PLUGIN_COMPAT_VERSION makes real `pi --mode rpc -e <cache dist> -ne` fail LOUDLY with a compat-mismatch error naming the found wg version (the loud-fail tripwire), while a MATCHING version loads with no 'Failed to load extension' error. SKIPs the live sub-check (not the scenario) when no `pi` binary is on PATH."
+description = "Pins implement-pi-plugin: the `ensure-pi-plugin` install primitive + hermetic `pi -e <cache>/pi-worksgood/index.js -ne` load. Credential-free core (pure `wg` binary): `wg pi-plugin compat-version` prints the embedded version; `wg pi-plugin install` (WG_PI_PLUGIN_FORCE_CACHE=1, isolated HOME/XDG_CACHE_HOME) materializes the embedded bundle into ${XDG_CACHE_HOME}/wg/worksgood-pi/<compat>/ with a `.wg-ok` integrity stamp and writes the ~/.pi/agent/settings.json extensions entry; a second install is byte-identical (idempotent); a corrupted cache (truncated index.js + missing .wg-ok) is detected as not-ready and self-healed by re-materializing the embedded truth. Live (only when a `pi` binary is present, still credential-free because the extension loads at pi startup before any model connection): a MISMATCHED WG_PI_PLUGIN_COMPAT_VERSION makes real `pi --mode rpc -e <cache dist> -ne` fail LOUDLY with a compat-mismatch error naming the found wg version (the loud-fail tripwire), while a MATCHING version loads with no 'Failed to load extension' error. SKIPs the live sub-check (not the scenario) when no `pi` binary is on PATH."
 timeout_seconds = 60
 
 [[scenario]]
@@ -1758,8 +1800,17 @@ script = "scenarios/pi_install_e2e.sh"
 owners = [
     "test-end-to",
 ]
-description = "Pins test-end-to: the pi<->wg install LIFECYCLE entry points not covered by pi_plugin_install_hermetic (which pins `wg pi-plugin install` + raw `pi -e`). Always-on credential-free core (pure `wg` binary, isolated HOME/XDG_CACHE_HOME): (2) PROFILE-DRIVEN install — from a clean ~/.pi+cache, `wg profile use pi` declaratively ensures the plugin ('Ensured wg-pi-plugin'), wires ~/.pi/agent/settings.json to the versioned cache dist, version-matched, `wg pi-plugin status` reports console-wired, and a second `profile use pi` is byte-identical (idempotent); (6) NODE-LESS install — with NO node/npm/pi anywhere on PATH, `wg pi-plugin install` still extracts the EMBEDDED bytes into the cache + .wg-ok stamp + wires settings (cargo-installed users need no toolchain). Live credential-free sub-checks (only when a `pi` binary is present): (1) HERMETIC HANDLER SPAWN — from a clean ~/.pi, `wg pi-handler` (WG_PI_PLUGIN_FORCE_CACHE=1) logs 'ensured plugin source=Cache' and spawns `pi --mode rpc … -e <cache>/<compat>/dist/index.js -ne`, and NEVER writes a global ~/.pi/agent/settings.json plugin entry; (5) LOUD COMPAT MISMATCH — a version-skewed WG_PI_PLUGIN_COMPAT_VERSION makes real `pi -e <cache dist> -ne` fail loudly+early naming the skew (no silent drift of the glm-5.2 401 class). The credentialed live wg-verb round-trips (a model calling wg_add back into the graph) are model-nondeterministic and documented in docs/pi-install-e2e-report.md / pi_plugin_live_validation, not gated here. SKIPs the live sub-checks (not the scenario) when no `pi` binary is on PATH."
+description = "Pins test-end-to: the pi<->wg install LIFECYCLE entry points not covered by pi_plugin_install_hermetic (which pins `wg pi-plugin install` + raw `pi -e`). Always-on credential-free core (pure `wg` binary, isolated HOME/XDG_CACHE_HOME): (2) PROFILE-DRIVEN install — from a clean ~/.pi+cache, `wg profile use pi` declaratively ensures the plugin ('Ensured pi-worksgood'), wires ~/.pi/agent/settings.json to the versioned cache dist, version-matched, `wg pi-plugin status` reports console-wired, and a second `profile use pi` is byte-identical (idempotent); (6) NODE-LESS install — with NO node/npm/pi anywhere on PATH, `wg pi-plugin install` still extracts the EMBEDDED bytes into the cache + .wg-ok stamp + wires settings (cargo-installed users need no toolchain). Live credential-free sub-checks (only when a `pi` binary is present): (1) HERMETIC HANDLER SPAWN — from a clean ~/.pi, `wg pi-handler` (WG_PI_PLUGIN_FORCE_CACHE=1) logs 'ensured plugin source=Cache' and spawns `pi --mode rpc … -e <cache>/<compat>/pi-worksgood/index.js -ne`, and NEVER writes a global ~/.pi/agent/settings.json plugin entry; (5) LOUD COMPAT MISMATCH — a version-skewed WG_PI_PLUGIN_COMPAT_VERSION makes real `pi -e <cache dist> -ne` fail loudly+early naming the skew (no silent drift of the glm-5.2 401 class). The credentialed live wg-verb round-trips (a model calling wg_add back into the graph) are model-nondeterministic and documented in docs/pi-install-e2e-report.md / pi_plugin_live_validation, not gated here. SKIPs the live sub-checks (not the scenario) when no `pi` binary is on PATH."
 timeout_seconds = 120
+
+[[scenario]]
+name = "pi_worksgood_identity"
+script = "scenarios/pi_worksgood_identity.sh"
+owners = [
+    "rename-pi-integration",
+]
+description = "Pins the WorksGood Pi rename through the real package/install/startup surfaces: package.json + lockfile are @worksgood/pi with the approved description; the canonical runtime parent makes Pi's live startup extension list display exactly pi-worksgood; a fresh offline wg pi-plugin install materializes the embedded worksgood-pi cache and remains the compatibility CLI; legacy @worksgood/wg-pi-plugin npm settings and old cache paths migrate once without duplicate loading, lost unrelated configuration, or repeated notices; and a real Pi compat mismatch names WorksGood loudly. Credential-free; live terminal checks skip only when Pi or tmux is unavailable."
+timeout_seconds = 90
 
 [[scenario]]
 name = "handler_first_bare_provider_model"
@@ -2315,8 +2366,9 @@ name = "explicit_execution_selection"
 script = "scenarios/explicit_execution_selection.sh"
 owners = [
     "require-explicit-execution",
+    "fix-explicit-execution",
 ]
-description = "Live terminal contract for explicit execution selection: isolated fresh HOME runs graph-only init/CRUD, real service start fails with WG-EXEC-UNSELECTED before daemon state, non-interactive setup without --route fails, explicit Codex setup writes only handler-first Codex routing, lint reports its source, and the real selected daemon lifecycle starts with Codex. Credential-free."
+description = "Live terminal contract for explicit execution selection: isolated fresh HOME runs graph-only init/CRUD, real service start fails with WG-EXEC-UNSELECTED before daemon state, the real interactive PTY accepts the recommended Pi default only as a recommendation and can explicitly remain graph-only, non-interactive setup without --route fails, explicit Codex setup writes only handler-first Codex routing, lint reports its source, and the real selected daemon lifecycle starts with Codex. Credential-free."
 timeout_seconds = 60
 
 [[scenario]]
@@ -2334,7 +2386,7 @@ script = "scenarios/tui_bootstrap_parent_graph_isolation.sh"
 owners = [
     "fix-integration-test",
 ]
-description = "Real tmux/PTY regression for integration-test/TUI subprocess isolation: launch a scratch TUI with a sentinel parent WG_DIR plus worker task/agent identity, wait for first-use chat bootstrap, require .chat-0 in scratch, and prove the parent graph hash/content is unchanged with no legacy .coordinator ghost. Credential-free."
+description = "Real tmux/PTY regression for integration-test/TUI subprocess isolation: launch a scratch TUI with a sentinel parent WG_DIR plus worker identity, prove opening alone leaves both graphs unchanged, then drive explicit command-mode n/Enter, require .chat-0 in scratch, and prove the parent graph remains unchanged with no legacy .coordinator ghost. Credential-free."
 timeout_seconds = 30
 
 [[scenario]]
@@ -2345,3 +2397,166 @@ owners = [
 ]
 description = "Regression (telegram-voice-notes): a Telegram voice note / audio / video_note becomes a normal message. Drives `wg telegram voice` (the detect→transcribe→inject dry-run the live listener runs) against a STUB gateway so no live whisper/ffmpeg/token is needed. Pins that a spoken 'add milk to the shopping list' routes IDENTICALLY to a typed add (fast-lane:shopping-add, reaching the plan seam), a spoken open question goes to the composer, the recording bytes reach the transcriber, and every failure reason (unconfigured→casa voice-setup, decode-failed→'mind typing it', silence) produces an honest in-persona reply — never silent."
 timeout_seconds = 30
+
+[[scenario]]
+name = "tui_immediate_chat_startup"
+script = "scenarios/tui_immediate_chat_startup.sh"
+owners = [
+    "restore-immediate-chat",
+    "fix-immediate-chat",
+    "reproduce-and-fix",
+    "validate-four-sided",
+]
+description = "Permanent real tmux/PTY human-flow gate for prioritized asynchronous chat startup: with an existing live tmux chat process, a 10k-task graph, 100MiB history/log artifacts, continuous graph publication, a real project-local FIFO storage stall, and a subsequent 5s unrelated full-bootstrap delay, launch real wg tui and type immediately. The exact existing pane must receive/echo the key in under 3s while storage is blocked; the one contextual row's identity/connection/route must agree; its PID/session must remain singular with the daemon off and on; and ordered first-frame/metadata/pane/key milestones plus the PTY n → Ctrl+O → command-mode n flow must be reported. Full labelled New-chat pointer boundaries are pinned by event/render tests. Credential-free."
+timeout_seconds = 30
+
+[[scenario]]
+name = "tui_chat_close_lifecycle"
+script = "scenarios/tui_chat_close_lifecycle.sh"
+owners = [
+    "validate-and-land",
+    "fix-tui-screen",
+    "reproduce-and-fix",
+    "validate-four-sided",
+]
+description = "Installed-binary real tmux/PTY flow for contextual terminal-chat routing and the command-mode Close lifecycle: selecting abandoned .chat-36 opens its exact Task/Detail context with no spawn/reattach, composer, or Chat action; returning to a live chat restores exactly one Chat row with fixed New chat and no legacy always-visible Close; Ctrl+O → w still reaches the identity/state/atomic-route modal; Cancel and Hide remain non-destructive; Stop tears down the identity-matching TUI PTY while preserving an Open/resumable task; and Archive produces Done+archived state with idempotent already-gone cleanup. The settled outer pane must contain every sentinel graph row and active identity exactly once, no stale subprocess text, global chrome, or outer-frame pair. Credential-free."
+timeout_seconds = 60
+
+[[scenario]]
+name = "tui_stateful_chat_restart_resume"
+script = "scenarios/tui_stateful_chat_restart_resume.sh"
+owners = [
+    "fix-tui-restart",
+    "fix-path-unique",
+]
+description = "Real tmux/PTY stateful-resume regression: route-less chat creation under a Pi/Codex handler-first profile persists the exact Pi route with no Claude fallback; the first TUI and a restarted TUI keep exactly one .chat-0 row, reattach the same persistent pane PID selected by tui-state.json, preserve Pi session history, and accept input; wg chat show agrees the TUI-owned tmux runtime is live; killing the pane surfaces the real recovery panel and R resurrects the saved route/session without adding a row. Credential-free fake Pi."
+timeout_seconds = 60
+
+[[scenario]]
+name = "chat_tmux_path_unique_terminal_resume"
+script = "scenarios/chat_tmux_path_unique_terminal_resume.sh"
+owners = [
+    "fix-path-unique",
+]
+description = "Real tmux/TUI ownership regression for fix-path-unique: two FS-isolated graphs with the same project basename get distinct path-hashed chat sessions, cannot report or attach each other's Pi pane, and normal same-graph restart reattaches the exact PID. A provably-owned legacy basename-only session is migrated in place using its WG_DIR marker. With a daemon live, done/archived/abandoned chat tasks plus a stale canonical tmux session are rejected before SetChatExecutor and cannot mutate task, route/session metadata, or tmux ownership. Credential-free fake Pi."
+timeout_seconds = 90
+
+[[scenario]]
+name = "tui_open_non_mutating"
+script = "scenarios/tui_open_non_mutating.sh"
+owners = [
+    "remove-implicit-chat",
+]
+description = "Installed-binary real tmux/PTY gate for remove-implicit-chat: opens/restarts an authoritative empty TUI twenty times across missing/corrupt route metadata and daemon down/up, injects delayed full bootstrap, and proves No chat selected + visible New chat with zero graph rows, UUID/chat dirs, session aliases, synthetic TUI/history state, handler tmux sessions, or provider argv. A terminal-only graph stays terminal. Then real command-mode n and a real SGR pointer click each open the chooser and create exactly one identity-pinned chat only after confirmation. Credential-free fake provider binaries."
+timeout_seconds = 120
+
+[[scenario]]
+name = "pi_plugin_model_cycle_context"
+script = "scenarios/pi_plugin_model_cycle_context.sh"
+owners = [
+    "fix-pi-plugin",
+]
+description = "Pins the standalone Pi Ctrl-P regression from the historical report docs/bugs/wg-pi-plugin-no-chat-id-model-writeback.md. Always-on credential-free event flow emits real model_select(source=cycle) shapes for OpenRouter Qwen and local llama.cpp: selected model changes while absent chat env yields zero backend wg calls and zero console errors. Canonical WG_CHAT_ID and WG_CHAT_REF alias each produce exactly one warm write-back to the exact .chat-N; a managed nonzero result stays one concise actionable line with no stack duplication. With tmux and the current binary, a real WG TUI launches a fake Pi child, proves WG_CHAT_ID=.chat-0 plus WG_CHAT_REF=chat-0, emits a model cycle, and verifies only coordinator-state-0 changes. When Pi+python3 are installed, it also drives the actual Ctrl-P byte repeatedly through a real standalone Pi TUI PTY with the built extension and dummy-auth custom models, asserting no graph call or write-back stack noise."
+timeout_seconds = 180
+
+[[scenario]]
+name = "tui_wg_add_output_confinement"
+script = "scenarios/tui_wg_add_output_confinement.sh"
+owners = [
+    "reproduce-and-fix",
+]
+description = "Installed-binary real tmux/nested-PTY regression for reproduce-and-fix: a custom chat issues four visible wg add commands while graph snapshots refresh rapidly, the mosh-compatible input policy is active, and the outer pane resizes down/back. The child proves stdout/stderr belong to its embedded PTY rather than ratatui's outer PTY; physical capture and tui-dump agree that Added task/Use --after appear once only in Chat while every graph row appears once. A deliberately unwritable tui-state path exercises terminal-silent diagnostics, then post-burst Close/Hide proves live input and a coherent graph-only repaint with no stale output or displaced borders. Credential-free."
+timeout_seconds = 60
+
+[[scenario]]
+name = "provider_completion_refusal_breaker"
+script = "scenarios/provider_completion_refusal_breaker.sh"
+owners = [
+    "integrate-luca-provider",
+    "fix-sigkilled-wrapper",
+]
+description = "Live credential-free daemon/spawn-breaker regression for Luca 02204b19's diagnosis: three fake Codex workers reach a real wg done blocked-graph refusal whose graph prose contains HTTP 401/quota, persist validated completion-refused provenance, and leave provider counters/service pause untouched; three genuine fake HTTP 401 wrapper crashes then reach threshold for exactly the canonical Codex handler+wire+endpoint health route. All six real generated run.sh wrappers are SIGKILLed after observing their heartbeat-watch descendant/process group; each watcher must exit promptly and the final scratch ownership scan must find no stale wrapper/shell/sleep/heartbeat process."
+timeout_seconds = 90
+
+[[scenario]]
+name = "nex_bg_process_group_pty"
+script = "scenarios/nex_bg_process_group_pty.sh"
+owners = [
+    "integrate-luca-detached",
+]
+description = "Live human terminal flow for Luca detached-process integration: a real PTY drives wg nex /bg run, status, output, kill, and /cancel. The job persists a start-validated session/process-group identity, produces output through Rust-opened descriptors, and a TERM-ignoring descendant is gone after kill with no orphan group. Credential-free; no model request is made."
+timeout_seconds = 45
+
+[[scenario]]
+name = "tui_pi_hot_upgrade_self_exec"
+script = "scenarios/tui_pi_hot_upgrade_self_exec.sh"
+owners = [
+    "reproduce-and-fix-2",
+]
+description = "Installed-binary real tmux/PTY regression for reproduce-and-fix-2: launch WG TUI through a symlink under a minimal non-login/mosh-like PATH whose first `wg` is a deliberately foreign WireGuard-style sentinel, atomically replace the installed image so /proc/<tui>/exe is '(deleted)', then drive command-mode New chat -> Pi -> double-confirm. The TUI must re-exec its authoritative image (never stale current_exe, missing PATH, or foreign PATH `wg`), create exactly one canonical row/path-owned tmux session, launch standalone interactive Pi (never pi-handler/RPC/hermetic plugin flags), and reattach the exact Pi PID after restart. Missing-Pi public and TUI negative controls name `pi` and leave zero rows/sessions. Credential-free fake Pi; Linux /proc-specific."
+timeout_seconds = 90
+
+[[scenario]]
+name = "wg_show_closed_consumer"
+script = "scenarios/wg_show_closed_consumer.sh"
+owners = [
+    "fix-wg-show-broken-pipe",
+]
+description = "Live terminal-flow regression for the reported `wg show <task> | head -n 1` failure. A large real task makes the real installed wg producer encounter a reader that closes after one line; head must succeed, wg must terminate quietly by conventional SIGPIPE with no panic/backtrace, and a normal unpiped show must still deliver the complete unchanged output. Credential-free and scratch-graph isolated."
+timeout_seconds = 30
+
+[[scenario]]
+name = "tui_four_sided_layout_mobile"
+script = "scenarios/tui_four_sided_layout_mobile.sh"
+owners = [
+    "implement-four-sided",
+    "fix-one-row",
+]
+description = "Candidate-binary real tmux/PTY flow for the one-row borderless inspector at desktop, medium, and Termux sizes: all-chat-archived recovery, contextual Chat/Task rows, globally fixed labelled New chat, cached agents/running/ready/disk pulse, one side/stacked seam, frameless full mode, mouse-disabled p layout controls, rollback/commit, narrow-to-wide preference restoration, and non-mutating startup/persistence. Credential-free."
+timeout_seconds = 180
+
+[[scenario]]
+name = "pending_eval_lifecycle_route_recovery"
+script = "scenarios/pending_eval_lifecycle_route_recovery.sh"
+owners = [
+    "salvage-and-finish",
+    "validate-integrated-luca-2",
+]
+description = "Credential-free real CLI/dispatcher regression for the FailedPendingEval lifecycle repair: Codex scaffolding persists a handler-first two-stage plan, the owning FLIP completes over FailedPendingEval while ordinary work stays gated, why-blocked agrees with dispatcher readiness without inventing an SCC cycle, a terminal evaluator without durable evidence cannot scorelessly promote its source, a historical bare-Codex pre-claim breaker row normalizes/rearms exactly once, and a completed claimed legacy evaluator with exactly one post-start Evaluation is losslessly linked once after restart without a semantic rerun. Handler matrices and concurrent-tick reservation are pinned by companion Rust tests."
+timeout_seconds = 60
+
+[[scenario]]
+name = "live_pi_evaluation_verdict_restart"
+script = "scenarios/live_pi_evaluation_verdict_restart.sh"
+owners = [
+    "fix-live-evaluation",
+]
+description = "Exact live writer→satellite-completion→restart-reader regression for the 2026-07-19 PendingEval stall: a real persisted-plan `wg evaluate run` drives the explicit Pi/openai-codex/Terra one-shot path (credential-free remote-response stub, Claude sentinel), writes the seven-dimension score-0.88 Evaluation and schema-2 durable-byte verdict, pins both files before/after satellite completion, then a fresh service tick consumes once and repeated restart ticks remain byte/idempotent. Independent evaluation/verdict tamper branches fail closed loudly and keep the parent pending."
+timeout_seconds = 90
+
+[[scenario]]
+name = "disk_sentinel_admission_cleanup"
+script = "scenarios/disk_sentinel_admission_cleanup.sh"
+owners = [
+    "add-disk-sentinel",
+]
+description = "Real CLI + tmux/TUI regression for add-disk-sentinel: synthesizes warn/pause/hard-refuse/auto-resume thresholds relative to measured free bytes without filling disk; pins cached wg status and async TUI disk state; exercises scriptable doctor/cleanup; and proves an unknown /tmp/wg-target-* survives because filenames never confer ownership. Rust companion tests pin four-build serialization with Pi/Terra evaluation eligibility, external owned-target reaping, PID identity/restart, open-file/artifact/dirty-worktree preservation, and measured stream compression."
+timeout_seconds = 45
+
+[[scenario]]
+name = "casa_wgfed_adapter_e2e"
+script = "scenarios/casa_wgfed_adapter_e2e.sh"
+owners = [
+    "prototype-and-test",
+]
+description = "Credential-free Casa companion acceptance flow across two filesystem-independent HOME/graph instances using only the real untrusted HTTP WG-Fed relay: signed+sealed request and recipient ACL; canonical derived trust and enforcing Review/digest pin; stable attributed origin/srcId product dedupe; exactly one wgid owner, correctly dated/device-aware outward reply, restart/outbox crash convergence and deterministic non-authoritative feed rebuild; content-addressed Exec offer/claim/grant/result transfer with scoped UCAN/lease wrong-task/expiry/replay/stale fences; then a signed+sealed report back."
+timeout_seconds = 120
+
+[[scenario]]
+name = "inline_evaluator_silent_heartbeat"
+script = "scenarios/inline_evaluator_silent_heartbeat.sh"
+owners = [
+    "fix-inline-evaluator",
+]
+description = "Installed-binary credential-free production regression for the five-minute inline-evaluator false reap: an exact persisted codex:gpt-5.6-luna evaluator emits no model output for longer than an accelerated heartbeat window while the process-bound, absolute-WG, explicit-graph watcher refreshes registry liveness; registry and a real tmux TUI report it active, daemon SIGKILL/restart does not duplicate it, and it completes once. A second genuinely hung Luna stub keeps heartbeating but is terminated by the independent hard inference timeout with no wrapper/model/heartbeat orphan. Foreign PATH wg plus Claude/Pi sentinels pin project and same-system route isolation."
+timeout_seconds = 60

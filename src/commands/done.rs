@@ -361,6 +361,129 @@ fn detect_worktree(wg_dir: &Path) -> Option<WorktreeInfo> {
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitIdentity {
+    name: String,
+    email: String,
+}
+
+impl GitIdentity {
+    fn from_author_fields(name: &str, email: &str) -> Option<Self> {
+        let name = name.trim();
+        let email = email.trim();
+        if name.is_empty()
+            || email.is_empty()
+            || name.chars().any(char::is_control)
+            || email.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(Self {
+            name: name.to_string(),
+            email: email.to_string(),
+        })
+    }
+
+    fn from_trailer_value(value: &str) -> Option<Self> {
+        let value = value.trim();
+        let open = value.rfind('<')?;
+        if !value.ends_with('>') {
+            return None;
+        }
+        Self::from_author_fields(&value[..open], &value[open + 1..value.len() - 1])
+    }
+
+    fn render(&self) -> String {
+        format!("{} <{}>", self.name, self.email)
+    }
+
+    fn dedup_key(&self) -> String {
+        self.email.to_lowercase()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SquashAttribution {
+    /// The oldest source commit's author remains the squash commit author.
+    author: GitIdentity,
+    /// Every other source author and every valid source Co-authored-by trailer.
+    coauthors: Vec<GitIdentity>,
+}
+
+/// Read attribution from every source commit that is not already reachable
+/// from the target `HEAD`. A squash discards those commit objects from main's
+/// ancestry, so the resulting commit must carry their identities explicitly.
+///
+/// NUL separators keep fields unambiguous because Git commit objects cannot
+/// contain NUL bytes. We recognize only a complete
+/// `Co-authored-by: Name <email>` line (case-insensitive key). Reading the body
+/// rather than only Git's final trailer block is intentional: older WG
+/// integration commits separated multiple co-author lines with blank lines, so
+/// `%(trailers:...)` returned only the final identity and caused the loss this
+/// path is responsible for repairing.
+fn collect_squash_attribution(
+    project_root: &str,
+    branch: &str,
+) -> Result<Option<SquashAttribution>> {
+    use std::collections::HashSet;
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args(["log", "--reverse", "-z", "--format=%an%x00%ae%x00%B"])
+        .arg(format!("HEAD..{branch}"))
+        .current_dir(project_root)
+        .output()
+        .context("Failed to read source attribution for squash merge")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git log failed while reading squash attribution: {}",
+            one_line_error(&output.stderr)
+        );
+    }
+
+    let fields = output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .collect::<Vec<_>>();
+    let mut commits = Vec::new();
+    for fields in fields.chunks_exact(3) {
+        let name = String::from_utf8_lossy(fields[0]);
+        let email = String::from_utf8_lossy(fields[1]);
+        let body = String::from_utf8_lossy(fields[2]);
+        let author = GitIdentity::from_author_fields(&name, &email).ok_or_else(|| {
+            anyhow::anyhow!("source commit has an invalid author identity: {name:?} <{email:?}>")
+        })?;
+        let coauthors = body
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case("co-authored-by")
+                    .then(|| GitIdentity::from_trailer_value(value))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        commits.push((author, coauthors));
+    }
+
+    let Some((author, _)) = commits.first() else {
+        return Ok(None);
+    };
+    let author = author.clone();
+    let mut seen = HashSet::from([author.dedup_key()]);
+    let mut coauthors = Vec::new();
+    for (commit_author, commit_coauthors) in commits {
+        for identity in std::iter::once(commit_author).chain(commit_coauthors) {
+            if seen.insert(identity.dedup_key()) {
+                coauthors.push(identity);
+            }
+        }
+    }
+
+    Ok(Some(SquashAttribution { author, coauthors }))
+}
+
 fn attempt_worktree_merge(wt: &WorktreeInfo, task_id: &str) -> Result<WorktreeMergeResult> {
     use std::process::Command;
 
@@ -373,19 +496,20 @@ fn attempt_worktree_merge(wt: &WorktreeInfo, task_id: &str) -> Result<WorktreeMe
         return Ok(WorktreeMergeResult::NotInWorktree);
     }
 
-    let commits_output = Command::new("git")
-        .args(["log", "--oneline"])
-        .arg(format!("HEAD..{}", wt.branch))
-        .current_dir(&wt.project_root)
-        .output()
-        .context("Failed to check commits on worktree branch")?;
+    // Serialize the source-range read together with the squash and commit.
+    // Otherwise another landing could advance main after attribution was read,
+    // making us credit commits that the actual squash no longer contains.
+    let merge_lock_path = Path::new(&wt.project_root)
+        .join(".wg-worktrees")
+        .join(".merge-lock");
+    if let Some(parent) = merge_lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _merge_lock = MergeLockGuard::acquire(&merge_lock_path)?;
 
-    let commit_count = String::from_utf8_lossy(&commits_output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .count();
+    let attribution = collect_squash_attribution(&wt.project_root, &wt.branch)?;
 
-    if commit_count == 0 {
+    if attribution.is_none() {
         // Before declaring NoCommits, make sure the agent didn't stage work and
         // forget to commit. `git status --porcelain` runs in the worktree
         // directory because the staging area is per-working-tree. Any entry
@@ -416,15 +540,6 @@ fn attempt_worktree_merge(wt: &WorktreeInfo, task_id: &str) -> Result<WorktreeMe
 
         return Ok(WorktreeMergeResult::NoCommits);
     }
-
-    let merge_lock_path = Path::new(&wt.project_root)
-        .join(".wg-worktrees")
-        .join(".merge-lock");
-    if let Some(parent) = merge_lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let _merge_lock = MergeLockGuard::acquire(&merge_lock_path)?;
 
     let merge_result = Command::new("git")
         .args(["merge", "--squash", &wt.branch])
@@ -465,13 +580,25 @@ fn attempt_worktree_merge(wt: &WorktreeInfo, task_id: &str) -> Result<WorktreeMe
 
         WorktreeMergeResult::Conflict { conflicting_files }
     } else {
+        let attribution = attribution.expect("source commits were checked before squash merge");
         let agent_label = wt.agent_id.as_deref().unwrap_or("unknown");
-        let commit_msg = format!(
+        let mut commit_msg = format!(
             "feat: {} ({})\n\nSquash-merged from worktree branch {}",
             task_id, agent_label, wt.branch
         );
+        if !attribution.coauthors.is_empty() {
+            commit_msg.push_str("\n\n");
+        }
+        for (index, coauthor) in attribution.coauthors.iter().enumerate() {
+            if index > 0 {
+                commit_msg.push('\n');
+            }
+            commit_msg.push_str("Co-authored-by: ");
+            commit_msg.push_str(&coauthor.render());
+        }
+        let author = attribution.author.render();
         let commit_output = Command::new("git")
-            .args(["commit", "-m", &commit_msg])
+            .args(["commit", "--author", &author, "-m", &commit_msg])
             .current_dir(&wt.project_root)
             .output()
             .context("Failed to commit squash merge")?;
@@ -1434,7 +1561,7 @@ pub fn run(
     skip_smoke: bool,
 ) -> Result<()> {
     let is_agent = std::env::var("WG_AGENT_ID").is_ok();
-    run_inner(
+    let result = run_inner(
         dir,
         id,
         converged,
@@ -1443,7 +1570,25 @@ pub fn run(
         is_agent,
         full_smoke,
         skip_smoke,
-    )
+    );
+
+    // Provider health consumes this typed provenance, not this command's
+    // human-facing stderr. The write is best-effort so an observability
+    // failure can never change `wg done` semantics; triage later validates
+    // agent/task/run identity against spawn metadata before trusting it.
+    if is_agent {
+        let outcome = match &result {
+            Ok(()) => worksgood::service::ExecutionOutcome::CompletionAccepted,
+            Err(error) => worksgood::service::ExecutionOutcome::CompletionRefused {
+                code: worksgood::service::completion_refusal_code(&error.to_string()),
+            },
+        };
+        if let Err(error) = worksgood::service::record_done_outcome(dir, id, outcome) {
+            eprintln!("Warning: failed to record wg done outcome: {error}");
+        }
+    }
+
+    result
 }
 
 fn run_inner(
@@ -1475,7 +1620,6 @@ fn run_inner(
     let blockers = query::after(&graph, id);
     if !blockers.is_empty() {
         let cycle_analysis = graph.compute_cycle_analysis();
-        let dependent_is_system = id.starts_with('.');
         let effective_blockers: Vec<_> = blockers
             .into_iter()
             .filter(|b| {
@@ -1487,29 +1631,14 @@ fn run_inner(
                 if in_same_cycle {
                     return false;
                 }
-                // PendingEval / FailedPendingEval bypass for system dependents:
-                // `.flip-X` / `.evaluate-X` ARE the rescue/eval pipeline — they
-                // must run on a soft-done (PendingEval) OR soft-failed
-                // (FailedPendingEval) source. See pick_done_target_status and
-                // query.rs (readiness treats both states identically for system
-                // dependents).
-                //
-                // General theorem: NO blocked-on edge may point from a rescue
-                // path back into the thing being rescued. `.flip-X` and
-                // `.evaluate-X` depend on `X`, but they ARE the mechanism that
-                // resolves a FailedPendingEval `X`. Gating their `wg done` on
-                // `X` being resolved is a circular wait — the exact deadlock
-                // this bypass exists to prevent. Omitting FailedPendingEval here
-                // (while query.rs exempts it) deadlocks a crashed run three
-                // ways: `.flip-X` can't done (blocked by X), `.evaluate-X` can't
-                // done (blocked by `.flip-X`), X can't resolve (waiting on
-                // `.evaluate-X`).
-                if dependent_is_system
-                    && matches!(
-                        b.status,
-                        Status::PendingEval | Status::FailedPendingEval
-                    )
-                {
+                // Luca's FailedPendingEval rescue exemption is relation-aware:
+                // only the owning `.flip-X` / direct `.evaluate-X` edge is the
+                // mechanism that resolves X. Other dot-prefixed work must not
+                // inherit this trust-bearing bypass.
+                if matches!(
+                    query::dependency_disposition(&b.id, id, &graph, Some(dir)),
+                    query::DependencyDisposition::EvalSystemBypass { .. }
+                ) {
                     return false;
                 }
                 // Terminal blockers (Failed / Abandoned) don't gate manual
@@ -2534,6 +2663,7 @@ fn run_inner(
         task.completed_at = Some(Utc::now().to_rfc3339());
         if target_status == Status::PendingEval {
             transitioned_to_pending_eval = true;
+            worksgood::eval_lifecycle::refresh_source_lifecycle(task);
         }
 
         // Clear any prior deliverable-preflight / no-operational-output /
@@ -4649,6 +4779,144 @@ mod tests {
         }
     }
 
+    fn make_attribution_repo() -> (tempfile::TempDir, PathBuf, String) {
+        let project = tempdir().unwrap();
+        let project_path = project.path().to_path_buf();
+        git(&project_path, &["init", "-b", "main"]);
+        git(
+            &project_path,
+            &["config", "user.email", "merge@example.com"],
+        );
+        git(&project_path, &["config", "user.name", "Merge User"]);
+        git(&project_path, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(project_path.join("README.md"), "initial\n").unwrap();
+        git(&project_path, &["add", "README.md"]);
+        git(&project_path, &["commit", "-m", "initial"]);
+        let branch = "wg/agent-test/attribution".to_string();
+        git(&project_path, &["checkout", "-b", &branch]);
+        (project, project_path, branch)
+    }
+
+    #[test]
+    fn test_squash_merge_preserves_source_authors_and_coauthor_trailers() {
+        let (_project, project_path, branch) = make_attribution_repo();
+
+        std::fs::write(project_path.join("luca.txt"), "baseline\n").unwrap();
+        git(&project_path, &["add", "luca.txt"]);
+        git(
+            &project_path,
+            &[
+                "commit",
+                "--author",
+                "Luca Pinello <lucapinello@gmail.com>",
+                "-m",
+                "source baseline\n\nMetadata containing record controls: \u{1e}\u{1f}\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+            ],
+        );
+
+        std::fs::write(project_path.join("integration.txt"), "integration\n").unwrap();
+        git(&project_path, &["add", "integration.txt"]);
+        git(
+            &project_path,
+            &[
+                "commit",
+                "--author",
+                "Erik Integrator <erik@example.com>",
+                "-m",
+                "integrate baseline\n\nCo-authored-by: Luca Pinello <lucapinello@gmail.com>",
+            ],
+        );
+        git(&project_path, &["checkout", "main"]);
+
+        let result = attempt_worktree_merge(&make_wt(&project_path, &branch), "attribution")
+            .expect("squash merge should succeed");
+        assert!(matches!(result, WorktreeMergeResult::Merged { .. }));
+
+        let (ok, commit) = git_capture(
+            &project_path,
+            &["show", "-s", "--format=%an <%ae>%n%B", "HEAD"],
+        );
+        assert!(ok);
+        assert!(
+            commit.starts_with("Luca Pinello <lucapinello@gmail.com>\n"),
+            "oldest source author must remain the squash author: {commit}"
+        );
+        assert_eq!(
+            commit
+                .matches("Co-authored-by: Erik Integrator <erik@example.com>")
+                .count(),
+            1,
+            "additional source authors must become one trailer: {commit}"
+        );
+        assert_eq!(
+            commit
+                .matches("Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>")
+                .count(),
+            1,
+            "existing source trailers must survive once: {commit}"
+        );
+        assert!(
+            !commit.contains("Co-authored-by: Luca Pinello"),
+            "the primary author must not be duplicated as a coauthor: {commit}"
+        );
+        let (ok, parsed_trailers) = git_capture(
+            &project_path,
+            &[
+                "show",
+                "-s",
+                "--format=%(trailers:key=Co-authored-by,valueonly)",
+                "HEAD",
+            ],
+        );
+        assert!(ok);
+        assert!(parsed_trailers.contains("Erik Integrator <erik@example.com>"));
+        assert!(parsed_trailers.contains("Claude Opus 4.8 <noreply@anthropic.com>"));
+    }
+
+    #[test]
+    fn test_squash_merge_preserves_coauthors_from_single_source_commit() {
+        let (_project, project_path, branch) = make_attribution_repo();
+
+        std::fs::write(project_path.join("provider.txt"), "provider\n").unwrap();
+        git(&project_path, &["add", "provider.txt"]);
+        git(
+            &project_path,
+            &[
+                "commit",
+                "--author",
+                "Erik Integrator <erik@example.com>",
+                "-m",
+                "provider fix\n\nCo-authored-by: Luca Pinello <lucapinello@gmail.com>\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+            ],
+        );
+        git(&project_path, &["checkout", "main"]);
+
+        let result = attempt_worktree_merge(&make_wt(&project_path, &branch), "provider")
+            .expect("squash merge should succeed");
+        assert!(matches!(result, WorktreeMergeResult::Merged { .. }));
+
+        let (ok, commit) = git_capture(
+            &project_path,
+            &["show", "-s", "--format=%an <%ae>%n%B", "HEAD"],
+        );
+        assert!(ok);
+        assert!(commit.starts_with("Erik Integrator <erik@example.com>\n"));
+        assert_eq!(
+            commit
+                .matches("Co-authored-by: Luca Pinello <lucapinello@gmail.com>")
+                .count(),
+            1,
+            "source coauthor must survive the squash: {commit}"
+        );
+        assert_eq!(
+            commit
+                .matches("Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>")
+                .count(),
+            1,
+            "all source coauthors must survive the squash: {commit}"
+        );
+    }
+
     #[test]
     fn test_done_pushes_main_and_deletes_branch_on_clean_merge() {
         let (_remote, _project, project_path, branch) = make_repo_with_remote("clean-merge");
@@ -5163,5 +5431,77 @@ mod tests {
         assert!(err.contains("deliverable preflight refused"));
         let graph = load_graph(&graph_path(&wg_dir)).unwrap();
         assert_ne!(graph.get_task("t1").unwrap().status, Status::Done);
+    }
+
+    #[test]
+    #[serial]
+    fn done_honors_explicit_deliverable_with_marker_in_name_for_assigned_worker() {
+        // Regression guard (PR #54 round 3, Erik CHANGES_REQUESTED): an
+        // explicit `## Deliverables` bullet whose filename contains a
+        // negative-framing marker substring (`discard-policy.md`) must remain
+        // a required deliverable. Previously `has_negative_framing` scanned the
+        // whole bullet, so the filename self-suppressed and the assigned worker
+        // could `wg done` a genuinely missing deliverable (exit 0, task Done,
+        // no `deliverable-missing` marker). Here the file is absent, so `wg
+        // done` — run as the assigned worker — must refuse, leave the task in
+        // progress, and record the `deliverable-missing` failure class.
+        let dir = tempdir().unwrap();
+        let project_root = dir.path();
+        let desc = "## Description\nDocument the discard policy.\n\n## Deliverables\n- discard-policy.md\n";
+        let mut task = task_with_desc("explicit-discard-name", desc);
+        task.assigned = Some("agent-worker-1".to_string());
+        setup_with_project_root(project_root, vec![task]);
+        let wg_dir = project_root.join(".wg");
+
+        // Simulate the assigned worker running `wg done` (agent path).
+        unsafe { std::env::set_var("WG_AGENT_ID", "agent-worker-1") };
+        let result = run(
+            &wg_dir,
+            "explicit-discard-name",
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        unsafe { std::env::remove_var("WG_AGENT_ID") };
+
+        assert!(
+            result.is_err(),
+            "assigned worker must not promote a missing explicit deliverable whose name contains a marker"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("deliverable preflight refused"), "got: {err}");
+        assert!(err.contains("discard-policy.md"), "got: {err}");
+
+        let graph = load_graph(&graph_path(&wg_dir)).unwrap();
+        let task = graph.get_task("explicit-discard-name").unwrap();
+        assert_eq!(task.status, Status::InProgress);
+        assert_eq!(task.failure_class, Some(FailureClass::DeliverableMissing));
+        assert!(
+            task.log
+                .iter()
+                .any(|e| e.actor == Some("deliverable-preflight".to_string())),
+            "expected a deliverable-missing marker in the task log"
+        );
+
+        // And once the deliverable exists, the same worker can complete it.
+        std::fs::write(project_root.join("discard-policy.md"), b"policy text").unwrap();
+        unsafe { std::env::set_var("WG_AGENT_ID", "agent-worker-1") };
+        let ok = run(
+            &wg_dir,
+            "explicit-discard-name",
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        unsafe { std::env::remove_var("WG_AGENT_ID") };
+        assert!(ok.is_ok(), "got: {:?}", ok.err());
+        let graph = load_graph(&graph_path(&wg_dir)).unwrap();
+        let task = graph.get_task("explicit-discard-name").unwrap();
+        assert_eq!(task.status, Status::Done);
+        assert_eq!(task.failure_class, None);
     }
 }
