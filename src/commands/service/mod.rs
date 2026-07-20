@@ -753,6 +753,13 @@ pub struct CoordinatorState {
     /// without rewriting global config. Persists across daemon restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_override: Option<String>,
+    /// LIVE dispatcher spawn-breaker snapshot, published by the daemon every
+    /// tick from the same breaker state it acts on. `wg service status` renders
+    /// this instead of independently re-loading the breaker file — the fix for
+    /// status printing "closed (healthy)" while the daemon held the breaker OPEN
+    /// (2026-07-19 status-lie post-mortem). `None` before the first tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_breaker: Option<spawn_breaker::SpawnBreakerSnapshot>,
 }
 
 impl CoordinatorState {
@@ -2366,6 +2373,12 @@ pub(crate) struct RegistryRefreshState {
     pub error_count: u64,
     /// When set, skip refresh attempts until this instant.
     pub cooldown_until: Option<std::time::Instant>,
+    /// Latched once we've told the operator (at INFO) that the registry refresh
+    /// is skipped for lack of an OpenRouter credential. Prevents re-logging that
+    /// benign skip every interval, and is cleared once a credential appears so a
+    /// later loss re-informs. A credential-less provider is NOT an error and
+    /// must never increment `error_count` or arm the cooldown.
+    pub no_credential_logged: bool,
 }
 
 /// Number of consecutive failures that trips the circuit breaker.
@@ -2391,6 +2404,28 @@ fn run_registry_refresh(dir: &Path, state: &mut RegistryRefreshState, logger: &D
     if interval == 0 {
         return; // Disabled
     }
+
+    // Credential-less provider: skip QUIETLY. The registry refresh only ranks
+    // OpenRouter models; when no OpenRouter API key is configured (e.g. the
+    // `[openrouter]` block holds only cap settings, no executor/model) there is
+    // simply nothing to fetch. That is NOT an error — it must not hard-error,
+    // must not increment the failure count, and must not arm the 60-minute
+    // cooldown (which could interact with dispatch). Log it once at INFO and
+    // return. See the 2026-07-19 registry-refresh-noise post-mortem.
+    if worksgood::executor::native::openai_client::resolve_openai_api_key_from_dir(dir).is_err() {
+        if !state.no_credential_logged {
+            logger.info(
+                "Registry refresh skipped: no API key for provider 'openrouter'. The model \
+                 registry only ranks OpenRouter models, so with no key configured there is \
+                 nothing to refresh — this is expected and does not pause anything. Configure a \
+                 key with `wg endpoints add` to enable model-benchmark refresh.",
+            );
+            state.no_credential_logged = true;
+        }
+        return;
+    }
+    // A credential is present (again): allow a future loss to re-inform.
+    state.no_credential_logged = false;
 
     // Circuit breaker: after a recent burst of failures, hold off and
     // don't even attempt the fetch. The instant the cooldown expires we
@@ -2727,6 +2762,7 @@ pub fn run_daemon(
         model_override: None,
         executor_override: None,
         endpoint_override: None,
+        spawn_breaker: None,
     };
     coord_state.save(&dir);
 
@@ -2783,6 +2819,47 @@ pub fn run_daemon(
     //
     // Enabled by default; disable with --no-coordinator-agent or
     // coordinator.coordinator_agent = false in config.toml.
+    // Zombie-handler reconciliation: `wg service stop` leaves handler
+    // subprocesses running by design, so a handler from a previous daemon
+    // generation can keep squatting a session lock and starve every new
+    // coordinator subprocess (which exits as a cooperative handoff with
+    // backoff). Before spawning THIS generation's supervisors, reap any lock
+    // whose holder is dead, a recycled foreign PID, running a deleted-worktree
+    // binary, or from a generation predating this boot — and SIGTERM the
+    // ours-gone-bad orphans so the successor can acquire cleanly. Runs once at
+    // boot; live current-generation handlers do not exist yet, so this only
+    // touches stragglers. See the 2026-07-19 zombie-handler post-mortem.
+    {
+        let chat_root = dir.join("chat");
+        let policy = worksgood::session_lock::ReconcilePolicy {
+            // Any handler that started before this daemon booted is a prior
+            // generation (no current-gen handler exists yet at boot).
+            reap_before: Some(chrono::Utc::now()),
+            kill_orphans: true,
+        };
+        let reaped = worksgood::session_lock::reconcile_session_locks(&chat_root, &policy);
+        if !reaped.is_empty() {
+            logger.warn(&format!(
+                "Reaped {} zombie session lock(s) at boot: {}",
+                reaped.len(),
+                reaped
+                    .iter()
+                    .map(|r| format!(
+                        "{}(pid={}, {}{})",
+                        r.chat_dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        r.pid,
+                        r.reason.label(),
+                        if r.killed { ", SIGTERM'd" } else { "" },
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+    }
+
     let enable_coordinator_agent = !no_coordinator_agent && config.coordinator.coordinator_agent;
     let mut coordinator_agents: std::collections::HashMap<
         u32,
@@ -3433,6 +3510,23 @@ pub fn run_daemon(
                     let breaker_path = spawn_breaker::SpawnBreakerState::path(&dir);
                     let mut breaker = spawn_breaker::SpawnBreakerState::load(&breaker_path);
                     let breaker_managing = breaker.opened_at.is_some();
+
+                    // Publish the LIVE breaker snapshot into coordinator state so
+                    // `wg service status` renders exactly what the daemon acts on
+                    // here — never a separately-loaded, drifted "closed (healthy)"
+                    // while the daemon holds it OPEN (status-lie post-mortem).
+                    {
+                        let breaker_cfg = spawn_breaker::SpawnBreakerConfig::from_config(
+                            &worksgood::config::Config::load_or_default(&dir),
+                        );
+                        coord_state.spawn_breaker = Some(spawn_breaker::SpawnBreakerSnapshot::capture(
+                            &breaker,
+                            chrono::Utc::now(),
+                            &breaker_cfg,
+                        ));
+                        coord_state.save(&dir);
+                    }
+
                     if breaker.take_alert() {
                         let episode = format!("open-{}", breaker.total_opens);
                         emit_operator_alert(
@@ -3932,13 +4026,20 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
     // Load coordinator state (persisted by daemon, reflects effective config + runtime)
     let coord = CoordinatorState::load_or_default(dir);
 
-    // Load the self-healing spawn circuit breaker state for a prominent readout.
+    // Spawn breaker readout. Prefer the LIVE snapshot the daemon published this
+    // tick into coordinator state — it is exactly what the daemon acted on. Only
+    // when no snapshot exists yet (pre-first-tick, or an older daemon build) do
+    // we fall back to re-deriving from the breaker file. This is the status-lie
+    // fix: status printed "closed (healthy)" while the daemon held the breaker
+    // OPEN because it re-loaded/re-derived from a separate, drifting source.
+    let breaker_now = chrono::Utc::now();
     let breaker = spawn_breaker::SpawnBreakerState::load(&spawn_breaker::SpawnBreakerState::path(dir));
     let breaker_cfg =
         spawn_breaker::SpawnBreakerConfig::from_config(&worksgood::config::Config::load_or_default(dir));
-    let breaker_now = chrono::Utc::now();
-    let breaker_phase = breaker.phase(breaker_now, &breaker_cfg);
-    let breaker_line = breaker.status_line(breaker_now, &breaker_cfg);
+    let live_breaker = coord.spawn_breaker.clone().unwrap_or_else(|| {
+        spawn_breaker::SpawnBreakerSnapshot::capture(&breaker, breaker_now, &breaker_cfg)
+    });
+    let breaker_line = live_breaker.summary.clone();
 
     // Provider-health pause readout — prominent so a service frozen because it
     // can't reach its AI is obvious at a glance (previously only a daemon.log
@@ -3988,14 +4089,15 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
                 "agents_spawned_last_tick": coord.agents_spawned,
             },
             "spawn_breaker": {
-                "phase": breaker_phase.label(),
-                "enabled": breaker_cfg.enabled(),
-                "consecutive_failures": breaker.consecutive_failures,
-                "threshold": breaker_cfg.threshold,
-                "cooldown_remaining_secs": breaker.cooldown_remaining_secs(breaker_now, &breaker_cfg),
-                "backoff_generation": breaker.open_generation,
-                "total_opens": breaker.total_opens,
+                "phase": live_breaker.phase,
+                "enabled": live_breaker.enabled,
+                "consecutive_failures": live_breaker.consecutive_failures,
+                "threshold": live_breaker.threshold,
+                "cooldown_remaining_secs": live_breaker.cooldown_remaining_secs,
+                "backoff_generation": live_breaker.backoff_generation,
+                "total_opens": live_breaker.total_opens,
                 "last_recovered_at": breaker.last_recovered_at,
+                "live": coord.spawn_breaker.is_some(),
                 "summary": breaker_line,
             },
             "provider_health": {
@@ -4095,17 +4197,14 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
         }
         // Spawn circuit breaker — prominent so a stuck/self-healing dispatcher is
         // obvious at a glance. An open breaker is flagged loudly.
-        match breaker_phase {
-            spawn_breaker::BreakerPhase::Closed => {
-                println!("Spawn breaker: {}", breaker_line);
-            }
-            spawn_breaker::BreakerPhase::Open | spawn_breaker::BreakerPhase::HalfOpen => {
-                println!("Spawn breaker: ⚠️  {}", breaker_line);
-                println!(
-                    "  (spawns paused after {} consecutive failures — the dispatcher will retry itself; check the server if this repeats)",
-                    breaker.consecutive_failures
-                );
-            }
+        if live_breaker.is_managing() {
+            println!("Spawn breaker: ⚠️  {}", breaker_line);
+            println!(
+                "  (spawns paused after {} consecutive failures — the dispatcher will retry itself; check the server if this repeats)",
+                live_breaker.consecutive_failures
+            );
+        } else {
+            println!("Spawn breaker: {}", breaker_line);
         }
         // Provider pause — prominent when frozen because the AI is unreachable.
         if provider_paused {
@@ -5226,6 +5325,7 @@ mod tests {
         let mut state = RegistryRefreshState {
             error_count: REGISTRY_REFRESH_FAILURE_THRESHOLD,
             cooldown_until: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            ..Default::default()
         };
         record_registry_refresh_outcome(
             &mut state,
@@ -5237,6 +5337,46 @@ mod tests {
             state.cooldown_until.is_none(),
             "breaker must clear on a successful refresh"
         );
+    }
+
+    #[test]
+    fn registry_refresh_credential_less_is_quiet_no_cooldown() {
+        // FIX 5 (registry-refresh noise): a credential-less provider must NOT
+        // hard-error, must NOT increment the failure count, and must NOT arm the
+        // 60-minute cooldown. It is a benign, quiet skip logged at most once.
+        let tmp = TempDir::new().unwrap();
+        let logger = DaemonLogger::open(tmp.path()).unwrap();
+        let mut state = RegistryRefreshState::default();
+
+        // Hermetic only when no OpenRouter key resolves from env/config; if the
+        // runner happens to export one, assert the credential-present branch.
+        let have_key =
+            worksgood::executor::native::openai_client::resolve_openai_api_key_from_dir(tmp.path())
+                .is_ok();
+        run_registry_refresh(tmp.path(), &mut state, &logger);
+
+        if have_key {
+            // A key is present → the benign-skip latch stays cleared.
+            assert!(!state.no_credential_logged);
+        } else {
+            assert_eq!(
+                state.error_count, 0,
+                "credential-less skip must not count as a failure"
+            );
+            assert!(
+                state.cooldown_until.is_none(),
+                "credential-less skip must not arm the cooldown"
+            );
+            assert!(
+                state.no_credential_logged,
+                "the benign skip is latched so it logs at most once"
+            );
+
+            // A second call stays quiet and still touches neither counter.
+            run_registry_refresh(tmp.path(), &mut state, &logger);
+            assert_eq!(state.error_count, 0);
+            assert!(state.cooldown_until.is_none());
+        }
     }
 
     #[test]
