@@ -21,6 +21,7 @@ mod coordinator;
 pub(crate) mod coordinator_agent;
 pub(crate) mod human_dispatch;
 pub mod ipc;
+pub(crate) mod spawn_breaker;
 mod triage;
 pub(crate) mod worktree;
 pub(crate) mod zero_output;
@@ -1748,6 +1749,73 @@ fn record_tick_events(
     }
 }
 
+/// Resolve the project root (which holds the `.wg/` directory) from a service
+/// `dir`. The daemon's `dir` IS the `.wg` directory (that's where `graph.jsonl`
+/// lives), so the project root is its parent.
+fn project_root_for(dir: &Path) -> PathBuf {
+    if dir.file_name().and_then(|n| n.to_str()) == Some(".wg") {
+        dir.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.to_path_buf())
+    } else {
+        dir.to_path_buf()
+    }
+}
+
+/// Emit a loud, plain-language operator alert about a stuck task runner.
+///
+/// Two guarantees, in order of reliability:
+/// 1. It is always logged loudly (`WARN`) — the daemon log and `wg service
+///    status` recent-errors surface it even when no chat is configured.
+/// 2. Best-effort: when a Telegram channel is configured it is DM'd directly to
+///    the operator chat. Everything past the log is wrapped so a missing config
+///    / network hiccup can never wedge the daemon.
+///
+/// The `spawn_breaker`/watchdog callers gate this on their own once-per-episode
+/// state (`take_alert`, the stall-tick episode), so the daemon only invokes it on
+/// a genuine open/re-open/wedge — no extra pacing layer is needed here.
+fn emit_operator_alert(dir: &Path, logger: &DaemonLogger, _episode: &str, text: &str) {
+    // (1) Always loud in the log.
+    logger.warn(text);
+
+    // (2) Best-effort direct DM to the configured operator chat.
+    let root = project_root_for(dir);
+    let config = match worksgood::notify::config::NotifyConfig::load(Some(&root)) {
+        Ok(Some(c)) => c,
+        _ => return, // No notify config → the loud log is the alert.
+    };
+    if !config.has_channel_config("telegram") {
+        return;
+    }
+    let tg_config = match worksgood::notify::telegram::TelegramConfig::from_notify_config(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            logger.warn(&format!("operator alert: invalid telegram config: {}", e));
+            return;
+        }
+    };
+    let chat_id = tg_config.chat_id.clone();
+    if chat_id.trim().is_empty() {
+        // Multi-bot-only config with no top-level operator chat — nothing to DM.
+        return;
+    }
+
+    let channel = worksgood::notify::telegram::TelegramChannel::new(tg_config);
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            logger.warn(&format!("operator alert: no async runtime: {}", e));
+            return;
+        }
+    };
+    use worksgood::notify::NotificationChannel;
+    match rt.block_on(channel.send_text(&chat_id, text)) {
+        Ok(_) => logger.info("operator alert DM sent"),
+        Err(e) => logger.warn(&format!("operator alert: telegram send failed: {}", e)),
+    }
+}
+
 /// Dispatch notifications for recently changed tasks via the notification router.
 ///
 /// Scans the graph for tasks that recently failed or became blocked, and sends
@@ -3142,11 +3210,35 @@ pub fn run_daemon(
                         coord_state.ticks, result.agents_alive, result.tasks_ready, result.agents_spawned
                     ));
 
+                    // Self-healing spawn circuit breaker: the dispatcher persisted
+                    // its state during the tick. If it just opened/re-opened it
+                    // armed an operator alert — surface it loudly AND DM the
+                    // operator (time-critical, via digest pacing), exactly once
+                    // per open episode. `breaker_managing` also tells the wedge
+                    // watchdog below to stand down: no spawns while the breaker is
+                    // open is EXPECTED, not a wedge, so we don't double-alert.
+                    let breaker_path = spawn_breaker::SpawnBreakerState::path(&dir);
+                    let mut breaker = spawn_breaker::SpawnBreakerState::load(&breaker_path);
+                    let breaker_managing = breaker.opened_at.is_some();
+                    if breaker.take_alert() {
+                        let episode = format!("open-{}", breaker.total_opens);
+                        emit_operator_alert(
+                            &dir,
+                            &logger,
+                            &episode,
+                            spawn_breaker::OPERATOR_ALERT_TEXT,
+                        );
+                        let _ = breaker.save(&breaker_path);
+                    }
+
                     // Dispatch watchdog (fix-wedge): detect a starved dispatcher —
                     // ready tasks present, yet nothing spawned and no live agents.
+                    // Suppressed while the breaker is intentionally holding spawns
+                    // (breaker_managing) since that path owns its own alerting.
                     if result.tasks_ready > 0
                         && result.agents_spawned == 0
                         && result.agents_alive == 0
+                        && !breaker_managing
                     {
                         no_dispatch_progress_ticks = no_dispatch_progress_ticks.saturating_add(1);
                         if no_dispatch_progress_ticks == WATCHDOG_STALL_TICKS
@@ -3160,6 +3252,15 @@ pub fn run_daemon(
                                  restart` clears it if this persists.",
                                 no_dispatch_progress_ticks, result.tasks_ready
                             ));
+                            // Loud operator DM for the wedge, routed time-critical
+                            // through digest pacing. Episode = the stall count so a
+                            // persistent wedge re-alerts periodically (never deduped).
+                            emit_operator_alert(
+                                &dir,
+                                &logger,
+                                &format!("wedge-{}", no_dispatch_progress_ticks),
+                                spawn_breaker::WATCHDOG_ALERT_TEXT,
+                            );
                         }
                     } else {
                         no_dispatch_progress_ticks = 0;
@@ -3606,6 +3707,14 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
     // Load coordinator state (persisted by daemon, reflects effective config + runtime)
     let coord = CoordinatorState::load_or_default(dir);
 
+    // Load the self-healing spawn circuit breaker state for a prominent readout.
+    let breaker = spawn_breaker::SpawnBreakerState::load(&spawn_breaker::SpawnBreakerState::path(dir));
+    let breaker_cfg =
+        spawn_breaker::SpawnBreakerConfig::from_config(&worksgood::config::Config::load_or_default(dir));
+    let breaker_now = chrono::Utc::now();
+    let breaker_phase = breaker.phase(breaker_now, &breaker_cfg);
+    let breaker_line = breaker.status_line(breaker_now, &breaker_cfg);
+
     // Log file info
     let log_path = log_file_path(dir);
     let log_path_str = log_path.to_string_lossy().to_string();
@@ -3640,6 +3749,17 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
                 "agents_alive": coord.agents_alive,
                 "tasks_ready": coord.tasks_ready,
                 "agents_spawned_last_tick": coord.agents_spawned,
+            },
+            "spawn_breaker": {
+                "phase": breaker_phase.label(),
+                "enabled": breaker_cfg.enabled(),
+                "consecutive_failures": breaker.consecutive_failures,
+                "threshold": breaker_cfg.threshold,
+                "cooldown_remaining_secs": breaker.cooldown_remaining_secs(breaker_now, &breaker_cfg),
+                "backoff_generation": breaker.open_generation,
+                "total_opens": breaker.total_opens,
+                "last_recovered_at": breaker.last_recovered_at,
+                "summary": breaker_line,
             },
             "log": {
                 "path": log_path_str,
@@ -3726,6 +3846,20 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
             );
         } else {
             println!("  No ticks yet");
+        }
+        // Spawn circuit breaker — prominent so a stuck/self-healing dispatcher is
+        // obvious at a glance. An open breaker is flagged loudly.
+        match breaker_phase {
+            spawn_breaker::BreakerPhase::Closed => {
+                println!("Spawn breaker: {}", breaker_line);
+            }
+            spawn_breaker::BreakerPhase::Open | spawn_breaker::BreakerPhase::HalfOpen => {
+                println!("Spawn breaker: ⚠️  {}", breaker_line);
+                println!(
+                    "  (spawns paused after {} consecutive failures — the dispatcher will retry itself; check the server if this repeats)",
+                    breaker.consecutive_failures
+                );
+            }
         }
         println!("Log: {}", log_path_str);
         if !recent_errors.is_empty() || !recent_fatals.is_empty() {
