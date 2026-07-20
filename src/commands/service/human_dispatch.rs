@@ -1067,7 +1067,7 @@ mod tests {
         worksgood::parser::save_graph(&WorkGraph::new(), crate::commands::graph_path(dir)).unwrap();
 
         let routed =
-            route_inbound_reply(dir, "telegram:otto", "luca-1", None, "morning everyone!");
+            route_inbound_reply(dir, "telegram:otto", "luca-1", Some("luca-1"), "morning everyone!");
 
         match routed {
             InboundReplyOutcome::NotParkedReply { persona } => {
@@ -1097,7 +1097,7 @@ mod tests {
         worksgood::parser::save_graph(&WorkGraph::new(), crate::commands::graph_path(dir)).unwrap();
 
         let routed =
-            route_inbound_reply(dir, "telegram:nadin", "luca-1", None, "answer for nadin");
+            route_inbound_reply(dir, "telegram:nadin", "luca-1", Some("luca-1"), "answer for nadin");
 
         match routed {
             InboundReplyOutcome::Rejected(reason) => {
