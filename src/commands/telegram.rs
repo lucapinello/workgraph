@@ -866,10 +866,27 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             msg.chat_type.as_deref(),
                             Some("group") | Some("supergroup")
                         ) {
+                            // Stamp the spoken mirror with the SAME durable dedupe
+                            // id as the inbound text path (#23, docs/20 §2): a
+                            // content fingerprint over (chat, sender, send-time,
+                            // body) so a listener re-delivery collapses to one pane
+                            // line; None when the transport surfaced no chat id /
+                            // send time (a null srcId is unique-by-construction on
+                            // the read side).
+                            let spoken = telegram_voice::spoken_feed_body(&text);
+                            let src_id = match (msg.chat_id.as_deref(), msg.sent_at) {
+                                (Some(cid), Some(date)) => {
+                                    let sender =
+                                        msg.sender_id.as_deref().unwrap_or(msg.sender.as_str());
+                                    Some(casa_feed::source_id(cid, sender, date, &spoken))
+                                }
+                                _ => None,
+                            };
                             let entry = casa_feed::group_entry(
                                 &msg.sender,
-                                &telegram_voice::spoken_feed_body(&text),
+                                &spoken,
                                 casa_feed::now_ms(),
+                                src_id,
                             );
                             if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
                                 eprintln!(
