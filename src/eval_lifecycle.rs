@@ -644,6 +644,29 @@ pub fn load_durable_verdicts(dir: &Path) -> Result<Vec<DurableEvalVerdict>> {
     Ok(verdicts)
 }
 
+/// True when a durable EVALUATE-stage verdict scoring at or above `threshold`
+/// is saved for this source's current lifecycle identity. `wg done` consults
+/// this so an operator can complete a task that already earned a passing
+/// verdict but wedged in `PendingEval` because its `.evaluate-X` satellite was
+/// gc'd or the transition was lost (engine-pendingeval-wedge, rescue-path
+/// parity). Fail-closed: an unreadable verdict store returns `false`.
+pub fn has_passing_eval_verdict(dir: &Path, source: &Task, threshold: f64) -> bool {
+    let lifecycle = source
+        .evaluation_lifecycle
+        .clone()
+        .unwrap_or_else(|| EvaluationLifecycle::for_source(source));
+    let Ok(verdicts) = load_durable_verdicts(dir) else {
+        return false;
+    };
+    verdicts.iter().any(|verdict| {
+        verdict.source_task == source.id
+            && verdict.pipeline_id == lifecycle.pipeline_id
+            && verdict.source_attempt == lifecycle.source_attempt
+            && verdict.stage == AgencyStage::Evaluate
+            && verdict.score >= threshold
+    })
+}
+
 /// Upgrade an unambiguous pre-schema Evaluation into durable pipeline evidence.
 /// Missing source timestamps and zero/multiple candidates are deliberately left
 /// untouched for operator review; this function never chooses "latest".
@@ -1062,6 +1085,61 @@ pub fn rearm_satellites_for_source(graph: &mut WorkGraph, source: &Task) -> bool
     modified
 }
 
+/// Apply the terminal transition a source in `PendingEval` / `FailedPendingEval`
+/// owes to `eval`. Returns `true` when the source was rescued in place (its
+/// satellite chain must be rearmed by the caller). This is the ONLY place the
+/// source's soft-eval status is resolved, so linking a verdict without calling
+/// this leaves the source silently wedged in `PendingEval`
+/// (`engine-pendingeval-wedge`). The caller must have already verified the
+/// source is in a soft-eval status and set the lifecycle's consumed verdict.
+fn transition_source_for_verdict(
+    source: &mut Task,
+    eval: &DurableEvalVerdict,
+    threshold: f64,
+    auto_rescue: bool,
+    max_rescues: u32,
+    pending_is_gated: bool,
+) -> bool {
+    let was_failed_pending = source.status == Status::FailedPendingEval;
+    let hard_reject = eval.score < threshold && (was_failed_pending || pending_is_gated);
+    let retry_source = hard_reject
+        && source.status == Status::PendingEval
+        && auto_rescue
+        && max_rescues > 0
+        && source.rescue_count < max_rescues;
+
+    if retry_source {
+        source.status = Status::Open;
+        source.rescue_count = source.rescue_count.saturating_add(1);
+        source.assigned = None;
+        source.started_at = None;
+        source.completed_at = None;
+        source.failure_reason = None;
+    } else if hard_reject {
+        source.status = Status::Failed;
+        source.retry_count = source.retry_count.saturating_add(1);
+        source.failure_reason = Some(format!(
+            "evaluation verdict {} rejected: score={:.2} < threshold={:.2}",
+            eval.verdict_id, eval.score, threshold
+        ));
+        source.completed_at = Some(Utc::now().to_rfc3339());
+    } else {
+        source.status = Status::Done;
+        source.rescued |= was_failed_pending;
+        source.completed_at = Some(Utc::now().to_rfc3339());
+    }
+    source.log.push(LogEntry {
+        timestamp: Utc::now().to_rfc3339(),
+        actor: Some("eval-lifecycle-reconcile".to_string()),
+        user: None,
+        message: format!(
+            "Consumed durable verdict {} exactly once: score={:.2}, outcome={}",
+            eval.verdict_id, eval.score, source.status
+        ),
+    });
+    retry_source
+}
+
 /// Link durable stage evidence and atomically consume an evaluator verdict into
 /// its source task. The caller runs this inside the graph's single
 /// `modify_graph` transaction, so `consumed_verdict` and the source transition
@@ -1137,17 +1215,50 @@ where
         }
 
         if let Some(consumed) = source_lifecycle.consumed_verdict.as_deref() {
-            if let Some(eval) = evals.first()
-                && eval.verdict_id != consumed
-            {
-                let source = graph.get_task_mut(&source_id).expect("collected source");
-                modified |= lifecycle_conflict(
-                    source,
-                    format!(
-                        "error[WG-EVAL-CONSUMPTION-CONFLICT]: source consumed {} but found {}",
-                        consumed, eval.verdict_id
-                    ),
-                );
+            match evals.first().copied() {
+                // A different verdict surfaced than the one already consumed:
+                // this needs operator selection, never a silent overwrite.
+                Some(eval) if eval.verdict_id != consumed => {
+                    let source = graph.get_task_mut(&source_id).expect("collected source");
+                    modified |= lifecycle_conflict(
+                        source,
+                        format!(
+                            "error[WG-EVAL-CONSUMPTION-CONFLICT]: source consumed {} but found {}",
+                            consumed, eval.verdict_id
+                        ),
+                    );
+                }
+                // The verdict was already linked+consumed into the lifecycle,
+                // yet the source never left its soft-eval status. That is the
+                // silent wedge (engine-pendingeval-wedge): linking without
+                // transitioning. Re-apply the terminal transition the consumed
+                // verdict demands so the source can finally complete.
+                Some(eval)
+                    if matches!(
+                        source_snapshot.status,
+                        Status::PendingEval | Status::FailedPendingEval
+                    ) =>
+                {
+                    let pending_gated = pending_is_gated(&source_snapshot);
+                    let source = graph.get_task_mut(&source_id).expect("collected source");
+                    let retry_source = transition_source_for_verdict(
+                        source,
+                        eval,
+                        threshold,
+                        auto_rescue,
+                        max_rescues,
+                        pending_gated,
+                    );
+                    modified = true;
+                    if retry_source {
+                        let rebound_source = graph
+                            .get_task(&source_id)
+                            .expect("source still exists")
+                            .clone();
+                        modified |= rearm_satellites_for_source(graph, &rebound_source);
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -1213,14 +1324,7 @@ where
             continue;
         }
 
-        let hard_reject = eval.score < threshold
-            && (source_snapshot.status == Status::FailedPendingEval
-                || pending_is_gated(&source_snapshot));
-        let retry_source = hard_reject
-            && source_snapshot.status == Status::PendingEval
-            && auto_rescue
-            && max_rescues > 0
-            && source_snapshot.rescue_count < max_rescues;
+        let pending_gated = pending_is_gated(&source_snapshot);
 
         let lifecycle = source
             .evaluation_lifecycle
@@ -1231,35 +1335,17 @@ where
         lifecycle.consumed_verdict = Some(eval.verdict_id.clone());
         lifecycle.execution_state = EvaluationExecutionState::Consumed;
 
-        if retry_source {
-            source.status = Status::Open;
-            source.rescue_count = source.rescue_count.saturating_add(1);
-            source.assigned = None;
-            source.started_at = None;
-            source.completed_at = None;
-            source.failure_reason = None;
-        } else if hard_reject {
-            source.status = Status::Failed;
-            source.retry_count = source.retry_count.saturating_add(1);
-            source.failure_reason = Some(format!(
-                "evaluation verdict {} rejected: score={:.2} < threshold={:.2}",
-                eval.verdict_id, eval.score, threshold
-            ));
-            source.completed_at = Some(Utc::now().to_rfc3339());
-        } else {
-            source.status = Status::Done;
-            source.rescued |= source_snapshot.status == Status::FailedPendingEval;
-            source.completed_at = Some(Utc::now().to_rfc3339());
-        }
-        source.log.push(LogEntry {
-            timestamp: Utc::now().to_rfc3339(),
-            actor: Some("eval-lifecycle-reconcile".to_string()),
-            user: None,
-            message: format!(
-                "Consumed durable verdict {} exactly once: score={:.2}, outcome={}",
-                eval.verdict_id, eval.score, source.status
-            ),
-        });
+        // Linking the verdict above and transitioning the source below are ONE
+        // atomic step — never split them, or the source wedges in PendingEval
+        // with a consumed verdict (engine-pendingeval-wedge).
+        let retry_source = transition_source_for_verdict(
+            source,
+            eval,
+            threshold,
+            auto_rescue,
+            max_rescues,
+            pending_gated,
+        );
         modified = true;
 
         if retry_source {
@@ -1469,6 +1555,72 @@ mod tests {
             3,
             |_| true,
         ));
+    }
+
+    #[test]
+    fn consumed_verdict_but_stuck_pending_eval_is_transitioned() {
+        // Regression (engine-pendingeval-wedge): the source's lifecycle already
+        // LINKED + consumed the passing verdict, yet the source never left
+        // PendingEval — the satellites were swept and the transition was lost.
+        // Every prior reconcile hit the `consumed_verdict.is_some()` branch and
+        // silently `continue`d. It must now finish the transition to Done.
+        let mut source = source();
+        source.status = Status::PendingEval;
+        let eval_verdict = verdict(&source, AgencyStage::Evaluate, 0.85);
+        let mut lifecycle = EvaluationLifecycle::for_source(&source);
+        lifecycle.linked_eval_verdict = Some(eval_verdict.verdict_id.clone());
+        lifecycle.consumed_verdict = Some(eval_verdict.verdict_id.clone());
+        lifecycle.execution_state = EvaluationExecutionState::Consumed;
+        source.evaluation_lifecycle = Some(lifecycle);
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(crate::graph::Node::Task(source));
+        // No `.evaluate-source` / `.flip-source`: they were gc'd mid-lifecycle.
+
+        assert!(reconcile_durable_verdicts(
+            &mut graph,
+            &[eval_verdict],
+            0.7,
+            true,
+            3,
+            |_| true,
+        ));
+        assert_eq!(graph.get_task("source").unwrap().status, Status::Done);
+    }
+
+    #[test]
+    fn pending_eval_with_vanished_satellites_still_transitions() {
+        // Regression (engine-pendingeval-wedge): a fresh PendingEval source whose
+        // `.evaluate-X` satellite was swept by `gc --include-done` before the
+        // verdict linked. Only the durable verdict remains — reconcile must
+        // still consume it and complete the source rather than wedge forever.
+        let mut source = source();
+        source.status = Status::PendingEval;
+        source.evaluation_lifecycle = Some(EvaluationLifecycle::for_source(&source));
+        let eval_verdict = verdict(&source, AgencyStage::Evaluate, 0.85);
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(crate::graph::Node::Task(source));
+
+        assert!(reconcile_durable_verdicts(
+            &mut graph,
+            &[eval_verdict.clone()],
+            0.7,
+            true,
+            3,
+            |_| true,
+        ));
+        let source = graph.get_task("source").unwrap();
+        assert_eq!(source.status, Status::Done);
+        assert_eq!(
+            source
+                .evaluation_lifecycle
+                .as_ref()
+                .unwrap()
+                .consumed_verdict
+                .as_deref(),
+            Some(eval_verdict.verdict_id.as_str())
+        );
     }
 
     #[test]
@@ -1899,5 +2051,53 @@ mod tests {
                 .to_string()
                 .contains("EVIDENCE")
         );
+    }
+
+    #[test]
+    fn has_passing_eval_verdict_reflects_saved_score() {
+        // Fix #3 predicate (engine-pendingeval-wedge): `wg done` uses this to let
+        // an operator complete a PendingEval task that already earned a passing
+        // verdict. It is threshold-relative and scoped to the source's identity.
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = source();
+        source.status = Status::PendingEval;
+        source.evaluation_lifecycle = Some(EvaluationLifecycle::for_source(&source));
+        let satellite = planned_satellite(".evaluate-source", &source);
+        let evaluation = Evaluation {
+            id: "eval-source-pass".into(),
+            task_id: source.id.clone(),
+            agent_id: "agent-1".into(),
+            role_id: "role".into(),
+            tradeoff_id: "tradeoff".into(),
+            score: 0.85,
+            dimensions: std::collections::HashMap::new(),
+            notes: "passing".into(),
+            evaluator: "codex:gpt-5.5".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            model: Some("codex:gpt-5.5".into()),
+            source: "llm".into(),
+            loop_iteration: 0,
+        };
+        crate::agency::save_evaluation(&evaluation, &dir.path().join("agency/evaluations"))
+            .unwrap();
+        write_durable_verdict(
+            dir.path(),
+            &source,
+            &satellite,
+            AgencyStage::Evaluate,
+            &evaluation,
+        )
+        .unwrap();
+
+        // A saved 0.85 verdict passes a 0.7 gate but not a 0.9 gate.
+        assert!(has_passing_eval_verdict(dir.path(), &source, 0.7));
+        assert!(!has_passing_eval_verdict(dir.path(), &source, 0.9));
+        // No saved verdict for an unrelated source id.
+        let other = Task {
+            id: "other".into(),
+            status: Status::PendingEval,
+            ..Task::default()
+        };
+        assert!(!has_passing_eval_verdict(dir.path(), &other, 0.7));
     }
 }

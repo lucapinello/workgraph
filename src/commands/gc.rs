@@ -17,6 +17,30 @@ const INTERNAL_PREFIXES: &[&str] = &[
     "evaluate-",
 ];
 
+/// Evaluation-lifecycle satellite prefixes. While the parent *source* task is
+/// still non-terminal (typically `PendingEval` / `FailedPendingEval`), these
+/// satellites are LIVE evidence the parent needs to transition — sweeping them
+/// mid-lifecycle wedges the parent in `PendingEval` forever, because the
+/// verdict-linking reconcile can no longer re-install the satellite plan.
+/// See task `engine-pendingeval-wedge`.
+const EVAL_SATELLITE_PREFIXES: &[&str] = &[".evaluate-", ".flip-"];
+
+/// True when `id` is an evaluation-lifecycle satellite whose parent source task
+/// is still non-terminal. Such satellites must never be garbage-collected: the
+/// satellite chain is treated as live for as long as the parent is.
+fn is_live_eval_satellite(graph: &worksgood::graph::WorkGraph, id: &str) -> bool {
+    for prefix in EVAL_SATELLITE_PREFIXES {
+        if let Some(parent_id) = id.strip_prefix(prefix)
+            && graph
+                .get_task(parent_id)
+                .is_some_and(|parent| !parent.status.is_terminal())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Get the best available terminal timestamp for a task.
 /// For done tasks, uses completed_at. For failed/abandoned, uses the last log
 /// entry timestamp (which is when fail/abandon was called), then falls back to
@@ -187,6 +211,15 @@ pub fn run(dir: &Path, dry_run: bool, include_done: bool, older: Option<&str>) -
                 to_gc.insert(task.id.clone());
             }
         }
+
+        // Never sweep an evaluation-lifecycle satellite while its parent source
+        // is still non-terminal. The daily-housekeeping `gc --include-done`
+        // otherwise reaps a `Done` `.evaluate-X` out from under an `X` still
+        // sitting in `PendingEval`, and the verdict-linking reconcile can no
+        // longer re-install the satellite plan — so `X` wedges forever. Treat
+        // the satellite chain as live for as long as the parent is
+        // (`engine-pendingeval-wedge`).
+        to_gc.retain(|id| !is_live_eval_satellite(graph, id));
 
         // Protected production tasks (live crons the family depends on) are
         // never garbage-collected, even when terminal. Without this, an
@@ -545,6 +578,76 @@ mod tests {
         assert!(
             !remaining.contains("task-b"),
             "abandoned task should be removed"
+        );
+    }
+
+    #[test]
+    fn gc_protects_eval_satellite_of_pending_eval_parent() {
+        // Regression (engine-pendingeval-wedge): the daily-housekeeping
+        // `gc --include-done` must NOT reap a Done `.evaluate-X` while `X` is
+        // still sitting in PendingEval — the satellite is live evidence the
+        // verdict-linking reconcile re-installs to transition the parent.
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        setup_graph(
+            wg_dir,
+            vec![
+                make_task("src-task", "Source mid-lifecycle", Status::PendingEval),
+                make_task_with_deps(
+                    ".evaluate-src-task",
+                    "Evaluate: src-task",
+                    Status::Done,
+                    vec!["src-task"],
+                ),
+                make_task_with_deps(
+                    ".flip-src-task",
+                    "FLIP: src-task",
+                    Status::Done,
+                    vec!["src-task"],
+                ),
+            ],
+        );
+
+        // --include-done would otherwise sweep both Done satellites.
+        run(wg_dir, false, true, None).unwrap();
+
+        let remaining = load_task_ids(wg_dir);
+        assert!(
+            remaining.contains(".evaluate-src-task"),
+            "`.evaluate-X` must survive gc while parent X is PendingEval"
+        );
+        assert!(
+            remaining.contains(".flip-src-task"),
+            "`.flip-X` must survive gc while parent X is PendingEval"
+        );
+        assert!(remaining.contains("src-task"), "PendingEval parent remains");
+    }
+
+    #[test]
+    fn gc_reaps_eval_satellite_once_parent_is_terminal() {
+        // Control: once the parent reaches a terminal status (Done), the
+        // satellite chain is no longer live and `gc --include-done` reaps it.
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        setup_graph(
+            wg_dir,
+            vec![
+                make_task("src-task", "Source finished", Status::Done),
+                make_task_with_deps(
+                    ".evaluate-src-task",
+                    "Evaluate: src-task",
+                    Status::Done,
+                    vec!["src-task"],
+                ),
+            ],
+        );
+
+        run(wg_dir, false, true, None).unwrap();
+
+        let remaining = load_task_ids(wg_dir);
+        assert!(
+            !remaining.contains(".evaluate-src-task"),
+            "`.evaluate-X` is reaped once parent X is terminal"
         );
     }
 

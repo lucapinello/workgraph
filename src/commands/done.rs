@@ -1535,11 +1535,27 @@ fn run_smoke_gate(
 /// flip it to `Done` once the eval scores ≥ `eval_gate_threshold`. Returns
 /// `Done` for system tasks (dot-prefixed) and any task whose eval is missing
 /// or already terminal.
-fn pick_done_target_status(graph: &worksgood::graph::WorkGraph, id: &str) -> Status {
+fn pick_done_target_status(
+    graph: &worksgood::graph::WorkGraph,
+    id: &str,
+    dir: &Path,
+    eval_threshold: f64,
+) -> Status {
     // System tasks (.evaluate-X, .flip-X, .assign-X, etc.) bypass the gate to
     // avoid recursion: gating .evaluate-X on .evaluate-.evaluate-X would
     // deadlock the eval pipeline.
     if id.starts_with('.') {
+        return Status::Done;
+    }
+    // Rescue-path parity (engine-pendingeval-wedge): a task already sitting in
+    // a soft-eval status with a saved PASSING verdict must complete on an
+    // explicit `wg done`. Otherwise a still-present `.evaluate-X` re-parks it in
+    // PendingEval forever even though its verdict already passed — the operator
+    // is asserting the work is accepted.
+    if let Some(task) = graph.get_task(id)
+        && matches!(task.status, Status::PendingEval | Status::FailedPendingEval)
+        && worksgood::eval_lifecycle::has_passing_eval_verdict(dir, task, eval_threshold)
+    {
         return Status::Done;
     }
     let eval_id = format!(".evaluate-{}", id);
@@ -2641,12 +2657,16 @@ fn run_inner(
     let disposable_ingest_snapshot = graph.get_task(id).filter(|t| t.is_disposable()).cloned();
 
     let id_owned = id.to_string();
+    let eval_threshold = Config::load_or_default(dir)
+        .agency
+        .eval_gate_threshold
+        .unwrap_or(0.7);
     let mut transitioned_to_pending_eval = false;
     let graph = modify_graph(&path, |graph| {
         // Decide target status BEFORE taking a mutable borrow on the task —
-        // the eval gate check needs to read other nodes (`.evaluate-X`) from
-        // the same graph.
-        let target_status = pick_done_target_status(graph, &id_owned);
+        // the eval gate check needs to read other nodes (`.evaluate-X`) and any
+        // saved durable verdict from the same graph.
+        let target_status = pick_done_target_status(graph, &id_owned, dir, eval_threshold);
 
         let task = match graph.get_task_mut(&id_owned) {
             Some(t) => t,
@@ -5503,5 +5523,100 @@ mod tests {
         let task = graph.get_task("explicit-discard-name").unwrap();
         assert_eq!(task.status, Status::Done);
         assert_eq!(task.failure_class, None);
+    }
+
+    #[test]
+    fn pick_done_pending_eval_no_verdict_keeps_gating() {
+        // Non-regression: a PendingEval task with a still-live `.evaluate-X` and
+        // NO saved verdict must stay in PendingEval (the eval gate is intact).
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        let mut eval = make_task(".evaluate-t1", "Evaluate: t1", Status::InProgress);
+        eval.after = vec!["t1".to_string()];
+        setup_workgraph(
+            dir_path,
+            vec![make_task("t1", "Source", Status::PendingEval), eval],
+        );
+        let graph = load_graph(&graph_path(dir_path)).unwrap();
+        assert_eq!(
+            pick_done_target_status(&graph, "t1", dir_path, 0.7),
+            Status::PendingEval
+        );
+    }
+
+    #[test]
+    fn pick_done_pending_eval_with_passing_verdict_completes() {
+        // Fix #3 (engine-pendingeval-wedge, rescue-path parity): a PendingEval
+        // task with a still-live `.evaluate-X` but a saved PASSING durable
+        // verdict must complete on an explicit `wg done` instead of re-parking.
+        use worksgood::agency::Evaluation;
+        use worksgood::config::{Config, RoleModelConfig};
+        use worksgood::eval_lifecycle::{
+            self, AgencyStage, DispatchSelectionSource, EvaluationLifecycle,
+        };
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        let mut source = make_task("t1", "Source", Status::PendingEval);
+        source.evaluation_lifecycle = Some(EvaluationLifecycle::for_source(&source));
+        let mut eval_sat = make_task(".evaluate-t1", "Evaluate: t1", Status::InProgress);
+        eval_sat.after = vec!["t1".to_string()];
+        setup_workgraph(dir_path, vec![source.clone(), eval_sat]);
+
+        // Persist a real, digest-verified passing verdict for t1.
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            provider: None,
+            model: Some("codex:gpt-5.5".into()),
+            tier: None,
+            endpoint: None,
+            reasoning: None,
+        });
+        let plan = eval_lifecycle::build_plan(
+            &config,
+            &source,
+            ".evaluate-t1",
+            DispatchSelectionSource::ScaffoldConfig,
+        )
+        .unwrap();
+        let mut satellite = make_task(".evaluate-t1", "Evaluate: t1", Status::InProgress);
+        satellite.agency_dispatch = Some(plan);
+        let evaluation = Evaluation {
+            id: "eval-t1-pass".into(),
+            task_id: "t1".into(),
+            agent_id: "agent-1".into(),
+            role_id: "role".into(),
+            tradeoff_id: "tradeoff".into(),
+            score: 0.85,
+            dimensions: std::collections::HashMap::new(),
+            notes: "passing".into(),
+            evaluator: "codex:gpt-5.5".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            model: Some("codex:gpt-5.5".into()),
+            source: "llm".into(),
+            loop_iteration: 0,
+        };
+        worksgood::agency::save_evaluation(&evaluation, &dir_path.join("agency/evaluations"))
+            .unwrap();
+        eval_lifecycle::write_durable_verdict(
+            dir_path,
+            &source,
+            &satellite,
+            AgencyStage::Evaluate,
+            &evaluation,
+        )
+        .unwrap();
+
+        let graph = load_graph(&graph_path(dir_path)).unwrap();
+        assert_eq!(
+            pick_done_target_status(&graph, "t1", dir_path, 0.7),
+            Status::Done,
+            "operator `wg done` must complete a PendingEval task with a saved passing verdict"
+        );
+        // A stricter gate than the saved score still respects the eval gate.
+        assert_eq!(
+            pick_done_target_status(&graph, "t1", dir_path, 0.9),
+            Status::PendingEval
+        );
     }
 }
