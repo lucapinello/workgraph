@@ -4291,6 +4291,86 @@ fn record_spawn_failure_and_quarantine(
     }
 }
 
+/// Self-cancel evaluation-lifecycle satellites orphaned by a terminal parent.
+///
+/// A `.flip-X` / `.evaluate-X` satellite exists ONLY to produce a verdict for
+/// its source task `X`. The PendingEval-wedge fix keeps such a satellite ALIVE
+/// while its parent is non-terminal (`is_live_eval_satellite` in `gc.rs` refuses
+/// to garbage-collect it). This is the COMPLEMENT for the terminal case: once the
+/// parent `X` is already terminal (Done/Failed/Abandoned) — e.g. an operator
+/// manually `wg done`-ed it out of a PendingEval wedge — the satellite has
+/// nothing left to score and must NOT keep retrying forever. Left alone, an
+/// orphaned satellite that also fails to spawn (transport exhausted) thrashes at
+/// aged priority and can starve the dispatcher-wide spawn breaker (2026-07-21
+/// recurrence). Mark each such non-terminal satellite `Abandoned` (self-cancel)
+/// with a loud log so it leaves the ready set permanently. Returns true if any
+/// satellite was cancelled.
+fn self_cancel_orphaned_eval_satellites(graph: &mut worksgood::graph::WorkGraph) -> bool {
+    // Collect first (immutable borrow) so the mutation pass can take &mut.
+    let orphans: Vec<(String, String, Status)> = graph
+        .tasks()
+        .filter(|t| t.id.starts_with(".flip-") || t.id.starts_with(".evaluate-"))
+        .filter(|t| !t.status.is_terminal())
+        .filter_map(|t| {
+            let source_id = t
+                .id
+                .strip_prefix(".flip-")
+                .or_else(|| t.id.strip_prefix(".evaluate-"))?;
+            let source = graph.get_task(source_id)?;
+            source
+                .status
+                .is_terminal()
+                .then(|| (t.id.clone(), source_id.to_string(), source.status))
+        })
+        .collect();
+
+    if orphans.is_empty() {
+        return false;
+    }
+
+    for (satellite_id, source_id, source_status) in &orphans {
+        if let Some(task) = graph.get_task_mut(satellite_id) {
+            task.status = Status::Abandoned;
+            task.assigned = None;
+            task.wait_condition = None;
+            task.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: Some("eval-lifecycle-orphan".to_string()),
+                user: None,
+                message: format!(
+                    "SELF-CANCELLED: source task '{}' is already {} (terminal); this \
+                     evaluation satellite has nothing left to score and will no longer be \
+                     retried (prevents transport-exhausted spawn thrash from starving the \
+                     dispatcher-wide spawn breaker).",
+                    source_id, source_status,
+                ),
+            });
+            eprintln!(
+                "[dispatcher] self-cancelled orphaned eval satellite '{}' (source '{}' is {})",
+                satellite_id, source_id, source_status
+            );
+        }
+    }
+    true
+}
+
+/// Whether a spawn error is the transport-exhausted / execution-exhausted
+/// terminal condition (`WG-EXEC-AGENCY-EXECUTION-EXHAUSTED`, raised by
+/// `EvaluationLifecycle::reserve_transport_attempt` once an immutable route
+/// generation has spent all its claimed transport attempts).
+///
+/// This is a PER-TASK terminal failure, NOT a systemic spawn outage: the same
+/// route generation can only fail `reserve_transport_attempt` again, so parking
+/// the satellite for retry (via `park_agency_execution_error`, which matches the
+/// broader `error[WG-EXEC-` prefix) just thrashes the dead route forever while
+/// its failures climb the dispatcher-wide breaker. It must instead feed the
+/// per-task quarantine and be EXCLUDED from the global breaker (2026-07-21
+/// breaker-starvation recurrence: two orphaned `.flip-*` satellites tripped the
+/// global breaker with 12 consecutive EXECUTION-EXHAUSTED failures).
+fn is_transport_exhausted(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("WG-EXEC-AGENCY-EXECUTION-EXHAUSTED")
+}
+
 /// Keep an agency satellite retryable when execution selection/readiness fails
 /// before claim. The Open->Waiting/Blocked mutation is the scheduling
 /// reservation: concurrent ticks holding the same stale ready snapshot cannot
@@ -4588,7 +4668,20 @@ fn spawn_agents_for_ready_tasks(
                             "[dispatcher] Failed to spawn assignment for {}: {}",
                             task_id, e
                         );
-                        if !park_agency_execution_error(&gp, &task_id, &e)
+                        if is_transport_exhausted(&e) {
+                            // Terminal per-task condition: quarantine (park at the
+                            // threshold), and ALWAYS exclude from the global breaker.
+                            record_spawn_failure_and_quarantine(
+                                &gp,
+                                &task_id,
+                                &format!("{}", e),
+                                "inline-assignment",
+                                task.exec_mode.as_deref(),
+                                config.coordinator.max_spawn_failures,
+                                quarantine_threshold,
+                            );
+                            poison_failures += 1;
+                        } else if !park_agency_execution_error(&gp, &task_id, &e)
                             && record_spawn_failure_and_quarantine(
                                 &gp,
                                 &task_id,
@@ -4621,7 +4714,20 @@ fn spawn_agents_for_ready_tasks(
                     }
                     Err(e) => {
                         eprintln!("[dispatcher] Failed to spawn eval for {}: {}", task_id, e);
-                        if !park_agency_execution_error(&gp, &task_id, &e)
+                        if is_transport_exhausted(&e) {
+                            // Terminal per-task condition: quarantine (park at the
+                            // threshold), and ALWAYS exclude from the global breaker.
+                            record_spawn_failure_and_quarantine(
+                                &gp,
+                                &task_id,
+                                &format!("{}", e),
+                                "inline-eval",
+                                task.exec_mode.as_deref(),
+                                config.coordinator.max_spawn_failures,
+                                quarantine_threshold,
+                            );
+                            poison_failures += 1;
+                        } else if !park_agency_execution_error(&gp, &task_id, &e)
                             && record_spawn_failure_and_quarantine(
                                 &gp,
                                 &task_id,
@@ -5165,6 +5271,15 @@ pub fn coordinator_tick(
                 },
             );
         }
+
+        // Phase 2.48: Self-cancel eval satellites orphaned by a terminal parent.
+        // Complement of the PendingEval-wedge gc guard (which keeps a satellite
+        // alive while its parent is non-terminal): once the parent is terminal
+        // (Done/Failed/Abandoned) the `.flip-*`/`.evaluate-*` satellite has nothing
+        // left to score, so it is marked Abandoned instead of thrashing at aged
+        // priority — where a transport-exhausted spawn failure could starve the
+        // dispatcher-wide spawn breaker (2026-07-21 recurrence).
+        modified |= self_cancel_orphaned_eval_satellites(graph);
 
         // Phase 2.5: Cycle iteration — reactivate cycles where all members are Done.
         {
@@ -7690,6 +7805,147 @@ mod tests {
         assert!(
             load_graph(&gp).unwrap().get_task("poison").unwrap().paused,
             "poison task parked at the quarantine threshold"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // engine-transport-exhausted: transport-exhausted → per-task quarantine +
+    // breaker exclusion, and terminal-parent satellite self-cancel.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transport_exhausted_error_is_detected_but_other_wg_exec_errors_are_not() {
+        // The REAL error the dispatcher sees when a satellite's immutable route
+        // generation has spent all its claimed transport attempts.
+        let mut task = Task::default();
+        task.id = ".flip-src".to_string();
+        let mut lifecycle = worksgood::eval_lifecycle::EvaluationLifecycle::for_source(&task);
+        lifecycle.transport_attempts =
+            worksgood::eval_lifecycle::MAX_EXECUTION_ATTEMPTS_PER_ROUTE_GENERATION;
+        let exhausted = lifecycle
+            .reserve_transport_attempt()
+            .expect_err("transport attempts must be exhausted");
+        assert!(
+            is_transport_exhausted(&exhausted),
+            "EXECUTION-EXHAUSTED must be recognised as transport-exhausted"
+        );
+
+        // Other WG-EXEC errors are transient route problems and MUST still flow
+        // through park_agency_execution_error (retry), not the quarantine path.
+        let route_unselected =
+            anyhow::anyhow!("error[WG-EXEC-AGENCY-ROUTE-UNSELECTED]: no persisted route");
+        assert!(!is_transport_exhausted(&route_unselected));
+        // A plain spawn error (connection refused, ENOENT, …) is not it either.
+        let generic = anyhow::anyhow!("spawn: connection refused");
+        assert!(!is_transport_exhausted(&generic));
+        // Detection survives error context wrapping (`{error:#}` chain).
+        let wrapped = exhausted.context("failed to spawn eval inline for .flip-src");
+        assert!(
+            is_transport_exhausted(&wrapped),
+            "detection must see the token through anyhow context chaining"
+        );
+    }
+
+    #[test]
+    fn transport_exhausted_failure_is_excluded_from_global_breaker() {
+        // Property that guarantees fix (1): every transport-exhausted failure is
+        // counted as a poison failure and therefore excluded from the breaker, so
+        // an un-spawnable satellite can never trip the dispatcher-wide breaker.
+        // A tick with N transport-exhausted failures and nothing else feeds the
+        // breaker zero failures.
+        assert_eq!(breaker_failures_excluding_poison(12, 0, 12), 0);
+    }
+
+    #[test]
+    fn orphaned_eval_satellite_self_cancels_on_terminal_parent() {
+        // Each terminal parent status orphans its satellite; all must self-cancel.
+        for (source_status, sat_prefix) in [
+            (Status::Done, ".flip-"),
+            (Status::Abandoned, ".evaluate-"),
+            (Status::Failed, ".flip-"),
+        ] {
+            let mut graph = WorkGraph::new();
+            let mut src = Task::default();
+            src.id = "src".to_string();
+            src.status = source_status;
+            graph.add_node(Node::Task(src));
+
+            let sat_id = format!("{sat_prefix}src");
+            let mut sat = Task::default();
+            sat.id = sat_id.clone();
+            sat.status = Status::Open;
+            sat.assigned = Some("agent-x".to_string());
+            graph.add_node(Node::Task(sat));
+
+            let cancelled = self_cancel_orphaned_eval_satellites(&mut graph);
+            assert!(
+                cancelled,
+                "satellite of a {source_status} parent must self-cancel"
+            );
+            let t = graph.get_task(&sat_id).unwrap();
+            assert_eq!(
+                t.status,
+                Status::Abandoned,
+                "orphaned satellite is marked Abandoned (source {source_status})"
+            );
+            assert!(t.assigned.is_none(), "self-cancel clears any stale assignee");
+            assert!(
+                t.log.iter().any(|e| e.actor.as_deref() == Some("eval-lifecycle-orphan")
+                    && e.message.contains("SELF-CANCELLED")),
+                "a loud self-cancel log entry is recorded"
+            );
+
+            // Idempotent: the now-terminal satellite is not touched again.
+            assert!(
+                !self_cancel_orphaned_eval_satellites(&mut graph),
+                "an already-Abandoned satellite is not re-cancelled"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_satellite_of_nonterminal_parent_is_preserved() {
+        // Complement invariant: while the parent is NON-terminal (the wedge case
+        // the gc guard protects), the satellite must stay alive so it can still
+        // produce the verdict that transitions the parent.
+        for source_status in [Status::PendingEval, Status::FailedPendingEval, Status::Open] {
+            let mut graph = WorkGraph::new();
+            let mut src = Task::default();
+            src.id = "pending".to_string();
+            src.status = source_status;
+            graph.add_node(Node::Task(src));
+
+            let mut sat = Task::default();
+            sat.id = ".evaluate-pending".to_string();
+            sat.status = Status::Open;
+            graph.add_node(Node::Task(sat));
+
+            assert!(
+                !self_cancel_orphaned_eval_satellites(&mut graph),
+                "satellite of a {source_status} (non-terminal) parent is preserved"
+            );
+            assert_eq!(
+                graph.get_task(".evaluate-pending").unwrap().status,
+                Status::Open,
+                "preserved satellite keeps running (source {source_status})"
+            );
+        }
+    }
+
+    #[test]
+    fn orphaned_satellite_with_missing_parent_is_left_alone() {
+        // A satellite whose source row no longer exists in the graph is handled
+        // by other reaping paths (gc / abandoned-source skip), not here — guard
+        // against a panic on the missing lookup.
+        let mut graph = WorkGraph::new();
+        let mut sat = Task::default();
+        sat.id = ".flip-vanished".to_string();
+        sat.status = Status::Open;
+        graph.add_node(Node::Task(sat));
+        assert!(!self_cancel_orphaned_eval_satellites(&mut graph));
+        assert_eq!(
+            graph.get_task(".flip-vanished").unwrap().status,
+            Status::Open
         );
     }
 
