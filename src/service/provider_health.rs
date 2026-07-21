@@ -668,8 +668,30 @@ pub fn classify_error(exit_code: Option<i32>, stderr: &str) -> ProviderErrorKind
     // must not be mistaken for a provider auth failure. If the provider itself
     // were down the agent would never have reached `wg done`, so this text can
     // only appear when the provider is healthy.
+    //
+    // BUG-A6-1 (done-spoof, inverted): the guard above is TOO eager. A provider
+    // can echo a done-looking sentence in its OWN error text while the real
+    // failure is a live outage — e.g. `provider said: Cannot mark 'x' as done;
+    // Authentication failed HTTP 401`. Blindly returning FatalTask there
+    // suppresses the outage: the provider-health counter never trips and the
+    // service flaps silently (the exact failure this comment warns about, now
+    // running the other way). The typed path (`classify_execution_outcome` on
+    // `CompletionRefused`) is spoof-proof via provenance; when only the string
+    // survives we must still resist it. So: keep the refusal as FatalTask UNLESS
+    // an unambiguous HARD provider signal co-occurs with the done-sentence AND
+    // the message is neither a blocked-by-unresolved-task list (whose embedded
+    // blocker titles legitimately carry provider words) nor a git/merge-back
+    // refusal (whose 401 is a push credential, not the model provider). In that
+    // narrow case, fall through to the provider matchers below.
     if is_wg_done_refusal(&stderr_lower) {
-        return ProviderErrorKind::FatalTask;
+        let outage_spoof = has_hard_provider_signal(&stderr_lower)
+            && !is_blocked_task_list_refusal(&stderr_lower)
+            && !is_git_merge_refusal(&stderr_lower);
+        if !outage_spoof {
+            return ProviderErrorKind::FatalTask;
+        }
+        // else: a real provider outage wearing a done-sentence — fall through to
+        // the auth/quota/CLI matchers so the outage is classified as such.
     }
 
     // Auth/Authorization failures (Fatal-Provider)
@@ -802,6 +824,49 @@ fn is_wg_done_refusal(stderr_lower: &str) -> bool {
         || (stderr_lower.contains("merge conflict") && stderr_lower.contains("cannot mark"))
 }
 
+/// An UNAMBIGUOUS hard provider outage signal (`stderr` already lowercased).
+///
+/// These are phrases only the model provider / API transport emits — a real
+/// auth rejection, a spent quota, or a billing block — as opposed to a bare word
+/// like "authentication" that a blocker task title might carry. Used by
+/// `classify_error` to detect a provider outage that has been wrapped in a
+/// `wg done`-looking sentence (BUG-A6-1). Kept deliberately narrow: the strong
+/// two-word/HTTP-prefixed forms, never the single loose token.
+fn has_hard_provider_signal(stderr_lower: &str) -> bool {
+    stderr_lower.contains("authentication failed")
+        || stderr_lower.contains("http 401")
+        || stderr_lower.contains("http 402")
+        || stderr_lower.contains("http 403")
+        || stderr_lower.contains("check your api key")
+        || stderr_lower.contains("insufficient permissions")
+        || stderr_lower.contains("balance exhausted")
+        || stderr_lower.contains("quota")
+        || stderr_lower.contains("cost cap")
+        || stderr_lower.contains("billing")
+}
+
+/// Whether the refusal is a "blocked by N unresolved task(s)" list (`stderr`
+/// already lowercased). Such refusals splice UNRELATED blocker task titles into
+/// the message, and those titles may legally contain provider-looking words
+/// (`fix-authentication`, `... HTTP 401 quota ...`). The embedded words describe
+/// OTHER tasks, never this execution's provider, so a blocked-list refusal is
+/// always task logic regardless of any hard-signal co-occurrence.
+fn is_blocked_task_list_refusal(stderr_lower: &str) -> bool {
+    stderr_lower.contains("blocked by") && stderr_lower.contains("unresolved task")
+}
+
+/// Whether the refusal comes from the done-time git merge-back / worktree step
+/// (`stderr` already lowercased). A 401 here is a git PUSH credential failure,
+/// not the model provider going down, so it stays task logic even when a hard
+/// provider signal appears to co-occur.
+fn is_git_merge_refusal(stderr_lower: &str) -> bool {
+    stderr_lower.contains("merge conflict")
+        || stderr_lower.contains("merge-back")
+        || stderr_lower.contains("git push")
+        || stderr_lower.contains("failed to push")
+        || (stderr_lower.contains("uncommitted") && stderr_lower.contains("refusing to mark"))
+}
+
 /// Extract provider/executor identifier from configuration
 pub fn extract_provider_id(executor: &str, model: Option<&str>) -> String {
     match executor {
@@ -908,6 +973,55 @@ mod tests {
         assert_eq!(
             classify_error(Some(1), "authentication failed (HTTP 401)"),
             ProviderErrorKind::FatalProvider
+        );
+    }
+
+    /// BUG-A6-1 (done-spoof, inverted): a provider echoes a `wg done`-looking
+    /// sentence in its OWN error text while the real failure is a live outage.
+    /// The string path must not let the done-sentence suppress the outage, yet
+    /// must still keep genuine refusals (blocked-task lists, git merge-back 401s)
+    /// as task logic — the embedded provider words there describe OTHER tasks or
+    /// a git push credential, not this execution's model provider.
+    #[test]
+    fn done_spoof_does_not_suppress_a_real_provider_outage() {
+        // Spoof: provider quotes a done-sentence AND reports a real 401 → outage.
+        assert_eq!(
+            classify_error(
+                Some(1),
+                "provider said: Cannot mark 'x' as done; Authentication failed HTTP 401"
+            ),
+            ProviderErrorKind::FatalProvider,
+            "a provider outage wearing a done-sentence must not be suppressed"
+        );
+        assert_eq!(
+            classify_error(
+                Some(1),
+                "Cannot mark 'x' as done — provider returned HTTP 402: balance exhausted"
+            ),
+            ProviderErrorKind::FatalProvider,
+            "a quota/billing outage wearing a done-sentence must not be suppressed"
+        );
+
+        // Blocked-task list: the auth/quota words live in an UNRELATED blocker
+        // title → still task logic, the provider counter must stay untouched.
+        assert_eq!(
+            classify_error(
+                Some(1),
+                "Cannot mark '.flip-X' as done: blocked by 1 unresolved task(s):\n  \
+                 - X (Authentication failed HTTP 401 quota): FailedPendingEval"
+            ),
+            ProviderErrorKind::FatalTask,
+            "provider words in a blocker title must not be read as an outage"
+        );
+
+        // Git merge-back 401: a push credential failure, not the model provider.
+        assert_eq!(
+            classify_error(
+                Some(1),
+                "Cannot mark 'x' as done: git push failed — fatal: Authentication failed for 'https://...'"
+            ),
+            ProviderErrorKind::FatalTask,
+            "a git-push 401 during merge-back is task logic, not a provider outage"
         );
     }
 
