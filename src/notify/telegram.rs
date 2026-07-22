@@ -140,6 +140,51 @@ impl TelegramConfig {
     }
 }
 
+/// Loudly flag a `chat_id` that CANNOT be the family group.
+///
+/// Per the Telegram Bot API, **group / supergroup / channel ids are negative**
+/// (supergroups begin `-100…`) while a **private 1:1 chat id is the positive
+/// user id**. The family relay is meant to post into the FAMILY GROUP — the same
+/// negative id for every bot. A *positive* `chat_id` where a group is expected
+/// silently DMs one person instead: the kiosk→group relay reports success
+/// (`relayError: null`) while the group sees nothing (docs/05 §5.4 ground truth).
+///
+/// Returns `Some(warning)` describing the misconfiguration when `chat_id` parses
+/// as a positive integer (a DM target), or `None` when it is a plausible group
+/// target (negative id), unset/empty (a separate "not configured" concern), or a
+/// non-numeric `@channelusername`. `bot_id` only makes the warning specific.
+pub fn group_chat_id_warning(bot_id: &str, chat_id: &str) -> Option<String> {
+    let trimmed = chat_id.trim();
+    match trimmed.parse::<i64>() {
+        // Negative → group / supergroup / channel: the expected relay target.
+        Ok(n) if n < 0 => None,
+        // Positive → a 1:1 DM id. This is the silent-misroute footgun.
+        Ok(n) => Some(format!(
+            "bot '{bot_id}': chat_id={n} is a POSITIVE id — that is a 1:1 DM, not the family \
+             GROUP. Group ids are negative (supergroups begin -100…). A kiosk→group relay will \
+             SILENTLY DM one person instead of posting to the group (relayError stays null). Fix \
+             .wg/notify.toml: set chat_id to the negative family-group id (docs/05 §5.4)."
+        )),
+        // Empty (unconfigured) or @channelusername — not the positive-DM footgun.
+        Err(_) => None,
+    }
+}
+
+/// Emit [`group_chat_id_warning`] to stderr for every configured bot at
+/// listener/gateway start, so a misrouting `chat_id` is caught LOUDLY on boot
+/// rather than discovered when the family never gets a relayed message. Returns
+/// the number of warnings emitted (0 = every chat_id is a plausible group).
+pub fn warn_on_dm_chat_ids(bots: &[(String, TelegramBotConfig)]) -> usize {
+    let mut warned = 0;
+    for (bot_id, cfg) in bots {
+        if let Some(w) = group_chat_id_warning(bot_id, &cfg.chat_id) {
+            eprintln!("⚠️  telegram chat_id misconfiguration — {w}");
+            warned += 1;
+        }
+    }
+    warned
+}
+
 // ---------------------------------------------------------------------------
 // Channel implementation
 // ---------------------------------------------------------------------------
@@ -1348,6 +1393,53 @@ agent_id = "nora"
         let types: Vec<&str> = channels.iter().map(|c| c.channel_type()).collect();
         assert!(types.contains(&"telegram"), "default bot present");
         assert!(types.contains(&"telegram:nora"), "named bot present");
+    }
+
+    #[test]
+    fn group_chat_id_warning_flags_positive_dm_ids_only() {
+        // Negative supergroup id — the correct family-group target. No warning.
+        assert!(group_chat_id_warning("nora", "-1001234567890").is_none());
+        // Plain negative group id — also a group. No warning.
+        assert!(group_chat_id_warning("nora", "-99").is_none());
+        // Empty / unset — a separate "not configured" concern, not this footgun.
+        assert!(group_chat_id_warning("nora", "").is_none());
+        assert!(group_chat_id_warning("nora", "   ").is_none());
+        // @channelusername — non-numeric, not the positive-DM footgun.
+        assert!(group_chat_id_warning("nora", "@casa_family").is_none());
+
+        // POSITIVE id — a 1:1 DM where the group is expected. LOUD warning that
+        // names the bot and points at the fix, so a silent misroute is caught.
+        let w = group_chat_id_warning("nora", "78901234").expect("positive id must warn");
+        assert!(w.contains("nora"), "warning names the bot: {w}");
+        assert!(w.contains("78901234"), "warning shows the id: {w}");
+        assert!(w.contains("DM"), "warning explains the DM misroute: {w}");
+        // Whitespace-padded positive id still warns (trimmed).
+        assert!(group_chat_id_warning("bruno", "  555  ").is_some());
+    }
+
+    #[test]
+    fn warn_on_dm_chat_ids_counts_only_the_misrouting_bots() {
+        let bots = vec![
+            (
+                "nora".to_string(),
+                TelegramBotConfig {
+                    bot_token: "t".into(),
+                    chat_id: "-1001".into(), // group — fine
+                    agent_id: Some("nora".into()),
+                    username: None,
+                },
+            ),
+            (
+                "bruno".to_string(),
+                TelegramBotConfig {
+                    bot_token: "t".into(),
+                    chat_id: "78901234".into(), // DM — misroute
+                    agent_id: Some("bruno".into()),
+                    username: None,
+                },
+            ),
+        ];
+        assert_eq!(warn_on_dm_chat_ids(&bots), 1);
     }
 
     #[test]
