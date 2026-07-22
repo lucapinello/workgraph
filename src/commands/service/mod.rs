@@ -1087,6 +1087,27 @@ pub fn run_tick(
     Ok(())
 }
 
+/// Explicit full rescan of the eval-verdict store. Clears the incremental
+/// cache/marker, runs a complete migration + verify, and repopulates them so the
+/// next coordinator tick is fast again. This is where an O(all-history) pass
+/// belongs — never the hot tick (engine-eval-verdict).
+pub fn run_eval_repair(dir: &Path) -> Result<()> {
+    let graph_path = graph_path(dir);
+    if !graph_path.exists() {
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
+    }
+    println!("Rescanning eval-verdict store (full migration + verify)...");
+    let started = std::time::Instant::now();
+    let report = worksgood::eval_lifecycle::repair_eval_verdicts(dir)?;
+    println!(
+        "Eval-verdict repair complete in {}ms: migrated {} legacy verdict(s), {} durable verdict(s) verified.",
+        started.elapsed().as_millis(),
+        report.migrated,
+        report.verdicts_loaded
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 pub fn find_orphan_daemon_pids(dir: &Path, exclude_pid: Option<u32>) -> Vec<u32> {
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());

@@ -3523,6 +3523,7 @@ fn main() -> Result<()> {
                 executor.as_deref(),
                 model.as_deref(),
             ),
+            ServiceCommands::EvalRepair => commands::service::run_eval_repair(&workgraph_dir),
             ServiceCommands::CreateChat {
                 name,
                 model,

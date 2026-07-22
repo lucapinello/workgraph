@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use worksgood::agency;
 use worksgood::agency::evolver::{self, EvolutionTrigger, EvolverState};
@@ -39,6 +39,61 @@ pub struct TickResult {
     pub tasks_ready: usize,
     /// Number of agents spawned in this tick
     pub agents_spawned: usize,
+}
+
+/// A tick exceeding this budget logs a per-phase breakdown so a wedge is
+/// self-diagnosing instead of needing a live frame sampler (engine-eval-verdict:
+/// the eval-verdict rescan silently spent 7+ minutes with no attribution).
+const TICK_WATCHDOG_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Records where a coordinator tick spends its time and, on ANY exit path
+/// (normal, early-return, or `?` error) whose total exceeds the budget, logs the
+/// per-phase timings. The `Drop` guarantee is what makes it robust across the
+/// tick's many early returns without threading a report call through each one.
+struct TickWatchdog {
+    start: Instant,
+    budget: Duration,
+    phases: Vec<(&'static str, Duration)>,
+}
+
+impl TickWatchdog {
+    fn new(budget: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            budget,
+            phases: Vec::new(),
+        }
+    }
+
+    /// Attribute the time elapsed since `since` to a named phase.
+    fn mark(&mut self, name: &'static str, since: Instant) {
+        self.phases.push((name, since.elapsed()));
+    }
+}
+
+impl Drop for TickWatchdog {
+    fn drop(&mut self) {
+        let total = self.start.elapsed();
+        if total <= self.budget {
+            return;
+        }
+        let mut breakdown = String::new();
+        let mut attributed = Duration::ZERO;
+        for (name, dur) in &self.phases {
+            attributed += *dur;
+            breakdown.push_str(&format!(" {}={}ms", name, dur.as_millis()));
+        }
+        breakdown.push_str(&format!(
+            " other={}ms",
+            total.saturating_sub(attributed).as_millis()
+        ));
+        eprintln!(
+            "[dispatcher] WATCHDOG: coordinator tick took {}ms (budget {}ms); phase timings:{}",
+            total.as_millis(),
+            self.budget.as_millis(),
+            breakdown
+        );
+    }
 }
 
 /// Clean up dead agents and count alive ones. Returns `None` with an early
@@ -4992,6 +5047,10 @@ pub fn coordinator_tick(
 ) -> Result<TickResult> {
     let graph_path = graph_path(dir);
 
+    // Watchdog: attribute per-phase time and log a breakdown if the whole tick
+    // blows its budget. Dropped at every return path (engine-eval-verdict).
+    let mut watchdog = TickWatchdog::new(TICK_WATCHDOG_BUDGET);
+
     // Load config for agency settings
     let config = Config::load_or_default(dir);
 
@@ -5059,6 +5118,27 @@ pub fn coordinator_tick(
             Ok(_) => {}
             Err(error) => eprintln!("[dispatcher] Disk cleanup warning: {error:#}"),
         }
+
+        // Same daily-housekeeping cadence: cap the evaluations dir so the
+        // eval-verdict store can't grow unbounded (it reached ~9.5k files in 12
+        // days and wedged the tick — engine-eval-verdict). Archive-not-delete;
+        // referenced/pending evaluations are always retained.
+        let retention_start = Instant::now();
+        match worksgood::eval_lifecycle::archive_stale_evaluations(
+            dir,
+            config
+                .coordinator
+                .resource_management
+                .evaluations_retention_max_count,
+        ) {
+            Ok(report) if report.archived > 0 => eprintln!(
+                "[dispatcher] Evaluations retention: archived {} file(s) ({} bytes), kept {} newest, protected {} referenced/pending",
+                report.archived, report.bytes_archived, report.kept, report.protected
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!("[dispatcher] Evaluations retention warning: {error:#}"),
+        }
+        watchdog.mark("evaluations_retention", retention_start);
     }
 
     // Phase 1: Clean up dead agents and count alive ones
@@ -5101,21 +5181,31 @@ pub fn coordinator_tick(
 
     // Verdict files are immutable evidence. Read them before taking the graph
     // writer lock, then link/consume them in the one atomic graph transaction.
-    let legacy_migration = worksgood::eval_lifecycle::migrate_unambiguous_legacy_verdicts(dir);
-    if let Ok(count) = legacy_migration.as_ref()
-        && *count > 0
+    //
+    // INCREMENTAL: the migration front door short-circuits on an unchanged
+    // fingerprint marker, and the verdict load reuses an already-verified cache
+    // unless a dir changed. Per-tick cost is therefore O(new files), not
+    // O(all-history) — the O(9.5k) rescan that wedged the dispatcher for an hour
+    // now belongs only in `wg service eval-repair` (engine-eval-verdict).
+    let migration_start = Instant::now();
+    let legacy_migration =
+        worksgood::eval_lifecycle::migrate_unambiguous_legacy_verdicts_incremental(dir);
+    watchdog.mark("eval_migration", migration_start);
+    if let Ok(outcome) = legacy_migration.as_ref()
+        && outcome.migrated > 0
     {
         eprintln!(
             "[dispatcher] linked {} unambiguous historical evaluation verdict(s)",
-            count
+            outcome.migrated
         );
     }
+    let load_start = Instant::now();
     let (durable_eval_verdicts, eval_evidence_usable) = match legacy_migration {
         Err(error) => {
             eprintln!("[dispatcher] eval lifecycle evidence unavailable (fail-closed): {error:#}");
             (Vec::new(), false)
         }
-        Ok(_) => match worksgood::eval_lifecycle::load_durable_verdicts(dir) {
+        Ok(_) => match worksgood::eval_lifecycle::load_durable_verdicts_cached(dir) {
             Ok(verdicts) => (verdicts, true),
             Err(error) => {
                 eprintln!(
@@ -5125,6 +5215,7 @@ pub fn coordinator_tick(
             }
         },
     };
+    watchdog.mark("eval_load_verdicts", load_start);
 
     // Phases 2.5–2.9: Graph maintenance (atomic load-modify-save).
     //
@@ -5132,6 +5223,7 @@ pub fn coordinator_tick(
     // entire load-modify-save cycle.  This prevents the "lost update" race
     // where a concurrent `wg` command (e.g. `wg publish`, `wg add`, `wg done`)
     // inserts a task between our load and save, and our save clobbers it.
+    let maintenance_start = Instant::now();
     modify_graph(&graph_path, |graph| {
         let mut modified = false;
 
@@ -5263,6 +5355,7 @@ pub fn coordinator_tick(
         modified
     })
     .context("Failed to load/save graph during maintenance phases")?;
+    watchdog.mark("graph_maintenance", maintenance_start);
 
     // Phases 3–4.8: Agency scaffolding (atomic load-modify-save).
     //
@@ -5270,6 +5363,7 @@ pub fn coordinator_tick(
     // notified AFTER the closure returns, so the (potentially network-bound)
     // human notification never runs while the graph file lock is held.
     let mut newly_parked_humans: Vec<human_dispatch::ParkedHumanTask> = Vec::new();
+    let scaffold_start = Instant::now();
     let graph = modify_graph(&graph_path, |graph| {
         let mut modified = false;
 
@@ -5319,6 +5413,7 @@ pub fn coordinator_tick(
         modified
     })
     .context("Failed to save graph after auto-assign/auto-evaluate; aborting tick")?;
+    watchdog.mark("agency_scaffold", scaffold_start);
 
     // Phase 4.8b: Render each newly parked task to its human (R11), out of lock.
     for parked in &newly_parked_humans {
