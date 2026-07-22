@@ -204,12 +204,42 @@ pub fn ack_line() -> String {
     "On it — one sec… \u{23f3}".to_string()
 }
 
+/// The name of a family member a stranger can ask to be added — derived from
+/// the household's own roster (the confirmed Telegram bindings), NOT hardcoded.
+///
+/// A prebuilt binary must never leak the DEVELOPER's name to a *different*
+/// family: the onboarding line greets any stranger pre-sign-in, so a baked-in
+/// "Ask Luca…" is shown to households that have never heard of Luca. This is the
+/// engine-side twin of the app's no-hardcoded-names guard. We return the first
+/// CONFIRMED member's name (author order in the binding map) so the line names a
+/// real person who can actually add them; `None` when the roster is empty or
+/// unreadable, in which case [`onboarding_line`] uses a neutral fallback.
+pub fn family_inviter_name(workgraph_dir: &Path) -> Option<String> {
+    let agency_dir = workgraph_dir.join("agency");
+    let map = TelegramBindingMap::load(&agency_dir).ok()?;
+    map.bindings
+        .iter()
+        .find(|b| b.confirmed && !b.name.trim().is_empty())
+        .map(|b| b.name.trim().to_string())
+}
+
 /// One polite line for a sender we don't recognise. Deliberately warm and
 /// jargon-free — no command syntax, no ids.
-pub fn onboarding_line() -> String {
-    "Hi there! \u{1f44b} I don't recognise you yet, so I can't chat just now. Ask Luca to add \
-     you to the family and I'll be right with you."
-        .to_string()
+///
+/// `inviter` is a family member the stranger can ask to be added, resolved from
+/// the household roster by [`family_inviter_name`]. When the roster names no one
+/// (empty/unreadable), we fall back to the NEUTRAL "a family member" — never a
+/// hardcoded personal name, which in a prebuilt binary would leak the
+/// developer's name to an unrelated household.
+pub fn onboarding_line(inviter: Option<&str>) -> String {
+    let who = inviter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("a family member");
+    format!(
+        "Hi there! \u{1f44b} I don't recognise you yet, so I can't chat just now. Ask {who} to add \
+         you to the family and I'll be right with you."
+    )
 }
 
 /// Graceful fallback when the addressed agent has no bound session yet.
@@ -870,8 +900,13 @@ pub async fn run_conversation_turn(
 ) -> Result<TurnOutcome> {
     match plan {
         ConversationPlan::Onboard { route, .. } => {
-            sink.send(&route.bot_id, &route.chat_id, &onboarding_line())
-                .await?;
+            let inviter = family_inviter_name(workgraph_dir);
+            sink.send(
+                &route.bot_id,
+                &route.chat_id,
+                &onboarding_line(inviter.as_deref()),
+            )
+            .await?;
             Ok(TurnOutcome::Onboarded)
         }
         ConversationPlan::Sessionless { route, .. } => {
@@ -3296,5 +3331,82 @@ mod tests {
         );
         // The honest, calendar-referencing fallback went out instead.
         assert!(lc.contains("calendar"), "not the honest fallback: {last}");
+    }
+
+    /// Seed a confirmed OR unconfirmed binding under `name` so the inviter
+    /// resolver has a roster to read.
+    fn add_binding(wg: &Path, sender: &str, name: &str, confirmed: bool) {
+        let agency_dir = wg.join("agency");
+        let mut map = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+        let mut b = crate::agency::TelegramBinding::new(
+            sender,
+            &format!("agent-{sender}"),
+            name,
+            Some("otto".to_string()),
+            Utc::now(),
+        );
+        b.confirmed = confirmed;
+        b.confirmed_at = confirmed.then(Utc::now);
+        map.add(b).unwrap();
+        map.save(&agency_dir).unwrap();
+    }
+
+    /// D17 — the prebuilt binary must NOT bake a developer's name into the
+    /// stranger-onboarding line. With no roster the line names "a family member"
+    /// (neutral), never "Luca"; given a real member it names THAT person.
+    #[test]
+    fn onboarding_line_never_hardcodes_a_developer_name() {
+        // Neutral fallback: no inviter known.
+        let neutral = onboarding_line(None);
+        assert!(
+            !neutral.to_lowercase().contains("luca"),
+            "onboarding line leaked a hardcoded name: {neutral}"
+        );
+        assert!(
+            neutral.contains("a family member"),
+            "neutral fallback missing: {neutral}"
+        );
+        assert!(neutral.contains("add"), "line lost its meaning: {neutral}");
+
+        // Derived from the roster: names the real member.
+        let derived = onboarding_line(Some("Robin"));
+        assert!(
+            derived.contains("Ask Robin to add"),
+            "did not name the roster member: {derived}"
+        );
+        assert!(
+            !derived.to_lowercase().contains("luca"),
+            "derived line leaked a hardcoded name: {derived}"
+        );
+
+        // Empty / whitespace inviter degrades to the neutral fallback, not a
+        // dangling "Ask  to add".
+        assert_eq!(onboarding_line(Some("   ")), neutral);
+    }
+
+    /// D17 — `family_inviter_name` reads the household's OWN roster: the first
+    /// confirmed member, ignoring unconfirmed bindings; `None` on an empty roster
+    /// (which drives the neutral fallback above).
+    #[test]
+    fn family_inviter_name_derives_from_confirmed_roster() {
+        let dir = tempdir().unwrap();
+        // Empty roster → nobody to name.
+        assert_eq!(family_inviter_name(dir.path()), None);
+
+        // An UNconfirmed binding must not be offered as an inviter.
+        add_binding(dir.path(), "pending-1", "Zoe", false);
+        assert_eq!(
+            family_inviter_name(dir.path()),
+            None,
+            "unconfirmed member must not be named as inviter"
+        );
+
+        // A confirmed member is named.
+        add_binding(dir.path(), "user-1", "Robin", true);
+        assert_eq!(
+            family_inviter_name(dir.path()).as_deref(),
+            Some("Robin"),
+            "confirmed member should be the inviter"
+        );
     }
 }

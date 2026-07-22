@@ -490,6 +490,15 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         anyhow::bail!("No Telegram bots configured — nothing to poll");
     }
 
+    // D20 — validate every bot's chat_id LOUDLY at listener start. A POSITIVE
+    // chat_id is a 1:1 DM, not the negative family GROUP the relay expects; left
+    // unflagged it makes a kiosk→group relay silently DM one person with
+    // relayError:null. Warn on boot rather than misroute in silence (docs/05
+    // §5.4). Non-fatal: an operator may deliberately target a DM, but they see
+    // the warning either way.
+    let all_bots = config.all_bots();
+    worksgood::notify::telegram::warn_on_dm_chat_ids(&all_bots);
+
     // Replies go out via one bot: the concierge (otto) when present, else the
     // first configured bot. This matches the pre-existing single-channel reply
     // behaviour — the poll fan-out below is the only change in scope here.
