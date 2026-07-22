@@ -4341,6 +4341,15 @@ pub struct ResourceManagementConfig {
     pub compress_terminal_streams: bool,
     #[serde(default = "default_stream_retention_days")]
     pub stream_retention_days: u64,
+
+    /// Cap the `agency/evaluations/` dir at this many newest files during daily
+    /// housekeeping; older ones are archived (never deleted) to
+    /// `agency/evaluations-archive/`. This bounds the unattended-months growth
+    /// that let the eval-verdict store reach ~9.5k files and wedge the tick.
+    /// Evaluations still referenced by a durable verdict or a pending task are
+    /// always retained. Set to 0 to disable. Default: 2000.
+    #[serde(default = "default_evaluations_retention_max_count")]
+    pub evaluations_retention_max_count: usize,
 }
 
 fn default_max_incomplete_retries() -> u32 {
@@ -4607,6 +4616,9 @@ fn default_compress_terminal_streams() -> bool {
 fn default_stream_retention_days() -> u64 {
     7
 }
+fn default_evaluations_retention_max_count() -> usize {
+    2000
+}
 
 impl Default for ResourceManagementConfig {
     fn default() -> Self {
@@ -4637,6 +4649,7 @@ impl Default for ResourceManagementConfig {
             disk_agent_heartbeat_seconds: default_disk_agent_heartbeat_seconds(),
             compress_terminal_streams: default_compress_terminal_streams(),
             stream_retention_days: default_stream_retention_days(),
+            evaluations_retention_max_count: default_evaluations_retention_max_count(),
         }
     }
 }

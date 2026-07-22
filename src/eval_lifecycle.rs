@@ -15,6 +15,7 @@ use crate::graph::{LogEntry, Status, Task, WorkGraph};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -551,35 +552,89 @@ fn compact_durable_json(bytes: &[u8]) -> Vec<u8> {
     compact
 }
 
-fn load_evaluation_evidence(dir: &Path, evaluation_id: &str) -> Result<EvaluationEvidence> {
-    let directory = dir.join("agency/evaluations");
-    let mut matching = Vec::new();
-    if directory.exists() {
-        for entry in fs::read_dir(&directory)? {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let bytes = fs::read(&path)?;
-            let evaluation: Evaluation = serde_json::from_slice(&bytes)
-                .with_context(|| format!("loading evaluation evidence {}", path.display()))?;
-            if evaluation.id == evaluation_id {
-                matching.push(EvaluationEvidence { evaluation, bytes });
-            }
-        }
-    }
-    if matching.len() != 1 {
-        anyhow::bail!(
-            "error[WG-EVAL-VERDICT-EVIDENCE]: evaluation {:?} has {} durable matches",
-            evaluation_id,
-            matching.len()
-        );
-    }
-    Ok(matching.pop().expect("one matching evaluation"))
+/// One-pass index of durable evaluation evidence, keyed by evaluation id.
+///
+/// Verifying N durable verdicts used to call `load_evaluation_evidence` — a
+/// full read+parse of *every* file in `agency/evaluations/` — once per verdict,
+/// i.e. O(N × E) file reads. At ~9.5k evaluation files that quadratic wedged the
+/// coordinator tick for over an hour (engine-eval-verdict). Building the index
+/// once and verifying against it collapses a load to O(E) reads.
+///
+/// Matching is by the record's INTERNAL `id`, not the filename stem: a durable
+/// verdict references its evaluation by id, and a real 2026-07-19 incident
+/// fixture stores that evaluation as `evaluation.json` (stem ≠ id). Only files
+/// whose parsed id is `wanted` are retained, bounding memory to the referenced
+/// set. Per-tick O(new files) comes from the verdict CACHE skipping this scan
+/// entirely while nothing changed — never from guessing ids off filenames.
+struct EvidenceIndex {
+    by_id: HashMap<String, Vec<EvaluationEvidence>>,
 }
 
+impl EvidenceIndex {
+    fn build(dir: &Path, wanted: &HashSet<String>) -> Result<Self> {
+        let directory = dir.join("agency/evaluations");
+        let mut by_id: HashMap<String, Vec<EvaluationEvidence>> = HashMap::new();
+        if directory.exists() {
+            for entry in fs::read_dir(&directory)? {
+                let path = entry?.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let bytes = fs::read(&path)?;
+                let evaluation: Evaluation = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("loading evaluation evidence {}", path.display()))?;
+                if !wanted.contains(&evaluation.id) {
+                    continue;
+                }
+                by_id
+                    .entry(evaluation.id.clone())
+                    .or_default()
+                    .push(EvaluationEvidence { evaluation, bytes });
+            }
+        }
+        Ok(Self { by_id })
+    }
+
+    fn lookup(&self, evaluation_id: &str) -> Result<&EvaluationEvidence> {
+        match self.by_id.get(evaluation_id) {
+            Some(list) if list.len() == 1 => Ok(&list[0]),
+            other => anyhow::bail!(
+                "error[WG-EVAL-VERDICT-EVIDENCE]: evaluation {:?} has {} durable matches",
+                evaluation_id,
+                other.map_or(0, Vec::len)
+            ),
+        }
+    }
+}
+
+/// Load the single durable evaluation whose internal id is `evaluation_id`.
+/// Off the hot path (one call in `write_durable_verdict`); shares the index
+/// builder, keeping only the one wanted record.
+fn load_evaluation_evidence(dir: &Path, evaluation_id: &str) -> Result<EvaluationEvidence> {
+    let wanted: HashSet<String> = std::iter::once(evaluation_id.to_string()).collect();
+    let mut index = EvidenceIndex::build(dir, &wanted)?;
+    index.lookup(evaluation_id)?;
+    Ok(index
+        .by_id
+        .remove(evaluation_id)
+        .and_then(|mut list| list.pop())
+        .expect("lookup verified exactly one match"))
+}
+
+/// Single-verdict verification used off the hot path (e.g. `write_durable_verdict`
+/// replay). Builds a one-id index; the batch loader shares one index across all
+/// verdicts instead of paying this per verdict.
 fn verify_evaluation_digest(dir: &Path, verdict: &DurableEvalVerdict) -> Result<()> {
-    let evidence = load_evaluation_evidence(dir, &verdict.evaluation_id).map_err(|error| {
+    let wanted: HashSet<String> = std::iter::once(verdict.evaluation_id.clone()).collect();
+    let index = EvidenceIndex::build(dir, &wanted)?;
+    verify_evaluation_digest_indexed(&index, verdict)
+}
+
+fn verify_evaluation_digest_indexed(
+    index: &EvidenceIndex,
+    verdict: &DurableEvalVerdict,
+) -> Result<()> {
+    let evidence = index.lookup(&verdict.evaluation_id).map_err(|error| {
         anyhow::anyhow!(
             "error[WG-EVAL-VERDICT-EVIDENCE]: verdict {}: {error:#}",
             verdict.verdict_id
@@ -616,6 +671,8 @@ pub fn load_durable_verdicts(dir: &Path) -> Result<Vec<DurableEvalVerdict>> {
     if !directory.exists() {
         return Ok(Vec::new());
     }
+    // Pass 1: read + integrity-check every verdict record. No evidence yet, so
+    // this is one cheap scan of the (small) verdicts dir.
     let mut verdicts = Vec::new();
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
@@ -637,19 +694,347 @@ pub fn load_durable_verdicts(dir: &Path) -> Result<Vec<DurableEvalVerdict>> {
                 path.display()
             );
         }
-        verify_evaluation_digest(dir, &verdict)?;
         verdicts.push(verdict);
+    }
+    // Pass 2: verify every verdict against durable evidence using ONE shared
+    // index built from a single evaluations-dir scan, reading only the files the
+    // verdicts actually reference. Was O(verdicts × all-evaluations) — the
+    // quadratic that wedged the dispatcher at ~9.5k files (engine-eval-verdict).
+    let wanted: HashSet<String> = verdicts
+        .iter()
+        .map(|verdict| verdict.evaluation_id.clone())
+        .collect();
+    let index = EvidenceIndex::build(dir, &wanted)?;
+    for verdict in &verdicts {
+        verify_evaluation_digest_indexed(&index, verdict)?;
     }
     verdicts.sort_by(|a, b| a.verdict_id.cmp(&b.verdict_id));
     Ok(verdicts)
+}
+
+// ---------------------------------------------------------------------------
+// Incremental evidence loading (engine-eval-verdict)
+//
+// The coordinator tick must never pay O(all-history) to link verdicts. Two
+// dir fingerprints (cheap stat-only listings) let the hot path reuse an
+// already-verified result whenever nothing changed, falling back to a full
+// indexed rescan only on a real change. A full rescan otherwise belongs in the
+// explicit `wg service eval-repair` command, not the tick.
+// ---------------------------------------------------------------------------
+
+const VERDICT_CACHE_SCHEMA: u16 = 1;
+const MIGRATION_MARKER_SCHEMA: u16 = 1;
+
+fn eval_lifecycle_dir(dir: &Path) -> PathBuf {
+    dir.join("agency").join("eval-lifecycle")
+}
+
+fn verdict_cache_path(dir: &Path) -> PathBuf {
+    eval_lifecycle_dir(dir).join("verdicts-cache.json")
+}
+
+fn migration_marker_path(dir: &Path) -> PathBuf {
+    eval_lifecycle_dir(dir).join("migration-marker.json")
+}
+
+fn evaluations_dir(dir: &Path) -> PathBuf {
+    dir.join("agency").join("evaluations")
+}
+
+/// Cheap, read-free fingerprint of a directory: entry count plus the newest
+/// entry mtime plus the directory's own mtime. Detects adds, removals, and
+/// in-place rewrites without reading a single file body, so recomputing it each
+/// tick is O(dir-listing), not O(all-history).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirFingerprint {
+    pub count: u64,
+    pub latest_mtime_ns: u128,
+    pub dir_mtime_ns: u128,
+}
+
+fn metadata_mtime_ns(meta: &fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |delta| delta.as_nanos())
+}
+
+pub fn dir_fingerprint(dir: &Path) -> DirFingerprint {
+    let mut fingerprint = DirFingerprint::default();
+    let Ok(dir_meta) = fs::metadata(dir) else {
+        return fingerprint;
+    };
+    fingerprint.dir_mtime_ns = metadata_mtime_ns(&dir_meta);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return fingerprint;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        fingerprint.count += 1;
+        if let Ok(meta) = entry.metadata() {
+            fingerprint.latest_mtime_ns = fingerprint.latest_mtime_ns.max(metadata_mtime_ns(&meta));
+        }
+    }
+    fingerprint
+}
+
+#[derive(Serialize, Deserialize)]
+struct VerdictCache {
+    schema: u16,
+    verdicts_fp: DirFingerprint,
+    evaluations_fp: DirFingerprint,
+    verdicts: Vec<DurableEvalVerdict>,
+}
+
+fn write_json_best_effort<T: Serialize>(path: &Path, value: &T) {
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, &bytes).is_ok() && fs::rename(&tmp, path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Incremental wrapper over [`load_durable_verdicts`]. Returns the cached,
+/// already-verified verdicts when neither the verdicts dir nor the evaluations
+/// dir has changed since the cache was written, so the hot coordinator tick is
+/// O(dir-listing) instead of O(all-history). Any fingerprint change falls back
+/// to a full indexed load (fail-closed integrity re-runs on every real change)
+/// and refreshes the cache.
+pub fn load_durable_verdicts_cached(dir: &Path) -> Result<Vec<DurableEvalVerdict>> {
+    let verdicts_fp = dir_fingerprint(&verdicts_dir(dir));
+    let evaluations_fp = dir_fingerprint(&evaluations_dir(dir));
+    if let Ok(bytes) = fs::read(verdict_cache_path(dir)) {
+        if let Ok(cache) = serde_json::from_slice::<VerdictCache>(&bytes) {
+            if cache.schema == VERDICT_CACHE_SCHEMA
+                && cache.verdicts_fp == verdicts_fp
+                && cache.evaluations_fp == evaluations_fp
+            {
+                return Ok(cache.verdicts);
+            }
+        }
+    }
+    let verdicts = load_durable_verdicts(dir)?;
+    // Re-fingerprint AFTER the scan so a write that raced our load invalidates
+    // the cache next tick rather than being masked by a pre-scan fingerprint.
+    let cache = VerdictCache {
+        schema: VERDICT_CACHE_SCHEMA,
+        verdicts_fp: dir_fingerprint(&verdicts_dir(dir)),
+        evaluations_fp: dir_fingerprint(&evaluations_dir(dir)),
+        verdicts: verdicts.clone(),
+    };
+    write_json_best_effort(&verdict_cache_path(dir), &cache);
+    Ok(verdicts)
+}
+
+#[derive(Serialize, Deserialize)]
+struct MigrationMarker {
+    schema: u16,
+    evaluations_fp: DirFingerprint,
+    verdicts_fp: DirFingerprint,
+}
+
+/// Outcome of an incremental migration attempt. `scanned` is `false` when the
+/// marker short-circuited the whole scan (the O(new files) fast path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationOutcome {
+    pub migrated: usize,
+    pub scanned: bool,
+}
+
+/// Incremental front door for [`migrate_unambiguous_legacy_verdicts`]. A marker
+/// records the evaluations + verdicts fingerprints at the last completed scan;
+/// while both are unchanged there is provably nothing new to migrate, so the
+/// tick skips the scan entirely. This is the "verified high-water mark" the hot
+/// path relies on to stay O(new files).
+pub fn migrate_unambiguous_legacy_verdicts_incremental(dir: &Path) -> Result<MigrationOutcome> {
+    let evaluations_fp = dir_fingerprint(&evaluations_dir(dir));
+    let verdicts_fp = dir_fingerprint(&verdicts_dir(dir));
+    if let Ok(bytes) = fs::read(migration_marker_path(dir)) {
+        if let Ok(marker) = serde_json::from_slice::<MigrationMarker>(&bytes) {
+            if marker.schema == MIGRATION_MARKER_SCHEMA
+                && marker.evaluations_fp == evaluations_fp
+                && marker.verdicts_fp == verdicts_fp
+            {
+                return Ok(MigrationOutcome {
+                    migrated: 0,
+                    scanned: false,
+                });
+            }
+        }
+    }
+    let migrated = migrate_unambiguous_legacy_verdicts(dir)?;
+    // Capture post-scan fingerprints so a migration that wrote new verdicts does
+    // not immediately re-scan on the next tick.
+    let marker = MigrationMarker {
+        schema: MIGRATION_MARKER_SCHEMA,
+        evaluations_fp: dir_fingerprint(&evaluations_dir(dir)),
+        verdicts_fp: dir_fingerprint(&verdicts_dir(dir)),
+    };
+    write_json_best_effort(&migration_marker_path(dir), &marker);
+    Ok(MigrationOutcome {
+        migrated,
+        scanned: true,
+    })
+}
+
+/// Archive-not-delete retention for `agency/evaluations/`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EvaluationArchiveReport {
+    pub archived: usize,
+    pub kept: usize,
+    pub protected: usize,
+    pub bytes_archived: u64,
+}
+
+/// Cap the evaluations dir at `keep_newest` files (by mtime), moving the rest to
+/// `agency/evaluations-archive/`. Evaluations still referenced by a durable
+/// verdict — or belonging to a task awaiting evaluation — are never archived, so
+/// this can never break `verify_evaluation_digest` or a pending migration.
+/// `keep_newest == 0` disables retention. Archive, never delete: the operator
+/// (or `wg service eval-repair`) can always move files back.
+pub fn archive_stale_evaluations(dir: &Path, keep_newest: usize) -> Result<EvaluationArchiveReport> {
+    let mut report = EvaluationArchiveReport::default();
+    if keep_newest == 0 {
+        return Ok(report);
+    }
+    let evaluations = evaluations_dir(dir);
+    if !evaluations.is_dir() {
+        return Ok(report);
+    }
+
+    let mut entries: Vec<(PathBuf, String, u128)> = Vec::new();
+    for entry in fs::read_dir(&evaluations)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let mtime = entry.metadata().map(|m| metadata_mtime_ns(&m)).unwrap_or(0);
+        entries.push((path, id, mtime));
+    }
+    // Newest first: the first `keep_newest` survive unconditionally.
+    entries.sort_by(|a, b| b.2.cmp(&a.2));
+    if entries.len() <= keep_newest {
+        report.kept = entries.len();
+        return Ok(report);
+    }
+
+    // Protected id set: evaluations referenced by a durable verdict never move.
+    let mut protected: HashSet<String> = HashSet::new();
+    if let Ok(verdicts) = load_durable_verdicts_cached(dir) {
+        for verdict in &verdicts {
+            protected.insert(verdict.evaluation_id.clone());
+        }
+    }
+    // Tasks awaiting evaluation: their candidate evaluations may not yet have a
+    // verdict, so protect by task id too (read only the archive candidates, and
+    // only when such tasks exist — bounded, off the hot tick).
+    let pending_tasks: HashSet<String> = crate::parser::load_graph(&dir.join("graph.jsonl"))
+        .map(|graph| {
+            graph
+                .tasks()
+                .filter(|task| {
+                    matches!(
+                        task.status,
+                        Status::PendingEval | Status::FailedPendingEval
+                    )
+                })
+                .map(|task| task.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let archive_dir = dir.join("agency").join("evaluations-archive");
+    for (index, (path, id, _mtime)) in entries.iter().enumerate() {
+        if index < keep_newest {
+            report.kept += 1;
+            continue;
+        }
+        if protected.contains(id) {
+            report.protected += 1;
+            continue;
+        }
+        if !pending_tasks.is_empty() {
+            if let Ok(bytes) = fs::read(path) {
+                if let Ok(evaluation) = serde_json::from_slice::<Evaluation>(&bytes) {
+                    if pending_tasks.contains(&evaluation.task_id) {
+                        report.protected += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if fs::create_dir_all(&archive_dir).is_err() {
+            continue;
+        }
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if fs::rename(path, archive_dir.join(file_name)).is_ok() {
+            report.archived += 1;
+            report.bytes_archived += size;
+        }
+    }
+    Ok(report)
+}
+
+/// Report from the explicit full-rescan repair path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EvalRepairReport {
+    pub migrated: usize,
+    pub verdicts_loaded: usize,
+}
+
+/// Explicit, operator-invoked full rescan. Clears the incremental cache and
+/// marker, runs a complete migration + verify, then repopulates both so the
+/// next tick is fast again. This is where an O(all-history) pass belongs — never
+/// the hot coordinator tick.
+pub fn repair_eval_verdicts(dir: &Path) -> Result<EvalRepairReport> {
+    let _ = fs::remove_file(verdict_cache_path(dir));
+    let _ = fs::remove_file(migration_marker_path(dir));
+    let migrated = migrate_unambiguous_legacy_verdicts(dir)?;
+    let verdicts = load_durable_verdicts(dir)?;
+    // Repopulate cache + marker for the fast path.
+    let _ = load_durable_verdicts_cached(dir);
+    let _ = migrate_unambiguous_legacy_verdicts_incremental(dir);
+    Ok(EvalRepairReport {
+        migrated,
+        verdicts_loaded: verdicts.len(),
+    })
 }
 
 /// Upgrade an unambiguous pre-schema Evaluation into durable pipeline evidence.
 /// Missing source timestamps and zero/multiple candidates are deliberately left
 /// untouched for operator review; this function never chooses "latest".
 pub fn migrate_unambiguous_legacy_verdicts(dir: &Path) -> Result<usize> {
-    let existing = load_durable_verdicts(dir)?;
+    // Migration only ever produces evidence for sources awaiting evaluation.
+    // Load the (single-file) graph first and bail before touching the durable
+    // verdict store or the evaluations dir when there is nothing pending — the
+    // steady-state common case — so the scan is O(graph), not O(all-history).
     let graph = crate::parser::load_graph(&dir.join("graph.jsonl"))?;
+    let has_pending = graph
+        .tasks()
+        .any(|task| matches!(task.status, Status::PendingEval | Status::FailedPendingEval));
+    if !has_pending {
+        return Ok(0);
+    }
+    let existing = load_durable_verdicts_cached(dir)?;
     let evaluations = crate::agency::load_all_evaluations_or_warn(&dir.join("agency/evaluations"));
     let mut migrated = 0;
 
@@ -1898,6 +2283,255 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("EVIDENCE")
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // engine-eval-verdict: incremental migration/cache, retention, and the
+    // synthetic 10k perf regression. The pre-fix hot path re-scanned EVERY file
+    // in agency/evaluations/ once per durable verdict — O(verdicts × all-history)
+    // — which wedged the coordinator for an hour at ~9.5k files.
+    // -------------------------------------------------------------------------
+
+    fn make_evaluation(id: &str, task_id: &str, score: f64) -> Evaluation {
+        Evaluation {
+            id: id.into(),
+            task_id: task_id.into(),
+            agent_id: "agent".into(),
+            role_id: "role".into(),
+            tradeoff_id: "tradeoff".into(),
+            score,
+            dimensions: std::collections::HashMap::new(),
+            notes: "synthetic".into(),
+            evaluator: "codex:gpt-5.5".into(),
+            timestamp: Utc::now().to_rfc3339(),
+            model: Some("codex:gpt-5.5".into()),
+            source: "llm".into(),
+            loop_iteration: 0,
+        }
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_marker_prevents_rescan_until_dir_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = source();
+        source.status = Status::FailedPendingEval;
+        source.started_at = Some((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        source.evaluation_lifecycle = Some(EvaluationLifecycle::for_source(&source));
+        let satellite = planned_satellite(".evaluate-source", &source);
+        let mut graph = WorkGraph::new();
+        graph.add_node(crate::graph::Node::Task(source.clone()));
+        graph.add_node(crate::graph::Node::Task(satellite));
+        crate::parser::save_graph(&graph, &dir.path().join("graph.jsonl")).unwrap();
+        let evaluation = make_evaluation("legacy-eval-source", &source.id, 0.9);
+        crate::agency::save_evaluation(&evaluation, &dir.path().join("agency/evaluations"))
+            .unwrap();
+
+        // First pass scans and migrates the unambiguous legacy verdict.
+        let first = migrate_unambiguous_legacy_verdicts_incremental(dir.path()).unwrap();
+        assert!(first.scanned);
+        assert_eq!(first.migrated, 1);
+
+        // Nothing changed → the marker short-circuits the whole scan (O(new)).
+        let second = migrate_unambiguous_legacy_verdicts_incremental(dir.path()).unwrap();
+        assert!(!second.scanned, "unchanged dirs must not re-scan");
+        assert_eq!(second.migrated, 0);
+
+        // A new evaluation file changes the fingerprint → the scan resumes.
+        let another = make_evaluation("another-eval", "other-task", 0.5);
+        crate::agency::save_evaluation(&another, &dir.path().join("agency/evaluations")).unwrap();
+        let third = migrate_unambiguous_legacy_verdicts_incremental(dir.path()).unwrap();
+        assert!(third.scanned, "a changed evaluations dir must re-scan");
+    }
+
+    #[test]
+    fn durable_verdict_cache_matches_uncached_and_refreshes_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source();
+        let satellite = planned_satellite(".evaluate-source", &source);
+        let evaluation = make_evaluation("eval-cache", &source.id, 0.9);
+        crate::agency::save_evaluation(&evaluation, &dir.path().join("agency/evaluations"))
+            .unwrap();
+        write_durable_verdict(
+            dir.path(),
+            &source,
+            &satellite,
+            AgencyStage::Evaluate,
+            &evaluation,
+        )
+        .unwrap();
+
+        let uncached = load_durable_verdicts(dir.path()).unwrap();
+        let cached = load_durable_verdicts_cached(dir.path()).unwrap();
+        assert_eq!(uncached, cached, "cache must match a full verified load");
+        assert_eq!(cached.len(), 1);
+        assert!(
+            verdict_cache_path(dir.path()).exists(),
+            "cache file is written on a miss"
+        );
+
+        // A warm hit returns the same already-verified result.
+        assert_eq!(load_durable_verdicts_cached(dir.path()).unwrap(), cached);
+
+        // Adding a second verdict changes the verdicts-dir fingerprint → the
+        // cache refreshes rather than serving a stale set.
+        let flip_eval = make_evaluation("eval-cache-flip", &source.id, 1.0);
+        crate::agency::save_evaluation(&flip_eval, &dir.path().join("agency/evaluations"))
+            .unwrap();
+        let flip_sat = planned_satellite(".flip-source", &source);
+        write_durable_verdict(
+            dir.path(),
+            &source,
+            &flip_sat,
+            AgencyStage::FlipComparison,
+            &flip_eval,
+        )
+        .unwrap();
+        assert_eq!(load_durable_verdicts_cached(dir.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retention_archives_oldest_keeps_newest_and_protects_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let evaluations = dir.path().join("agency/evaluations");
+
+        // A referenced evaluation (given the oldest mtime) — protected because a
+        // durable verdict still needs it, even though it is beyond keep_newest.
+        let source = source();
+        let satellite = planned_satellite(".evaluate-source", &source);
+        let referenced = make_evaluation("eval-referenced", &source.id, 0.9);
+        crate::agency::save_evaluation(&referenced, &evaluations).unwrap();
+        write_durable_verdict(
+            dir.path(),
+            &source,
+            &satellite,
+            AgencyStage::Evaluate,
+            &referenced,
+        )
+        .unwrap();
+        set_mtime(&evaluations.join("eval-referenced.json"), 1_000_000);
+
+        // Four unreferenced evaluations with strictly newer mtimes.
+        for i in 0..4u64 {
+            let ev = make_evaluation(&format!("eval-extra-{i}"), "other", 0.1);
+            crate::agency::save_evaluation(&ev, &evaluations).unwrap();
+            set_mtime(&evaluations.join(format!("eval-extra-{i}.json")), 2_000_000 + i);
+        }
+
+        // 5 files, keep_newest = 1. The newest survives; of the 4 remaining
+        // candidates the 3 unreferenced archive and the referenced-oldest is
+        // protected.
+        let report = archive_stale_evaluations(dir.path(), 1).unwrap();
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.protected, 1);
+        assert_eq!(report.archived, 3);
+        assert!(
+            evaluations.join("eval-referenced.json").exists(),
+            "a verdict-referenced evaluation is never archived"
+        );
+        // Archive-not-delete: the 3 moved files live under evaluations-archive/.
+        let archive = dir.path().join("agency/evaluations-archive");
+        assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 3);
+
+        // keep_newest = 0 disables retention entirely.
+        assert_eq!(archive_stale_evaluations(dir.path(), 0).unwrap().archived, 0);
+    }
+
+    /// Write a valid schema-2 durable verdict directly (bypasses the single-source
+    /// verdict-id collision in `write_durable_verdict`) so many verdicts can point
+    /// at distinct evaluations in the synthetic fixture.
+    fn write_synthetic_verdict(dir: &Path, index: usize, evaluation: &Evaluation) {
+        let eval_path = dir
+            .join("agency/evaluations")
+            .join(format!("{}.json", evaluation.id));
+        let bytes = fs::read(&eval_path).unwrap();
+        let mut verdict = DurableEvalVerdict {
+            schema: EVAL_LIFECYCLE_SCHEMA,
+            verdict_id: format!("verdict-{index:05}"),
+            verdict_digest: String::new(),
+            evaluation_id: evaluation.id.clone(),
+            pipeline_id: format!("pipeline-{index}"),
+            source_task: evaluation.task_id.clone(),
+            source_attempt: 0,
+            stage: AgencyStage::Evaluate,
+            producer_run_id: "run".into(),
+            score: evaluation.score,
+            evaluation_digest_schema: EVALUATION_DIGEST_DURABLE_BYTES_SCHEMA,
+            evaluation_digest: digest_bytes(&bytes),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        verdict.verdict_digest = compute_verdict_digest(&verdict).unwrap();
+        let verdicts = verdicts_dir(dir);
+        fs::create_dir_all(&verdicts).unwrap();
+        fs::write(
+            verdicts.join(format!("{}.json", verdict.verdict_id)),
+            serde_json::to_vec_pretty(&verdict).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn synthetic_10k_evaluations_link_under_budget_and_cache_is_incremental() {
+        let dir = tempfile::tempdir().unwrap();
+        let evaluations = dir.path().join("agency/evaluations");
+        fs::create_dir_all(&evaluations).unwrap();
+        // Empty graph so the incremental migration front door has something to
+        // read (no pending tasks → it early-returns and just writes the marker).
+        crate::parser::save_graph(&WorkGraph::new(), &dir.path().join("graph.jsonl")).unwrap();
+
+        const TOTAL: usize = 10_000;
+        const REFERENCED: usize = 200;
+        for i in 0..TOTAL {
+            let ev = make_evaluation(&format!("eval-{i:05}"), "bulk", 0.5);
+            // Direct write (no per-file fsync) keeps seeding 10k files fast.
+            fs::write(
+                evaluations.join(format!("eval-{i:05}.json")),
+                serde_json::to_vec_pretty(&ev).unwrap(),
+            )
+            .unwrap();
+            if i < REFERENCED {
+                write_synthetic_verdict(dir.path(), i, &ev);
+            }
+        }
+
+        // Cold: full indexed load over a 10k-file evaluations dir. Pre-fix this
+        // was ~200 × 10k ≈ 2M file reads; now it is one dir listing + 200 reads.
+        let cold_start = std::time::Instant::now();
+        let cold = load_durable_verdicts_cached(dir.path()).unwrap();
+        let cold_ms = cold_start.elapsed().as_millis();
+        assert_eq!(cold.len(), REFERENCED);
+
+        // Warm: fingerprints unchanged → served from cache, no evidence scan.
+        let warm_start = std::time::Instant::now();
+        let warm = load_durable_verdicts_cached(dir.path()).unwrap();
+        let warm_ms = warm_start.elapsed().as_millis();
+        assert_eq!(warm, cold);
+
+        // Migration marker: first pass scans, second short-circuits.
+        let first = migrate_unambiguous_legacy_verdicts_incremental(dir.path()).unwrap();
+        let second = migrate_unambiguous_legacy_verdicts_incremental(dir.path()).unwrap();
+        assert!(first.scanned);
+        assert!(!second.scanned, "marker must prevent a re-scan");
+
+        eprintln!(
+            "[engine-eval-verdict] 10k fixture: cold link {cold_ms}ms, warm(cached) link {warm_ms}ms"
+        );
+        // Generous budget: the point is it finishes in well under the 7+ minutes
+        // that wedged the live dispatcher.
+        let budget = std::time::Duration::from_secs(60);
+        assert!(
+            cold_start.elapsed() < budget,
+            "cold link must finish under budget, took {cold_ms}ms"
+        );
+        assert!(
+            warm_ms <= cold_ms,
+            "warm cached link must not be slower than the cold scan"
         );
     }
 }

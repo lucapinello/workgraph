@@ -6319,6 +6319,13 @@ pub enum ServiceCommands {
         model: Option<String>,
     },
 
+    /// Rebuild the eval-verdict incremental cache/marker with a full rescan.
+    ///
+    /// The coordinator tick only ever does incremental (O(new files)) verdict
+    /// work; the O(all-history) rescan lives here. Run this after manually
+    /// editing/restoring the evaluations dir or if verdict linking looks stale.
+    EvalRepair,
+
     /// Create a new chat agent session (legacy alias: create-coordinator)
     #[command(alias = "create-coordinator")]
     CreateChat {
