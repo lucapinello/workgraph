@@ -654,6 +654,18 @@ fn build_compose_prompt(
     agent_id: &str,
     human_message: &str,
 ) -> String {
+    // THREAD CONTEXT (task nora-clarify-engine, fix 2): the gateway forwards the
+    // ORIGINATING pane's recent turns via `WG_THREAD_CONTEXT` so a topic
+    // follow-up ("tell me the calories" right after a pasta-pomodoro nutrition
+    // line) resolves against that thread and is ANSWERED, instead of the composer
+    // treating it as an ambiguous fresh ask and clarifying. Read from env at the
+    // production boundary and threaded into the pure `_at` builder so tests stay
+    // deterministic. Unset (the Telegram listener path, which reads the session
+    // inbox) → `None`, prompt unchanged.
+    let thread = std::env::var("WG_THREAD_CONTEXT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     // Household local time is the existing `chrono::Local` seam (same as the
     // fast lane and task-stamping). Threaded through the `_at` variant so the
     // scope/clock rules are testable with a fixed clock.
@@ -663,6 +675,7 @@ fn build_compose_prompt(
         agent_id,
         human_message,
         chrono::Local::now().naive_local(),
+        thread.as_deref(),
     )
 }
 
@@ -675,6 +688,7 @@ fn build_compose_prompt_at(
     agent_id: &str,
     human_message: &str,
     now: chrono::NaiveDateTime,
+    thread_context: Option<&str>,
 ) -> String {
     let summary = read_session_summary(workgraph_dir, session_ref);
 
@@ -709,6 +723,23 @@ fn build_compose_prompt_at(
     if !history.is_empty() {
         prompt.push_str("Recent conversation:\n");
         prompt.push_str(&history.join("\n"));
+        prompt.push_str("\n\n");
+    }
+    // THREAD CONTEXT (task nora-clarify-engine, fix 2): the recent turns of the
+    // ORIGINATING conversation, forwarded by the gateway. A topic follow-up
+    // ("tell me the calories" right after a pasta-pomodoro nutrition line) is
+    // ambiguous in isolation, so without this the composer asks a clarifying
+    // question; WITH it, the topic is resolvable and the persona answers directly.
+    // The explicit instruction tells the model to treat the new message as a
+    // continuation and NOT clarify when the thread already carries the referent.
+    if let Some(thread) = thread_context.map(str::trim).filter(|t| !t.is_empty()) {
+        prompt.push_str(
+            "Recent messages in this conversation (the message below is very likely a \
+             follow-up to these — resolve any pronoun, \"it\", or omitted topic from here \
+             and answer DIRECTLY; do NOT ask what they mean when the topic is already \
+             clear from these turns):\n",
+        );
+        prompt.push_str(thread);
         prompt.push_str("\n\n");
     }
     prompt.push_str(
@@ -3162,7 +3193,7 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
         let grounded =
-            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now);
+            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now, None);
         assert!(
             grounded.contains("Dentist"),
             "tomorrow's appointment missing from prompt:\n{grounded}"
@@ -3175,13 +3206,13 @@ mod tests {
         assert!(!grounded.contains("Chickpea"), "Mon meal leaked:\n{grounded}");
 
         // A whole-week ask still surfaces the full week's meals.
-        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now);
+        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now, None);
         assert!(week.contains("Baked salmon"));
         assert!(week.contains("Luca PT check-in"));
         assert!(week.to_lowercase().contains("do not stall"));
 
         // Small talk carries no read-shaped WEEK block (no meal dump)...
-        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now);
+        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now, None);
         assert!(!plain.contains("Baked salmon"));
         // ...but it DOES now carry the always-on anti-fabrication calendar-truth
         // line (rule 5, §6.7). Wed 07-15 has no calendar events → the model is
@@ -3199,9 +3230,74 @@ mod tests {
             .unwrap()
             .and_hms_opt(15, 0, 0)
             .unwrap();
-        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon);
+        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon, None);
         assert!(greet.contains("PT check-in"), "real event missing from greeting prompt:\n{greet}");
         assert!(greet.to_lowercase().contains("do not invent"), "{greet}");
+    }
+
+    /// THREAD CONTEXT (task nora-clarify-engine, fix 2): the gateway forwards the
+    /// originating pane's recent turns via `WG_THREAD_CONTEXT`; the composer must
+    /// inject them so a topic follow-up ("tell me the calories" right after a
+    /// pasta-pomodoro nutrition line) is ANSWERED, not clarified. Without the
+    /// context the ambiguous ask stands alone; with it, the referent is in the
+    /// prompt AND the model is explicitly told not to ask what they mean.
+    #[test]
+    fn thread_context_is_injected_so_topic_followups_compose_not_clarify() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        let thread = "You: Tonight is pasta pomodoro — light, about 480 calories a plate.\n\
+                      Human: nice";
+
+        // WITH thread context: the referent ("pasta pomodoro", its calories) is in
+        // the prompt, and the composer is told to resolve the follow-up and NOT
+        // clarify when the topic is already clear.
+        let followup = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "tell me the calories",
+            now,
+            Some(thread),
+        );
+        assert!(
+            followup.contains("pasta pomodoro"),
+            "thread context (the referent) missing from the compose prompt:\n{followup}"
+        );
+        assert!(
+            followup.to_lowercase().contains("follow-up")
+                && followup.to_lowercase().contains("do not ask what they mean"),
+            "compose-not-clarify instruction missing from the prompt:\n{followup}"
+        );
+
+        // WITHOUT thread context: the same ambiguous ask carries no referent and
+        // no follow-up instruction — this is exactly the state that made the engine
+        // clarify instead of answer.
+        let bare = build_compose_prompt_at(&wg, &uuid, "otto", "tell me the calories", now, None);
+        assert!(!bare.contains("pasta pomodoro"), "referent leaked without a thread:\n{bare}");
+        assert!(
+            !bare.to_lowercase().contains("do not ask what they mean"),
+            "follow-up instruction present without a thread:\n{bare}"
+        );
+
+        // An empty/whitespace thread is treated as absent (no stray block).
+        let blank = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "tell me the calories",
+            now,
+            Some("   "),
+        );
+        assert!(!blank.to_lowercase().contains("do not ask what they mean"), "{blank}");
     }
 
     /// RULE 3 (corrections stick): "Nadin is not logged so ignore this" is

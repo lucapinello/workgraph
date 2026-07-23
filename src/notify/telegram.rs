@@ -170,6 +170,18 @@ pub fn group_chat_id_warning(bot_id: &str, chat_id: &str) -> Option<String> {
     }
 }
 
+/// True when `chat_id` is a Telegram **1:1 DM** target — a positive user id.
+///
+/// Per the Bot API, group / supergroup / channel ids are negative (supergroups
+/// begin `-100…`); a private chat id is the positive user id. An empty string or
+/// a non-numeric `@channelusername` is neither a DM nor the footgun. This is the
+/// predicate behind [`group_chat_id_warning`], exposed so routing code (e.g. the
+/// clarify emission) can REFUSE to target a bare human DM and fall back to the
+/// family group instead. See task `nora-clarify-engine` / docs/05 §5.4.
+pub fn is_dm_chat_id(chat_id: &str) -> bool {
+    matches!(chat_id.trim().parse::<i64>(), Ok(n) if n > 0)
+}
+
 /// Emit [`group_chat_id_warning`] to stderr for every configured bot at
 /// listener/gateway start, so a misrouting `chat_id` is caught LOUDLY on boot
 /// rather than discovered when the family never gets a relayed message. Returns

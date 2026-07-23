@@ -2173,6 +2173,46 @@ fn resolve_group_chat_id(config: &TelegramConfig, chat_id_override: Option<&str>
         .find(|c| !c.trim().is_empty())
 }
 
+/// The chat a clarify window must reopen against: the ORIGINATING conversation
+/// (the family-group `target` the gateway forwarded / a web pane maps to), and
+/// NEVER a bare 1:1 DM id.
+///
+/// The live regression (task `nora-clarify-engine`): the engine wrote a clarify
+/// to `.casa/clarify.jsonl` keyed by Luca's positive DM id (8905220378), so a
+/// bare "yes" would only continue in his private chat — the family group that
+/// asked never saw the follow-up, and only the gateway watchdog rescued it from
+/// silence. Commit 313c6a6f already WARNS on a DM chat_id (D20); this makes the
+/// behaviour safe: honour the passed group `target`, but if it is a positive DM
+/// id fall back to the first configured family-group chat id (negative), and
+/// only when nothing configures a group at all do we keep the target best-effort.
+fn clarify_target(target: &str, config: &TelegramConfig) -> String {
+    use worksgood::notify::telegram::is_dm_chat_id;
+    if !is_dm_chat_id(target) {
+        // Group / supergroup / channel / @username — the expected clarify target.
+        return target.to_string();
+    }
+    // `target` is a 1:1 DM id — reopen the clarify in the family group instead.
+    let group = config
+        .all_bots()
+        .into_iter()
+        .map(|(_, b)| b.chat_id)
+        .find(|c| !c.trim().is_empty() && !is_dm_chat_id(c))
+        .or_else(|| {
+            let c = config.chat_id.trim().to_string();
+            (!c.is_empty() && !is_dm_chat_id(&c)).then_some(c)
+        });
+    match group {
+        Some(g) => {
+            eprintln!(
+                "⚠️  clarify target {target} is a 1:1 DM (D20) — reopening the clarify \
+                 window in the family group {g} instead of the human's private chat"
+            );
+            g
+        }
+        None => target.to_string(),
+    }
+}
+
 /// `wg telegram route` — show how a group message would be routed to a family
 /// voice, without sending anything.
 ///
@@ -3376,10 +3416,16 @@ pub fn run_web_inbound(
     let clarify_root = project_root(workgraph_dir);
     let clarify_now = chrono::Utc::now().timestamp();
     let clarify_window = ownership::ClarifyLedger::window_secs();
+    // The clarify window must reopen against the ORIGINATING conversation (the
+    // family group), never a bare 1:1 DM id — otherwise a bare "yes" only
+    // continues in one human's private chat and the group that asked is stranded
+    // (task nora-clarify-engine). Sanitised once here and used for BOTH the
+    // pending-lookup and the ledger open below so the fingerprint chat matches.
+    let clarify_chat = clarify_target(&target, &config);
     let mut clarify_continued_body: Option<String> = None;
     if let Some(ex) = ownership::clarify_continuation(
         &clarify_root,
-        &target,
+        &clarify_chat,
         &auth_sender,
         message,
         clarify_now,
@@ -3450,6 +3496,11 @@ pub fn run_web_inbound(
                 "sender": sender,
                 "auth_sender": auth_sender,
                 "target": target,
+                // The chat a clarify window would reopen against — the family
+                // group, never a bare 1:1 DM id (task nora-clarify-engine). Exposed
+                // credential-free so the DM-guard is provable through the real
+                // binary without a live compose (which the dry-run seam skips).
+                "clarify_target": clarify_chat,
                 "who": who,
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
@@ -3613,7 +3664,7 @@ pub fn run_web_inbound(
                         .unwrap_or_else(|| bot.bot_id.clone());
                     if let Err(e) = ownership::ClarifyLedger::open(
                         &clarify_root,
-                        &target,
+                        &clarify_chat,
                         &auth_sender,
                         &voice,
                         body,
@@ -6848,6 +6899,58 @@ mod tests {
             bots: HashMap::new(),
         };
         assert_eq!(resolve_group_chat_id(&empty, None), None);
+    }
+
+    #[test]
+    fn clarify_target_reroutes_a_dm_id_to_the_family_group() {
+        // THE LIVE REGRESSION (task nora-clarify-engine): the engine opened a
+        // clarify window keyed by Luca's positive DM id (8905220378), so a bare
+        // "yes" would only continue in his private chat and the family GROUP that
+        // asked was stranded. A clarify must reopen against the originating group.
+        let mut bots = HashMap::new();
+        bots.insert(
+            "nora".to_string(),
+            TelegramBotConfig {
+                bot_token: "111:AAA".to_string(),
+                chat_id: "-1001112223334".to_string(),
+                agent_id: Some("nora".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        // A positive DM id (Luca's) is REFUSED and rerouted to the negative group.
+        assert_eq!(clarify_target("8905220378", &config), "-1001112223334");
+        // A group/supergroup id is honoured verbatim (the gateway-forwarded target).
+        assert_eq!(clarify_target("-1001112223334", &config), "-1001112223334");
+        // A different explicit group target is also honoured, not overwritten.
+        assert_eq!(clarify_target("-100999", &config), "-100999");
+    }
+
+    #[test]
+    fn clarify_target_falls_back_to_legacy_group_then_best_effort() {
+        // No bots map, but a negative legacy top-level group is configured: a DM
+        // target still reroutes to it.
+        let legacy = TelegramConfig {
+            bot_token: "123:ABC".to_string(),
+            chat_id: "-100555".to_string(),
+            bots: HashMap::new(),
+        };
+        assert_eq!(clarify_target("8905220378", &legacy), "-100555");
+
+        // Nothing configures ANY group (only DM-shaped ids anywhere) → keep the
+        // target best-effort rather than dropping the clarify entirely. This is
+        // the residual D20 footgun the boot-time warning already flags loudly.
+        let no_group = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: "42".to_string(),
+            bots: HashMap::new(),
+        };
+        assert_eq!(clarify_target("8905220378", &no_group), "8905220378");
     }
 
     #[test]
