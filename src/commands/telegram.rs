@@ -3344,6 +3344,32 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 /// itself sends into the group.
 ///
 /// [`SilenceReason::BotSender`]: worksgood::notify::telegram_group::SilenceReason
+///
+/// The idempotency key for a web-inbound single-voice turn — UNIQUE per message,
+/// STABLE on a genuine re-fire.
+///
+/// `run_composed_turn`'s "one reply per turn" guard keys "already answered" on the
+/// `request_id` (an outbox entry under that id ⇒ skip compose+send). A request_id that
+/// is CONSTANT per `(chat, bot)` — as the old `web-{chat}-{bot}` was — makes the SECOND
+/// named ask to this voice in this chat match the FIRST turn's outbox entry and
+/// short-circuit to `Replied` while composing, sending, and mirroring NOTHING. That is
+/// the exact 17:03 lie (task live-compose-reliability): the engine logged
+/// "single voice (nora) answered [replied]" yet the pane got silence, because the guard
+/// treated a brand-new question as a duplicate of an earlier one.
+///
+/// Folding a stable content hash of the message body into the id fixes both directions:
+/// a genuine re-fire (identical body — a listener re-poll, a gateway retry, a
+/// restart-replay) still collides and dedupes, while a NEW question gets a NEW id and is
+/// actually answered. `DefaultHasher` is fixed-key SipHash (deterministic across runs —
+/// the same convention `casa_feed`/`reminder` use), so the dedupe survives a restart.
+fn web_inbound_request_id(reply_chat: &str, bot_id: &str, body: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    body.trim().hash(&mut h);
+    format!("web-{}-{}-{:016x}", reply_chat, bot_id, h.finish())
+}
+
 /// Pick the `(bot_id, chat)` a fast-lane confirmation should go out as: the
 /// elected single voice when the ask elected one (so a food edit confirms in the
 /// chef's voice, a workout edit in the coach's), else the first configured bot in
@@ -3636,7 +3662,7 @@ pub fn run_web_inbound(
                     feed_path.clone(),
                     config.clone(),
                 );
-                let request_id = format!("web-{}-{}", reply_chat, bot.bot_id);
+                let request_id = web_inbound_request_id(reply_chat, &bot.bot_id, body);
                 let timing = convo::AckTiming::from_env();
                 let wg_config = worksgood::config::Config::load_merged(workgraph_dir).ok();
                 let composer = wg_config.map(convo::OneshotComposer::from_config);
@@ -6899,6 +6925,39 @@ mod tests {
             bots: HashMap::new(),
         };
         assert_eq!(resolve_group_chat_id(&empty, None), None);
+    }
+
+    #[test]
+    fn web_inbound_request_id_is_unique_per_message_stable_on_refire() {
+        // THE 17:03 LIE (task live-compose-reliability): the id was CONSTANT per
+        // (chat, bot), so the idempotency guard treated the SECOND named ask to Nora
+        // as a duplicate of the first and returned `[replied]` while sending nothing.
+        let a = web_inbound_request_id("-100777", "nora", "what's for dinner Monday?");
+        let b = web_inbound_request_id("-100777", "nora", "and what about Tuesday?");
+        assert_ne!(
+            a, b,
+            "two DIFFERENT questions to the same voice must get DIFFERENT ids (else the 2nd is silently deduped)"
+        );
+
+        // A genuine re-fire — the SAME body (a listener re-poll / gateway retry /
+        // restart-replay) — must still collide so the double-post guard holds.
+        let a_again = web_inbound_request_id("-100777", "nora", "what's for dinner Monday?");
+        assert_eq!(a, a_again, "an identical re-fire must dedupe to the SAME id");
+
+        // Whitespace-only differences are a re-fire, not a new turn (body is trimmed).
+        assert_eq!(
+            web_inbound_request_id("-100777", "nora", "  what's for dinner Monday?  "),
+            a,
+            "leading/trailing whitespace must not defeat the re-fire dedupe",
+        );
+
+        // Distinct chat or bot ⇒ distinct id (a shared body across voices/chats is
+        // still separate turns).
+        assert_ne!(a, web_inbound_request_id("-100888", "nora", "what's for dinner Monday?"));
+        assert_ne!(a, web_inbound_request_id("-100777", "bruno", "what's for dinner Monday?"));
+
+        // The id keeps its stable, greppable prefix for log correlation.
+        assert!(a.starts_with("web--100777-nora-"), "unexpected id shape: {a}");
     }
 
     #[test]
