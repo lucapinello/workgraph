@@ -30,7 +30,7 @@ use worksgood::notify::telegram::{TelegramBotConfig, TelegramConfig};
 /// Slugify a display name into a board/agent-id-safe handle.
 ///
 /// Lowercases, replaces any run of non-alphanumeric characters with a single
-/// `-`, and trims leading/trailing `-`. "Nadin O'Brien" → "nadin-o-brien".
+/// `-`, and trims leading/trailing `-`. "Alex O'Brien" → "alex-o-brien".
 fn slugify(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut prev_dash = false;

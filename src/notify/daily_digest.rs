@@ -104,7 +104,7 @@ pub struct Nudge {
     /// Stable de-dupe key (caller-supplied; e.g. a reminder id). The pacing store
     /// never fires or queues the same id twice.
     pub id: String,
-    /// Display name of the human to reach, e.g. `"Luca"`.
+    /// Display name of the human to reach, e.g. `"Alex"`.
     pub recipient: String,
     /// Which sender produced it.
     pub kind: NudgeKind,

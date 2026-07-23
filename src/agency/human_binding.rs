@@ -13,9 +13,9 @@
 //! ```yaml
 //! bindings:
 //!   - telegram_user: "78901234"
-//!     agent_id: human-nadin
-//!     name: Nadin
-//!     bot_id: nadin
+//!     agent_id: human-alex
+//!     name: Alex
+//!     bot_id: alex
 //!     confirmed: true
 //!     created_at: "2026-07-10T12:00:00Z"
 //!     confirmed_at: "2026-07-10T12:03:11Z"
@@ -114,8 +114,8 @@ pub fn is_numeric_id(s: &str) -> bool {
 ///
 /// A numeric id (`78901234`) is kept verbatim — it is the stable, spoof-proof
 /// authorization identity. Anything else is treated as a username handle: the
-/// leading `@` (if any) is stripped and it is lowercased, so `@Nadin`, `Nadin`
-/// and `nadin` all normalize to `nadin` and match the listener's lowercased
+/// leading `@` (if any) is stripped and it is lowercased, so `@Alex`, `Alex`
+/// and `alex` all normalize to `alex` and match the listener's lowercased
 /// `from.username`.
 pub fn normalize_identity(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -193,7 +193,7 @@ impl TelegramBindingMap {
     }
 
     /// Find a binding by human display `name`, case-insensitively — how the
-    /// reminder engine resolves a plan row's recipient ("Luca") to the chat/bot
+    /// reminder engine resolves a plan row's recipient ("Alex") to the chat/bot
     /// that reaches them.
     pub fn find_by_name_ci(&self, name: &str) -> Option<&TelegramBinding> {
         self.bindings

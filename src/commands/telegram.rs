@@ -3233,17 +3233,17 @@ impl worksgood::notify::telegram_conversation::ReplySink for FeedMirrorSink {
 /// Resolve a WEB session sender to a confirmed human's binding key.
 ///
 /// A message typed in the kiosk pane carries a web identity — a `humanId` from
-/// `GET /auth/me` (e.g. `luca`) or, pre-`web-identity-sign`, the household
-/// default display name (`Luca`). The conversation composer downstream
+/// `GET /auth/me` (e.g. `alex`) or, pre-`web-identity-sign`, the household
+/// default display name (`Alex`). The conversation composer downstream
 /// (`sender_is_confirmed` → `find_by_user`) matches the binding's stored
 /// `telegram_user` **verbatim** (a numeric Telegram id for Casa Pinello), so a
-/// bare `luca`/`Luca` would never resolve as a confirmed human and every voice
+/// bare `alex`/`Alex` would never resolve as a confirmed human and every voice
 /// would answer with the onboarding line instead of a grounded reply.
 ///
 /// So we resolve here, mirroring `resolve_auth_sender`'s boundary role for the
 /// Telegram path: first the direct identity match (numeric id or `@handle`),
 /// then a web-friendly match on the binding's display `name` or its agency
-/// `agent_id` (`human-luca`). We return the binding's `telegram_user` so the
+/// `agent_id` (`human-alex`). We return the binding's `telegram_user` so the
 /// verbatim downstream lookup recognizes the confirmed human. An unresolved
 /// sender falls back to its raw form (handled exactly as an unbound human —
 /// the onboarding line, never a crash).
@@ -3278,7 +3278,7 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 /// The live gap this closes: the kiosk send box only RELAYED a line into the
 /// family Telegram group via a bot, and Telegram bots never see other bots'
 /// messages — so the listener's election/conversation pipeline NEVER ran on a
-/// kiosk-typed message. It was posted (`💬 Luca (kiosk): …`) and never answered,
+/// kiosk-typed message. It was posted (`💬 Alex (kiosk): …`) and never answered,
 /// while the same words typed on a phone got four replies.
 ///
 /// This command runs the SAME pipeline the listener runs on a group message,

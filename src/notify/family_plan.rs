@@ -56,7 +56,7 @@ pub struct ShoppingSection {
 ///
 /// The calendar merges cook slots, sessions, and standing events — and, crucially
 /// for the reminder engine, any **reminder rows** the family drafts, e.g.
-/// `| Tue 07-14 | 19:30 | ⏰ Reminder: Luca PT check-in (if unanswered) | Otto |`.
+/// `| Tue 07-14 | 19:30 | ⏰ Reminder: Alex PT check-in (if unanswered) | Otto |`.
 /// The engine ([`crate::notify::reminder`]) reads these rows and fires the ones
 /// shaped like reminders at their `date`+`time`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +69,7 @@ pub struct CalendarEvent {
     /// Clock time as written in the Time column, e.g. `"19:30"` (may be empty).
     pub time: String,
     /// The Event column text, emoji kept, markdown stripped, e.g.
-    /// `"⏰ Reminder: Luca PT check-in (if unanswered)"`.
+    /// `"⏰ Reminder: Alex PT check-in (if unanswered)"`.
     pub event: String,
     /// The Source column, e.g. `"Otto"` — which voice owns the row.
     pub source: String,
@@ -78,7 +78,7 @@ pub struct CalendarEvent {
 /// One workout session from a person's workout table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkoutDay {
-    /// The person the block belongs to, e.g. `"Luca"`, `"Nadin"`.
+    /// The person the block belongs to, e.g. `"Alex"`, `"Sam"`.
     pub person: String,
     /// Three-letter weekday, e.g. `"Mon"`.
     pub weekday: String,
@@ -182,7 +182,7 @@ impl PlanDoc {
                         items: Vec::new(),
                     }),
                     Section::Workouts => {
-                        // "Luca — strength focus (…)" → person = "Luca".
+                        // "Alex — strength focus (…)" → person = "Alex".
                         let person = h3
                             .split(['—', '-'])
                             .next()

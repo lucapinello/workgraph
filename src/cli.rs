@@ -5413,7 +5413,7 @@ pub enum HumanCommands {
     /// Telegram binding, then DM a "reply YES to join" handshake (or print the
     /// manual step when no bot is configured).
     Add {
-        /// Display name of the human (e.g. "Nadin").
+        /// Display name of the human (e.g. "Alex").
         name: String,
 
         /// Telegram user id (numeric) or @handle to bind and DM.
@@ -7085,7 +7085,7 @@ pub enum TelegramCommands {
     /// listener's bot-loop guard, so the group mirror is never double-answered.
     WebInbound {
         /// The web session's human identity — a `humanId` from `GET /auth/me`
-        /// (e.g. `luca`), or the household default display name (`Luca`) while
+        /// (e.g. `alex`), or the household default display name (`Alex`) while
         /// `web-identity-sign` is unmerged. Resolved to the confirmed human's
         /// binding so the composer answers grounded.
         #[arg(long)]

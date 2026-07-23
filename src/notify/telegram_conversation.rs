@@ -209,7 +209,7 @@ pub fn ack_line() -> String {
 ///
 /// A prebuilt binary must never leak the DEVELOPER's name to a *different*
 /// family: the onboarding line greets any stranger pre-sign-in, so a baked-in
-/// "Ask Luca…" is shown to households that have never heard of Luca. This is the
+/// "Ask <the developer>…" is shown to households that have never heard of them. This is the
 /// engine-side twin of the app's no-hardcoded-names guard. We return the first
 /// CONFIRMED member's name (author order in the binding map) so the line names a
 /// real person who can actually add them; `None` when the roster is empty or
@@ -358,7 +358,7 @@ pub fn sender_is_confirmed(workgraph_dir: &Path, sender: &str) -> bool {
 }
 
 /// The human's display name for this Telegram `sender`, from the binding map
-/// (e.g. `"Luca"`), or empty when the sender resolves to no known name. Used to
+/// (e.g. `"Alex"`), or empty when the sender resolves to no known name. Used to
 /// stamp a conversationally-created task's origin and to answer that person's
 /// "are they done yet?".
 fn requester_display_name(workgraph_dir: &Path, sender: &str) -> String {
@@ -3353,7 +3353,7 @@ mod tests {
 
     /// D17 — the prebuilt binary must NOT bake a developer's name into the
     /// stranger-onboarding line. With no roster the line names "a family member"
-    /// (neutral), never "Luca"; given a real member it names THAT person.
+    /// (neutral), never a hardcoded developer name; given a real member it names THAT person.
     #[test]
     fn onboarding_line_never_hardcodes_a_developer_name() {
         // Neutral fallback: no inviter known.

@@ -5,10 +5,10 @@
 //! # What fires
 //!
 //! One source: a `## 3. Calendar` row shaped like an errand, e.g.
-//! `| Sat 07-18 | 09:00 | 🛒 Market run (Luca) — fresh fish + produce | Otto (§4) |`.
+//! `| Sat 07-18 | 09:00 | 🛒 Market run (Alex) — fresh fish + produce | Otto (§4) |`.
 //! [`ErrandReminder::from_calendar_event`] recognises the `🛒` / `market run` /
 //! `errand` shape, pulls out the **runner** (the first known family member named
-//! in the row — the plan literally writes `Market run (Luca)`), the owning voice
+//! in the row — the plan literally writes `Market run (Alex)`), the owning voice
 //! (the Source column), and the errand's wall-clock time. The nudge is scheduled
 //! for the errand time **minus a small lead** ([`resolve_lead`], default 15 min,
 //! overridable via `CASA_ERRAND_LEAD_MIN`) so the runner sees it before leaving.
@@ -124,7 +124,7 @@ pub struct ErrandReminder {
     pub errand_at: NaiveDateTime,
     /// When to nudge: `errand_at` minus the configured lead, e.g. Sat 08:45.
     pub due: NaiveDateTime,
-    /// Display name of the runner to DM, e.g. `"Luca"`. Empty when the row named
+    /// Display name of the runner to DM, e.g. `"Alex"`. Empty when the row named
     /// no known member (the caller then falls back to the group).
     pub recipient: String,
     /// The voice/bot that owns and sends the nudge, e.g. `"otto"`.
@@ -413,12 +413,12 @@ fn clean_store(store: &str) -> String {
 }
 
 /// Clean an errand Event cell into a short label: strip the leading `🛒`, then
-/// keep the text up to the first `(` or em/en-dash (`"🛒 Market run (Luca) —
+/// keep the text up to the first `(` or em/en-dash (`"🛒 Market run (Alex) —
 /// fresh fish"` → `"Market run"`). Deterministic — feeds the stable id hash.
 fn clean_errand_label(event: &str) -> String {
     let mut s = event.trim();
     s = s.trim_start_matches(CART).trim();
-    // Cut at the first parenthesis or dash so "(Luca) — fresh fish" drops off.
+    // Cut at the first parenthesis or dash so "(Alex) — fresh fish" drops off.
     let cut = s
         .find('(')
         .into_iter()
