@@ -741,11 +741,44 @@ fn build_compose_prompt_at(
         );
         prompt.push_str(thread);
         prompt.push_str("\n\n");
+        // RECENCY DISCIPLINE (task owner-pin-engine, spec item 3): the window
+        // above can carry STALE unanswered asks from hours ago (e.g. an old
+        // "how many calories in the pasta?") alongside the LIVE referent (the
+        // duck-breast exchange seconds ago). The 17:5x repro answered pasta
+        // first and buried the duck. So: the MOST RECENT exchange is THE
+        // referent — lead with it and answer it first and primarily. An older
+        // unanswered ask may be closed AFTERWARD, but only if explicitly marked
+        // as such ("and to close the loop on the earlier pasta question: …") —
+        // never led with, never blended so the family can't tell which dish a
+        // number belongs to.
+        prompt.push_str(
+            "IMPORTANT — the LAST message in that list is the live topic. The new message \
+             below refers to the MOST RECENT exchange, so answer THAT first and primarily. \
+             If an OLDER, still-unanswered question is in the list, only address it AFTER \
+             you've fully answered the recent one, and clearly label it as the older topic \
+             (e.g. \"and to close the loop on the earlier <dish> question: …\"). Never lead \
+             with the older topic, and never blend two dishes' numbers together so it's \
+             unclear which is which.\n\n",
+        );
     }
     prompt.push_str(
         "Reply to the message below in a natural, friendly way. Keep it short and \
          conversational. Talk like a person texting family — no jargon, no task ids, no \
          status dumps, no markdown headings. Just answer.\n\n",
+    );
+    // FIRST-PERSON, NO-DEFERRAL (task owner-pin-engine): the delivering voice IS
+    // this persona — so answer as yourself and finish the thought. The 17:5x
+    // repro had the answer land, then dangle "…let me get Nora's exact take"
+    // (from Nora herself) — a third-person self-reference AND a fresh promise to
+    // no one. This instruction closes it at generation time; the `enforce_no_
+    // deferral` guard strips any tail that slips through.
+    prompt.push_str(
+        "You ARE this person — answer fully in the first person, as yourself. Never refer \
+         to yourself in the third person or talk about yourself as if you were another \
+         member of the team. You are the one delivering this answer, so give it and stop: \
+         do NOT end with a fresh promise to \"get back to you\", \"get someone's exact \
+         take\", \"check with\" anyone, or \"circle back\" — if you know the answer, say \
+         it now; there is no one else to defer to.\n\n",
     );
     prompt.push_str(
         "If the message is asking the family to actually DO something (change the week, \
@@ -1442,6 +1475,26 @@ async fn finalize_composed_reply(
         && !grounding::is_deliberation_request(human_message)
     {
         reply_text = grounding::enforce_answer_shape(&reply_text, false);
+    }
+
+    // NO DANGLING-PROMISE TAIL (rule 6, task owner-pin-engine): a DELIVERED
+    // answer must not end on a fresh "let me get X's exact take / I'll get back
+    // to you / let me check with <someone>" deferral. The 17:5x repro: the
+    // pinned persona (Nora) acked "on it", the compose delivered the calorie
+    // answer, then tacked on "…let me get Nora's exact take" — a new promise
+    // that dangles forever. Runs on EVERY reply, like the anti-fabrication guard
+    // (a deferral tail is volunteered, not tied to the ask shape), and strips
+    // ONLY the trailing deferral clause, never emptying the reply. The persona
+    // IS the delivering voice; there is no one to defer to.
+    {
+        let deferred = grounding::enforce_no_deferral(&reply_text);
+        if deferred != reply_text {
+            eprintln!(
+                "[{}] deferral guard: stripped a dangling-promise tail from {agent_id}'s draft",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+            reply_text = deferred;
+        }
     }
 
     // ANTI-FABRICATION GUARD (rule 5, docs/20 §6.7): a composed reply must NEVER
@@ -3298,6 +3351,59 @@ mod tests {
             Some("   "),
         );
         assert!(!blank.to_lowercase().contains("do not ask what they mean"), "{blank}");
+    }
+
+    /// RECENCY DISCIPLINE (task owner-pin-engine, spec item 3): when the thread
+    /// window carries a STALE unanswered ask ("how many calories in the pasta?")
+    /// alongside a FRESH referent (a duck-breast exchange seconds ago), the
+    /// compose prompt must instruct the model to lead with the MOST RECENT topic
+    /// and only close the older loop afterward, explicitly labelled. The 17:5x
+    /// repro ("I asked duck but I got pasta calories?") buried the live duck
+    /// under the stale pasta ask.
+    #[test]
+    fn thread_context_enforces_recency_leads_with_fresh_referent() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "nora", &uuid).unwrap();
+
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 23)
+            .unwrap()
+            .and_hms_opt(17, 55, 0)
+            .unwrap();
+
+        // The window: a STALE pasta-calories ask from hours ago, then a FRESH
+        // duck-breast exchange seconds before the new "tell me the calories".
+        let thread = "Human: how many calories in the pasta pomodoro?\n\
+                      You: Tonight is duck breast with roast potatoes.\n\
+                      Human: sounds great";
+
+        let followup = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "nora",
+            "tell me the calories",
+            now,
+            Some(thread),
+        );
+
+        // The recency instruction is present: lead with the most recent, close
+        // older loops only afterward and explicitly labelled.
+        let lower = followup.to_lowercase();
+        assert!(
+            lower.contains("most recent") && lower.contains("answer that first"),
+            "recency (lead-with-fresh) instruction missing from the prompt:\n{followup}"
+        );
+        assert!(
+            lower.contains("close the loop on the earlier"),
+            "explicit older-loop labelling instruction missing:\n{followup}"
+        );
+        // The instruction must land AFTER the raw thread block (the model reads
+        // the discipline after seeing the turns it applies to).
+        let thread_pos = followup.find("duck breast").expect("thread block present");
+        let recency_pos = followup.find("the LAST message in that list").expect("recency instr present");
+        assert!(recency_pos > thread_pos, "recency instruction placed before the thread block:\n{followup}");
     }
 
     /// RULE 3 (corrections stick): "Nadin is not logged so ignore this" is

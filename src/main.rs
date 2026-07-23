@@ -4007,15 +4007,29 @@ fn main() -> Result<()> {
                 sender,
                 message,
                 chat_id,
+                owner,
                 dry_run,
-            } => commands::telegram::run_web_inbound(
-                &workgraph_dir,
-                &sender,
-                &message,
-                chat_id.as_deref(),
-                dry_run,
-                cli.json,
-            ),
+            } => {
+                // The pin arrives as the `--owner` flag OR, from the gateway's
+                // shell-out, the `WG_OWNER_PIN` env var (task owner-pin-engine).
+                // The env var is the forward-compatible transport (an older
+                // binary ignores it rather than erroring on an unknown flag);
+                // an explicit flag wins for the CLI/dry-run proof.
+                let owner_pin = owner.filter(|s| !s.trim().is_empty()).or_else(|| {
+                    std::env::var("WG_OWNER_PIN")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                });
+                commands::telegram::run_web_inbound(
+                    &workgraph_dir,
+                    &sender,
+                    &message,
+                    chat_id.as_deref(),
+                    owner_pin.as_deref(),
+                    dry_run,
+                    cli.json,
+                )
+            }
             TelegramCommands::PhotoPlan {
                 update,
                 reply,

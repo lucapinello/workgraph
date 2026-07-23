@@ -7100,6 +7100,18 @@ pub enum TelegramCommands {
         #[arg(long)]
         chat_id: Option<String>,
 
+        /// Pin the DELIVERING voice to this persona (agent/bot id, e.g. `nora`)
+        /// for a domain-owned heavy turn (task `owner-pin-engine`). When the
+        /// gateway resolves a domain owner and drops that persona's crisp ack,
+        /// it forwards the same id here so the async reply comes back in the
+        /// SAME voice — not a re-election winner. The gateway forwards it via
+        /// the `WG_OWNER_PIN` env var (forward-compatible: an older binary that
+        /// hasn't learned this flag simply ignores the env var); this flag is
+        /// the explicit CLI twin for the scratch-project/dry-run proof. Omitted
+        /// / `otto` / an unknown persona → elect as today.
+        #[arg(long)]
+        owner: Option<String>,
+
         /// Run the real election + planning and report who WOULD answer, but
         /// send nothing (credential-free scripted-test seam, like
         /// `wg telegram elect` / `discuss`).

@@ -509,6 +509,138 @@ pub fn enforce_answer_shape(reply: &str, allow_question: bool) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Rule 6 — no dangling-promise deferral tails on a DELIVERED answer
+// ---------------------------------------------------------------------------
+
+/// Deferral phrases that turn a DELIVERED answer into a fresh dangling promise.
+///
+/// The 17:5x repro (task owner-pin-engine): Nora acked "on it", the compose
+/// delivered the calorie answer — and then tacked on "…let me get Nora's exact
+/// take". On a delivered turn there is no one left to defer to: the persona IS
+/// the voice and already answered, so a trailing clause opening with one of
+/// these is a new promise that will never be kept. Matched as substrings against
+/// the NORMALISED trailing clause (apostrophe-free — see [`normalize`] — so
+/// "I'll" -> "ill", "Nora's" -> "noras"). Kept SPECIFIC (multi-word, never a bare
+/// "let me get") so a legitimate action-ack ("on it, I'll change the week") is
+/// never mistaken for a deferral.
+const DEFERRAL_MARKERS: &[&str] = &[
+    "get back to you",
+    "getting back to you",
+    "get back to u",
+    "circle back",
+    "ill follow up",
+    "follow up with you",
+    "ill loop in",
+    "let me check with",
+    "let me confirm with",
+    "let me double check with",
+    "let me verify with",
+    "let me ask nora",
+    "let me get the exact",
+    "let me get you the exact",
+    "let me get an exact",
+    "let me get their exact",
+    "let me get her exact",
+    "let me get his exact",
+    "let me pull the exact",
+    "let me pull her exact",
+    "let me pull their exact",
+    "let me find out",
+    "let me confirm the exact",
+    "exact take",
+    "get their exact",
+    "get her exact",
+    "get his exact",
+    "ill get you the exact",
+    "ill get the exact",
+    "ill get their exact",
+    "ill get her exact",
+    "ill get his exact",
+    "ill get back to you",
+    "ill find out",
+    "ill check with",
+    "ill confirm with",
+    "ill get you exact numbers",
+    "get you the exact numbers",
+    "get the exact numbers",
+];
+
+/// True when `clause` (a single trailing sentence/clause) is a dangling-promise
+/// deferral — a fresh "let me get X's exact take / I'll get back to you" tacked
+/// onto an answer that was already delivered. Pure.
+pub fn is_deferral_tail(clause: &str) -> bool {
+    let norm = normalize(clause);
+    if norm.is_empty() {
+        return false;
+    }
+    DEFERRAL_MARKERS.iter().any(|m| norm.contains(m))
+}
+
+/// Byte offset where the reply's final clause begins: just after the last
+/// clause-boundary character. Unlike [`strip_trailing_question`]'s splitter this
+/// also treats the ellipsis (`…` and the ASCII run in `...`), the em-dash (`—`),
+/// and the semicolon as boundaries, because a deferral is usually *appended*
+/// with one of those rather than a full stop ("…let me get Nora's exact take.").
+/// A boundary that is the very last non-space char is skipped (a terminal `.`
+/// does not start an empty final clause). Returns 0 when there is no boundary.
+fn final_clause_start(trimmed: &str) -> usize {
+    let end = trimmed.trim_end().len();
+    let mut start = 0usize;
+    for (i, c) in trimmed.char_indices() {
+        if i >= end {
+            break;
+        }
+        if matches!(c, '.' | '!' | '?' | '\n' | '…' | ';' | '—') {
+            let next = i + c.len_utf8();
+            if next < end {
+                start = next;
+            }
+        }
+    }
+    start
+}
+
+/// Split a reply's final clause off and, if it is a dangling-promise deferral,
+/// return `(body_without_it, Some(the_deferral))`. Otherwise `(reply, None)`
+/// unchanged. Pure; the caller (a delivered-answer guard) decides whether to
+/// drop it, and never empties the reply.
+pub fn strip_deferral_tail(reply: &str) -> (String, Option<String>) {
+    let trimmed = reply.trim_end();
+    if trimmed.is_empty() {
+        return (reply.to_string(), None);
+    }
+    let start = final_clause_start(trimmed);
+    let tail = trimmed[start..].trim();
+    if tail.is_empty() || !is_deferral_tail(tail) {
+        return (reply.to_string(), None);
+    }
+    // Trim the boundary char that introduced the tail if it was a *soft*
+    // connector ("…", "—", ";") — leaving it dangling ("It's 450 calories …")
+    // reads as a truncation. A hard sentence end ("." "!" "?") is kept so the
+    // body still terminates cleanly.
+    let body = trimmed[..start]
+        .trim_end()
+        .trim_end_matches(['…', '—', ';', '\n'])
+        .trim_end()
+        .to_string();
+    (body, Some(tail.to_string()))
+}
+
+/// Enforce the "no dangling-promise tail on a DELIVERED answer" rule (rule 6,
+/// sibling of the anti-fabrication rewrite). If the reply ends in a deferral
+/// clause, drop it (returning the plain-ended body); a body that would be left
+/// empty — a reply that is *only* a deferral — is returned unchanged, so we
+/// never send nothing (the compose prompt's first-person/no-promise instruction
+/// keeps that degenerate case vanishingly rare).
+pub fn enforce_no_deferral(reply: &str) -> String {
+    let (body, stripped) = strip_deferral_tail(reply);
+    match stripped {
+        Some(_) if !body.trim().is_empty() => body,
+        _ => reply.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rule 3 — scope: answer exactly the day/window the human asked about
 // ---------------------------------------------------------------------------
 
@@ -1744,5 +1876,81 @@ mod tests {
         // A spent day (asked Thu 20:00, after the 09:00 dentist) → clear.
         let spent = schedule_context_line(Some(&doc), at(2026, 7, 16, 20, 0));
         assert!(spent.to_lowercase().contains("nothing on the calendar"), "{spent}");
+    }
+
+    // --- Rule 6: no dangling-promise deferral tail (task owner-pin-engine) ---
+
+    /// THE 17:5x REPRO: the answer lands, then dangles "…let me get Nora's exact
+    /// take" — a fresh promise to no one. The guard strips ONLY that trailing
+    /// clause and leaves the delivered answer intact.
+    #[test]
+    fn deferral_tail_is_stripped_from_delivered_answer() {
+        // The exact repro tail (ellipsis-appended, third-person self-reference).
+        let repro = "Pasta pomodoro is solid at 400-450 calories a plate. Let me get Nora's exact take.";
+        let cleaned = enforce_no_deferral(repro);
+        assert!(
+            cleaned.contains("400-450"),
+            "the delivered answer must survive the strip:\n{cleaned}"
+        );
+        assert!(
+            !cleaned.to_lowercase().contains("exact take"),
+            "the deferral tail must be gone:\n{cleaned}"
+        );
+
+        // A variety of deferral shapes, each appended to a real answer.
+        for tail in [
+            "…let me get her exact take",
+            "I'll get back to you with the exact numbers.",
+            "Let me check with Nora on that.",
+            "let me confirm the exact figure",
+            "I'll circle back on it.",
+        ] {
+            let reply = format!("It's about 450 calories. {tail}");
+            let out = enforce_no_deferral(&reply);
+            assert!(
+                out.to_lowercase().contains("450 calories"),
+                "answer lost for tail {tail:?}:\n{out}"
+            );
+            assert!(
+                out.len() < reply.len(),
+                "tail {tail:?} was not stripped:\n{out}"
+            );
+        }
+    }
+
+    /// A legitimate action-ack ("on it, I'll change the week") is NOT a deferral
+    /// — the markers are specific enough not to swallow real commitments, and a
+    /// plain answer with no tail is returned unchanged.
+    #[test]
+    fn deferral_guard_leaves_legitimate_replies_untouched() {
+        for ok in [
+            "On it — I'll change the week to duck on Thursday.",
+            "Pasta pomodoro is about 450 calories a plate.",
+            "Sounds good, see you tonight!",
+            "I'll add it to the shopping list right now.",
+        ] {
+            assert_eq!(
+                enforce_no_deferral(ok),
+                ok,
+                "a legitimate reply was mangled by the deferral guard:\n{ok}"
+            );
+        }
+    }
+
+    /// A reply that is ONLY a deferral (no body left) is returned unchanged — the
+    /// guard never sends nothing.
+    #[test]
+    fn deferral_guard_never_empties_the_reply() {
+        let only = "Let me get Nora's exact take.";
+        assert_eq!(enforce_no_deferral(only), only, "must never strip to empty");
+
+        // strip_deferral_tail still reports the tail for a body-bearing reply,
+        // and reports None when there is no deferral.
+        let (body, tail) = strip_deferral_tail("It's 450 calories. Let me get her exact take.");
+        assert!(body.contains("450"), "{body}");
+        assert!(tail.is_some(), "tail should be detected");
+        let (body2, tail2) = strip_deferral_tail("It's 450 calories, enjoy!");
+        assert_eq!(body2, "It's 450 calories, enjoy!");
+        assert!(tail2.is_none());
     }
 }
