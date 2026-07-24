@@ -1278,6 +1278,233 @@ pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// WEEK CONTEXT (task week-grounding-engine) — the gateway forwards the parsed
+// Dinners table (day→dish + family-local today/tomorrow markers) via the
+// `WG_WEEK_CONTEXT` env var, built by the SAME `weekSource` parser the Week view
+// uses. This is the engine-side twin of the anti-fabrication guard: the composer
+// answers dinner/meal questions FROM the table (prompt injection, below), and a
+// reply that FALSELY claims a planned day is empty — the LIVE Nora bug, "Nothing's
+// locked in for Saturday yet" while the table has "Saturday: Baked white fish" —
+// is rewritten to the honest answer (the dish). The gateway's never-claim-empty
+// guard cannot catch these because engine-composed replies write to the feed via
+// FeedMirrorSink in the ENGINE process, so the guard MUST live here.
+// ---------------------------------------------------------------------------
+
+/// The parsed `WG_WEEK_CONTEXT`: which weekdays have a planned dinner (keyed by
+/// lowercase full weekday name → dish text), plus which weekday "today" and
+/// "tomorrow" resolve to (so a relative-day empty-claim — "nothing for tomorrow"
+/// — can be checked against the real plan). A day whose dish is blank or the
+/// sentinel "not planned yet" is NOT recorded as planned.
+#[derive(Debug, Default, Clone)]
+pub struct WeekContext {
+    by_day: std::collections::HashMap<String, String>,
+    today: Option<String>,
+    tomorrow: Option<String>,
+}
+
+impl WeekContext {
+    /// No day carries a planned dish — the guard is a no-op.
+    pub fn is_empty(&self) -> bool {
+        self.by_day.is_empty()
+    }
+}
+
+/// Parse the `WG_WEEK_CONTEXT` text the gateway builds (see
+/// `weekSource.buildWeekContext`): `- Saturday (July 25): Baked white fish…` day
+/// lines, plus `Today is Friday — dinner: …` / `Tomorrow is Saturday — dinner:
+/// …` markers. Tolerant and pure — any line it doesn't recognise is ignored, so
+/// a future gateway format tweak degrades to "fewer planned days", never a panic.
+pub fn parse_week_context(text: &str) -> WeekContext {
+    let mut wc = WeekContext::default();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("- ") {
+            // "Saturday (July 25): Baked white fish" → day, dish.
+            if let Some((left, dish)) = rest.split_once(':') {
+                let day = left
+                    .split('(')
+                    .next()
+                    .unwrap_or(left)
+                    .trim()
+                    .to_lowercase();
+                let dish = dish.trim();
+                if weekday_token(&day).is_some()
+                    && !dish.is_empty()
+                    && !dish.eq_ignore_ascii_case("not planned yet")
+                {
+                    wc.by_day.insert(day, dish.to_string());
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("Today is ") {
+            wc.today = first_weekday_word(rest);
+        } else if let Some(rest) = line.strip_prefix("Tomorrow is ") {
+            wc.tomorrow = first_weekday_word(rest);
+        }
+    }
+    wc
+}
+
+/// The first token in `s` that is a weekday name, lowercased (e.g. from "Friday
+/// — dinner: …" → "friday"). `None` when no leading weekday is present.
+fn first_weekday_word(s: &str) -> Option<String> {
+    for tok in s.split(|c: char| !c.is_alphabetic()) {
+        let t = tok.to_lowercase();
+        if weekday_token(&t).is_some() {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// The compose-prompt block for a forwarded `WG_WEEK_CONTEXT`: the gateway's
+/// parsed Dinners table wrapped with the standing instruction to answer
+/// dinner/meal questions FROM the table and to NEVER claim a day is empty when it
+/// has an entry here. Mirrors the thread-context injection (a raw forwarded block
+/// plus an explicit instruction). `None` when the forwarded context is blank so
+/// the prompt is unchanged on the Telegram-listener path (env unset).
+pub fn week_context_block(week_context: &str) -> Option<String> {
+    let text = week_context.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str(
+        "THIS WEEK'S DINNERS — the family's real plan, parsed from the Dinners table. \
+         Answer any dinner or meal question (today, tonight, tomorrow, or a named day) \
+         FROM this table, never from a plan's prose notes or a week \"skeleton\". If a \
+         day below has a dish, that day IS planned — NEVER say it is empty, unplanned, \
+         not locked in, not set, or undecided:\n",
+    );
+    out.push_str(text);
+    out.push('\n');
+    Some(out)
+}
+
+// Negation tokens that, alongside a planning word, mark a sentence as asserting
+// nothing is planned. Matched as whole words against the NORMALISED sentence
+// (apostrophes dropped, so "isn't"→"isnt", "nothing's"→"nothings").
+const WEEK_EMPTY_NEGATIONS: &[&str] = &[
+    "nothing", "nothings", "no", "not", "none", "nope", "nada", "havent", "hasnt", "hadnt",
+    "dont", "doesnt", "didnt", "isnt", "arent", "wasnt", "werent", "cant", "wont", "unplanned",
+    "undecided", "tbd", "blank", "empty",
+];
+
+// Planning-status stems: a normalised token STARTING with any of these, in a
+// sentence that also carries a negation, means "no plan for the meal". Stems (not
+// whole words) so "planned/planning", "locked", "scheduled", "decided",
+// "cooking", "figured", "eating" all match.
+const WEEK_PLAN_STEMS: &[&str] = &[
+    "plan", "lock", "schedul", "set", "settl", "decid", "menu", "figur", "nail", "sort",
+    "line", "dinner", "supper", "meal", "cook", "eat", "mak", "food",
+];
+
+/// Whole-word membership of `word` in the space-separated, already-normalised
+/// `norm` (padded so boundaries hold at the ends).
+fn norm_has_word(norm: &str, word: &str) -> bool {
+    let padded = format!(" {norm} ");
+    padded.contains(&format!(" {word} "))
+}
+
+/// Any normalised token in `norm` starts with `stem`.
+fn norm_has_stem(norm: &str, stem: &str) -> bool {
+    norm.split(' ').any(|t| t.starts_with(stem))
+}
+
+/// A single (already-normalised) sentence asserts that nothing is planned: it
+/// carries BOTH a negation token AND a planning-status stem.
+fn sentence_claims_empty(norm: &str) -> bool {
+    let has_neg = WEEK_EMPTY_NEGATIONS.iter().any(|w| norm_has_word(norm, w));
+    let has_plan = WEEK_PLAN_STEMS.iter().any(|s| norm_has_stem(norm, s));
+    has_neg && has_plan
+}
+
+/// The terms a draft might use to refer to `weekday` (a lowercase full name):
+/// the name itself plus "today"/"tonight"/"tomorrow" when `wc` maps them to it.
+fn day_terms_for(wc: &WeekContext, weekday: &str) -> Vec<String> {
+    let mut terms = vec![weekday.to_string()];
+    if wc.today.as_deref() == Some(weekday) {
+        terms.push("today".to_string());
+        terms.push("tonight".to_string());
+    }
+    if wc.tomorrow.as_deref() == Some(weekday) {
+        terms.push("tomorrow".to_string());
+    }
+    terms
+}
+
+/// Does `draft` already name the planned `dish`? A dish word of length ≥4 present
+/// in the normalised draft means the reply is grounded on the real dish (so it is
+/// NOT a false-empty claim, even if some other clause reads as a hedge). This is
+/// the safety net that keeps the guard from clobbering a reply that DOES answer.
+fn draft_mentions_dish(draft_norm: &str, dish: &str) -> bool {
+    normalize(dish)
+        .split(' ')
+        .filter(|w| w.len() >= 4)
+        .any(|w| norm_has_word(draft_norm, w))
+}
+
+/// Planned days a `draft` FALSELY claims are empty/unplanned. For each day that
+/// has a dish in `wc`: if the draft does NOT already name the dish, and some
+/// sentence both asserts nothing is planned AND references that day (by name, or
+/// by today/tonight/tomorrow when they map to it), the day is a false-empty
+/// claim. Returns `(Capitalised weekday, dish)` pairs in week order. Pure.
+pub fn false_empty_week_claims(draft: &str, wc: &WeekContext) -> Vec<(String, String)> {
+    if wc.is_empty() {
+        return Vec::new();
+    }
+    let draft_norm = normalize(draft);
+    let sentences: Vec<String> = draft
+        .split(|c: char| matches!(c, '.' | '!' | '?' | '\n' | ';'))
+        .map(normalize)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (weekday, dish) in &wc.by_day {
+        if draft_mentions_dish(&draft_norm, dish) {
+            continue;
+        }
+        let terms = day_terms_for(wc, weekday);
+        let hit = sentences.iter().any(|s| {
+            sentence_claims_empty(s) && terms.iter().any(|t| norm_has_word(s, t))
+        });
+        if hit {
+            out.push((capitalize_weekday(weekday), dish.clone()));
+        }
+    }
+    out.sort_by_key(|(day, _)| {
+        weekday_token(&day.to_lowercase())
+            .map(|w| w.num_days_from_monday())
+            .unwrap_or(7)
+    });
+    out
+}
+
+/// Uppercase the first letter of a lowercase weekday name.
+fn capitalize_weekday(day: &str) -> String {
+    let mut chars = day.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The honest rewrite for a reply that falsely claimed a planned day was empty:
+/// name the real dish for each falsely-claimed day. Mirrors the anti-fabrication
+/// rewrite (a whole-reply replacement), but here we CAN state the truth — the
+/// plan is right in front of us — rather than fall back to "I can't see it".
+pub fn week_grounding_rewrite(days: &[(String, String)]) -> String {
+    let parts: Vec<String> = days
+        .iter()
+        .map(|(day, dish)| format!("{day}'s dinner is {dish}"))
+        .collect();
+    let mut line = parts.join(", and ");
+    if !line.ends_with('.') {
+        line.push('.');
+    }
+    line
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -1952,5 +2179,108 @@ mod tests {
         let (body2, tail2) = strip_deferral_tail("It's 450 calories, enjoy!");
         assert_eq!(body2, "It's 450 calories, enjoy!");
         assert!(tail2.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // WEEK CONTEXT / never-claim-empty guard (task week-grounding-engine)
+    // -----------------------------------------------------------------------
+
+    /// The gateway's `WG_WEEK_CONTEXT` text (weekSource.buildWeekContext shape).
+    fn sample_week_context() -> String {
+        "This week's dinners, parsed from the family plan's Dinners table:\n\
+         - Friday (July 24): Chicken tray bake\n\
+         - Saturday (July 25): Baked white fish with tomato, olives & capers\n\
+         - Sunday (July 26): not planned yet\n\
+         Today is Friday — dinner: Chicken tray bake.\n\
+         Tomorrow is Saturday — dinner: Baked white fish with tomato, olives & capers."
+            .to_string()
+    }
+
+    #[test]
+    fn parse_week_context_records_only_planned_days() {
+        let wc = parse_week_context(&sample_week_context());
+        assert!(!wc.is_empty());
+        assert_eq!(wc.by_day.get("friday").map(String::as_str), Some("Chicken tray bake"));
+        assert_eq!(
+            wc.by_day.get("saturday").map(String::as_str),
+            Some("Baked white fish with tomato, olives & capers")
+        );
+        // "not planned yet" is NOT a planned day.
+        assert!(!wc.by_day.contains_key("sunday"));
+        assert_eq!(wc.today.as_deref(), Some("friday"));
+        assert_eq!(wc.tomorrow.as_deref(), Some("saturday"));
+    }
+
+    /// THE LIVE NORA BUG: "what's for dinner tomorrow?" → "Nothing's locked in for
+    /// Saturday yet." while the Dinners table HAS a dish for Saturday. The guard
+    /// must catch the false-empty claim and rewrite it to the honest dish.
+    #[test]
+    fn never_claim_empty_rewrites_false_empty_for_a_planned_day() {
+        let wc = parse_week_context(&sample_week_context());
+        let draft = "Nothing's locked in for Saturday yet.";
+        let claims = false_empty_week_claims(draft, &wc);
+        assert_eq!(claims.len(), 1, "expected one false-empty claim, got {claims:?}");
+        assert_eq!(claims[0].0, "Saturday");
+        let rewritten = week_grounding_rewrite(&claims);
+        assert!(
+            rewritten.contains("Baked white fish with tomato, olives & capers"),
+            "rewrite must name the real dish:\n{rewritten}"
+        );
+        assert!(rewritten.starts_with("Saturday's dinner is"), "{rewritten}");
+    }
+
+    /// A relative-day empty-claim ("nothing planned for tomorrow") is caught too,
+    /// because the context maps tomorrow → Saturday, which is planned.
+    #[test]
+    fn never_claim_empty_resolves_tomorrow_to_the_planned_weekday() {
+        let wc = parse_week_context(&sample_week_context());
+        let claims = false_empty_week_claims("We haven't planned dinner for tomorrow.", &wc);
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].0, "Saturday");
+    }
+
+    /// A reply that ALREADY names the dish is grounded — never rewritten, even if
+    /// a nearby clause reads like a hedge.
+    #[test]
+    fn never_claim_empty_leaves_a_grounded_reply_alone() {
+        let wc = parse_week_context(&sample_week_context());
+        let draft = "Saturday's dinner is baked white fish — nothing else is locked in yet though.";
+        assert!(
+            false_empty_week_claims(draft, &wc).is_empty(),
+            "a reply that names the dish must not be flagged"
+        );
+    }
+
+    /// A genuinely unplanned day (Sunday, "not planned yet") is NOT a false claim
+    /// — saying it's open is honest, so the guard must leave it alone.
+    #[test]
+    fn never_claim_empty_allows_an_honestly_empty_day() {
+        let wc = parse_week_context(&sample_week_context());
+        assert!(
+            false_empty_week_claims("Nothing's planned for Sunday yet.", &wc).is_empty(),
+            "an honestly-empty day must not be rewritten"
+        );
+    }
+
+    /// No forwarded context (or an empty one) → the guard and the prompt block are
+    /// both no-ops (the Telegram-listener path).
+    #[test]
+    fn week_context_absent_is_a_noop() {
+        let empty = parse_week_context("");
+        assert!(empty.is_empty());
+        assert!(false_empty_week_claims("Nothing's locked in for Saturday yet.", &empty).is_empty());
+        assert!(week_context_block("").is_none());
+        assert!(week_context_block("   ").is_none());
+    }
+
+    /// The injected prompt block carries the table AND the NEVER-claim-empty
+    /// instruction (the prompt-injection half of the fix).
+    #[test]
+    fn week_context_block_carries_table_and_instruction() {
+        let block = week_context_block(&sample_week_context()).expect("block present");
+        assert!(block.contains("Baked white fish with tomato, olives & capers"));
+        let lower = block.to_lowercase();
+        assert!(lower.contains("never say it is empty"), "{block}");
+        assert!(lower.contains("from this table"), "{block}");
     }
 }

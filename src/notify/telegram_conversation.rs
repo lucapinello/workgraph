@@ -666,6 +666,18 @@ fn build_compose_prompt(
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // WEEK CONTEXT (task week-grounding-engine): the gateway forwards the parsed
+    // Dinners table (day→dish + family-local today/tomorrow markers) via
+    // `WG_WEEK_CONTEXT`, built by the SAME weekSource parser the Week view uses.
+    // The LIVE Nora bug — "Nothing's locked in for Saturday yet" while the plan
+    // table has "Saturday: Baked white fish" — was the composer answering from the
+    // plan's prose skeleton instead of the table. Read at the production boundary
+    // (unset on the Telegram-listener path → `None`, prompt unchanged) and threaded
+    // into the pure `_at` builder so tests stay deterministic.
+    let week = std::env::var("WG_WEEK_CONTEXT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     // Household local time is the existing `chrono::Local` seam (same as the
     // fast lane and task-stamping). Threaded through the `_at` variant so the
     // scope/clock rules are testable with a fixed clock.
@@ -676,6 +688,7 @@ fn build_compose_prompt(
         human_message,
         chrono::Local::now().naive_local(),
         thread.as_deref(),
+        week.as_deref(),
     )
 }
 
@@ -689,6 +702,7 @@ fn build_compose_prompt_at(
     human_message: &str,
     now: chrono::NaiveDateTime,
     thread_context: Option<&str>,
+    week_context: Option<&str>,
 ) -> String {
     let summary = read_session_summary(workgraph_dir, session_ref);
 
@@ -818,6 +832,20 @@ fn build_compose_prompt_at(
     // edit-shaped classifier. Best-effort — a missing plan just omits the block.
     if grounding::is_read_shaped(human_message) {
         if let Some(block) = grounding::fetch_scoped(&root, now, human_message) {
+            prompt.push_str(&block);
+            prompt.push('\n');
+        }
+    }
+
+    // WEEK CONTEXT (task week-grounding-engine): the gateway's parsed Dinners
+    // table, wrapped with the standing instruction to answer dinner/meal
+    // questions FROM it and NEVER claim a day is empty when it has an entry. This
+    // is the authoritative dinner source (parsed from the SAME weekSource the Week
+    // view uses), so it lands AFTER the prose-based grounded block above — the
+    // table wins for "what's for dinner <day>?". Absent (Telegram-listener path)
+    // → omitted, prompt unchanged.
+    if let Some(week) = week_context {
+        if let Some(block) = grounding::week_context_block(week) {
             prompt.push_str(&block);
             prompt.push('\n');
         }
@@ -1516,6 +1544,30 @@ async fn finalize_composed_reply(
                 chrono::Utc::now().format("%H:%M:%S"),
             );
             reply_text = grounding::grounding_fallback_line();
+        }
+    }
+
+    // NEVER-CLAIM-EMPTY WEEK GUARD (task week-grounding-engine): the engine-side
+    // twin of the anti-fabrication guard for the OTHER failure direction. Anti-
+    // fabrication stops the composer INVENTING a schedule fact; this stops it
+    // DENYING one that is right there in the plan — the LIVE Nora bug, "Nothing's
+    // locked in for Saturday yet" while the Dinners table has "Saturday: Baked
+    // white fish". The gateway forwards that table via `WG_WEEK_CONTEXT`; a reply
+    // that asserts a planned day is empty (and doesn't already name the dish) is
+    // rewritten to the honest answer. Runs on EVERY reply (like anti-fabrication)
+    // and only when the env carries a table — unset → no-op. MUST live here in the
+    // ENGINE process: engine-composed replies write to the feed via FeedMirrorSink
+    // here, so the gateway's own never-claim-empty guard never sees them.
+    if let Ok(raw) = std::env::var("WG_WEEK_CONTEXT") {
+        let wc = grounding::parse_week_context(&raw);
+        let false_empty = grounding::false_empty_week_claims(&reply_text, &wc);
+        if !false_empty.is_empty() {
+            eprintln!(
+                "[{}] never-claim-empty guard: {agent_id}'s draft claims planned day(s) {:?} are empty — rewriting to the honest dish",
+                chrono::Utc::now().format("%H:%M:%S"),
+                false_empty.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(),
+            );
+            reply_text = grounding::week_grounding_rewrite(&false_empty);
         }
     }
 
@@ -3246,7 +3298,7 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
         let grounded =
-            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now, None);
+            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now, None, None);
         assert!(
             grounded.contains("Dentist"),
             "tomorrow's appointment missing from prompt:\n{grounded}"
@@ -3259,13 +3311,13 @@ mod tests {
         assert!(!grounded.contains("Chickpea"), "Mon meal leaked:\n{grounded}");
 
         // A whole-week ask still surfaces the full week's meals.
-        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now, None);
+        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now, None, None);
         assert!(week.contains("Baked salmon"));
         assert!(week.contains("Luca PT check-in"));
         assert!(week.to_lowercase().contains("do not stall"));
 
         // Small talk carries no read-shaped WEEK block (no meal dump)...
-        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now, None);
+        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now, None, None);
         assert!(!plain.contains("Baked salmon"));
         // ...but it DOES now carry the always-on anti-fabrication calendar-truth
         // line (rule 5, §6.7). Wed 07-15 has no calendar events → the model is
@@ -3283,7 +3335,7 @@ mod tests {
             .unwrap()
             .and_hms_opt(15, 0, 0)
             .unwrap();
-        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon, None);
+        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon, None, None);
         assert!(greet.contains("PT check-in"), "real event missing from greeting prompt:\n{greet}");
         assert!(greet.to_lowercase().contains("do not invent"), "{greet}");
     }
@@ -3320,6 +3372,7 @@ mod tests {
             "tell me the calories",
             now,
             Some(thread),
+            None,
         );
         assert!(
             followup.contains("pasta pomodoro"),
@@ -3334,7 +3387,7 @@ mod tests {
         // WITHOUT thread context: the same ambiguous ask carries no referent and
         // no follow-up instruction — this is exactly the state that made the engine
         // clarify instead of answer.
-        let bare = build_compose_prompt_at(&wg, &uuid, "otto", "tell me the calories", now, None);
+        let bare = build_compose_prompt_at(&wg, &uuid, "otto", "tell me the calories", now, None, None);
         assert!(!bare.contains("pasta pomodoro"), "referent leaked without a thread:\n{bare}");
         assert!(
             !bare.to_lowercase().contains("do not ask what they mean"),
@@ -3349,8 +3402,72 @@ mod tests {
             "tell me the calories",
             now,
             Some("   "),
+            None,
         );
         assert!(!blank.to_lowercase().contains("do not ask what they mean"), "{blank}");
+    }
+
+    /// WEEK CONTEXT (task week-grounding-engine): the gateway forwards the parsed
+    /// Dinners table via `WG_WEEK_CONTEXT`; the composer must inject it into the
+    /// prompt with the standing NEVER-claim-empty instruction so a "what's for
+    /// dinner tomorrow?" turn is answered FROM the table. Without the context the
+    /// block is absent (the Telegram-listener path); with it, the table AND the
+    /// instruction are in the prompt.
+    #[test]
+    fn week_context_is_injected_with_never_claim_empty_instruction() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "nora", &uuid).unwrap();
+
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+
+        // The gateway's parsed Dinners table (weekSource.buildWeekContext shape).
+        let week = "This week's dinners, parsed from the family plan's Dinners table:\n\
+                    - Friday (July 24): Chicken tray bake\n\
+                    - Saturday (July 25): Baked white fish with tomato, olives & capers\n\
+                    Today is Friday — dinner: Chicken tray bake.\n\
+                    Tomorrow is Saturday — dinner: Baked white fish with tomato, olives & capers.";
+
+        // WITH week context: the table AND the NEVER-claim-empty instruction land
+        // in the prompt.
+        let grounded = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "nora",
+            "what's for dinner tomorrow?",
+            now,
+            None,
+            Some(week),
+        );
+        assert!(
+            grounded.contains("Baked white fish with tomato, olives & capers"),
+            "the Dinners table dish is missing from the compose prompt:\n{grounded}"
+        );
+        let lower = grounded.to_lowercase();
+        assert!(
+            lower.contains("this week's dinners") && lower.contains("never say it is empty"),
+            "the NEVER-claim-empty week instruction is missing from the prompt:\n{grounded}"
+        );
+
+        // WITHOUT week context: no stray week block (the Telegram-listener path).
+        let bare = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "nora",
+            "what's for dinner tomorrow?",
+            now,
+            None,
+            None,
+        );
+        assert!(
+            !bare.to_lowercase().contains("never say it is empty"),
+            "the week instruction leaked without a forwarded table:\n{bare}"
+        );
     }
 
     /// RECENCY DISCIPLINE (task owner-pin-engine, spec item 3): when the thread
@@ -3386,6 +3503,7 @@ mod tests {
             "tell me the calories",
             now,
             Some(thread),
+            None,
         );
 
         // The recency instruction is present: lead with the most recent, close
