@@ -159,6 +159,54 @@ fn is_daemon_managed(task: &worksgood::graph::Task) -> bool {
         .any(|tag| DAEMON_MANAGED_TAGS.contains(&tag.as_str()))
 }
 
+/// A **family turn**: a task born from a live family conversation (web-chat,
+/// Telegram 1:1, or the family group), stamped with a [`TaskOrigin`] at
+/// `wg add` time by the composer's task-creation path. Ordinary `wg add` dev
+/// work — the feature/fix agents that make up a "dev storm" — has no origin.
+///
+/// These are the tasks the family-first lane prioritizes and lets consume the
+/// reserved executor headroom: a conversationally-created follow-up ("rebalance
+/// the week") and any origin-stamped report-back run as the requester's live
+/// reply, so they must never wait behind background development work.
+fn is_family_turn(task: &worksgood::graph::Task) -> bool {
+    task.origin.is_some()
+}
+
+/// A task the family-first reserve caps: an ordinary background dev agent — the
+/// heavy `claude`/`codex` spawn that makes up a "dev storm" and consumes the
+/// shared model budget. Exempt (never capped) are:
+/// - **family turns** (origin-stamped) — the reserve exists to keep them unblocked;
+/// - **inline system tasks** (`.assign`/`.evaluate`/`.flip`) — the cheap machinery
+///   that dispatches everything, including family turns;
+/// - **shell-mode tasks** — inline command forks, not model-budget spawns.
+fn is_capped_dev_task(task: &worksgood::graph::Task) -> bool {
+    let is_shell = task.exec_mode.as_deref() == Some("shell");
+    !is_family_turn(task) && !worksgood::graph::is_system_task(&task.id) && !is_shell
+}
+
+/// Count executor slots currently occupied by ordinary dev agents (a live
+/// process whose task is a [`is_capped_dev_task`]). This is the running total
+/// the family-first reserve holds under `max_agents - family_reserved_slots`.
+/// An alive agent whose task can't be resolved is counted as dev — the safe
+/// direction, since it preserves family headroom rather than spending it.
+fn count_alive_dev_agents(dir: &Path, graph: &worksgood::graph::WorkGraph) -> usize {
+    let registry = match AgentRegistry::load(dir) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    registry
+        .agents
+        .values()
+        .filter(|a| a.is_alive() && is_process_alive(a.pid))
+        .filter(|a| {
+            graph
+                .get_task(&a.task_id)
+                .map(is_capped_dev_task)
+                .unwrap_or(true)
+        })
+        .count()
+}
+
 fn build_admission_denial(
     task: &Task,
     builds_blocked: bool,
@@ -3906,6 +3954,11 @@ fn sort_tasks_by_priority_with_features<'a>(
     let mut task_priorities: Vec<_> = tasks
         .into_iter()
         .map(|task| {
+            // Family-first lane: a live family conversation turn outranks ALL
+            // ordinary dev work regardless of numeric priority, so a busy dev
+            // graph can never push a family reply to the back of the dispatch
+            // order. This is the "priority class the dispatcher schedules first".
+            let family = is_family_turn(task);
             let mut effective_priority = task.priority;
 
             // Starvation prevention: bump priority for old tasks
@@ -3938,25 +3991,27 @@ fn sort_tasks_by_priority_with_features<'a>(
                 effective_priority = inherited_priority;
             }
 
-            (task, effective_priority)
+            (task, effective_priority, family)
         })
         .collect();
 
-    // Sort by effective priority descending (higher number = higher priority),
-    // then by dispatch_count ascending (CFS-like fair share: prefer less-dispatched tasks)
-    task_priorities.sort_by(|(a_task, a_prio), (b_task, b_prio)| {
-        b_prio
-            .cmp(a_prio)
+    // Sort family turns first, then by effective priority descending (higher
+    // number = higher priority), then by dispatch_count ascending (CFS-like fair
+    // share: prefer less-dispatched tasks).
+    task_priorities.sort_by(|(a_task, a_prio, a_family), (b_task, b_prio, b_family)| {
+        b_family
+            .cmp(a_family)
+            .then(b_prio.cmp(a_prio))
             .then(a_task.dispatch_count.cmp(&b_task.dispatch_count))
     });
 
     // Idle gate: only include idle (priority 0) tasks when no higher-priority tasks are in the set
-    let has_normal_or_higher = task_priorities.iter().any(|(_, p)| *p >= PRIORITY_NORMAL);
+    let has_normal_or_higher = task_priorities.iter().any(|(_, p, _)| *p >= PRIORITY_NORMAL);
     if has_normal_or_higher {
-        task_priorities.retain(|(_, p)| *p != PRIORITY_IDLE);
+        task_priorities.retain(|(_, p, _)| *p != PRIORITY_IDLE);
     }
 
-    let sorted_tasks: Vec<_> = task_priorities.into_iter().map(|(task, _)| task).collect();
+    let sorted_tasks: Vec<_> = task_priorities.into_iter().map(|(task, _, _)| task).collect();
 
     // Log priority decisions if we have tasks
     if !sorted_tasks.is_empty() {
@@ -4455,6 +4510,7 @@ fn spawn_agents_for_ready_tasks(
     config: &Config,
     default_model: Option<&str>,
     slots_available: usize,
+    max_agents: usize,
     auto_assign: bool,
 ) -> usize {
     let cycle_analysis = graph.compute_cycle_analysis();
@@ -4520,6 +4576,22 @@ fn spawn_agents_for_ready_tasks(
     let mut poison_failures = 0usize;
     let quarantine_threshold = config.coordinator.spawn_quarantine_threshold;
 
+    // Family-first reserve: hold `family_reserved_slots` of executor headroom
+    // back from ordinary dev work so a family conversation compose never starves
+    // behind a dev storm. Ordinary dev agents (see `is_capped_dev_task`) run at
+    // most `dev_cap = max_agents - family_reserved_slots` concurrently; the
+    // remaining slots stay as CPU + model-budget headroom that only family turns
+    // may consume — the origin-stamped follow-up tasks scheduled first above, and
+    // the machine headroom the gateway's queue-bypassing one-shot composes draw
+    // on. Clamped so at least one dev slot always survives (a machine with only
+    // dev work still makes progress). `family_reserved_slots == 0` disables it.
+    let family_reserved = config
+        .coordinator
+        .family_reserved_slots
+        .min(max_agents.saturating_sub(1));
+    let dev_cap = max_agents.saturating_sub(family_reserved);
+    let mut dev_running = count_alive_dev_agents(dir, graph);
+
     for task in final_ready.iter() {
         if spawned >= slots_available {
             break;
@@ -4536,6 +4608,19 @@ fn spawn_agents_for_ready_tasks(
 
         // Skip daemon-managed loop tasks — handled directly by the daemon, not spawned as agents
         if is_daemon_managed(task) {
+            continue;
+        }
+
+        // Family-first reserve gate: ordinary dev work may not consume the slots
+        // held for family replies. Family turns and inline system tasks are
+        // exempt (see `is_capped_dev_task`). This is a `continue`, not a `break`:
+        // a family turn further down the (family-first-sorted) ready set can
+        // still be spawned into a reserved slot this same tick.
+        if family_reserved > 0 && is_capped_dev_task(task) && dev_running >= dev_cap {
+            eprintln!(
+                "[dispatcher] Deferring dev task '{}' — reserving {} executor slot(s) for family replies ({}/{} dev slots in use)",
+                task.id, family_reserved, dev_running, dev_cap
+            );
             continue;
         }
 
@@ -4842,6 +4927,9 @@ fn spawn_agents_for_ready_tasks(
                 eprintln!("[dispatcher] Spawned {} (PID {})", agent_id, pid);
                 record_dispatch(&gp, &task.id);
                 spawned += 1;
+                if is_capped_dev_task(task) {
+                    dev_running += 1;
+                }
                 if build_class.is_heavy() {
                     active_build_heavy += 1;
                 }
@@ -5504,6 +5592,7 @@ pub fn coordinator_tick(
         &config,
         Some(effective_model.as_str()),
         slots_available,
+        max_agents,
         config.agency.auto_assign,
     );
 
@@ -7066,7 +7155,7 @@ mod tests {
 
         let config = Config::load_or_default(wg_dir);
         let result = spawn_agents_for_ready_tasks(
-            wg_dir, &graph, "shell", &config, None, 10, true, // auto_assign = true
+            wg_dir, &graph, "shell", &config, None, 10, 10, true, // auto_assign = true
         );
 
         // Task should be skipped (no agent), so nothing spawned
@@ -8333,6 +8422,96 @@ mod tests {
         );
         assert_eq!(sorted3[0].id, "task-low");
         assert_eq!(sorted3[1].id, "task-idle");
+    }
+
+    /// Build a NORMAL-priority task carrying a conversational origin (a "family
+    /// turn": a web-chat / Telegram ask the composer stamped at `wg add` time).
+    fn family_turn_task(id: &str) -> Task {
+        let mut t = Task::default();
+        t.id = id.to_string();
+        t.title = "family reply".to_string();
+        t.status = worksgood::graph::Status::Open;
+        t.priority = worksgood::graph::PRIORITY_NORMAL;
+        t.created_at = Some(Utc::now().to_rfc3339());
+        t.origin = Some(worksgood::graph::TaskOrigin::new(
+            worksgood::graph::OriginChannel::Web,
+            "web-session-1",
+            "Luca",
+            "otto",
+            None,
+        ));
+        t
+    }
+
+    /// The family-first lane: a live family conversation turn is dispatched
+    /// BEFORE ordinary dev work even when the dev task carries a strictly higher
+    /// numeric priority. This is the "priority class the dispatcher schedules
+    /// first" — a busy dev graph can never push a family reply to the back.
+    #[test]
+    fn test_family_turn_scheduled_before_higher_priority_dev() {
+        let config = Config::default();
+        let mut graph = WorkGraph::new();
+
+        // A CRITICAL ordinary dev task (no origin) — the "dev storm".
+        let mut dev = Task::default();
+        dev.id = "dev-critical".to_string();
+        dev.title = "urgent refactor".to_string();
+        dev.status = worksgood::graph::Status::Open;
+        dev.priority = worksgood::graph::PRIORITY_CRITICAL;
+        dev.created_at = Some(Utc::now().to_rfc3339());
+
+        // A merely-NORMAL family turn — but it is a live family reply.
+        let fam = family_turn_task("fam-reply");
+
+        graph.add_node(Node::Task(dev.clone()));
+        graph.add_node(Node::Task(fam.clone()));
+
+        // Pass dev first to prove the sort, not input order, decides.
+        let tasks: Vec<&Task> = vec![
+            graph.get_task("dev-critical").unwrap(),
+            graph.get_task("fam-reply").unwrap(),
+        ];
+
+        let sorted = sort_tasks_by_priority_with_features(&graph, tasks, &config);
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(
+            sorted[0].id, "fam-reply",
+            "a family turn must be picked before a higher-priority dev task"
+        );
+        assert_eq!(sorted[1].id, "dev-critical");
+    }
+
+    /// The reserve's classification: only ordinary dev agents are capped; family
+    /// turns, inline system tasks, and shell-mode command forks are exempt.
+    #[test]
+    fn test_is_capped_dev_task_classification() {
+        // Ordinary dev work (no origin, not system, not shell) → capped.
+        let mut dev = Task::default();
+        dev.id = "impl-feature".to_string();
+        assert!(is_capped_dev_task(&dev), "plain dev work is capped");
+
+        // Family turn (origin-stamped) → exempt.
+        assert!(
+            !is_capped_dev_task(&family_turn_task("fam")),
+            "a family turn is never capped by the reserve"
+        );
+
+        // Inline system task (.assign-*) → exempt.
+        let mut sys = Task::default();
+        sys.id = ".assign-impl-feature".to_string();
+        assert!(
+            !is_capped_dev_task(&sys),
+            "inline system tasks (.assign/.evaluate/.flip) are exempt"
+        );
+
+        // Shell-mode command fork → exempt (not a model-budget spawn).
+        let mut shell = Task::default();
+        shell.id = "run-validation".to_string();
+        shell.exec_mode = Some("shell".to_string());
+        assert!(
+            !is_capped_dev_task(&shell),
+            "shell-mode inline command forks are exempt"
+        );
     }
 
     #[test]

@@ -4163,6 +4163,22 @@ pub struct CoordinatorConfig {
     #[serde(default = "default_spawn_quarantine_threshold")]
     pub spawn_quarantine_threshold: u32,
 
+    /// Family-first reserve: how many of the `max_agents` executor slots are held
+    /// back from ordinary `wg` dev work so a family conversation compose never
+    /// starves behind a dev storm. On the shared family machine, ordinary
+    /// implementation/fix agents (a `wg add` task with no conversational
+    /// `origin`) may run at most `max_agents - family_reserved_slots`
+    /// concurrently; the remaining slots stay as CPU + model-budget headroom that
+    /// only *family turns* may consume — a conversationally-created follow-up task
+    /// (stamped with a `TaskOrigin`), and the machine headroom the gateway's
+    /// one-shot ephemeral composes (web-inbound / listener report-backs, which
+    /// bypass this queue entirely) draw on to stay snappy. Family turns and the
+    /// cheap inline system tasks (`.assign`/`.evaluate`/`.flip`) are never capped
+    /// by this reserve. Clamped so at least one dev slot always remains. Default:
+    /// 1. Set to 0 to disable (legacy behavior: dev work may fill every slot).
+    #[serde(default = "default_family_reserved_slots")]
+    pub family_reserved_slots: usize,
+
     /// Dispatcher-level self-healing spawn circuit breaker: how many CONSECUTIVE
     /// dispatcher-wide spawn failures (across all tasks) trip the breaker open,
     /// pausing all spawns for a cooldown. Unlike `max_spawn_failures` (a per-task
@@ -4468,6 +4484,10 @@ fn default_spawn_quarantine_threshold() -> u32 {
     3
 }
 
+fn default_family_reserved_slots() -> usize {
+    1
+}
+
 fn default_spawn_breaker_threshold() -> u32 {
     10
 }
@@ -4674,6 +4694,7 @@ impl Default for CoordinatorConfig {
             max_verify_failures: default_max_verify_failures(),
             max_spawn_failures: default_max_spawn_failures(),
             spawn_quarantine_threshold: default_spawn_quarantine_threshold(),
+            family_reserved_slots: default_family_reserved_slots(),
             spawn_breaker_threshold: default_spawn_breaker_threshold(),
             spawn_breaker_cooldown_secs: default_spawn_breaker_cooldown_secs(),
             spawn_breaker_max_cooldown_secs: default_spawn_breaker_max_cooldown_secs(),
