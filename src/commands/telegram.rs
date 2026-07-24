@@ -4645,6 +4645,101 @@ async fn deliver_lifecycle_fire(
     Ok(())
 }
 
+/// The owner's DM chat for a dead-end escalation, and the bot that speaks it.
+///
+/// Prefers the concierge persona ([`OPERATOR_ALERT_BOT`] — Otto), whose 1:1 chat
+/// id IS the household owner's DM; falls back to the legacy top-level operator
+/// `chat_id`, then to any configured bot, so a household that named its
+/// coordinator something else still gets the alert. `None` when nothing is
+/// configured — the caller then relies on the loud stderr line.
+///
+/// [`OPERATOR_ALERT_BOT`]: worksgood::notify::lifecycle::OPERATOR_ALERT_BOT
+fn operator_alert_route(config: &TelegramConfig) -> Option<(String, String)> {
+    use worksgood::notify::lifecycle::OPERATOR_ALERT_BOT;
+    let usable = |id: &String, bot: &worksgood::notify::telegram::TelegramBotConfig| {
+        (!bot.bot_token.trim().is_empty() && !bot.chat_id.trim().is_empty())
+            .then(|| (id.clone(), bot.chat_id.clone()))
+    };
+    // Otto by bot key or by the agent id he fronts.
+    if let Some(hit) = config
+        .bots
+        .iter()
+        .find(|(id, bot)| {
+            id.eq_ignore_ascii_case(OPERATOR_ALERT_BOT)
+                || bot
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(OPERATOR_ALERT_BOT))
+        })
+        .and_then(|(id, bot)| usable(id, bot))
+    {
+        return Some(hit);
+    }
+    // Legacy single-bot operator chat.
+    if !config.bot_token.trim().is_empty() && !config.chat_id.trim().is_empty() {
+        return Some((String::new(), config.chat_id.clone()));
+    }
+    // Any bot at all beats silence for a dead-end ask.
+    config
+        .bots
+        .iter()
+        .find_map(|(id, bot)| usable(id, bot))
+}
+
+/// Deliver ONE dead-end operator alert — a family-origin task that failed with
+/// no retry behind it. The family already heard the honest "I've flagged it"
+/// line; this is the flag being raised, so the ask is never a dead end.
+///
+/// Loud on stderr FIRST (that record survives a missing/broken bot config),
+/// then best-effort DM'd to the owner as Otto. Errors are reported, never
+/// propagated: a failed escalation must not abort the remaining report-backs.
+async fn deliver_operator_alert(
+    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
+    config: &TelegramConfig,
+    alert: &worksgood::notify::lifecycle::OperatorAlert,
+) -> bool {
+    eprintln!(
+        "[{}] DEAD-END family ask {} ({}): {}",
+        chrono::Utc::now().format("%H:%M:%S"),
+        alert.task_id,
+        if alert.requester.trim().is_empty() {
+            "unknown requester"
+        } else {
+            alert.requester.trim()
+        },
+        alert.text,
+    );
+    let Some((bot_id, chat_id)) = operator_alert_route(config) else {
+        eprintln!(
+            "[{}] operator alert for {} not DM'd: no telegram bot/chat configured (logged only)",
+            chrono::Utc::now().format("%H:%M:%S"),
+            alert.task_id,
+        );
+        return false;
+    };
+    match sink.send(&bot_id, &chat_id, &alert.text).await {
+        Ok(_) => {
+            println!(
+                "[{}] operator alert for {} → owner chat {} via {}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                alert.task_id,
+                chat_id,
+                if bot_id.is_empty() { "legacy bot" } else { &bot_id },
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "[{}] operator alert for {} FAILED to send: {}",
+                chrono::Utc::now().format("%H:%M:%S"),
+                alert.task_id,
+                worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+            );
+            false
+        }
+    }
+}
+
 /// Report conversational tasks' progress back to the chats they came from — the
 /// `wg telegram lifecycle` seam (see [`crate::cli::TelegramCommands::Lifecycle`]).
 ///
@@ -4728,7 +4823,25 @@ pub fn run_lifecycle(
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&rows)?);
-        } else if result.fired.is_empty() && result.capped.is_empty() {
+            let alerts: Vec<_> = result
+                .operator_alerts
+                .iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "task": a.task_id,
+                        "operator_alert": true,
+                        "requester": a.requester,
+                        "text": a.text,
+                    })
+                })
+                .collect();
+            if !alerts.is_empty() {
+                println!("{}", serde_json::to_string_pretty(&alerts)?);
+            }
+        } else if result.fired.is_empty()
+            && result.capped.is_empty()
+            && result.operator_alerts.is_empty()
+        {
             println!("Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).", now.format("%Y-%m-%d %H:%M"));
         } else {
             for f in &result.fired {
@@ -4736,6 +4849,9 @@ pub fn run_lifecycle(
             }
             for f in &result.capped {
                 println!("[dry-run] (capped → folds into digest) {}", lifecycle::dry_run_line(f));
+            }
+            for a in &result.operator_alerts {
+                println!("{}", lifecycle::dry_run_alert_line(a));
             }
         }
         return Ok(());
@@ -4764,9 +4880,19 @@ pub fn run_lifecycle(
     };
     let mut sent = 0usize;
     let mut undelivered = 0usize;
-    if !result.fired.is_empty() {
+    let mut alerted = 0usize;
+    if !result.fired.is_empty() || !result.operator_alerts.is_empty() {
         let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
         rt.block_on(async {
+            // DEAD-END ESCALATION FIRST. A family-origin task that failed with no
+            // retry behind it just told the family "I've flagged it so it isn't
+            // forgotten" — raising the flag is what makes that line true, so it
+            // goes out even if a report-back delivery below fails.
+            for a in &result.operator_alerts {
+                if deliver_operator_alert(sink.as_ref(), &config, a).await {
+                    alerted += 1;
+                }
+            }
             for f in &result.fired {
                 match deliver_lifecycle_fire(sink.as_ref(), &config, &feed_path, f).await {
                     Ok(()) => sent += 1,
@@ -4796,9 +4922,14 @@ pub fn run_lifecycle(
                 "sent": sent,
                 "undelivered": undelivered,
                 "capped": result.capped.len(),
+                "operator_alerts": result.operator_alerts.len(),
+                "operator_alerts_sent": alerted,
             })
         );
-    } else if result.fired.is_empty() && result.capped.is_empty() {
+    } else if result.fired.is_empty()
+        && result.capped.is_empty()
+        && result.operator_alerts.is_empty()
+    {
         println!("Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).", now.format("%Y-%m-%d %H:%M"));
     }
     Ok(())

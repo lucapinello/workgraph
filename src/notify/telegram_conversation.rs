@@ -1147,6 +1147,75 @@ fn create_origin_task(
     Ok(id)
 }
 
+/// The log prefix an amendment writes, so the worker (and the audit trail) can
+/// see the correction arrived after the task was minted.
+pub const AMENDMENT_LOG_PREFIX: &str = "AMENDED (follow-up):";
+
+/// Whether `task_id` is still open for amendment — i.e. present and not in a
+/// terminal state. A finished/failed task is never amended: a follow-up after
+/// the work landed is a genuinely new ask.
+///
+/// In-progress counts as open: the pizza burst's siblings arrived while the
+/// first task was being claimed, which is exactly the case to coalesce.
+fn task_is_open(workgraph_dir: &Path, task_id: &str) -> bool {
+    let path = workgraph_dir.join("graph.jsonl");
+    let Ok(graph) = crate::parser::load_graph(&path) else {
+        return false;
+    };
+    graph
+        .get_task(task_id)
+        .is_some_and(|t| !t.status.is_terminal())
+}
+
+/// AMEND an open task with a rapid corrective follow-up: append the new wording
+/// to its description and log it, rather than spawning a sibling task that the
+/// dedupe will only abandon later (Luca's three pizza tasks).
+///
+/// The description append is what the worker actually reads when it claims the
+/// task, so a correction that lands before the claim is honored by the same
+/// single owner. The log line is the audit trail — and, because it bumps
+/// `last_interaction_at`, the amendment also surfaces as live activity.
+fn amend_origin_task(
+    workgraph_dir: &Path,
+    task_id: &str,
+    human_message: &str,
+    requester: &str,
+) -> Result<()> {
+    use crate::graph::LogEntry;
+    let path = workgraph_dir.join("graph.jsonl");
+    let mut graph =
+        crate::parser::load_graph(&path).map_err(|e| anyhow::anyhow!("load graph: {e}"))?;
+    let who = requester.trim();
+    let who = if who.is_empty() { "the family" } else { who };
+    let text = human_message.trim();
+    if text.is_empty() {
+        anyhow::bail!("empty follow-up, nothing to amend");
+    }
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    {
+        let task = graph
+            .get_task_mut(task_id)
+            .ok_or_else(|| anyhow::anyhow!("task {task_id} not found"))?;
+        if task.status.is_terminal() {
+            anyhow::bail!("task {task_id} is already {}", task.status);
+        }
+        let addition = format!("\n\nFollow-up from {who}: {text}");
+        task.description = Some(match task.description.take() {
+            Some(existing) if !existing.trim().is_empty() => format!("{existing}{addition}"),
+            _ => addition.trim_start().to_string(),
+        });
+        task.log.push(LogEntry {
+            timestamp: now_iso.clone(),
+            actor: None,
+            user: Some(who.to_string()),
+            message: format!("{AMENDMENT_LOG_PREFIX} {text}"),
+        });
+        task.last_interaction_at = Some(now_iso);
+    }
+    crate::parser::save_graph(&graph, &path).map_err(|e| anyhow::anyhow!("save graph: {e}"))?;
+    Ok(())
+}
+
 /// Drive a bounded compose turn: race the composer against the ack/timeout
 /// clock. Emits the latency ack once past `ack_after`; on success relays the
 /// answer (editing the ack in place); on failure OR at `reply_timeout` sends the
@@ -1640,18 +1709,77 @@ fn try_create_origin_task(
 
     let fp = ownership::fingerprint(human_message, &origin.chat_id);
     let now = chrono::Utc::now().timestamp();
-    let window = ownership::IntentLedger::window_secs();
-    if let Some(existing) = ownership::IntentLedger::find_recent(&root, &fp, now, window) {
-        // The safety net fired: this exact ask already became a task inside the
-        // window. Refuse the duplicate and reuse it — regardless of persona.
-        println!(
-            "[{}] duplicate intent, task {} already exists (persona {} chat {})",
-            chrono::Utc::now().format("%H:%M:%S"),
-            existing,
-            origin.persona,
-            origin.chat_id,
-        );
-        return Some(existing);
+    let domain = ownership::classify_domain(human_message);
+
+    // THE THREE-TASK PIZZA SPAWN (Luca, 2026-07-24 14:27/14:28/14:29). Exact-ask
+    // dedupe collapses IDENTICAL asks; it cannot collapse a human refining one
+    // intent out loud ("pizza tomorrow night" → "just mozzarella" → "sorry just
+    // margherita…"). Each refinement minted its own task and two were abandoned
+    // as duplicates minutes later. So a rapid corrective follow-up — same chat,
+    // same sender, same domain, inside the amendment window, with the first
+    // task still open — AMENDS that task instead of spawning a sibling.
+    match ownership::decide_creation(
+        &root,
+        human_message,
+        &origin.chat_id,
+        &origin.requester,
+        now,
+        |id| task_is_open(workgraph_dir, id),
+    ) {
+        ownership::CreateDecision::Duplicate { task_id } => {
+            // The safety net fired: this exact ask already became a task inside
+            // the window. Refuse the duplicate and reuse it — regardless of persona.
+            println!(
+                "[{}] duplicate intent, task {} already exists (persona {} chat {})",
+                chrono::Utc::now().format("%H:%M:%S"),
+                task_id,
+                origin.persona,
+                origin.chat_id,
+            );
+            return Some(task_id);
+        }
+        ownership::CreateDecision::Amend { task_id } => {
+            match amend_origin_task(workgraph_dir, &task_id, human_message, &origin.requester) {
+                Ok(()) => {
+                    println!(
+                        "[{}] rapid follow-up from {} amended task {} instead of spawning a sibling \
+                         (domain {} chat {})",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        origin.requester,
+                        task_id,
+                        domain.slug(),
+                        origin.chat_id,
+                    );
+                    // Record the new wording against the SAME task so a third
+                    // refinement dedupes/amends against it too.
+                    if let Err(e) = ownership::IntentLedger::record(
+                        &root,
+                        &fp,
+                        &task_id,
+                        &origin.persona,
+                        &origin.chat_id,
+                        &origin.requester,
+                        domain,
+                        now,
+                    ) {
+                        eprintln!(
+                            "[{}] failed to record amended task intent: {e}",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                        );
+                    }
+                    return Some(task_id);
+                }
+                Err(e) => {
+                    // Fail OPEN: a real ask is never dropped. Fall through and
+                    // create the task rather than lose the correction.
+                    eprintln!(
+                        "[{}] could not amend {task_id}, creating a fresh task instead: {e:#}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                    );
+                }
+            }
+        }
+        ownership::CreateDecision::Create => {}
     }
     match create_origin_task(workgraph_dir, title, origin) {
         Ok(id) => {
@@ -1663,10 +1791,18 @@ fn try_create_origin_task(
                 origin.chat_id,
             );
             // Record the intent so any sibling turn (a later collective voice, a
-            // restart-replayed message) dedupes against it.
-            if let Err(e) =
-                ownership::IntentLedger::record(&root, &fp, &id, &origin.persona, now)
-            {
+            // restart-replayed message) dedupes against it — and so a rapid
+            // corrective follow-up finds it to amend.
+            if let Err(e) = ownership::IntentLedger::record(
+                &root,
+                &fp,
+                &id,
+                &origin.persona,
+                &origin.chat_id,
+                &origin.requester,
+                domain,
+                now,
+            ) {
                 eprintln!(
                     "[{}] failed to record task intent for dedupe: {e}",
                     chrono::Utc::now().format("%H:%M:%S"),
@@ -2679,6 +2815,115 @@ mod tests {
             "nora",
             "the creation choke point re-stamps an off-domain meal task to its owner (Nora)"
         );
+    }
+
+    /// THE THREE-TASK PIZZA SPAWN (Luca, 2026-07-24 14:27/14:28/14:29). Three
+    /// rapid messages refining ONE intent each minted their own task; the dedupe
+    /// then abandoned two as duplicates, and each abandon spoke a false "I'll
+    /// take another crack at it" to the family. Driven through the REAL creation
+    /// choke point: the follow-ups must AMEND the first task, so exactly one task
+    /// exists and nothing is ever there to be abandoned.
+    #[test]
+    fn rapid_pizza_follow_ups_amend_one_task_instead_of_spawning_three() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let origin = crate::graph::TaskOrigin::new(
+            crate::graph::OriginChannel::TelegramGroup,
+            "8905220378",
+            "Luca",
+            "nora",
+            Some("nora".to_string()),
+        );
+
+        // 14:27 — the ask lands and mints one task.
+        let first = try_create_origin_task(
+            &wg,
+            "can we do pizza tomorrow night",
+            "Update Saturday dinner plan to pizza",
+            &origin,
+        )
+        .expect("the first ask creates a task");
+
+        // 14:28 and 14:29 — refinements. Same human, same chat, same subject.
+        let second = try_create_origin_task(
+            &wg,
+            "just mozzarella",
+            "Change Saturday dinner from Pasta to Mozzarella Pizza",
+            &origin,
+        );
+        let third = try_create_origin_task(
+            &wg,
+            "sorry just margherita pizza for saturday",
+            "prep margherita pizza for saturday dinner tomorrow",
+            &origin,
+        );
+        assert_eq!(second.as_deref(), Some(first.as_str()), "follow-up amends");
+        assert_eq!(third.as_deref(), Some(first.as_str()), "follow-up amends");
+
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
+        assert_eq!(
+            stamped.len(),
+            1,
+            "one exchange, ONE task — got {:?}",
+            stamped.iter().map(|t| &t.id).collect::<Vec<_>>()
+        );
+
+        // The corrections are not lost: they reach the worker via the description
+        // and are recorded in the log.
+        let task = stamped[0];
+        let desc = task.description.clone().unwrap_or_default();
+        assert!(desc.contains("just mozzarella"), "amendment kept: {desc}");
+        assert!(desc.contains("margherita"), "amendment kept: {desc}");
+        assert!(desc.contains("Follow-up from Luca"), "attributed: {desc}");
+        assert_eq!(
+            task.log
+                .iter()
+                .filter(|e| e.message.starts_with(AMENDMENT_LOG_PREFIX))
+                .count(),
+            2,
+            "each correction is logged once"
+        );
+        assert!(!task.status.is_terminal(), "the survivor is still live");
+    }
+
+    /// A follow-up that arrives AFTER the task finished is a genuinely new ask —
+    /// amendment must never resurrect closed work.
+    #[test]
+    fn a_follow_up_after_the_work_landed_creates_a_new_task() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let origin = crate::graph::TaskOrigin::new(
+            crate::graph::OriginChannel::TelegramGroup,
+            "8905220379",
+            "Luca",
+            "nora",
+            Some("nora".to_string()),
+        );
+        let first = try_create_origin_task(
+            &wg,
+            "can we do pizza tomorrow night",
+            "Update Saturday dinner plan to pizza",
+            &origin,
+        )
+        .unwrap();
+
+        // The work lands.
+        let path = wg.join("graph.jsonl");
+        let mut graph = crate::parser::load_graph(&path).unwrap();
+        graph.get_task_mut(&first).unwrap().status = crate::graph::Status::Done;
+        crate::parser::save_graph(&graph, &path).unwrap();
+
+        let second = try_create_origin_task(
+            &wg,
+            "actually make it margherita",
+            "Change Saturday pizza to margherita",
+            &origin,
+        )
+        .unwrap();
+        assert_ne!(second, first, "a closed task is never amended");
+        let graph = crate::parser::load_graph(&path).unwrap();
+        assert_eq!(graph.tasks().filter(|t| t.origin.is_some()).count(), 2);
     }
 
     /// The choke point leaves an ON-domain creation untouched: Otto creating a

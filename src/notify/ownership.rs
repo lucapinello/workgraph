@@ -78,6 +78,20 @@ impl Domain {
         }
     }
 
+    /// Parse a [`slug`](Self::slug) back into a domain — the ledger stores the
+    /// slug, and an unrecognized/legacy value is `None` (never a wrong guess).
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug.trim() {
+            "meal-planning" => Some(Domain::MealPlanning),
+            "cooking" => Some(Domain::Cooking),
+            "workouts" => Some(Domain::Workouts),
+            "calendar" => Some(Domain::Calendar),
+            "shopping" => Some(Domain::Shopping),
+            "coordination" => Some(Domain::Coordination),
+            _ => None,
+        }
+    }
+
     /// The ordered `household.toml` domain tags this domain maps to, most
     /// specific first. [`OwnerMap`] returns the first persona that lists any of
     /// them, so a household that splits meals into `nutrition` (Nora) vs
@@ -581,6 +595,18 @@ pub fn fingerprint(ask: &str, chat_id: &str) -> String {
     format!("{}\u{1f}{}", chat_id.trim(), normalized)
 }
 
+/// Default amendment window: a follow-up from the SAME human, in the SAME chat,
+/// about the SAME domain, arriving this soon after the first ask AMENDS the task
+/// that ask created instead of spawning a sibling.
+///
+/// 3 minutes, matching [`DEFAULT_CLARIFY_WINDOW_SECS`] — Luca's pizza burst
+/// spanned 14:27 → 14:29 ("pizza tomorrow night", "just mozzarella", "sorry just
+/// margherita…"), three corrective refinements of one intent that the exact-ask
+/// fingerprint could not collapse because each message said something *new*.
+/// Long enough for a human to think of the correction, short enough that a
+/// genuinely separate ask an hour later starts its own task.
+pub const DEFAULT_AMEND_WINDOW_SECS: i64 = 180;
+
 /// One recorded task-creation intent. Append-only JSONL under
 /// `<root>/.casa/intents.jsonl` — the same `.casa` surface the preference store
 /// and conversation feed use — so the dedupe survives a process restart (the
@@ -595,6 +621,14 @@ pub struct IntentRecord {
     pub task_id: String,
     /// The persona that created it (for the audit trail).
     pub persona: String,
+    /// The chat the ask arrived in — the amendment key, alongside `requester`
+    /// and `domain`. Empty on records written before this field existed.
+    pub chat_id: String,
+    /// The human who asked. Amendment is same-sender only: two people asking
+    /// about dinner in the same minute are two asks, not a correction.
+    pub requester: String,
+    /// The ask's [`Domain`] slug — "same subject" for amendment purposes.
+    pub domain: String,
 }
 
 impl IntentRecord {
@@ -604,22 +638,159 @@ impl IntentRecord {
             "fingerprint": self.fingerprint,
             "task_id": self.task_id,
             "persona": self.persona,
+            "chat_id": self.chat_id,
+            "requester": self.requester,
+            "domain": self.domain,
         })
         .to_string()
     }
 
     fn from_json_line(line: &str) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        let str_field = |key: &str| {
+            v.get(key)
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         Some(Self {
             ts: v.get("ts")?.as_i64()?,
             fingerprint: v.get("fingerprint")?.as_str()?.to_string(),
             task_id: v.get("task_id")?.as_str()?.to_string(),
-            persona: v
-                .get("persona")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
+            persona: str_field("persona"),
+            chat_id: str_field("chat_id"),
+            requester: str_field("requester"),
+            domain: str_field("domain"),
         })
+    }
+}
+
+/// What a conversational turn should do with an ask that wants to become a task.
+///
+/// The three-task pizza spawn is the regression: the exact-ask dedupe
+/// ([`IntentLedger::find_recent`]) only collapses *identical* asks, so three
+/// rapid refinements of one intent each minted their own task, two of which were
+/// then abandoned as duplicates. [`decide_creation`] adds the middle case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateDecision {
+    /// A new ask — mint a task.
+    Create,
+    /// The identical ask already became `task_id` inside the dedupe window —
+    /// reuse it, create nothing.
+    Duplicate { task_id: String },
+    /// A rapid corrective follow-up to `task_id`, which is still open: AMEND it
+    /// with the new text (append to its description + log) instead of spawning a
+    /// sibling that will only be abandoned later.
+    Amend { task_id: String },
+}
+
+/// Single words that mark a message as a CORRECTION of something just said,
+/// rather than a fresh request. Matched as whole tokens.
+const CORRECTION_WORDS: &[&str] = &[
+    "actually", "sorry", "just", "instead", "rather", "no", "not", "nope",
+    "correction", "nevermind", "scratch", "meant", "oops", "wait", "also",
+];
+
+/// Multi-word correction cues, matched as substrings of the normalized text.
+const CORRECTION_PHRASES: &[&str] = &[
+    "make it",
+    "make that",
+    "change that",
+    "change it to",
+    "scratch that",
+    "i mean",
+    "i meant",
+    "on second thought",
+    "better yet",
+    "or maybe",
+    "forget the",
+];
+
+/// Whether `text` reads like a correction of an ask already in flight ("just
+/// mozzarella", "sorry just margherita…", "actually make it Thursday") rather
+/// than a new request.
+///
+/// This is what lets a fragment that carries too little signal to classify —
+/// every one of Luca's refinements landed in the [`Domain::Coordination`]
+/// catch-all — be folded into the open ask instead of minting a task of its own,
+/// WITHOUT swallowing a genuinely new short request ("call the plumber").
+pub fn is_corrective_follow_up(text: &str) -> bool {
+    let words = tokens(text);
+    if words.is_empty() {
+        return false;
+    }
+    if CORRECTION_WORDS.iter().any(|w| has_word(&words, w)) {
+        return true;
+    }
+    let normalized = words.join(" ");
+    CORRECTION_PHRASES.iter().any(|p| normalized.contains(p))
+}
+
+/// Whether two domains are the same SUBJECT for amendment purposes.
+///
+/// Equal domains obviously are. Meal planning and cooking are one subject to a
+/// family ("pizza tomorrow night" classifies as cooking, "swap Saturday dinner"
+/// as meal planning — the same conversation). And a correction that classifies
+/// into the [`Domain::Coordination`] catch-all carries no subject of its own, so
+/// it inherits the open ask's.
+fn amendable_subject(prev: Domain, next: Domain, next_text: &str) -> bool {
+    if prev == next {
+        return true;
+    }
+    let food = |d: Domain| matches!(d, Domain::MealPlanning | Domain::Cooking);
+    if food(prev) && food(next) {
+        return true;
+    }
+    next == Domain::Coordination && is_corrective_follow_up(next_text)
+}
+
+/// Decide whether an ask should mint a task, reuse one, or amend one.
+///
+/// Order matters:
+/// 1. **Exact duplicate** inside [`IntentLedger::window_secs`] → reuse (the
+///    existing single-owner safety net, unchanged).
+/// 2. **Rapid corrective follow-up** — same chat + same requester + the same
+///    subject ([`amendable_subject`]), inside
+///    [`IntentLedger::amend_window_secs`], and the earlier task still open
+///    (`is_open`) → amend it. The newest matching task wins.
+/// 3. Otherwise → create.
+///
+/// `is_open` is injected (the caller reads the live graph) so this whole
+/// decision is pure over the ledger + a predicate, and testable without a graph.
+/// An empty `requester` never amends: without a sender to key on, a follow-up
+/// cannot be told from a second person's separate ask.
+pub fn decide_creation(
+    root: &Path,
+    ask: &str,
+    chat_id: &str,
+    requester: &str,
+    now_epoch: i64,
+    is_open: impl Fn(&str) -> bool,
+) -> CreateDecision {
+    let fp = fingerprint(ask, chat_id);
+    if let Some(task_id) =
+        IntentLedger::find_recent(root, &fp, now_epoch, IntentLedger::window_secs())
+    {
+        return CreateDecision::Duplicate { task_id };
+    }
+    let domain = classify_domain(ask);
+    let candidate = IntentLedger::recent_for_sender(
+        root,
+        chat_id,
+        requester,
+        now_epoch,
+        IntentLedger::amend_window_secs(),
+    )
+    .into_iter()
+    .filter(|r| {
+        Domain::from_slug(&r.domain)
+            .is_some_and(|prev| amendable_subject(prev, domain, ask))
+    })
+    .filter(|r| is_open(&r.task_id))
+    .next_back();
+    match candidate {
+        Some(r) => CreateDecision::Amend { task_id: r.task_id },
+        None => CreateDecision::Create,
     }
 }
 
@@ -652,13 +823,65 @@ impl IntentLedger {
             .last()
     }
 
+    /// Every intent from `requester` in `chat_id` still inside `window_secs` of
+    /// `now_epoch`, oldest first — the candidates a rapid corrective follow-up
+    /// could be amending.
+    ///
+    /// Records written before the chat/requester/domain fields existed carry
+    /// empty strings and simply never match — an old ledger degrades to the
+    /// previous behaviour (create a sibling) rather than mis-amending.
+    pub fn recent_for_sender(
+        root: &Path,
+        chat_id: &str,
+        requester: &str,
+        now_epoch: i64,
+        window_secs: i64,
+    ) -> Vec<IntentRecord> {
+        if window_secs <= 0 {
+            return Vec::new();
+        }
+        let chat = chat_id.trim();
+        let who = requester.trim();
+        if who.is_empty() || chat.is_empty() {
+            return Vec::new();
+        }
+        let Ok(body) = std::fs::read_to_string(Self::path(root)) else {
+            return Vec::new();
+        };
+        body.lines()
+            .filter_map(IntentRecord::from_json_line)
+            .filter(|r| {
+                r.chat_id == chat
+                    && !r.requester.is_empty()
+                    && r.requester.eq_ignore_ascii_case(who)
+                    && !r.domain.is_empty()
+                    && (now_epoch - r.ts) >= 0
+                    && (now_epoch - r.ts) <= window_secs
+            })
+            .collect()
+    }
+
+    /// The amendment window in seconds — [`DEFAULT_AMEND_WINDOW_SECS`] unless
+    /// `CASA_AMEND_WINDOW_SECS` overrides it (0 or negative disables amendment).
+    pub fn amend_window_secs() -> i64 {
+        std::env::var("CASA_AMEND_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_AMEND_WINDOW_SECS)
+    }
+
     /// Durably record a fresh intent, creating `.casa/` if needed. Append-only:
-    /// a new intent never clobbers an earlier one.
+    /// a new intent never clobbers an earlier one. `chat_id`/`requester`/`domain`
+    /// are the amendment key ([`find_amendable`](Self::find_amendable)).
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         root: &Path,
         fp: &str,
         task_id: &str,
         persona: &str,
+        chat_id: &str,
+        requester: &str,
+        domain: Domain,
         now_epoch: i64,
     ) -> std::io::Result<()> {
         let rec = IntentRecord {
@@ -666,6 +889,9 @@ impl IntentLedger {
             fingerprint: fp.to_string(),
             task_id: task_id.to_string(),
             persona: persona.trim().to_string(),
+            chat_id: chat_id.trim().to_string(),
+            requester: requester.trim().to_string(),
+            domain: domain.slug().to_string(),
         };
         let path = Self::path(root);
         if let Some(dir) = path.parent() {
@@ -1043,7 +1269,17 @@ mod tests {
         let fp = fingerprint("swap Thursday dinner to grilled tofu", "group-42");
         // Nora creates first.
         assert_eq!(IntentLedger::find_recent(root, &fp, 1000, 300), None);
-        IntentLedger::record(root, &fp, "swap-thursday-dinner", "nora", 1000).unwrap();
+        IntentLedger::record(
+            root,
+            &fp,
+            "swap-thursday-dinner",
+            "nora",
+            "group-42",
+            "Luca",
+            Domain::MealPlanning,
+            1000,
+        )
+        .unwrap();
         // Bruno, 20s later, same ask → duplicate, reuses Nora's task.
         assert_eq!(
             IntentLedger::find_recent(root, &fp, 1020, 300),
@@ -1058,6 +1294,233 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fp = fingerprint("anything", "c1");
         assert_eq!(IntentLedger::find_recent(dir.path(), &fp, 0, 300), None);
+    }
+
+    // ---- rapid corrective follow-ups AMEND, they don't spawn siblings ------
+    //
+    // Luca, 2026-07-24 14:27/14:28/14:29: "pizza tomorrow night", then "just
+    // mozzarella", then "sorry just margherita…". Three tasks were minted; two
+    // were abandoned as duplicates minutes later and each abandon spoke a false
+    // "I'll take another crack at it" to the family.
+
+    /// Record a first ask exactly as `try_create_origin_task` does.
+    fn record_ask(root: &Path, ask: &str, chat: &str, who: &str, task_id: &str, ts: i64) {
+        IntentLedger::record(
+            root,
+            &fingerprint(ask, chat),
+            task_id,
+            "nora",
+            chat,
+            who,
+            classify_domain(ask),
+            ts,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rapid_follow_up_amends_the_open_task_instead_of_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let chat = "8905220378";
+        let always_open = |_: &str| true;
+
+        // 14:27 — the first ask mints the task.
+        assert_eq!(
+            decide_creation(
+                root,
+                "can we do pizza tomorrow night",
+                chat,
+                "Luca",
+                1000,
+                always_open
+            ),
+            CreateDecision::Create
+        );
+        record_ask(
+            root,
+            "can we do pizza tomorrow night",
+            chat,
+            "Luca",
+            "update-saturday-dinner-plan-to",
+            1000,
+        );
+
+        // 14:28 — a refinement, 60s later. Different words, so the exact-ask
+        // dedupe cannot see it; the amendment window can.
+        assert_eq!(
+            decide_creation(root, "just mozzarella", chat, "Luca", 1060, always_open),
+            CreateDecision::Amend {
+                task_id: "update-saturday-dinner-plan-to".to_string()
+            }
+        );
+
+        // 14:29 — a second refinement, 120s in. Still an amendment.
+        assert_eq!(
+            decide_creation(
+                root,
+                "sorry just margherita pizza for saturday",
+                chat,
+                "Luca",
+                1120,
+                always_open
+            ),
+            CreateDecision::Amend {
+                task_id: "update-saturday-dinner-plan-to".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn amendment_requires_same_sender_same_domain_same_chat_and_a_live_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let chat = "8905220378";
+        let always_open = |_: &str| true;
+        record_ask(
+            root,
+            "can we do pizza tomorrow night",
+            chat,
+            "Luca",
+            "update-saturday-dinner-plan-to",
+            1000,
+        );
+
+        // A DIFFERENT person asking about dinner is a separate ask, not a
+        // correction of Luca's.
+        assert_eq!(
+            decide_creation(root, "just mozzarella", chat, "Sara", 1060, always_open),
+            CreateDecision::Create
+        );
+        // A different DOMAIN from the same person is a separate ask.
+        assert_eq!(
+            decide_creation(
+                root,
+                "book me a dentist appointment on tuesday",
+                chat,
+                "Luca",
+                1060,
+                always_open
+            ),
+            CreateDecision::Create
+        );
+        // A different CHAT is a separate conversation.
+        assert_eq!(
+            decide_creation(root, "just mozzarella", "other-chat", "Luca", 1060, always_open),
+            CreateDecision::Create
+        );
+        // Past the window (3 min) it is a genuinely new ask.
+        assert_eq!(
+            decide_creation(root, "just mozzarella", chat, "Luca", 1000 + 400, always_open),
+            CreateDecision::Create
+        );
+        // An unnamed requester can never amend — no sender to key on.
+        assert_eq!(
+            decide_creation(root, "just mozzarella", chat, "  ", 1060, always_open),
+            CreateDecision::Create
+        );
+    }
+
+    #[test]
+    fn a_new_unrelated_request_is_not_swallowed_by_the_amendment_window() {
+        // The catch-all inherit rule is gated on a CORRECTION cue, so a short but
+        // genuinely new ask still mints its own task even inside the window.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let chat = "8905220378";
+        record_ask(
+            root,
+            "can we do pizza tomorrow night",
+            chat,
+            "Luca",
+            "update-saturday-dinner-plan-to",
+            1000,
+        );
+        for fresh in ["call the plumber", "remind everyone about the party"] {
+            assert_eq!(
+                decide_creation(root, fresh, chat, "Luca", 1060, |_| true),
+                CreateDecision::Create,
+                "'{fresh}' is a new ask, not a correction"
+            );
+        }
+        // …while the corrective fragments are folded in.
+        for correction in ["just mozzarella", "actually no onions", "sorry, make it thin crust"] {
+            assert!(
+                is_corrective_follow_up(correction),
+                "'{correction}' reads as a correction"
+            );
+            assert_eq!(
+                decide_creation(root, correction, chat, "Luca", 1060, |_| true),
+                CreateDecision::Amend {
+                    task_id: "update-saturday-dinner-plan-to".to_string()
+                },
+                "'{correction}' must amend, not spawn"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_task_is_never_amended() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let chat = "8905220378";
+        record_ask(
+            root,
+            "can we do pizza tomorrow night",
+            chat,
+            "Luca",
+            "update-saturday-dinner-plan-to",
+            1000,
+        );
+        // The work already landed → a follow-up is a NEW ask, not a correction.
+        assert_eq!(
+            decide_creation(root, "just mozzarella", chat, "Luca", 1060, |_| false),
+            CreateDecision::Create
+        );
+    }
+
+    #[test]
+    fn an_identical_repeat_is_still_a_duplicate_not_an_amendment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let chat = "8905220378";
+        let ask = "can we do pizza tomorrow night";
+        record_ask(root, ask, chat, "Luca", "update-saturday-dinner-plan-to", 1000);
+        assert_eq!(
+            decide_creation(root, ask, chat, "Luca", 1030, |_| true),
+            CreateDecision::Duplicate {
+                task_id: "update-saturday-dinner-plan-to".to_string()
+            },
+            "the exact-ask safety net still wins — reuse, don't amend"
+        );
+    }
+
+    #[test]
+    fn a_legacy_ledger_without_the_amendment_key_never_mis_amends() {
+        // Records written before chat/requester/domain existed carry empty
+        // strings; they must degrade to "create", never glue a new ask onto an
+        // unrelated old task.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = IntentLedger::path(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "ts": 1000,
+                    "fingerprint": fingerprint("old ask", "8905220378"),
+                    "task_id": "ancient-task",
+                    "persona": "nora",
+                })
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            decide_creation(root, "just mozzarella", "8905220378", "Luca", 1060, |_| true),
+            CreateDecision::Create
+        );
     }
 
     // ---- typo-tolerant + swap-shaped classification ----------------------

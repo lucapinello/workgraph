@@ -23,6 +23,18 @@
 //! * **The lines** — [`render_line`] composes the family-voice notification for
 //!   each event, in the composing persona's voice ("Nora and Bruno are on it
 //!   🍳" / "Done! …, the week's updated" / an honest, never-technical snag line).
+//! * **Only promise what happens** — [`FailureShape`], derived from live task
+//!   evidence by [`failure_shape`], decides WHICH honest not-done line goes out
+//!   (and whether one goes out at all). Luca's 2026-07-24 pizza exchange is the
+//!   regression: three rapid messages minted three tasks, dedupe abandoned two
+//!   as duplicates, and each abandon spoke "Ran into a snag — I'll take another
+//!   crack at it" to the family — twice, from two personas, promising a retry no
+//!   machinery performs, when nothing had actually failed and the survivor
+//!   landed the pizza. A duplicate-abandon is now **silent**; a genuinely
+//!   dropped abandon says so without promising a retry; and the retry promise
+//!   is spoken ONLY when a re-attempt is actually queued
+//!   ([`retry_is_scheduled`]). A final, no-retry failure of a family-origin task
+//!   also raises an [`OperatorAlert`] so it is never a dead end.
 //! * **"Are they done yet?"** — [`is_status_question`] + [`answer_status`]
 //!   answer a status question from LIVE task state, not a generic chat turn.
 //! * **"Let me know when…"** — [`is_follow_request`] + [`FOLLOW_ACK`] acknowledge
@@ -90,9 +102,196 @@ pub fn event_for_status(status: Status) -> Option<LifecycleEvent> {
     }
 }
 
-/// The lifecycle event a task warrants, given its live status.
+/// The lifecycle event a task warrants, given its live status — **or `None` when
+/// the task owes the family silence**.
+///
+/// The silence case is the duplicate-abandon (Luca's pizza exchange): when the
+/// dedupe consolidates sibling tasks minted from one exchange, the losers are
+/// abandoned with a `Duplicate of <survivor>` reason. Nothing failed and nothing
+/// was dropped — the survivor is doing the work and its own `Done` line is the
+/// only thing the family should ever hear. Suppressing the event HERE keeps
+/// every consumer silent at once: [`pending_fires`] never spins the coordinator's
+/// trigger for it, [`LifecycleInput::from_task`] never builds an input, and
+/// [`lifecycle_tick`] never fires a line.
 pub fn event_for_task(task: &Task) -> Option<LifecycleEvent> {
+    if is_silent_duplicate(task) {
+        return None;
+    }
     event_for_status(task.status)
+}
+
+// ---------------------------------------------------------------------------
+// Only promise what actually happens: the shape of a not-done outcome
+// ---------------------------------------------------------------------------
+
+/// WHY a task is not done — which decides what the family may honestly be told.
+///
+/// The old code had one `Failed` line for all four of these, and it promised a
+/// retry: "Ran into a snag on that one — I'll take another crack at it." That is
+/// a lie in three of the four cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureShape {
+    /// A re-attempt is genuinely queued (redispatchable status, pending backoff,
+    /// or a rescue/replacement task exists). ONLY this shape may promise
+    /// "I'll take another crack at it".
+    RetryScheduled,
+    /// It failed and nothing will re-attempt it — retries exhausted, or a
+    /// rejected verdict. Honest copy, and an [`OperatorAlert`] so a family-origin
+    /// failure is never a dead end.
+    Final,
+    /// Genuinely dropped work: abandoned for a reason that is NOT "duplicate of
+    /// something else". Honest copy, no retry claim — the family is invited to
+    /// ask again.
+    Dropped,
+    /// Abandoned as a duplicate of a surviving sibling. The family hears NOTHING:
+    /// the survivor's own `Done` line is the whole story.
+    Duplicate,
+}
+
+impl FailureShape {
+    /// Stable slug for logs and the `--dry-run` seam.
+    pub fn slug(self) -> &'static str {
+        match self {
+            FailureShape::RetryScheduled => "retry-scheduled",
+            FailureShape::Final => "final",
+            FailureShape::Dropped => "dropped",
+            FailureShape::Duplicate => "duplicate",
+        }
+    }
+
+    /// Whether this shape owes the family any line at all.
+    pub fn is_silent(self) -> bool {
+        self == FailureShape::Duplicate
+    }
+}
+
+/// Reason substrings that mark an abandon as *"this ask is already being handled
+/// by another task"* rather than dropped work. Matched case-insensitively as
+/// substrings so every writer of the reason is covered: the live
+/// consolidation prose ("Duplicate of update-saturday-dinner-plan-to — the
+/// Telegram listener created three tasks…"), the intent-ledger wording
+/// ("duplicate intent, task X already exists"), and hyphenated/short forms.
+const DUPLICATE_ABANDON_MARKERS: &[&str] = &[
+    "duplicate of",
+    "duplicate-of",
+    "duplicate intent",
+    "dupe of",
+    "dup of",
+    "consolidated into",
+    "superseded by",
+    "already covered by",
+];
+
+/// Whether an abandon `reason` marks the task as a duplicate of a surviving
+/// sibling — the abandon the family must never hear about.
+pub fn is_duplicate_abandon_reason(reason: Option<&str>) -> bool {
+    let Some(r) = reason else { return false };
+    let low = r.to_ascii_lowercase();
+    DUPLICATE_ABANDON_MARKERS.iter().any(|m| low.contains(m))
+}
+
+/// Whether `task` is an abandoned duplicate — i.e. owes the family total
+/// silence. `superseded_by` counts too: `wg abandon --superseded-by <survivor>`
+/// records the same fact structurally.
+pub fn is_silent_duplicate(task: &Task) -> bool {
+    if task.status != Status::Abandoned {
+        return false;
+    }
+    if !task.superseded_by.is_empty() {
+        return true;
+    }
+    is_duplicate_abandon_reason(task.failure_reason.as_deref())
+}
+
+/// Reason/log substrings that positively say NO further attempt will happen.
+/// These win over any retry evidence — a task that exhausted its retries has
+/// often also logged the earlier "marked as incomplete (attempt #1)" breadcrumbs.
+const RETRY_EXHAUSTED_MARKERS: &[&str] = &[
+    "retry exhausted",
+    "retries exhausted",
+    "no retries remaining",
+    "verdict",  // "evaluation verdict X rejected: score=…" — the eval declined to rescue
+    "giving up",
+    "quarantine",
+];
+
+/// Log/reason substrings the engine writes when a re-attempt IS genuinely
+/// queued. `wg incomplete` writes the first one when it leaves retries on the
+/// clock and re-arms the task for dispatch with a backoff `ready_after`;
+/// `wg rescue` writes the rescue-task breadcrumb.
+const RETRY_SCHEDULED_MARKERS: &[&str] = &[
+    "marked as incomplete (attempt",
+    "retry scheduled",
+    "scheduled for retry",
+    "requeued for retry",
+    "respawn scheduled",
+    "will retry",
+    "rescue task",
+];
+
+/// Whether a re-attempt of `task` is ACTUALLY scheduled — the only condition
+/// under which the family may be promised another crack at it.
+///
+/// Positive evidence only, and it defaults to `false`: an unproven promise is
+/// exactly the bug. The engine's real re-attempt paths are
+///
+/// * [`Status::Incomplete`] — `wg incomplete` left retries on the clock and the
+///   dispatcher picks `Open | Incomplete` up again (with the configured backoff
+///   in `ready_after`);
+/// * a rescue/replacement task recorded in `superseded_by` (or logged by
+///   `wg rescue`) — a different task will do the work;
+/// * an explicit retry/respawn breadcrumb in the log.
+///
+/// A bare [`Status::Failed`] with retries nominally "remaining" is NOT a
+/// scheduled retry: nothing in the dispatcher re-opens a Failed task on its own.
+/// The eval-driven auto-rescue path reopens the task to `Open` (so the family
+/// hears no failure at all); when the verdict is rejected instead, the task
+/// lands `Failed` and stays there — final.
+pub fn retry_is_scheduled(task: &Task) -> bool {
+    // A terminal-dead reason that names exhaustion/rejection settles it.
+    let reason_low = task
+        .failure_reason
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if RETRY_EXHAUSTED_MARKERS
+        .iter()
+        .any(|m| reason_low.contains(m))
+    {
+        return false;
+    }
+    // Redispatchable: the coordinator will claim this again.
+    if task.status == Status::Incomplete {
+        return true;
+    }
+    // A replacement/rescue task carries the work forward.
+    if !task.superseded_by.is_empty() {
+        return true;
+    }
+    task.log.iter().any(|e| {
+        let low = e.message.to_ascii_lowercase();
+        RETRY_SCHEDULED_MARKERS.iter().any(|m| low.contains(m))
+            && !RETRY_EXHAUSTED_MARKERS.iter().any(|m| low.contains(m))
+    })
+}
+
+/// The honest shape of `task`'s not-done outcome (see [`FailureShape`]).
+///
+/// An abandon splits on WHY: a duplicate is silent, anything else is dropped
+/// work. A failure splits on whether a re-attempt is really queued.
+pub fn failure_shape(task: &Task) -> FailureShape {
+    if task.status == Status::Abandoned {
+        return if is_silent_duplicate(task) {
+            FailureShape::Duplicate
+        } else {
+            FailureShape::Dropped
+        };
+    }
+    if retry_is_scheduled(task) {
+        FailureShape::RetryScheduled
+    } else {
+        FailureShape::Final
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,14 +445,35 @@ fn join_names(names: &[String]) -> String {
     }
 }
 
+/// The ONLY line that may promise a retry — spoken exclusively when
+/// [`retry_is_scheduled`] is true, i.e. a re-attempt really is queued.
+pub const FAILED_RETRY_LINE: &str =
+    "Ran into a snag on that one — I'll take another crack at it. Sorry for the wait!";
+
+/// The honest line for a failure with NO retry behind it: no promise, but the
+/// ask is not silently dropped either — it is flagged to the operator (see
+/// [`OperatorAlert`]).
+pub const FAILED_FINAL_LINE: &str = "That didn't work out — I've flagged it so it isn't forgotten 🙏";
+
+/// The honest line for genuinely dropped work (a non-duplicate abandon): no
+/// retry claim, and the family is told how to get it back.
+pub const ABANDON_DROPPED_LINE: &str =
+    "I couldn't finish that one — ask me again if you still want it 🙏";
+
 /// Compose the family-voice notification for `event`, in the origin persona's
-/// voice.
+/// voice — or `None` when the family owes silence.
 ///
 /// * `Started` — "Nora and Bruno are on it 🍳" when the workers are known, else
 ///   the composing persona's own "on it".
 /// * `Done` — "Done! {what changed}" when a change summary was recorded, else a
 ///   warm generic completion.
-/// * `Failed` — an honest, never-technical one-liner.
+/// * `Failed` — an honest, never-technical one-liner chosen by `failure`, which
+///   is the whole point: [`FailureShape::RetryScheduled`] gets the retry promise
+///   ([`FAILED_RETRY_LINE`]) because a retry really is queued;
+///   [`FailureShape::Final`] gets [`FAILED_FINAL_LINE`];
+///   [`FailureShape::Dropped`] gets [`ABANDON_DROPPED_LINE`]; and
+///   [`FailureShape::Duplicate`] gets **`None`** — a consolidated sibling is not
+///   news the family should ever receive.
 ///
 /// `workers` are the persona names doing the work (from the task's assignee, at
 /// notification time); `summary` is the family-voice "what changed" line.
@@ -262,8 +482,9 @@ pub fn render_line(
     event: LifecycleEvent,
     workers: &[String],
     summary: Option<&str>,
-) -> String {
-    match event {
+    failure: FailureShape,
+) -> Option<String> {
+    Some(match event {
         LifecycleEvent::Started => {
             // FAMILY-VOICE GATE (morning-taco-bugs): speak only names that pass
             // [`is_family_safe_name`]. A raw worker id ("agent-2972") is dropped
@@ -296,11 +517,14 @@ pub fn render_line(
             }
             None => "All done — that's sorted ✅".to_string(),
         },
-        LifecycleEvent::Failed => {
-            "Ran into a snag on that one — I'll take another crack at it. Sorry for the wait!"
-                .to_string()
-        }
-    }
+        LifecycleEvent::Failed => match failure {
+            // A duplicate-abandon is not news: the survivor speaks for the ask.
+            FailureShape::Duplicate => return None,
+            FailureShape::RetryScheduled => FAILED_RETRY_LINE.to_string(),
+            FailureShape::Final => FAILED_FINAL_LINE.to_string(),
+            FailureShape::Dropped => ABANDON_DROPPED_LINE.to_string(),
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -348,21 +572,32 @@ pub fn is_status_question(message: &str) -> bool {
 pub struct TaskState {
     /// Family-facing description of the ask (e.g. "tweak this week's meals").
     pub what: String,
-    /// The lifecycle stage, or `None` while still queued (Open/Waiting).
+    /// The lifecycle stage, or `None` while still queued (Open/Waiting) — or
+    /// while owing silence (a duplicate-abandon; see `shape`).
     pub event: Option<LifecycleEvent>,
     /// The "what changed" summary, when the task is done and recorded one.
     pub summary: Option<String>,
+    /// For a not-done task, WHY — so a status answer promises a retry only when
+    /// one is queued, and skips a consolidated duplicate entirely. `None` for a
+    /// task that is running or done.
+    pub shape: Option<FailureShape>,
 }
 
 impl TaskState {
     /// Derive a status snapshot from a live task: its human-facing ask, its
-    /// lifecycle stage, and any recorded change summary.
+    /// lifecycle stage, any recorded change summary, and — when it is not done —
+    /// the honest [`FailureShape`] of that outcome.
     pub fn from_task(task: &Task) -> Self {
         let event = event_for_task(task);
+        let shape = match task.status {
+            Status::Failed | Status::Abandoned | Status::Incomplete => Some(failure_shape(task)),
+            _ => None,
+        };
         Self {
             what: task_what(task),
             event,
             summary: event.and_then(|e| summary_with_fallback(task, e)),
+            shape,
         }
     }
 }
@@ -382,6 +617,11 @@ pub fn answer_status(states: &[TaskState]) -> Option<String> {
     let mut queued: Vec<&TaskState> = Vec::new();
     let mut failed: Vec<&TaskState> = Vec::new();
     for st in states {
+        // A consolidated duplicate is not part of the answer at all — the
+        // survivor's own state is what the human is asking about.
+        if st.shape == Some(FailureShape::Duplicate) {
+            continue;
+        }
         match st.event {
             Some(LifecycleEvent::Done) => done.push(st),
             Some(LifecycleEvent::Started) => running.push(st),
@@ -412,9 +652,21 @@ pub fn answer_status(states: &[TaskState]) -> Option<String> {
         parts.push(format!("All done{payoff} ✅"));
     }
     if !failed.is_empty() {
-        parts.push(
-            "One of them hit a snag — I'm getting it sorted and will let you know.".to_string(),
-        );
+        // Same honesty rule as the lifecycle line: only claim it's being sorted
+        // when a re-attempt is actually queued.
+        let retrying = failed
+            .iter()
+            .any(|st| st.shape == Some(FailureShape::RetryScheduled));
+        parts.push(if retrying {
+            "One of them hit a snag — I'm getting it sorted and will let you know.".to_string()
+        } else {
+            "One of them didn't work out — I've flagged it so it isn't forgotten 🙏".to_string()
+        });
+    }
+    if parts.is_empty() {
+        // Everything on file was silent (e.g. only consolidated duplicates) —
+        // nothing to report, so the caller falls back to an ordinary chat turn.
+        return None;
     }
     Some(parts.join(" "))
 }
@@ -651,13 +903,21 @@ pub struct LifecycleInput {
     pub event: LifecycleEvent,
     pub workers: Vec<String>,
     pub summary: Option<String>,
+    /// For a `Failed` event, the honest shape of the outcome — which line may be
+    /// spoken, and whether one may be spoken at all. Irrelevant (and
+    /// [`FailureShape::Final`] by convention) for `Started`/`Done`.
+    pub failure: FailureShape,
+    /// The human-facing description of the ask ([`task_what`]) — used by the
+    /// dead-end [`OperatorAlert`], never by a family line.
+    pub what: String,
 }
 
 impl LifecycleInput {
     /// Build the input for a task, or `None` when it is not origin-stamped or
-    /// owes no notification yet. `workers` is the persona name(s) doing the work
-    /// (resolved by the caller from the task's assignee, falling back to the
-    /// origin persona).
+    /// owes no notification yet (including the duplicate-abandon that owes
+    /// silence — see [`event_for_task`]). `workers` is the persona name(s) doing
+    /// the work (resolved by the caller from the task's assignee, falling back to
+    /// the origin persona).
     pub fn from_task(task: &Task, workers: Vec<String>) -> Option<Self> {
         let origin = task.origin.clone()?;
         let event = event_for_task(task)?;
@@ -667,12 +927,25 @@ impl LifecycleInput {
             event,
             workers,
             summary: summary_with_fallback(task, event),
+            failure: if event == LifecycleEvent::Failed {
+                failure_shape(task)
+            } else {
+                FailureShape::Final
+            },
+            what: task_what(task),
         })
     }
 
-    /// The rendered family-voice line for this input.
-    pub fn render(&self) -> String {
-        render_line(&self.origin, self.event, &self.workers, self.summary.as_deref())
+    /// The rendered family-voice line for this input, or `None` when it owes
+    /// silence.
+    pub fn render(&self) -> Option<String> {
+        render_line(
+            &self.origin,
+            self.event,
+            &self.workers,
+            self.summary.as_deref(),
+            self.failure,
+        )
     }
 }
 
@@ -694,7 +967,51 @@ pub struct LifecycleTickResult {
     /// `(task, event)` notifications skipped because the pacing cap was spent —
     /// folded into the next digest rather than piling on standalone pings.
     pub capped: Vec<LifecycleFire>,
+    /// Owner-facing alerts for family-origin tasks that failed with NO retry
+    /// behind them. The family got an honest "I've flagged it" line; this is the
+    /// flag actually being raised, so the ask is never a dead end.
+    pub operator_alerts: Vec<OperatorAlert>,
 }
+
+/// A dead-end family ask, escalated to the household owner (delivered as an Otto
+/// DM by the caller). Raised exactly once per task, keyed by
+/// [`alert_notification_id`] in the same [`FiredLog`] the family lines use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorAlert {
+    /// The task that dead-ended.
+    pub task_id: String,
+    /// Who asked for it (so the owner knows whose ask is stuck).
+    pub requester: String,
+    /// The plain-language alert body.
+    pub text: String,
+    /// The exactly-once id recorded for this alert.
+    pub notification_id: String,
+}
+
+/// The exactly-once id for a task's dead-end operator alert. Distinct from the
+/// family line's [`notification_id`] so the two are independent: the alert still
+/// fires when the family line was capped, and neither swallows the other.
+pub fn alert_notification_id(task_id: &str) -> String {
+    format!("lifecycle-alert:{task_id}:failed")
+}
+
+/// The owner-facing body for a dead-end family ask. Plain language (the owner is
+/// a person, not a log reader) but it DOES name the task id — unlike a family
+/// line, this one exists to be acted on.
+pub fn operator_alert_text(task_id: &str, what: &str, requester: &str) -> String {
+    let who = requester.trim();
+    let who = if who.is_empty() { "someone" } else { who };
+    let what = what.trim();
+    let what = if what.is_empty() { "a chat request" } else { what };
+    format!(
+        "⚠️ {who} asked for something that didn't get done and won't retry on its own: \
+         \"{what}\". I told them it's flagged, not fixed. Task `{task_id}` — worth a look."
+    )
+}
+
+/// The bot that carries an operator alert: the concierge/coordinator persona,
+/// whose DM chat is the household owner's.
+pub const OPERATOR_ALERT_BOT: &str = "otto";
 
 /// Scan `inputs`, firing each not-yet-sent `(task, event)` notification exactly
 /// once, paced through the daily-digest choke point.
@@ -708,6 +1025,10 @@ pub struct LifecycleTickResult {
 /// * Under the per-person cap → [`LifecycleTickResult::fired`], recorded `Sent`.
 /// * Over the cap → [`LifecycleTickResult::capped`], recorded `Sent` too (it was
 ///   handled — folded into the digest by the pacing layer — so it never re-fires).
+/// * Owing silence (a duplicate-abandon that reached here anyway) → skipped
+///   WITHOUT recording, so nothing is fired and nothing is falsely marked sent.
+/// * A dead-end failure ([`FailureShape::Final`]) → additionally raises one
+///   [`OperatorAlert`], on its own exactly-once id.
 pub fn lifecycle_tick(
     inputs: &[LifecycleInput],
     log: &mut FiredLog,
@@ -721,11 +1042,39 @@ pub fn lifecycle_tick(
             // No one to report back to — nothing to pace or fire.
             continue;
         }
+        // SILENCE FIRST (the pizza regression): a duplicate-abandon renders to
+        // nothing, and must not be recorded as handled either — the survivor owns
+        // the conversation, and if this task is later genuinely resolved the
+        // event that matters is still free to fire.
+        let Some(text) = input.render() else {
+            continue;
+        };
+
+        // DEAD-END ESCALATION. A family-origin task that failed with no retry
+        // behind it told the family "I've flagged it" — so actually raise the
+        // flag. Keyed independently of the family line so a capped/duplicate
+        // family line can never swallow the alert.
+        if input.event == LifecycleEvent::Failed && input.failure == FailureShape::Final {
+            let alert_id = alert_notification_id(&input.task_id);
+            if !log.contains(&alert_id) {
+                log.record(&alert_id, now, Outcome::OnTime);
+                result.operator_alerts.push(OperatorAlert {
+                    task_id: input.task_id.clone(),
+                    requester: input.origin.requester.clone(),
+                    text: operator_alert_text(
+                        &input.task_id,
+                        &input.what,
+                        &input.origin.requester,
+                    ),
+                    notification_id: alert_id,
+                });
+            }
+        }
+
         let id = notification_id(&input.task_id, input.event);
         if log.contains(&id) {
             continue;
         }
-        let text = input.render();
         let nudge = to_nudge(&input.task_id, input.event, &input.origin, &text, now);
         let fire = LifecycleFire {
             task_id: input.task_id.clone(),
@@ -765,6 +1114,15 @@ pub fn dry_run_line(fire: &LifecycleFire) -> String {
         bot,
         fire.origin.persona,
         fire.text,
+    )
+}
+
+/// Format a dead-end [`OperatorAlert`] for the `--dry-run` seam: who it goes to
+/// and as whom.
+pub fn dry_run_alert_line(alert: &OperatorAlert) -> String {
+    format!(
+        "[dry-run] operator-alert for {} → owner DM via bot '{}': {}",
+        alert.task_id, OPERATOR_ALERT_BOT, alert.text,
     )
 }
 
@@ -874,19 +1232,23 @@ mod tests {
     #[test]
     fn lifecycle_started_names_the_workers() {
         let o = origin();
+        let started = |workers: &[String]| {
+            render_line(
+                &o,
+                LifecycleEvent::Started,
+                workers,
+                None,
+                FailureShape::Final,
+            )
+            .unwrap()
+        };
         assert_eq!(
-            render_line(&o, LifecycleEvent::Started, &["nora".into(), "bruno".into()], None),
+            started(&["nora".into(), "bruno".into()]),
             "Nora and Bruno are on it 🍳"
         );
-        assert_eq!(
-            render_line(&o, LifecycleEvent::Started, &["nora".into()], None),
-            "Nora is on it 🍳"
-        );
+        assert_eq!(started(&["nora".into()]), "Nora is on it 🍳");
         // No known workers → the composing persona's own "on it".
-        assert_eq!(
-            render_line(&o, LifecycleEvent::Started, &[], None),
-            "Otto's on it 🍳"
-        );
+        assert_eq!(started(&[]), "Otto's on it 🍳");
     }
 
     /// THE 7:20 TACO LEAK (morning-taco-bugs). The started-notification composed
@@ -904,7 +1266,14 @@ mod tests {
             Some("bruno".to_string()),
         );
         assert_eq!(
-            render_line(&o, LifecycleEvent::Started, &["agent-2972".into()], None),
+            render_line(
+                &o,
+                LifecycleEvent::Started,
+                &["agent-2972".into()],
+                None,
+                FailureShape::Final
+            )
+            .unwrap(),
             "Bruno's on it 🍳"
         );
         // A safe co-worker still speaks; the junk id is filtered out of the join.
@@ -913,8 +1282,10 @@ mod tests {
                 &o,
                 LifecycleEvent::Started,
                 &["nora".into(), "agent-2972".into()],
-                None
-            ),
+                None,
+                FailureShape::Final
+            )
+            .unwrap(),
             "Nora is on it 🍳"
         );
     }
@@ -973,7 +1344,17 @@ mod tests {
                     LifecycleEvent::Done,
                     LifecycleEvent::Failed,
                 ] {
-                    forbidden(&render_line(&o, event, &workers, Some(clean_summary)));
+                    // Every not-done shape must clear the gate too — the honest
+                    // final/dropped copies are family lines like any other.
+                    for shape in [
+                        FailureShape::RetryScheduled,
+                        FailureShape::Final,
+                        FailureShape::Dropped,
+                    ] {
+                        forbidden(
+                            &render_line(&o, event, &workers, Some(clean_summary), shape).unwrap(),
+                        );
+                    }
                 }
             }
         }
@@ -984,22 +1365,40 @@ mod tests {
         let o = origin();
         let summary = "Carbonara Wednesday, eggs Tuesday, and fish for Saturday lunch — the week's updated.";
         assert_eq!(
-            render_line(&o, LifecycleEvent::Done, &[], Some(summary)),
+            render_line(&o, LifecycleEvent::Done, &[], Some(summary), FailureShape::Final).unwrap(),
             "Done! Carbonara Wednesday, eggs Tuesday, and fish for Saturday lunch — the week's updated ✅"
         );
         assert_eq!(
-            render_line(&o, LifecycleEvent::Done, &[], None),
+            render_line(&o, LifecycleEvent::Done, &[], None, FailureShape::Final).unwrap(),
             "All done — that's sorted ✅"
         );
     }
 
     #[test]
     fn lifecycle_failed_is_honest_never_technical() {
-        let line = render_line(&origin(), LifecycleEvent::Failed, &[], None);
-        assert!(line.to_lowercase().contains("snag"));
-        for jargon in ["panic", "error", "exit", "stderr", "None", "unwrap", "task"] {
-            assert!(!line.contains(jargon), "no jargon '{jargon}' in: {line}");
+        // Every family-facing not-done line stays plain and jargon-free.
+        for shape in [
+            FailureShape::RetryScheduled,
+            FailureShape::Final,
+            FailureShape::Dropped,
+        ] {
+            let line = render_line(&origin(), LifecycleEvent::Failed, &[], None, shape).unwrap();
+            for jargon in ["panic", "error", "exit", "stderr", "None", "unwrap", "task"] {
+                assert!(!line.contains(jargon), "no jargon '{jargon}' in: {line}");
+            }
         }
+        assert!(
+            render_line(
+                &origin(),
+                LifecycleEvent::Failed,
+                &[],
+                None,
+                FailureShape::RetryScheduled
+            )
+            .unwrap()
+            .to_lowercase()
+            .contains("snag")
+        );
     }
 
     // -- status questions ------------------------------------------------------
@@ -1029,6 +1428,7 @@ mod tests {
             what: "tweak this week's meals".into(),
             event: Some(LifecycleEvent::Started),
             summary: None,
+            shape: None,
         };
         let a = answer_status(&[running]).unwrap();
         assert!(a.contains("on it now"), "{a}");
@@ -1038,6 +1438,7 @@ mod tests {
             what: "tweak this week's meals".into(),
             event: Some(LifecycleEvent::Done),
             summary: Some("carbonara Wednesday, eggs Tuesday".into()),
+            shape: None,
         };
         let a2 = answer_status(&[done]).unwrap();
         assert!(a2.starts_with("All done"), "{a2}");
@@ -1087,6 +1488,8 @@ mod tests {
             event,
             workers: vec!["nora".into(), "bruno".into()],
             summary: None,
+            failure: FailureShape::RetryScheduled,
+            what: "tweak this week's meals".to_string(),
         }
     }
 
@@ -1183,7 +1586,7 @@ mod tests {
         let mut t = task_with("replace-friday-dinner-chicken-with-trout", Status::Done);
         t.title = "replace friday dinner chicken with trout".into();
         let input = LifecycleInput::from_task(&t, vec![]).unwrap();
-        let line = input.render();
+        let line = input.render().unwrap();
         assert!(line.starts_with("Done!"), "{line}");
         assert!(line.contains("trout"), "must say what changed: {line}");
         assert_ne!(line, "All done — that's sorted ✅");
@@ -1199,7 +1602,7 @@ mod tests {
             user: None,
             message: "LIFECYCLE_SUMMARY: Friday's dinner is now roast trout & potatoes".into(),
         });
-        let line = LifecycleInput::from_task(&t, vec![]).unwrap().render();
+        let line = LifecycleInput::from_task(&t, vec![]).unwrap().render().unwrap();
         assert_eq!(line, "Done! Friday's dinner is now roast trout & potatoes ✅");
     }
 
@@ -1212,15 +1615,24 @@ mod tests {
             None
         );
         let failed = task_with("swap-the-meals", Status::Failed);
-        let line = LifecycleInput::from_task(&failed, vec![]).unwrap().render();
-        assert!(line.to_lowercase().contains("snag"), "{line}");
+        let line = LifecycleInput::from_task(&failed, vec![])
+            .unwrap()
+            .render()
+            .unwrap();
         assert!(!line.contains("swap"), "failed line must not quote the title: {line}");
     }
 
     #[test]
     fn lifecycle_summary_is_capped_to_a_one_liner() {
         let long = "a ".repeat(200); // ~400 chars, well over the cap
-        let line = render_line(&origin(), LifecycleEvent::Done, &[], Some(&long));
+        let line = render_line(
+            &origin(),
+            LifecycleEvent::Done,
+            &[],
+            Some(&long),
+            FailureShape::Final,
+        )
+        .unwrap();
         // "Done! " + capped body + " ✅" — body must respect SUMMARY_MAX_CHARS.
         assert!(line.ends_with('✅'));
         assert!(line.contains('…'), "over-long summary is elided: {line}");
@@ -1275,6 +1687,274 @@ mod tests {
         let p = pending_fires([done].iter(), never);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].event, LifecycleEvent::Done);
+    }
+
+    // -- THE PIZZA REGRESSION: honest not-done voice -------------------------
+    //
+    // 2026-07-24, Luca's group: three rapid messages minted three tasks
+    // (14:27/28/29). Dedupe correctly abandoned two as duplicates of the
+    // survivor — and each abandon spoke "Ran into a snag on that one — I'll take
+    // another crack at it. Sorry for the wait!" to the family, twice, from two
+    // personas. Nothing had failed (the survivor landed the pizza) and no
+    // machinery was going to retry anything.
+
+    /// The exact live reason strings, verbatim from `.wg/graph.jsonl`.
+    fn duplicate_reason() -> String {
+        "Duplicate of update-saturday-dinner-plan-to — the Telegram listener created three \
+         tasks (14:27/14:28/14:29) from Luca's single 'pizza tomorrow night' request. \
+         Consolidated into one owner to avoid concurrent edits to the same live plan file."
+            .to_string()
+    }
+
+    fn abandoned_duplicate(id: &str) -> Task {
+        let mut t = task_with(id, Status::Abandoned);
+        t.failure_reason = Some(duplicate_reason());
+        t
+    }
+
+    #[test]
+    fn duplicate_abandon_is_completely_silent() {
+        let dup = abandoned_duplicate("prep-margherita-pizza-for-saturday");
+
+        // (a) The event itself is suppressed, so every consumer is silent at once.
+        assert!(is_silent_duplicate(&dup));
+        assert_eq!(failure_shape(&dup), FailureShape::Duplicate);
+        assert_eq!(
+            event_for_task(&dup),
+            None,
+            "a duplicate-abandon owes the family NO lifecycle event"
+        );
+
+        // (b) The coordinator's trigger never spins for it.
+        assert!(
+            pending_fires([dup.clone()].iter(), |_| false).is_empty(),
+            "a duplicate-abandon must not be a pending fire"
+        );
+
+        // (c) No input is built, so nothing can be rendered or sent.
+        assert!(LifecycleInput::from_task(&dup, vec!["bruno".into()]).is_none());
+
+        // (d) Even if a Duplicate shape reaches the renderer, it renders nothing.
+        assert_eq!(
+            render_line(
+                &origin(),
+                LifecycleEvent::Failed,
+                &[],
+                None,
+                FailureShape::Duplicate
+            ),
+            None
+        );
+
+        // (e) And the tick fires nothing — not even a capped/recorded entry.
+        let mut log = FiredLog::default();
+        let mut store = DigestStore::default();
+        let policy = DigestPolicy::default();
+        let mut inp = input("prep-margherita-pizza-for-saturday", LifecycleEvent::Failed);
+        inp.failure = FailureShape::Duplicate;
+        let r = lifecycle_tick(&[inp], &mut log, &mut store, now(), &policy);
+        assert!(r.fired.is_empty(), "no family line for a duplicate-abandon");
+        assert!(r.capped.is_empty());
+        assert!(
+            r.operator_alerts.is_empty(),
+            "a duplicate is not a dead end — nothing to escalate"
+        );
+    }
+
+    #[test]
+    fn duplicate_abandon_via_superseded_by_is_silent_too() {
+        // `wg abandon --superseded-by <survivor>` records the same fact
+        // structurally, with no prose reason at all.
+        let mut dup = task_with("change-saturday-dinner-from-pasta", Status::Abandoned);
+        dup.superseded_by = vec!["update-saturday-dinner-plan-to".to_string()];
+        assert!(is_silent_duplicate(&dup));
+        assert_eq!(event_for_task(&dup), None);
+    }
+
+    #[test]
+    fn non_duplicate_abandon_is_honest_without_promising_a_retry() {
+        // Genuinely dropped work still owes the family a word — but never the
+        // retry promise, because nothing will retry it.
+        let mut dropped = task_with("book-the-dentist", Status::Abandoned);
+        dropped.failure_reason = Some("no longer needed for this week".into());
+        assert!(!is_silent_duplicate(&dropped));
+        assert_eq!(failure_shape(&dropped), FailureShape::Dropped);
+        assert_eq!(
+            event_for_task(&dropped),
+            Some(LifecycleEvent::Failed),
+            "a real drop is still reported"
+        );
+
+        let line = LifecycleInput::from_task(&dropped, vec![])
+            .unwrap()
+            .render()
+            .unwrap();
+        assert_eq!(line, ABANDON_DROPPED_LINE);
+        assert!(!line.contains("another crack"), "no retry promise: {line}");
+        assert!(line.contains("ask me again"), "{line}");
+    }
+
+    #[test]
+    fn failed_promises_a_retry_only_when_one_is_scheduled() {
+        // (a) Retries left on the clock and the task re-armed for dispatch —
+        //     `wg incomplete`'s real state. The promise is TRUE here.
+        let mut retrying = task_with("swap-thursday-dinner", Status::Incomplete);
+        retrying.retry_count = 1;
+        retrying.max_retries = Some(3);
+        retrying.log.push(LogEntry {
+            timestamp: "2026-07-24T14:31:00".into(),
+            actor: None,
+            user: None,
+            message: "Task marked as incomplete (attempt #1 (2 remaining)): tool timeout".into(),
+        });
+        assert!(retry_is_scheduled(&retrying));
+        assert_eq!(failure_shape(&retrying), FailureShape::RetryScheduled);
+        assert_eq!(
+            render_line(
+                &origin(),
+                LifecycleEvent::Failed,
+                &[],
+                None,
+                FailureShape::RetryScheduled
+            )
+            .unwrap(),
+            FAILED_RETRY_LINE
+        );
+
+        // (b) Retries exhausted → Failed, and NOTHING re-opens a Failed task.
+        //     The promise would be a lie, so the honest copy goes out instead.
+        let mut exhausted = task_with("swap-thursday-dinner", Status::Failed);
+        exhausted.retry_count = 3;
+        exhausted.max_retries = Some(3);
+        exhausted.failure_reason =
+            Some("Retry exhausted (3/3 attempts). Last incomplete reason: tool timeout".into());
+        exhausted.log.push(LogEntry {
+            timestamp: "2026-07-24T14:31:00".into(),
+            actor: None,
+            user: None,
+            // The earlier retry breadcrumb is still in the log — exhaustion wins.
+            message: "Task marked as incomplete (attempt #1 (2 remaining)): tool timeout".into(),
+        });
+        assert!(!retry_is_scheduled(&exhausted));
+        assert_eq!(failure_shape(&exhausted), FailureShape::Final);
+        let line = LifecycleInput::from_task(&exhausted, vec![])
+            .unwrap()
+            .render()
+            .unwrap();
+        assert_eq!(line, FAILED_FINAL_LINE);
+        assert!(!line.contains("another crack"), "no false promise: {line}");
+        assert!(line.contains("flagged"), "{line}");
+
+        // (c) A bare Failed with retries nominally "remaining" is STILL final:
+        //     the dispatcher only claims Open|Incomplete, so nothing re-attempts
+        //     it. Default-to-honest is the whole point.
+        let mut bare = task_with("swap-thursday-dinner", Status::Failed);
+        bare.retry_count = 1;
+        bare.max_retries = Some(5);
+        assert!(!retry_is_scheduled(&bare));
+        assert_eq!(failure_shape(&bare), FailureShape::Final);
+
+        // (d) A rejected eval verdict is final too (auto-rescue reopens to Open
+        //     instead, which fires no failure line at all).
+        let mut rejected = task_with("swap-thursday-dinner", Status::Failed);
+        rejected.failure_reason =
+            Some("evaluation verdict v-7 rejected: score=0.31 < threshold=0.70".into());
+        assert_eq!(failure_shape(&rejected), FailureShape::Final);
+
+        // (e) A rescue/replacement task carries the work forward → honest promise.
+        let mut rescued = task_with("swap-thursday-dinner", Status::Failed);
+        rescued.superseded_by = vec!["rescue-swap-thursday-dinner".to_string()];
+        assert!(retry_is_scheduled(&rescued));
+        assert_eq!(failure_shape(&rescued), FailureShape::RetryScheduled);
+    }
+
+    #[test]
+    fn final_failure_raises_exactly_one_operator_alert() {
+        let mut log = FiredLog::default();
+        let mut store = DigestStore::default();
+        let policy = DigestPolicy::default();
+
+        let mut inp = input("swap-thursday-dinner", LifecycleEvent::Failed);
+        inp.failure = FailureShape::Final;
+        let r = lifecycle_tick(&[inp.clone()], &mut log, &mut store, now(), &policy);
+
+        // The family got the honest line…
+        assert_eq!(r.fired.len(), 1);
+        assert_eq!(r.fired[0].text, FAILED_FINAL_LINE);
+        // …and the flag was actually raised to the owner.
+        assert_eq!(r.operator_alerts.len(), 1);
+        let alert = &r.operator_alerts[0];
+        assert_eq!(alert.task_id, "swap-thursday-dinner");
+        assert_eq!(alert.requester, "Luca");
+        assert!(alert.text.contains("Luca"), "{}", alert.text);
+        assert!(alert.text.contains("swap-thursday-dinner"), "{}", alert.text);
+        assert_eq!(
+            alert.notification_id,
+            alert_notification_id("swap-thursday-dinner")
+        );
+
+        // Exactly once: a re-tick escalates nothing again.
+        let r2 = lifecycle_tick(&[inp], &mut log, &mut store, now(), &policy);
+        assert!(r2.operator_alerts.is_empty(), "alert must fire exactly once");
+        assert!(r2.fired.is_empty());
+    }
+
+    #[test]
+    fn a_retrying_or_dropped_failure_raises_no_operator_alert() {
+        let policy = DigestPolicy::default();
+        for shape in [FailureShape::RetryScheduled, FailureShape::Dropped] {
+            let mut log = FiredLog::default();
+            let mut store = DigestStore::default();
+            let mut inp = input("swap-thursday-dinner", LifecycleEvent::Failed);
+            inp.failure = shape;
+            let r = lifecycle_tick(&[inp], &mut log, &mut store, now(), &policy);
+            assert_eq!(r.fired.len(), 1, "{shape:?} still tells the family");
+            assert!(
+                r.operator_alerts.is_empty(),
+                "{shape:?} is not a dead end — no owner alert"
+            );
+        }
+    }
+
+    #[test]
+    fn status_answer_skips_duplicates_and_never_over_promises() {
+        // A consolidated duplicate is invisible to "are they done yet?" — the
+        // survivor's own state answers the question.
+        let dup = TaskState::from_task(&abandoned_duplicate("prep-margherita-pizza"));
+        assert_eq!(dup.shape, Some(FailureShape::Duplicate));
+        assert_eq!(
+            answer_status(&[dup.clone()]),
+            None,
+            "a duplicate alone is nothing to report"
+        );
+
+        let done = TaskState {
+            what: "make Saturday dinner pizza".into(),
+            event: Some(LifecycleEvent::Done),
+            summary: Some("Saturday is pizza margherita".into()),
+            shape: None,
+        };
+        let a = answer_status(&[dup, done]).unwrap();
+        assert!(a.starts_with("All done"), "{a}");
+        assert!(!a.contains("queued"), "a duplicate is not 'queued up': {a}");
+
+        // A dead-end failure is not described as being sorted out.
+        let mut ex = task_with("swap-thursday-dinner", Status::Failed);
+        ex.failure_reason = Some("Retry exhausted (3/3 attempts).".into());
+        let a2 = answer_status(&[TaskState::from_task(&ex)]).unwrap();
+        assert!(a2.contains("flagged"), "{a2}");
+        assert!(!a2.contains("getting it sorted"), "no false promise: {a2}");
+
+        // …but a genuinely retrying one is.
+        let mut inc = task_with("swap-thursday-dinner", Status::Incomplete);
+        inc.log.push(LogEntry {
+            timestamp: "2026-07-24T14:31:00".into(),
+            actor: None,
+            user: None,
+            message: "Task marked as incomplete (attempt #1 (2 remaining)): timeout".into(),
+        });
+        let a3 = answer_status(&[TaskState::from_task(&inc)]).unwrap();
+        assert!(a3.contains("queued up") || a3.contains("sorted"), "{a3}");
     }
 
     #[test]
