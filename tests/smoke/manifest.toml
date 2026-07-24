@@ -2560,3 +2560,12 @@ owners = [
 ]
 description = "Installed-binary credential-free production regression for the five-minute inline-evaluator false reap: an exact persisted codex:gpt-5.6-luna evaluator emits no model output for longer than an accelerated heartbeat window while the process-bound, absolute-WG, explicit-graph watcher refreshes registry liveness; registry and a real tmux TUI report it active, daemon SIGKILL/restart does not duplicate it, and it completes once. A second genuinely hung Luna stub keeps heartbeating but is terminated by the independent hard inference timeout with no wrapper/model/heartbeat orphan. Foreign PATH wg plus Claude/Pi sentinels pin project and same-system route isolation."
 timeout_seconds = 60
+
+[[scenario]]
+name = "lifecycle_voice_only_promises_what_happens"
+script = "scenarios/lifecycle_voice_only_promises_what_happens.sh"
+owners = [
+    "lifecycle-voice-honesty",
+]
+description = "Regression (lifecycle-voice-honesty, Luca 2026-07-24): three rapid pizza messages minted three tasks, dedupe abandoned two as duplicates, and each abandon reached the family as 'Ran into a snag — I'll take another crack at it' — twice, from two personas, promising a retry no machinery performs, when nothing had failed. Drives the real engine tick through the real `wg telegram lifecycle --dry-run` CLI over a scratch graph built from the live task shapes and pins four rules: a duplicate-abandon produces NO family line at all; a retries-exhausted failure uses the honest final copy AND raises an operator alert so the ask is not a dead end; a failure with a real rescue behind it still keeps the retry promise; a genuinely dropped (non-duplicate) abandon is reported honestly without a retry claim."
+timeout_seconds = 60
