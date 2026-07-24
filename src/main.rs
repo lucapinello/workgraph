@@ -3817,6 +3817,15 @@ fn main() -> Result<()> {
                 persona.as_deref(),
             ),
             TelegramCommands::Status => commands::telegram::run_status(cli.json),
+            TelegramCommands::Health { quiet } => {
+                // Exit code IS the contract (a supervisor branches on it), so a
+                // deaf listener must not exit 0 just because we printed about it.
+                match commands::telegram::run_health(&workgraph_dir, cli.json, quiet) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => std::process::exit(1),
+                    Err(e) => Err(e),
+                }
+            }
             TelegramCommands::Poll { timeout, chat_id } => {
                 commands::telegram::run_poll(chat_id.as_deref(), timeout)
             }

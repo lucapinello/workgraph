@@ -4060,6 +4060,23 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
         provider_pause_secs.map(|s| worksgood::format_duration(s, false));
     let provider_last_probe = provider_health.last_probe_at.clone();
 
+    // Inbound-listener health — a DEAF listener (process alive, every
+    // `getUpdates` failing) used to be invisible here: status printed a clean
+    // bill of health while the family chat had received nothing for two hours
+    // and the only evidence was 889 identical lines in .casa/telegram.log
+    // (task `investigate-telegram-getupdates`). Surfaced with the same
+    // prominence as the provider pause, because the consequence is the same
+    // shape: the household is talking to something that cannot hear it.
+    let listener_health = worksgood::notify::listener_health::ListenerHealth::load(dir);
+    let listener_summary = listener_health.summary_line(breaker_now);
+    let listener_advice = listener_health.advice_line(breaker_now);
+    let listener_alarming = listener_health.is_alarming(breaker_now);
+    let listener_deaf_bots: Vec<String> = listener_health
+        .deaf_bots(breaker_now)
+        .iter()
+        .map(|b| b.bot_id.clone())
+        .collect();
+
     // Log file info
     let log_path = log_file_path(dir);
     let log_path_str = log_path.to_string_lossy().to_string();
@@ -4115,6 +4132,14 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
                 "paused_for_secs": provider_pause_secs,
                 "last_probe_at": provider_last_probe,
                 "pause_generation": provider_health.pause_generation,
+            },
+            "messaging": {
+                "summary": listener_summary,
+                "alarming": listener_alarming,
+                "deaf_bots": listener_deaf_bots,
+                "advice": listener_advice,
+                "reporting": !listener_health.is_empty(),
+                "bots": listener_health.bots.clone(),
             },
             "log": {
                 "path": log_path_str,
@@ -4236,6 +4261,21 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
             }
         } else {
             println!("Provider: OK");
+        }
+        // Messaging (inbound listener). Loud when the family cannot be heard.
+        if listener_alarming {
+            println!("Messaging: ⚠️  {}", listener_summary);
+            if let Some(ref advice) = listener_advice {
+                println!("  {}", advice);
+            }
+            if !listener_deaf_bots.is_empty() {
+                println!("  Deaf bots: {}", listener_deaf_bots.join(", "));
+            }
+        } else {
+            // Either genuinely healthy, or telegram is not configured at all —
+            // `summary_line` says which ("OK — N bot(s) polling…" vs "not
+            // reporting…"), so we never claim health we have no evidence for.
+            println!("Messaging: {}", listener_summary);
         }
         println!("Log: {}", log_path_str);
         if !recent_errors.is_empty() || !recent_fatals.is_empty() {

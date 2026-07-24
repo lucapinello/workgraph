@@ -484,10 +484,27 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     // mentions of the others. We long-poll EVERY bot concurrently (one tokio
     // task per bot, each persisting its own offset) and funnel them all into
     // one shared receiver, which the single routing pipeline below drains.
-    let channels = TelegramChannel::all_from_notify_config(&notify_config)
-        .context("Failed to build Telegram channels")?;
+    // Each poll task publishes its health under `<dir>/service/listener_health/`
+    // so a DEAF listener (process alive, every poll failing — the 2026-07-24
+    // blocked-egress incident) is visible to `wg service status` and to the casa
+    // supervisor instead of existing only as log noise nobody reads.
+    let channels: Vec<TelegramChannel> = TelegramChannel::all_from_notify_config(&notify_config)
+        .context("Failed to build Telegram channels")?
+        .into_iter()
+        .map(|ch| ch.publishing_health_to(dir))
+        .collect();
     if channels.is_empty() {
         anyhow::bail!("No Telegram bots configured — nothing to poll");
+    }
+    // Start this run from a clean slate so a previous run's failure streak
+    // cannot make a freshly started listener look deaf.
+    let bot_ids: Vec<String> = channels.iter().map(|c| c.bot_id().to_string()).collect();
+    if let Err(e) = worksgood::notify::listener_health::reset_for_new_run(
+        dir,
+        &bot_ids,
+        chrono::Utc::now(),
+    ) {
+        eprintln!("warning: could not initialize listener health state: {e:#}");
     }
 
     // D20 — validate every bot's chat_id LOUDLY at listener start. A POSITIVE
@@ -5882,6 +5899,63 @@ pub fn run_status(json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `wg telegram health` — is the listener actually HEARING the family?
+///
+/// Reads the per-bot poll health published by the running listener (see
+/// [`worksgood::notify::listener_health`]) and returns `Ok(true)` when inbound
+/// messages are arriving, `Ok(false)` when the listener is deaf or nothing is
+/// polling. The caller maps `false` to a non-zero exit so a shell supervisor can
+/// branch on it without parsing text.
+///
+/// Deliberately credential-free and network-free: it makes no Telegram call, so
+/// it is safe to run every minute from a supervisor loop and it works in a
+/// hermetic test with no tokens.
+pub fn run_health(dir: &Path, json: bool, quiet: bool) -> Result<bool> {
+    use worksgood::notify::listener_health::ListenerHealth;
+
+    let now = chrono::Utc::now();
+    let health = ListenerHealth::load(dir);
+    let alarming = health.is_alarming(now);
+    let healthy = !alarming;
+
+    if quiet {
+        return Ok(healthy);
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "healthy": healthy,
+            "reporting": !health.is_empty(),
+            "summary": health.summary_line(now),
+            "advice": health.advice_line(now),
+            "deaf_bots": health.deaf_bots(now).iter().map(|b| b.bot_id.clone()).collect::<Vec<_>>(),
+            "bots": health.bots,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if alarming {
+        println!("Listener: ⚠️  {}", health.summary_line(now));
+        if let Some(advice) = health.advice_line(now) {
+            println!("  {advice}");
+        }
+        for bot in health.deaf_bots(now) {
+            println!(
+                "  {}: {} consecutive failure(s), {} total{}",
+                bot.bot_id,
+                bot.consecutive_failures,
+                bot.total_failures,
+                bot.last_error
+                    .as_deref()
+                    .map(|e| format!(" — last: {e}"))
+                    .unwrap_or_default()
+            );
+        }
+    } else {
+        println!("Listener: {}", health.summary_line(now));
+    }
+
+    Ok(healthy)
 }
 
 /// Handle an action button callback.

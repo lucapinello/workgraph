@@ -16,6 +16,7 @@ pub mod family_plan;
 pub mod fast_lane;
 pub mod grounding;
 pub mod lifecycle;
+pub mod listener_health;
 pub mod meal_feedback;
 pub mod ownership;
 pub mod parity;

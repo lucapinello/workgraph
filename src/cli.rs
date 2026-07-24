@@ -6567,6 +6567,25 @@ pub enum TelegramCommands {
     /// Show Telegram configuration status
     Status,
 
+    /// Report whether the listener is actually HEARING the family.
+    ///
+    /// Reads the per-bot poll health the running listener publishes under
+    /// `.wg/service/listener_health/` and answers the one question the
+    /// supervisor cannot answer by checking that a process exists: are inbound
+    /// messages arriving? Exits 0 when healthy, **1 when the listener is deaf
+    /// or nothing is polling**, so a supervisor can branch on it directly.
+    ///
+    /// Why this exists (task `investigate-telegram-getupdates`): on 2026-07-24
+    /// a network-policy block on `api.telegram.org` made all five bots fail
+    /// every poll for over two hours. The listener process was alive, the
+    /// supervisor was satisfied, and the family chat was silently deaf — the
+    /// only evidence was 889 identical lines in `.casa/telegram.log`.
+    Health {
+        /// Print nothing; communicate only via the exit code.
+        #[arg(long, short)]
+        quiet: bool,
+    },
+
     /// Poll for replies from the configured Telegram chat
     ///
     /// Calls the Telegram Bot API getUpdates endpoint and filters for messages

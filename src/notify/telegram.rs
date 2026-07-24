@@ -219,6 +219,13 @@ pub struct TelegramChannel {
     /// distinctly.
     channel_type: String,
     client: reqwest::Client,
+    /// Where this bot's poll task publishes its health (see
+    /// [`super::listener_health`]). `None` (the default) keeps health
+    /// publishing off — used by the legacy single-bot `listen()` and by tests
+    /// that do not care. The multi-bot listener sets it to the project's
+    /// `.wg` dir so `wg service status` and the casa supervisor can SEE a deaf
+    /// listener instead of it existing only as log noise.
+    health_dir: Option<std::path::PathBuf>,
 }
 
 impl TelegramChannel {
@@ -256,7 +263,21 @@ impl TelegramChannel {
             bot,
             channel_type,
             client: build_poll_client(),
+            health_dir: None,
         }
+    }
+
+    /// Publish this bot's poll health under `wg_dir` (the project's `.wg`
+    /// directory) so a *different* process can tell a deaf listener from a
+    /// healthy one.
+    ///
+    /// Builder-style rather than a constructor argument because only the
+    /// multi-bot listener knows the project dir; every other construction site
+    /// (send-only paths, tests) legitimately has no dir and must keep working
+    /// unchanged.
+    pub fn publishing_health_to(mut self, wg_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.health_dir = Some(wg_dir.into());
+        self
     }
 
     /// Build all configured Telegram channels from a [`super::config::NotifyConfig`].
@@ -644,12 +665,18 @@ impl TelegramChannel {
         // to decide which open `awaiting-human` task should receive the reply.
         let channel_tag = self.channel_type.clone();
         let bot_id = self.bot_id.clone();
+        // Where to publish poll health, if this channel was built with a dir.
+        let health_dir = self.health_dir.clone();
 
         tokio::spawn(async move {
             let mut offset: i64 = offset_path.as_deref().map(load_offset).unwrap_or(0);
             // Tracks the consecutive-failure streak; drives exponential backoff
             // and the periodic client rebuild.
             let mut backoff_state = PollBackoffState::default();
+            // The failure kind we have already diagnosed out loud for this
+            // episode. Cleared on recovery so a NEW outage always gets a fresh
+            // diagnosis line rather than being deduped against the last one.
+            let mut diagnosed: Option<super::listener_health::PollFailureKind> = None;
 
             loop {
                 let updates = match get_updates_once(
@@ -671,11 +698,23 @@ impl TelegramChannel {
                                 "polling {} resumed after {} consecutive failure(s)",
                                 bot_id, streak
                             );
+                            diagnosed = None;
+                        }
+                        // Publish the success so an external reader can tell
+                        // "quiet but healthy" from "wedged". Best-effort: a
+                        // health-file write must never break polling.
+                        if let Some(ref hd) = health_dir {
+                            let _ = super::listener_health::record_success(
+                                hd,
+                                &bot_id,
+                                chrono::Utc::now(),
+                            );
                         }
                         updates
                     }
                     Err(e) => {
                         let action = backoff_state.on_failure();
+                        let rendered = redact_bot_token(&format!("{e:#}"));
                         // A reqwest transport error's `Display` embeds the full
                         // request URL — which contains the bot token
                         // (`.../bot<token>/getUpdates`). Redact it before it
@@ -686,8 +725,35 @@ impl TelegramChannel {
                             bot_id,
                             backoff_state.consecutive_failures,
                             action.backoff.as_secs(),
-                            redact_bot_token(&format!("{e:#}"))
+                            rendered
                         );
+                        // Publish health + emit ONE loud, actionable diagnosis
+                        // per (bot, failure-kind) episode. The 2026-07-24
+                        // incident produced 889 identical raw transport lines
+                        // and not one line saying what to do about them; the
+                        // raw error repeats for the backoff ladder's benefit,
+                        // the diagnosis prints once so it stays findable.
+                        let kind = super::listener_health::PollFailureKind::classify(&rendered);
+                        if let Some(ref hd) = health_dir {
+                            let _ = super::listener_health::record_failure(
+                                hd,
+                                &bot_id,
+                                backoff_state.consecutive_failures,
+                                &rendered,
+                                chrono::Utc::now(),
+                            );
+                        }
+                        let deaf_now = backoff_state.consecutive_failures
+                            >= super::listener_health::DEAF_AFTER_FAILURES;
+                        if deaf_now && diagnosed != Some(kind) {
+                            diagnosed = Some(kind);
+                            eprintln!(
+                                "polling {bot_id}: DEAF after {} consecutive failures [{}] — {}",
+                                backoff_state.consecutive_failures,
+                                kind.label(),
+                                kind.diagnosis()
+                            );
+                        }
                         // After a sustained streak the connection pool itself
                         // may be wedged (half-dead sockets, a lost IPv6 path,
                         // leaked FDs). Rebuilding drops every pooled connection
