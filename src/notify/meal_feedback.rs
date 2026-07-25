@@ -146,19 +146,22 @@ impl MealRating {
 // The ask (family voice)
 // ---------------------------------------------------------------------------
 
-/// Compose Bruno's warm one-line ask for a just-cooked dish. Family voice
+/// Compose a warm one-line ask for a just-cooked dish. Family voice
 /// (docs/04): natural, one clear ask, no jargon, offers the low-effort 👍👎 path
-/// *and* an open door for a sentence. `dish` is tonight's dinner from the plan.
+/// *and* an open door for a sentence. The delivering bot already presents the
+/// configured voice, so the text carries no compiled persona signature. `dish`
+/// is tonight's dinner from the plan.
 pub fn compose_ask(dish: &str) -> String {
     let dish = dish.trim();
     if dish.is_empty() {
-        return "How was dinner tonight? 👍 👎 or just tell me — I'll keep notes for next week. — Bruno".to_string();
+        return "How was dinner tonight? 👍 👎 or just tell me — I'll keep notes for next week."
+            .to_string();
     }
     // Lower-case the leading article-free dish so it reads like speech in the
     // sentence ("How was the salmon?"), but keep it verbatim if it looks like a
     // proper name (starts with an already-capitalised multi-word dish is fine as-is).
     format!(
-        "How was the {dish} tonight? 👍 👎 or just tell me — I'll remember it for next week. — Bruno",
+        "How was the {dish} tonight? 👍 👎 or just tell me — I'll remember it for next week.",
         dish = speakable_dish(dish)
     )
 }
@@ -673,7 +676,10 @@ mod tests {
         let line = compose_ask("Salmon");
         assert!(line.contains("salmon"), "should name the dish: {line}");
         assert!(line.contains("👍") && line.contains("👎"), "offers the quick path");
-        assert!(line.contains("Bruno"), "signed in-persona");
+        assert_eq!(
+            line,
+            "How was the salmon tonight? 👍 👎 or just tell me — I'll remember it for next week."
+        );
         // No jargon leaks (docs/04).
         assert!(!line.to_lowercase().contains("task"));
         assert!(!line.contains("W29"));
@@ -690,7 +696,10 @@ mod tests {
         assert!(!salmon.contains("potatoes"), "sides trimmed: {salmon}");
         // Empty dish still yields a warm, valid ask.
         let generic = compose_ask("   ");
-        assert!(generic.contains("dinner") && generic.contains("Bruno"));
+        assert_eq!(
+            generic,
+            "How was dinner tonight? 👍 👎 or just tell me — I'll keep notes for next week."
+        );
     }
 
     // ---- intent routing ----
