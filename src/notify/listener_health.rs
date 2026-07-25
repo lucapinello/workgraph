@@ -180,9 +180,7 @@ impl PollFailureKind {
             Self::RateLimited => {
                 "Telegram is rate-limiting these polls — most often a SECOND listener polling the same bot (check for duplicate `wg telegram listen` processes)"
             }
-            Self::Other => {
-                "unrecognised poll failure — read the raw error in the listener log"
-            }
+            Self::Other => "unrecognised poll failure — read the raw error in the listener log",
         }
     }
 
@@ -510,7 +508,10 @@ impl ListenerHealth {
                     secs,
                     self.bots.len()
                 ),
-                None => "NOT POLLING — listener health is unreadable; is `wg telegram listen` running?".to_string(),
+                None => {
+                    "NOT POLLING — listener health is unreadable; is `wg telegram listen` running?"
+                        .to_string()
+                }
             };
         }
         let deaf = self.deaf_bots(now);
@@ -526,7 +527,10 @@ impl ListenerHealth {
                     self.bots.len(),
                     (now - ts).num_seconds().max(0)
                 ),
-                None => format!("starting up — {} bot(s), no poll completed yet", self.bots.len()),
+                None => format!(
+                    "starting up — {} bot(s), no poll completed yet",
+                    self.bots.len()
+                ),
             }
         } else {
             let total: u64 = deaf.iter().map(|b| b.total_failures).sum();
@@ -588,10 +592,15 @@ mod tests {
         let err = "getUpdates request failed: error sending request for url \
                    (https://api.telegram.org/bot<redacted>/getUpdates): \
                    client error (Connect): tls handshake eof";
-        assert_eq!(PollFailureKind::classify(err), PollFailureKind::EgressBlocked);
-        assert!(PollFailureKind::classify(err)
-            .diagnosis()
-            .contains("blocked"));
+        assert_eq!(
+            PollFailureKind::classify(err),
+            PollFailureKind::EgressBlocked
+        );
+        assert!(
+            PollFailureKind::classify(err)
+                .diagnosis()
+                .contains("blocked")
+        );
     }
 
     #[test]
@@ -599,20 +608,29 @@ mod tests {
         // A Cisco WSA answers plain HTTP with a 403 block page. That is a
         // POLICY block, not a bad bot token — mislabelling it would send the
         // operator to rotate credentials for no reason.
-        let err = "HTTP status 403 Forbidden (Via: 1.1 phswsa3.partners.org:80 (Cisco-WSA/15.2.0-164))";
-        assert_eq!(PollFailureKind::classify(err), PollFailureKind::EgressBlocked);
+        let err =
+            "HTTP status 403 Forbidden (Via: 1.1 phswsa3.partners.org:80 (Cisco-WSA/15.2.0-164))";
+        assert_eq!(
+            PollFailureKind::classify(err),
+            PollFailureKind::EgressBlocked
+        );
     }
 
     #[test]
     fn classifies_real_auth_failure_as_unauthorized() {
         let err = "getUpdates request failed: 401 Unauthorized";
-        assert_eq!(PollFailureKind::classify(err), PollFailureKind::Unauthorized);
+        assert_eq!(
+            PollFailureKind::classify(err),
+            PollFailureKind::Unauthorized
+        );
     }
 
     #[test]
     fn classifies_dns_and_timeout_and_rate_limit_distinctly() {
         assert_eq!(
-            PollFailureKind::classify("error sending request: dns error: failed to lookup address information"),
+            PollFailureKind::classify(
+                "error sending request: dns error: failed to lookup address information"
+            ),
             PollFailureKind::DnsFailure
         );
         assert_eq!(
@@ -666,7 +684,10 @@ mod tests {
         rec.total_failures = 400;
         rec.last_success_at = Some(t("2026-07-24T18:00:00Z").to_rfc3339());
         rec.last_failure_at = Some(t("2026-07-24T19:00:00Z").to_rfc3339());
-        assert!(rec.is_deaf(t("2026-07-24T19:00:00Z")), "1h without a success");
+        assert!(
+            rec.is_deaf(t("2026-07-24T19:00:00Z")),
+            "1h without a success"
+        );
     }
 
     #[test]
@@ -739,7 +760,12 @@ mod tests {
         let line = health.summary_line(now);
         assert!(line.starts_with("DEAF — 5/5"), "got: {line}");
         assert!(line.contains("egress-blocked"), "got: {line}");
-        assert!(health.advice_line(now).unwrap().contains("api.telegram.org"));
+        assert!(
+            health
+                .advice_line(now)
+                .unwrap()
+                .contains("api.telegram.org")
+        );
     }
 
     #[test]
@@ -763,7 +789,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let health = ListenerHealth::load(tmp.path());
         assert!(health.is_empty());
-        assert!(health.summary_line(t("2026-07-24T19:00:00Z")).contains("not reporting"));
+        assert!(
+            health
+                .summary_line(t("2026-07-24T19:00:00Z"))
+                .contains("not reporting")
+        );
         assert!(!health.is_totally_deaf(t("2026-07-24T19:00:00Z")));
     }
 
@@ -777,7 +807,10 @@ mod tests {
         let health = ListenerHealth::load(dir);
         assert!(!health.is_totally_deaf(now));
         assert_eq!(health.deaf_bots(now).len(), 1);
-        assert_eq!(health.dominant_kind(now), Some(PollFailureKind::Unauthorized));
+        assert_eq!(
+            health.dominant_kind(now),
+            Some(PollFailureKind::Unauthorized)
+        );
         assert!(health.summary_line(now).starts_with("DEAF — 1/2"));
     }
 
@@ -789,7 +822,14 @@ mod tests {
         // answer is "nothing is running".
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        record_failure(dir, "nora", 65, "tls handshake eof", t("2026-07-24T12:00:00Z")).unwrap();
+        record_failure(
+            dir,
+            "nora",
+            65,
+            "tls handshake eof",
+            t("2026-07-24T12:00:00Z"),
+        )
+        .unwrap();
         let health = ListenerHealth::load(dir);
         let now = t("2026-07-24T19:00:00Z"); // seven hours later
         assert!(health.is_stale(now, STALE_AFTER_SECS));
@@ -805,7 +845,14 @@ mod tests {
         // read as DEAF, never as "not polling" — the cause matters.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        record_failure(dir, "nora", 65, "tls handshake eof", t("2026-07-24T18:59:15Z")).unwrap();
+        record_failure(
+            dir,
+            "nora",
+            65,
+            "tls handshake eof",
+            t("2026-07-24T18:59:15Z"),
+        )
+        .unwrap();
         let health = ListenerHealth::load(dir);
         let now = t("2026-07-24T19:00:00Z"); // 45s later — inside one backoff step
         assert!(!health.is_stale(now, STALE_AFTER_SECS));
@@ -816,14 +863,25 @@ mod tests {
     fn reset_for_new_run_clears_a_previous_runs_streak() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        record_failure(dir, "nora", 65, "tls handshake eof", t("2026-07-24T12:00:00Z")).unwrap();
+        record_failure(
+            dir,
+            "nora",
+            65,
+            "tls handshake eof",
+            t("2026-07-24T12:00:00Z"),
+        )
+        .unwrap();
         let start = t("2026-07-24T19:00:00Z");
         reset_for_new_run(dir, &["nora".to_string(), "bruno".to_string()], start).unwrap();
 
         let health = ListenerHealth::load(dir);
         assert_eq!(health.bots.len(), 2);
         assert!(!health.is_alarming(t("2026-07-24T19:00:01Z")));
-        assert!(health.summary_line(t("2026-07-24T19:00:01Z")).contains("starting up"));
+        assert!(
+            health
+                .summary_line(t("2026-07-24T19:00:01Z"))
+                .contains("starting up")
+        );
         assert_eq!(health.bots["nora"].total_failures, 0);
     }
 

@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::write_atomic;
 use crate::notify::family_plan::{CalendarEvent, PlanDoc};
+use crate::notify::ownership::OwnerMap;
 
 /// The alarm-clock emoji that prefixes a reminder, both in the plan and the DM.
 const ALARM: char = '\u{23f0}';
@@ -91,6 +92,7 @@ impl Reminder {
         week_code: &str,
         ev: &CalendarEvent,
         members: &[String],
+        owners: &OwnerMap,
     ) -> Option<Reminder> {
         if !is_reminder_event(&ev.event) {
             return None;
@@ -100,7 +102,7 @@ impl Reminder {
         let due = due_date.and_time(time);
         let body = clean_reminder_body(&ev.event);
         let recipient = first_member(&ev.event, members).unwrap_or_default();
-        let bot = normalize_bot(&ev.source);
+        let bot = resolve_plan_source(&ev.source, owners)?;
         // Stable id: week + date + time + a hash of the body, so a re-parse of the
         // same plan yields the same key (exactly-once across restarts) but two
         // different reminder rows never collide.
@@ -133,10 +135,10 @@ impl Reminder {
 }
 
 /// Collect every reminder-shaped row in a parsed plan into [`Reminder`]s.
-pub fn reminders_from_plan(plan: &PlanDoc, members: &[String]) -> Vec<Reminder> {
+pub fn reminders_from_plan(plan: &PlanDoc, members: &[String], owners: &OwnerMap) -> Vec<Reminder> {
     plan.calendar
         .iter()
-        .filter_map(|ev| Reminder::from_calendar_event(&plan.week_code, ev, members))
+        .filter_map(|ev| Reminder::from_calendar_event(&plan.week_code, ev, members, owners))
         .collect()
 }
 
@@ -165,18 +167,29 @@ fn clean_reminder_body(event: &str) -> String {
     s.to_string()
 }
 
-/// Lower-case a Source cell into a bot/agent id: `"Otto"` → `"otto"`, and
-/// `"Mira/Otto"` → the first voice (`"mira"`) which owns the row.
+/// Resolve a plan Source cell to one stable household persona id.
 ///
-/// `pub(crate)` so the errand engine ([`crate::notify::errand`]) resolves the
-/// owning voice of a `🛒 Market run` row with the identical rule.
-pub(crate) fn normalize_bot(source: &str) -> String {
-    source
-        .split(['/', '(', ' '])
+/// Plan authors write display text, which may contain spaces and may change over
+/// time. Preserve the first authored reference (before plan annotations such as
+/// `/`, `(`, `§`, or `→`) and resolve it through the current household roster.
+/// A non-empty unknown or ambiguous reference is rejected rather than guessed
+/// from roster order. An empty Source remains empty so delivery may use only the
+/// recipient's explicit bot binding.
+///
+/// `pub(crate)` so the errand engine ([`crate::notify::errand`]) uses the exact
+/// same stable-identity rule.
+pub(crate) fn resolve_plan_source(source: &str, owners: &OwnerMap) -> Option<String> {
+    if source.trim().is_empty() {
+        return Some(String::new());
+    }
+    let reference = source
+        .split(['/', '(', '\u{00a7}', '\u{2192}'])
         .map(|s| s.trim())
         .find(|s| !s.is_empty())
-        .unwrap_or("")
-        .to_ascii_lowercase()
+        .unwrap_or("");
+    owners
+        .resolve_unique_persona_ref(reference)
+        .map(str::to_string)
 }
 
 /// Find the first known member display name that appears in `text`, matched
@@ -336,7 +349,11 @@ pub fn tick(
         match decide(r.due, now, policy) {
             FireDecision::Pending => {}
             FireDecision::Fire { late } => {
-                log.record(&r.id, now, if late { Outcome::Late } else { Outcome::OnTime });
+                log.record(
+                    &r.id,
+                    now,
+                    if late { Outcome::Late } else { Outcome::OnTime },
+                );
                 result.fired.push(Firing {
                     reminder: r.clone(),
                     late,
@@ -429,6 +446,16 @@ impl FiredLog {
         });
     }
 
+    /// Remove one handled id so a delivery that was not confirmed can be
+    /// attempted by the next scheduler tick.
+    ///
+    /// The scheduler records before transport for crash safety. Its caller must
+    /// therefore re-arm the exact id when transport exhausts its retries, then
+    /// persist this log before returning. Other ids are left untouched.
+    pub fn rearm(&mut self, id: &str) -> bool {
+        self.entries.remove(id).is_some()
+    }
+
     /// Number of handled ids (for status/tests).
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -496,11 +523,7 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
 }
 
 /// Turn a parsed intent into a stored [`Reminder`] with a stable ad-hoc id.
-pub fn intent_to_reminder(
-    intent: &AdHocIntent,
-    recipient: &str,
-    bot: &str,
-) -> Reminder {
+pub fn intent_to_reminder(intent: &AdHocIntent, recipient: &str, bot: &str) -> Reminder {
     let id = format!(
         "adhoc:{}:{:016x}",
         intent.due.format("%Y%m%dT%H%M"),
@@ -576,7 +599,11 @@ fn long_weekday_name(wd: Weekday) -> &'static str {
 /// Falls back to a part-of-day default, else 9am. `had` is true when the text
 /// carried an explicit clock or part-of-day word (used to require a time signal
 /// when there is no day word).
-fn resolve_time(low: &str, _now: NaiveDateTime, _date: NaiveDate) -> (NaiveTime, Option<String>, bool) {
+fn resolve_time(
+    low: &str,
+    _now: NaiveDateTime,
+    _date: NaiveDate,
+) -> (NaiveTime, Option<String>, bool) {
     if let Some((t, label)) = parse_explicit_time(low) {
         return (t, Some(label), true);
     }
@@ -712,13 +739,26 @@ fn extract_body(text: &str) -> String {
 fn strip_trailing_time(body: &str) -> String {
     let mut words: Vec<&str> = body.split_whitespace().collect();
     let is_timeword = |w: &str| {
-        let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_ascii_lowercase();
+        let w = w
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_ascii_lowercase();
         matches!(
             w.as_str(),
-            "today" | "tonight" | "tomorrow" | "morning" | "afternoon" | "evening"
-                | "night" | "noon" | "at" | "on"
-        ) || WEEKDAYS.iter().any(|(names, _)| names.contains(&w.as_str()))
-            || parse_time_token(&w).is_some_and(|_| w.contains(':') || w.ends_with("am") || w.ends_with("pm"))
+            "today"
+                | "tonight"
+                | "tomorrow"
+                | "morning"
+                | "afternoon"
+                | "evening"
+                | "night"
+                | "noon"
+                | "at"
+                | "on"
+        ) || WEEKDAYS
+            .iter()
+            .any(|(names, _)| names.contains(&w.as_str()))
+            || parse_time_token(&w)
+                .is_some_and(|_| w.contains(':') || w.ends_with("am") || w.ends_with("pm"))
     };
     // Trim from both ends only (keep interior words intact).
     while words.first().is_some_and(|w| is_timeword(w)) {
@@ -815,10 +855,17 @@ mod tests {
     use crate::notify::family_plan::CalendarEvent;
 
     fn members() -> Vec<String> {
-        vec![
-            "Luca".to_string(),
-            "Nadin".to_string(),
-        ]
+        vec!["Luca".to_string(), "Nadin".to_string()]
+    }
+
+    fn owners() -> OwnerMap {
+        OwnerMap::casa_default()
+    }
+
+    fn owners_from_toml(body: &str) -> OwnerMap {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("household.toml"), body).unwrap();
+        OwnerMap::from_household_toml(dir.path()).expect("valid household fixture")
     }
 
     fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
@@ -836,7 +883,8 @@ mod tests {
             event: "\u{23f0} Reminder: Luca PT check-in (if unanswered)".into(),
             source: "Otto".into(),
         };
-        Reminder::from_calendar_event("2026-W29", &ev, &members()).expect("reminder-shaped")
+        Reminder::from_calendar_event("2026-W29", &ev, &members(), &owners())
+            .expect("reminder-shaped")
     }
 
     #[test]
@@ -847,7 +895,10 @@ mod tests {
         assert_eq!(r.bot, "otto");
         assert_eq!(r.text, "Luca PT check-in (if unanswered)");
         assert_eq!(r.source, ReminderSource::Plan);
-        assert_eq!(r.message(false), "\u{23f0} Luca PT check-in (if unanswered)");
+        assert_eq!(
+            r.message(false),
+            "\u{23f0} Luca PT check-in (if unanswered)"
+        );
     }
 
     #[test]
@@ -859,7 +910,7 @@ mod tests {
             event: "Cook: chickpea & spinach curry".into(),
             source: "Bruno".into(),
         };
-        assert!(Reminder::from_calendar_event("2026-W29", &ev, &members()).is_none());
+        assert!(Reminder::from_calendar_event("2026-W29", &ev, &members(), &owners()).is_none());
     }
 
     #[test]
@@ -874,7 +925,10 @@ mod tests {
         let policy = FirePolicy::default();
         let due = dt(2026, 7, 14, 19, 30);
         // Exactly at due, and 1 min after: on time.
-        assert_eq!(decide(due, due, &policy), FireDecision::Fire { late: false });
+        assert_eq!(
+            decide(due, due, &policy),
+            FireDecision::Fire { late: false }
+        );
         assert_eq!(
             decide(due, dt(2026, 7, 14, 19, 31), &policy),
             FireDecision::Fire { late: false }
@@ -993,11 +1047,8 @@ mod tests {
     fn adhoc_intent_weekday_and_to_body() {
         // Thursday morning default, body after "to".
         let now = dt(2026, 7, 12, 10, 0); // Sunday
-        let intent = parse_reminder_intent(
-            "Otto remind me Thursday to defrost the trout",
-            now,
-        )
-        .expect("reminder intent");
+        let intent = parse_reminder_intent("Otto remind me Thursday to defrost the trout", now)
+            .expect("reminder intent");
         assert_eq!(intent.due.weekday(), Weekday::Thu);
         assert_eq!(intent.due.time(), nt(9, 0), "morning default");
         assert_eq!(intent.text, "Defrost the trout");
@@ -1007,9 +1058,8 @@ mod tests {
     #[test]
     fn adhoc_intent_explicit_clock() {
         let now = dt(2026, 7, 12, 10, 0);
-        let intent =
-            parse_reminder_intent("remind me tomorrow at 7pm to call the plumber", now)
-                .expect("intent");
+        let intent = parse_reminder_intent("remind me tomorrow at 7pm to call the plumber", now)
+            .expect("intent");
         assert_eq!(intent.due, dt(2026, 7, 13, 19, 0));
         assert_eq!(intent.text, "Call the plumber");
     }
@@ -1027,8 +1077,7 @@ mod tests {
     fn adhoc_intent_becomes_stored_reminder() {
         let now = dt(2026, 7, 12, 10, 0);
         let intent =
-            parse_reminder_intent("remind me tomorrow morning to water the plants", now)
-                .unwrap();
+            parse_reminder_intent("remind me tomorrow morning to water the plants", now).unwrap();
         let r = intent_to_reminder(&intent, "Luca", "otto");
         assert_eq!(r.recipient, "Luca");
         assert_eq!(r.bot, "otto");
@@ -1043,8 +1092,7 @@ mod tests {
         let path = AdHocStore::path(dir.path());
         let now = dt(2026, 7, 12, 10, 0);
         let intent =
-            parse_reminder_intent("remind me tomorrow morning to water the plants", now)
-                .unwrap();
+            parse_reminder_intent("remind me tomorrow morning to water the plants", now).unwrap();
         let r = intent_to_reminder(&intent, "Luca", "otto");
 
         let mut store = AdHocStore::load(&path);
@@ -1058,8 +1106,68 @@ mod tests {
     }
 
     #[test]
-    fn source_with_slash_picks_first_voice() {
-        assert_eq!(normalize_bot("Mira/Otto"), "mira");
-        assert_eq!(normalize_bot("Otto (§4)"), "otto");
+    fn multiword_source_resolves_unique_stable_owner() {
+        let owners = owners_from_toml(
+            r#"
+[[agent]]
+id = "coordination-anchor-7"
+name = "Harbor Keeper"
+domains = ["coordination", "calendar"]
+
+[[agent]]
+id = "meal-anchor-4"
+name = "Pantry Lantern"
+domains = ["meals"]
+"#,
+        );
+        let plan = PlanDoc::parse(
+            "2026-W31",
+            r#"
+**Week of Monday 2026-07-27 → Sunday 2026-08-02**
+
+## 1. Dinners (Mon 07-27 → Sun 08-02)
+| Day | Slot | Dish | Prep |
+|---|---|---|---|
+| Mon 07-27 | Vegetarian | Summer pasta | ~20 min |
+
+## 3. Calendar
+| Day | Time | Event | Source |
+|---|---|---|---|
+| Tue 07-28 | 19:30 | ⏰ Reminder: Luca PT check-in | Harbor Keeper (§4) |
+"#,
+        );
+        assert_eq!(
+            plan.meals.len(),
+            1,
+            "the fixture must exercise the production `## 1. Dinners (…)` shape",
+        );
+        let reminders = reminders_from_plan(&plan, &members(), &owners);
+        let reminder = reminders
+            .first()
+            .expect("live-shaped reminder row resolves");
+        assert_eq!(
+            reminder.bot, "coordination-anchor-7",
+            "the complete authored display name must resolve to its stable id",
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_unknown_nonempty_source_fails_closed() {
+        let owners = owners_from_toml(
+            r#"
+[[agent]]
+id = "coordination-anchor-a"
+name = "Shared Lantern"
+domains = ["coordination"]
+
+[[agent]]
+id = "coordination-anchor-b"
+name = "Shared Lantern"
+domains = ["calendar"]
+"#,
+        );
+        assert_eq!(resolve_plan_source("Shared Lantern", &owners), None);
+        assert_eq!(resolve_plan_source("Unknown Lantern", &owners), None);
+        assert_eq!(resolve_plan_source("", &owners), Some(String::new()));
     }
 }

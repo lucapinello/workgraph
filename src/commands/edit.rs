@@ -1973,7 +1973,7 @@ mod tests {
             &[],
             &[],
             &[],
-            &[], // choices,
+            &[],  // choices,
             None, // max_retries
             None, // model
             None, // provider
@@ -2163,7 +2163,7 @@ mod tests {
             &[],
             &[],
             &[],
-            &[], // choices,
+            &[],  // choices,
             None, // max_retries
             None, // model
             None, // provider

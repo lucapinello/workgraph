@@ -6,11 +6,11 @@
 //! Every command is one row of [`FAMILY_COMMANDS`]. A row declares:
 //!
 //! * `keyword` — the slash word (`"/dinner"`),
-//! * `owner` — the bot id whose voice answers in the group (`"bruno"`),
+//! * `domain` — the household domain whose configured owner answers in the group,
 //! * `description` — the one-line `/help` + Telegram autocomplete blurb
 //!   (family voice, docs/04),
 //! * `data_source` — a short label of where the answer comes from (docs/debug),
-//! * `kind` — [`CommandKind::Single`] (one reply from `owner`) or
+//! * `kind` — [`CommandKind::Single`] (one reply from the domain owner) or
 //!   [`CommandKind::Roster`] (`/standup`: one post per voice), and
 //! * `compose` — a **pure** function `fn(&CommandContext) -> String` that
 //!   renders the reply from live data (the graph, `notify.toml`, and the parsed
@@ -24,19 +24,18 @@
 //! # Exactly-once and all-bots-off safe
 //!
 //! Commands ride on the same dedupe + election layer as everything else. The
-//! single `wg telegram listen` process de-duplicates the four copies of a group
+//! single `wg telegram listen` process de-duplicates the copies of a group
 //! message (privacy-off delivers each `/command` to every bot) down to one, then
-//! composes a single reply and sends it **as the owner bot**. One orchestrator,
+//! composes a single reply and sends it **as the configured owner bot**. One orchestrator,
 //! one send ⇒ exactly-once, regardless of how many bots are muted.
 //!
 //! # Group vs 1:1 (the voice choice)
 //!
-//! * **Group** — the *owner* answers: `/dinner` is always Bruno's voice, even if
-//!   another bot happened to receive the copy that won dedupe. This keeps each
-//!   command in its natural persona.
+//! * **Group** — the command domain's configured owner answers, even if another
+//!   bot happened to receive the copy that won dedupe.
 //! * **1:1** — the bot **you messaged** answers, in its own send path, with the
 //!   same composed content. We deliberately do *not* relay a 1:1 `/dinner` over
-//!   to Bruno's DM thread: the person asked *this* bot, so *this* bot replies.
+//!   to another DM thread: the person asked *this* bot, so *this* bot replies.
 //!   The content is identical (same `compose`), only the sending bot differs.
 //!   Documented in docs/09 §commands.
 
@@ -45,8 +44,8 @@ use std::collections::HashSet;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use super::family_plan::{self, PlanDoc};
-use super::telegram::TelegramConfig;
-use super::telegram_standup::{self, humanize_title, DEFAULT_ROSTER};
+use super::ownership::{Domain, OwnerMap};
+use super::telegram_standup::{self, StandupMember, humanize_title};
 use crate::graph::{Status, WorkGraph};
 
 /// How a command's reply is delivered.
@@ -68,8 +67,8 @@ pub type ComposeFn = fn(&CommandContext<'_>) -> String;
 pub struct FamilyCommand {
     /// The slash keyword, lowercase, with leading slash, e.g. `"/dinner"`.
     pub keyword: &'static str,
-    /// The bot id whose voice owns this command in the group, e.g. `"bruno"`.
-    pub owner: &'static str,
+    /// The household domain whose configured owner answers in the group.
+    pub domain: Domain,
     /// One-line description (family voice) for `/help` and `setMyCommands`.
     pub description: &'static str,
     /// Where the answer comes from — a short label for docs / diagnostics.
@@ -85,6 +84,11 @@ impl FamilyCommand {
     pub fn name(&self) -> &str {
         self.keyword.trim_start_matches('/')
     }
+
+    /// Resolve this command's voice from project-local household ownership.
+    pub fn owner<'a>(&self, owner_map: &'a OwnerMap) -> Option<&'a str> {
+        owner_map.owner_for_domain(self.domain)
+    }
 }
 
 /// Everything a `compose` function may read. All borrowed and pre-resolved, so
@@ -94,8 +98,8 @@ pub struct CommandContext<'a> {
     /// the graph could not be loaded — composers then report an empty/quiet
     /// state rather than failing.
     pub graph: Option<&'a WorkGraph>,
-    /// The Telegram roster config (for `/standup` voice ordering).
-    pub config: &'a TelegramConfig,
+    /// The ordered project-local Telegram roster (for `/standup`).
+    pub roster: &'a [StandupMember],
     /// Parsed weekly plans, sorted oldest→newest (for `/dinner`, `/shopping`,
     /// `/week`).
     pub plans: &'a [PlanDoc],
@@ -113,7 +117,7 @@ pub struct CommandContext<'a> {
 pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     FamilyCommand {
         keyword: "/dinner",
-        owner: "bruno",
+        domain: Domain::Cooking,
         description: "What's for dinner tonight",
         data_source: "current week plan — today's dinner",
         kind: CommandKind::Single,
@@ -121,7 +125,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/shopping",
-        owner: "otto",
+        domain: Domain::Shopping,
         description: "This week's shopping list",
         data_source: "current week plan — shopping list",
         kind: CommandKind::Single,
@@ -129,7 +133,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/week",
-        owner: "otto",
+        domain: Domain::Coordination,
         description: "The week at a glance",
         data_source: "current week plan — meals + workouts; graph — confirmations",
         kind: CommandKind::Single,
@@ -137,7 +141,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/reminders",
-        owner: "otto",
+        domain: Domain::Calendar,
         description: "What's pending or coming up",
         data_source: "graph — parked human tasks + cron next-fire",
         kind: CommandKind::Single,
@@ -145,7 +149,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/standup",
-        owner: "otto",
+        domain: Domain::Coordination,
         description: "A quick check-in from the whole team",
         data_source: "graph — each voice's live tasks",
         kind: CommandKind::Roster,
@@ -153,7 +157,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/help",
-        owner: "otto",
+        domain: Domain::Coordination,
         description: "Show what you can ask us",
         data_source: "the command table itself",
         kind: CommandKind::Single,
@@ -199,8 +203,17 @@ pub fn compose(cmd: &FamilyCommand, ctx: &CommandContext<'_>) -> String {
 /// whole-ish tokens so ordinary family words ("ready in ten minutes") don't trip
 /// it. See `fix-command-leaks`.
 const OPERATOR_VOCAB: &[&str] = &[
-    "claim ", "unclaim", "wg claim", "wg done", "workgraph", "task id", "task_id",
-    "coordinator", "`claim", "`done", "`status`",
+    "claim ",
+    "unclaim",
+    "wg claim",
+    "wg done",
+    "workgraph",
+    "task id",
+    "task_id",
+    "coordinator",
+    "`claim",
+    "`done",
+    "`status`",
 ];
 
 /// Whether `text` is safe to render into a FAMILY chat: no markdown code
@@ -343,7 +356,7 @@ fn compose_reminders(ctx: &CommandContext<'_>) -> String {
 fn compose_standup(ctx: &CommandContext<'_>) -> String {
     let empty = WorkGraph::new();
     let graph = ctx.graph.unwrap_or(&empty);
-    let posts = telegram_standup::plan_standup(graph, ctx.config, DEFAULT_ROSTER);
+    let posts = telegram_standup::plan_standup(graph, ctx.roster);
     posts
         .iter()
         .map(|p| p.text.clone())
@@ -357,9 +370,7 @@ fn compose_help(_ctx: &CommandContext<'_>) -> String {
     for cmd in FAMILY_COMMANDS {
         out.push_str(&format!("\n{} — {}", cmd.keyword, cmd.description));
     }
-    out.push_str(
-        "\n\nType any of these in the group, or message a bot directly — either works.",
-    );
+    out.push_str("\n\nType any of these in the group, or message a bot directly — either works.");
     out
 }
 
@@ -419,7 +430,14 @@ fn upcoming_scheduled(ctx: &CommandContext<'_>) -> Vec<String> {
             if fire < ctx.now {
                 return None;
             }
-            Some((fire, format!("{} — {}", bullet_title(&t.title), friendly_when(fire, ctx.now))))
+            Some((
+                fire,
+                format!(
+                    "{} — {}",
+                    bullet_title(&t.title),
+                    friendly_when(fire, ctx.now)
+                ),
+            ))
         })
         .collect();
     items.sort_by_key(|(when, _)| *when);
@@ -453,7 +471,10 @@ fn friendly_when(when: DateTime<Utc>, now: DateTime<Utc>) -> String {
 /// True when a task is assigned to one of the known human operators (checking
 /// both the resolved `agent` and the human-friendly `assigned` fields).
 fn task_is_human(task: &crate::graph::Task, humans: &HashSet<String>) -> bool {
-    task.agent.as_deref().map(|a| humans.contains(a)).unwrap_or(false)
+    task.agent
+        .as_deref()
+        .map(|a| humans.contains(a))
+        .unwrap_or(false)
         || task
             .assigned
             .as_deref()
@@ -482,6 +503,8 @@ fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
 mod tests {
     use super::*;
     use crate::graph::{Node, Task, WaitCondition, WaitSpec};
+    use crate::notify::telegram::TelegramConfig;
+    use crate::notify::telegram_standup::HouseholdPersona;
     use std::collections::HashMap;
 
     const W29: &str = include_str!("../../tests/fixtures/family_plan_w29.md");
@@ -515,16 +538,33 @@ mod tests {
         }
     }
 
+    fn casa_roster(config: &TelegramConfig) -> Vec<StandupMember> {
+        let presentations = [
+            ("nora", "Nora", "🥗"),
+            ("bruno", "Bruno", "🍳"),
+            ("mira", "Coach Mira", "💪"),
+            ("otto", "Otto", "📋"),
+        ]
+        .into_iter()
+        .map(|(id, name, emoji)| HouseholdPersona {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            emoji: emoji.to_string(),
+        })
+        .collect::<Vec<_>>();
+        telegram_standup::plan_roster(config, &presentations).unwrap()
+    }
+
     fn ctx<'a>(
         plans: &'a [PlanDoc],
         graph: Option<&'a WorkGraph>,
         humans: &'a HashSet<String>,
-        config: &'a TelegramConfig,
+        roster: &'a [StandupMember],
         today: NaiveDate,
     ) -> CommandContext<'a> {
         CommandContext {
             graph,
-            config,
+            roster,
             plans,
             today,
             now: now(),
@@ -544,10 +584,15 @@ mod tests {
             let kw = cmd.keyword;
             assert_eq!(match_command(kw).unwrap().keyword, kw);
             assert_eq!(
-                match_command(&format!("{kw}@bruno_chef_bot")).unwrap().keyword,
+                match_command(&format!("{kw}@bruno_chef_bot"))
+                    .unwrap()
+                    .keyword,
                 kw
             );
-            assert_eq!(match_command(&format!("  {kw} please ")).unwrap().keyword, kw);
+            assert_eq!(
+                match_command(&format!("  {kw} please ")).unwrap().keyword,
+                kw
+            );
             assert_eq!(
                 match_command(&format!("wg {}", kw.trim_start_matches('/')))
                     .unwrap()
@@ -579,7 +624,8 @@ mod tests {
         let plans: Vec<PlanDoc> = Vec::new();
         let humans = HashSet::new();
         let cfg = casa_config();
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let roster = casa_roster(&cfg);
+        let c = ctx(&plans, None, &humans, &roster, date(2026, 7, 15));
         for cmd in FAMILY_COMMANDS {
             let out = compose(cmd, &c);
             assert!(
@@ -594,8 +640,7 @@ mod tests {
     fn help_lists_every_command_in_the_table() {
         let plans: Vec<PlanDoc> = Vec::new();
         let humans = HashSet::new();
-        let cfg = casa_config();
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
         let help = compose_help(&c);
         for cmd in FAMILY_COMMANDS {
             assert!(help.contains(cmd.keyword), "help missing {}", cmd.keyword);
@@ -613,9 +658,8 @@ mod tests {
     fn dinner_returns_the_actual_dish_for_today() {
         let plans = w29();
         let humans = HashSet::new();
-        let cfg = casa_config();
         // Wednesday 07-15 in the fixture is the lentil & beet salad.
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
         let out = compose_dinner(&c);
         assert!(out.contains("Lentil & roasted-beet salad"), "got: {out}");
         assert!(out.contains("30 min"), "prep time surfaced: {out}");
@@ -626,9 +670,8 @@ mod tests {
     fn dinner_is_honest_when_today_has_no_plan() {
         let plans = w29();
         let humans = HashSet::new();
-        let cfg = casa_config();
         // 07-12 is the day before W29 begins — no covering plan.
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 12));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 12));
         let out = compose_dinner(&c);
         assert!(out.to_lowercase().contains("don't have"), "got: {out}");
         assert!(out.to_lowercase().contains("plan"), "offers to plan: {out}");
@@ -638,8 +681,7 @@ mod tests {
     fn shopping_lists_real_items_under_store_sections() {
         let plans = w29();
         let humans = HashSet::new();
-        let cfg = casa_config();
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
         let out = compose_shopping(&c);
         assert!(out.contains("Fishmonger"), "store section: {out}");
         assert!(out.contains("Salmon fillets"), "grounded item: {out}");
@@ -650,25 +692,26 @@ mod tests {
     fn week_shows_meals_as_weekday_names_plus_workouts() {
         let plans = w29();
         let humans = HashSet::new();
-        let cfg = casa_config();
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
         let out = compose_week(&c);
         assert!(out.contains("Monday"), "weekday name, not a date: {out}");
         assert!(!out.contains("07-13"), "no raw dates: {out}");
-        assert!(out.contains("Chickpea & spinach curry"), "meal grounded: {out}");
+        assert!(
+            out.contains("Chickpea & spinach curry"),
+            "meal grounded: {out}"
+        );
         assert!(out.contains("Workouts:"), "workouts line: {out}");
         assert!(out.contains("Luca"), "workout person: {out}");
     }
 
     #[test]
     fn reminders_lists_pending_human_task_and_is_cheerful_when_empty() {
-        let cfg = casa_config();
         let plans: Vec<PlanDoc> = Vec::new();
 
         // Empty graph → cheerful.
         let empty = WorkGraph::new();
         let humans = HashSet::new();
-        let c = ctx(&plans, Some(&empty), &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, Some(&empty), &humans, &[], date(2026, 7, 15));
         let out = compose_reminders(&c);
         assert!(out.to_lowercase().contains("caught up"), "got: {out}");
 
@@ -684,7 +727,7 @@ mod tests {
         }));
         let mut humans = HashSet::new();
         humans.insert("human-nadin".to_string());
-        let c = ctx(&plans, Some(&graph), &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, Some(&graph), &humans, &[], date(2026, 7, 15));
         let out = compose_reminders(&c);
         assert!(out.contains("Waiting on a reply"), "section: {out}");
         assert!(out.contains("Ask Nadin"), "grounded title: {out}");
@@ -692,7 +735,6 @@ mod tests {
 
     #[test]
     fn reminders_surfaces_upcoming_cron_task() {
-        let cfg = casa_config();
         let plans: Vec<PlanDoc> = Vec::new();
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(Task {
@@ -708,7 +750,7 @@ mod tests {
             ..Default::default()
         }));
         let humans = HashSet::new();
-        let c = ctx(&plans, Some(&graph), &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, Some(&graph), &humans, &[], date(2026, 7, 15));
         let out = compose_reminders(&c);
         assert!(out.contains("Coming up"), "section: {out}");
         assert!(out.contains("Draft next week"), "grounded title: {out}");
@@ -720,7 +762,8 @@ mod tests {
         let plans: Vec<PlanDoc> = Vec::new();
         let graph = WorkGraph::new();
         let humans = HashSet::new();
-        let c = ctx(&plans, Some(&graph), &humans, &cfg, date(2026, 7, 15));
+        let roster = casa_roster(&cfg);
+        let c = ctx(&plans, Some(&graph), &humans, &roster, date(2026, 7, 15));
         let out = compose_standup(&c);
         assert!(out.contains("Nora"));
         assert!(out.contains("Bruno"));
@@ -729,12 +772,16 @@ mod tests {
     }
 
     #[test]
-    fn owners_are_the_expected_voices() {
+    fn opaque_domain_owners_drive_command_voice() {
         let by = |kw: &str| FAMILY_COMMANDS.iter().find(|c| c.keyword == kw).unwrap();
-        assert_eq!(by("/dinner").owner, "bruno");
-        assert_eq!(by("/shopping").owner, "otto");
-        assert_eq!(by("/week").owner, "otto");
-        assert_eq!(by("/reminders").owner, "otto");
+        let owners = OwnerMap::from_pairs([
+            ("quartz", vec!["cooking", "recipes"]),
+            ("harbor", vec!["shopping", "calendar", "coordination"]),
+        ]);
+        assert_eq!(by("/dinner").owner(&owners), Some("quartz"));
+        assert_eq!(by("/shopping").owner(&owners), Some("harbor"));
+        assert_eq!(by("/week").owner(&owners), Some("harbor"));
+        assert_eq!(by("/reminders").owner(&owners), Some("harbor"));
         assert_eq!(by("/standup").kind, CommandKind::Roster);
     }
 }

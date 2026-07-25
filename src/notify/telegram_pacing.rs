@@ -158,7 +158,11 @@ mod tests {
         // 2 minutes before start → fresh enough, answered.
         assert!(!is_stale_backlog(start - 120, start, DEFAULT_STALE_SECS));
         // Exactly at the threshold boundary is NOT stale (strictly older).
-        assert!(!is_stale_backlog(start - DEFAULT_STALE_SECS, start, DEFAULT_STALE_SECS));
+        assert!(!is_stale_backlog(
+            start - DEFAULT_STALE_SECS,
+            start,
+            DEFAULT_STALE_SECS
+        ));
         // A live message sent after startup is never stale.
         assert!(!is_stale_backlog(start + 5, start, DEFAULT_STALE_SECS));
     }
@@ -169,15 +173,24 @@ mod tests {
         assert!(c.admit_collective(100), "first collective admits");
         assert!(!c.admit_collective(110), "10s later → coalesced");
         assert!(!c.admit_collective(129), "29s later → coalesced");
-        assert!(c.admit_collective(131), "31s after the admitted one → admits again");
-        assert!(!c.admit_collective(140), "within window of the new anchor → coalesced");
+        assert!(
+            c.admit_collective(131),
+            "31s after the admitted one → admits again"
+        );
+        assert!(
+            !c.admit_collective(140),
+            "within window of the new anchor → coalesced"
+        );
     }
 
     #[test]
     fn named_burst_is_per_agent() {
         let mut c = BurstCoalescer::new(30);
         assert!(c.admit_named("nora", 100), "first to nora admits");
-        assert!(!c.admit_named("nora", 105), "quick repeat to nora coalesces");
+        assert!(
+            !c.admit_named("nora", 105),
+            "quick repeat to nora coalesces"
+        );
         // A different agent in the same window is unaffected.
         assert!(c.admit_named("bruno", 106), "bruno is independent");
         // After the window, nora admits again.
@@ -217,7 +230,10 @@ mod tests {
         // The exact reported case: "why they don't reply?" 21s after otto's reply
         // was already sent was wrongly logged "concierge coalesced (burst)".
         let mut c = BurstCoalescer::new(30);
-        assert!(c.admit_named("otto", 11_48_15), "first concierge turn admits");
+        assert!(
+            c.admit_named("otto", 11_48_15),
+            "first concierge turn admits"
+        );
         c.mark_named_sent("otto"); // otto's reply was sent
         assert!(
             c.admit_named("otto", 11_48_36),
@@ -231,11 +247,17 @@ mod tests {
         // flurry within the window collapses to one reply.
         let mut c = BurstCoalescer::new(30);
         assert!(c.admit_collective(100), "first admits, now pending");
-        assert!(!c.admit_collective(105), "arrives during composition → coalesced");
+        assert!(
+            !c.admit_collective(105),
+            "arrives during composition → coalesced"
+        );
         assert!(!c.admit_collective(120), "still composing → coalesced");
         // Same for named.
         assert!(c.admit_named("otto", 200), "first named admits, pending");
-        assert!(!c.admit_named("otto", 210), "during composition → coalesced");
+        assert!(
+            !c.admit_named("otto", 210),
+            "during composition → coalesced"
+        );
     }
 
     #[test]
@@ -249,6 +271,9 @@ mod tests {
 
         let mut c = BurstCoalescer::new(30);
         assert!(c.admit_named("otto", 100));
-        assert!(c.admit_named("otto", 131), "window bounds a pending named turn");
+        assert!(
+            c.admit_named("otto", 131),
+            "window bounds a pending named turn"
+        );
     }
 }

@@ -40,6 +40,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use super::IncomingMessage;
+use super::grounding::{self, FamilyVoiceRoster};
 
 // ---------------------------------------------------------------------------
 // Photo parsing
@@ -262,8 +263,8 @@ pub fn build_vision_prompt(
         }
         _ => {
             p.push_str(
-                "You are Bruno, a warm, food-savvy member of the family team who helps \
-                 keep the shopping list right.\n\n",
+                "You are the household helper who received this photo. Reply warmly and \
+                 help keep the shared shopping list accurate.\n\n",
             );
         }
     }
@@ -412,7 +413,11 @@ pub enum ShoppingAction {
 /// whitespace, drop a trailing plural `s` on the last word so "lemons" matches
 /// "lemon". Mirrors the gateway's own `norm` intent without importing it.
 fn norm_item(s: &str) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let collapsed = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     // Singularize the final token only (avoid butchering "chickpeas" mid-word).
     if let Some((head, last)) = collapsed.rsplit_once(' ') {
         format!("{head} {}", singular(last))
@@ -455,7 +460,10 @@ fn names_match(name: &str, item_text: &str) -> bool {
 /// wins (we keep what we still need on the list) — so a model that lists an
 /// item on both sides never leaves it wrongly crossed off. Duplicate actions on
 /// the same key are de-duplicated.
-pub fn plan_shopping_actions(verdict: &VisionVerdict, list: &[ShoppingItem]) -> Vec<ShoppingAction> {
+pub fn plan_shopping_actions(
+    verdict: &VisionVerdict,
+    list: &[ShoppingItem],
+) -> Vec<ShoppingAction> {
     use std::collections::HashSet;
     let mut actions: Vec<ShoppingAction> = Vec::new();
     let mut crossed_keys: HashSet<String> = HashSet::new();
@@ -689,8 +697,7 @@ impl TelegramPhotoDownloader {
 impl PhotoDownloader for TelegramPhotoDownloader {
     async fn download(&self, file_id: &str, dest: &Path) -> Result<()> {
         // 1. Resolve the file path via getFile.
-        let get_file_url =
-            format!("https://api.telegram.org/bot{}/getFile", self.bot_token);
+        let get_file_url = format!("https://api.telegram.org/bot{}/getFile", self.bot_token);
         let resp = self
             .client
             .post(&get_file_url)
@@ -765,6 +772,7 @@ pub async fn run_photo_shopping_turn(
     downloader: &dyn PhotoDownloader,
     composer: &dyn VisionComposer,
     gateway: &dyn ShoppingGateway,
+    family_roster: &FamilyVoiceRoster,
     scratch_dir: &Path,
 ) -> Result<PhotoTurnResult> {
     // 1. Download (cap the album; the cap is the caller's responsibility to
@@ -830,19 +838,22 @@ pub async fn run_photo_shopping_turn(
     } else {
         verdict.reply_text
     };
+    // Photo replies bypass telegram_conversation's finalizer and go straight to
+    // BotReplySink. Guard the model copy here so every caller receives exactly
+    // the family-safe text that may be delivered.
+    let reply_text = grounding::enforce_family_voice(&reply_text, family_roster);
 
-    Ok(PhotoTurnResult { reply_text, actions })
+    Ok(PhotoTurnResult {
+        reply_text,
+        actions,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn photo_msg(
-        file_id: &str,
-        caption: &str,
-        media_group_id: Option<&str>,
-    ) -> IncomingMessage {
+    fn photo_msg(file_id: &str, caption: &str, media_group_id: Option<&str>) -> IncomingMessage {
         IncomingMessage {
             channel: "telegram".to_string(),
             sender: "luca".to_string(),
@@ -940,10 +951,7 @@ mod tests {
 
     #[test]
     fn photo_lone_photos_are_separate_turns() {
-        let msgs = vec![
-            photo_msg("f1", "one", None),
-            photo_msg("f2", "two", None),
-        ];
+        let msgs = vec![photo_msg("f1", "one", None), photo_msg("f2", "two", None)];
         let turns = coalesce_album(&msgs);
         assert_eq!(turns.len(), 2);
     }
@@ -968,6 +976,31 @@ mod tests {
         let turns = coalesce_album(&msgs);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].file_ids, vec!["f2"]);
+    }
+
+    #[test]
+    fn photo_prompt_uses_configured_voice_or_a_name_free_fallback() {
+        let image_refs = vec!["@/tmp/scratch-photo.jpg".to_string()];
+        let configured = build_vision_prompt(
+            Some("Zephyra is the household's pantry guide."),
+            &[],
+            "What do we need?",
+            &image_refs,
+        );
+        assert!(
+            configured.contains("Zephyra is the household's pantry guide."),
+            "the elected voice summary must remain authoritative"
+        );
+
+        let fallback = build_vision_prompt(None, &[], "What do we need?", &image_refs);
+        assert!(
+            fallback.starts_with("You are the household helper who received this photo."),
+            "a missing session summary must use a role-neutral prompt"
+        );
+        assert!(
+            !fallback.contains("Zephyra"),
+            "the neutral fallback must not invent the configured fixture voice"
+        );
     }
 
     // --- verdict parsing ---------------------------------------------------
@@ -1021,10 +1054,14 @@ mod tests {
             text: "Chickpeas".into()
         }));
         // "lemons" already on list uncrossed → no action; "chard" missing → add.
-        assert!(actions.contains(&ShoppingAction::Add { text: "chard".into() }));
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, ShoppingAction::CrossOff { text, .. } if text == "Lemons")));
+        assert!(actions.contains(&ShoppingAction::Add {
+            text: "chard".into()
+        }));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ShoppingAction::CrossOff { text, .. } if text == "Lemons"))
+        );
     }
 
     #[test]
@@ -1055,9 +1092,11 @@ mod tests {
             need: vec!["eggs".into()],
         };
         let actions = plan_shopping_actions(&verdict, &list);
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, ShoppingAction::CrossOff { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ShoppingAction::CrossOff { .. }))
+        );
     }
 
     #[test]
@@ -1152,6 +1191,13 @@ mod tests {
         }
     }
 
+    fn family_roster() -> FamilyVoiceRoster {
+        FamilyVoiceRoster::from_names(
+            ["Nora", "Bruno", "Coach Mira", "Otto"],
+            ["Household Member"],
+        )
+    }
+
     #[tokio::test]
     async fn photo_turn_composes_with_image_and_list_then_applies_via_endpoints() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1182,6 +1228,7 @@ mod tests {
             &FakeDownloader,
             &composer,
             &gateway,
+            &family_roster(),
             tmp.path(),
         )
         .await
@@ -1191,7 +1238,10 @@ mod tests {
         assert_eq!(composer.seen_images.lock().unwrap().as_slice(), &[2]);
         let prompt = composer.seen_prompt.lock().unwrap().clone();
         assert!(prompt.contains("Chickpeas"), "list is in the prompt");
-        assert!(prompt.contains("bruno what do we still need?"), "caption in prompt");
+        assert!(
+            prompt.contains("bruno what do we still need?"),
+            "caption in prompt"
+        );
         assert!(prompt.contains("@"), "image reference in prompt");
 
         // Reply is family-voice with the marker stripped.
@@ -1200,10 +1250,73 @@ mod tests {
 
         // Mutations went through the endpoints: cross off chickpeas, add chard.
         let calls = gateway.calls.lock().unwrap().clone();
-        assert!(calls.contains(&"toggle p:s|chickpeas true".to_string()), "calls={calls:?}");
+        assert!(
+            calls.contains(&"toggle p:s|chickpeas true".to_string()),
+            "calls={calls:?}"
+        );
         assert!(calls.contains(&"add chard".to_string()), "calls={calls:?}");
 
         // Temp files cleaned up.
         assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn photo_turn_guards_model_copy_without_losing_shopping_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let turn = CoalescedPhotoTurn {
+            media_group_id: None,
+            file_ids: vec!["f1".into()],
+            caption: "what do we still need?".into(),
+            chat_id: Some("-100".into()),
+            chat_type: Some("group".into()),
+            sender: "member-1".into(),
+        };
+        let composer = RecordingComposer {
+            reply: concat!(
+                "Bruno 💬 **Chard** is still needed. ",
+                "Zephyra will join us. ",
+                "I'll pull that from the live gateway. ",
+                "Dispatcher healthy. Otto's got this one.\n",
+                "SHOPPING_UPDATE: have=[chickpeas]; need=[chard]",
+            )
+            .into(),
+            seen_images: std::sync::Mutex::new(Vec::new()),
+            seen_prompt: std::sync::Mutex::new(String::new()),
+        };
+        let gateway = FakeGateway {
+            items: vec![item("p:s|chickpeas", "Chickpeas", false)],
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let result = run_photo_shopping_turn(
+            &turn,
+            None,
+            &PhotoLimits::default(),
+            &FakeDownloader,
+            &composer,
+            &gateway,
+            &family_roster(),
+            tmp.path(),
+        )
+        .await
+        .expect("turn ok");
+
+        assert_eq!(result.reply_text, "Chard is still needed.");
+        assert_eq!(
+            result.actions,
+            vec![
+                ShoppingAction::CrossOff {
+                    key: "p:s|chickpeas".into(),
+                    text: "Chickpeas".into(),
+                },
+                ShoppingAction::Add {
+                    text: "chard".into(),
+                },
+            ],
+            "guarding the reply must not discard the already-planned list mutations",
+        );
+        let calls = gateway.calls.lock().unwrap().clone();
+        assert!(calls.contains(&"toggle p:s|chickpeas true".to_string()));
+        assert!(calls.contains(&"add chard".to_string()));
     }
 }

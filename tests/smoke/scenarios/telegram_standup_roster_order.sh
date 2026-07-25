@@ -2,12 +2,12 @@
 # Smoke: `/standup` posts exactly one message per named voice, in roster order.
 #
 # Pins the group-standup contract (docs/09 §3): a `/standup` in the family group
-# must produce EXACTLY four posts — nora, bruno, mira, otto — in that fixed
-# order, no duplicates, each in family voice. We exercise the real command path
+# must produce exactly one post per joined household persona, in the authored
+# `[[agent]]` order, no duplicates, each in family voice. We exercise the real command path
 # (`wg telegram standup --dry-run`, the on-demand equivalent of the listener's
-# `/standup` intercept) against a fixture config whose bots are deliberately
-# stored OUT of roster order, and assert the emitted posts come back in canonical
-# roster order regardless. Dry-run prints the plan instead of hitting Telegram,
+# `/standup` intercept) against opaque fixture ids whose bots are deliberately
+# stored OUT of roster order, and assert the emitted posts come back in household
+# order with household-authored names/emoji. Dry-run prints instead of hitting Telegram,
 # so the scenario needs no network or real tokens.
 
 set -euo pipefail
@@ -19,23 +19,37 @@ require_wg
 scratch="$(make_scratch)"
 mkdir -p "$scratch/.wg"
 
-# Fixture: four named bots (dummy tokens), inserted out of roster order to prove
-# the ordering is imposed by the command, not by config/HashMap iteration.
+# The authored order is deliberately neither alphabetical nor bot-map order.
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "agent-zeta"
+name = "North Star"
+emoji = "🌙"
+
+[[agent]]
+id = "agent-alpha"
+name = "Garden Lantern"
+emoji = "🏮"
+
+[[agent]]
+id = "agent-kappa"
+name = "Quiet Harbor"
+emoji = "🧭"
+TOML
+
+# Dummy bot secrets, inserted in a different order. The join key is the opaque
+# agent id; neither names nor emoji are derived from these keys.
 cat >"$scratch/.wg/notify.toml" <<'TOML'
-[telegram.bots.otto]
-bot_token = "0000000000:otto-dummy-token"
+[telegram.bots.agent-kappa]
+bot_token = "0000000000:kappa-dummy-token"
 chat_id   = "-1000000000001"
 
-[telegram.bots.mira]
-bot_token = "0000000000:mira-dummy-token"
+[telegram.bots.agent-zeta]
+bot_token = "0000000000:zeta-dummy-token"
 chat_id   = "-1000000000001"
 
-[telegram.bots.nora]
-bot_token = "0000000000:nora-dummy-token"
-chat_id   = "-1000000000001"
-
-[telegram.bots.bruno]
-bot_token = "0000000000:bruno-dummy-token"
+[telegram.bots.agent-alpha]
+bot_token = "0000000000:alpha-dummy-token"
 chat_id   = "-1000000000001"
 TOML
 
@@ -46,22 +60,45 @@ out="$(cd "$scratch" && wg telegram standup --dry-run 2>&1)" || {
 
 echo "$out"
 
-# Exactly four posts.
+# Exactly three joined household voices.
 count="$(echo "$out" | grep -c '^--- \[' || true)"
-[ "$count" -eq 4 ] || loud_fail "expected 4 posts, got $count"
+[ "$count" -eq 3 ] || loud_fail "expected 3 posts, got $count"
 
-# Roster order: nora, bruno, mira, otto — extracted from the per-post headers.
-order="$(echo "$out" | sed -n 's/^--- \[[0-9]*\] \([a-z]*\) .*/\1/p' | tr '\n' ',' )"
-[ "$order" = "nora,bruno,mira,otto," ] || loud_fail "roster order wrong: got '$order'"
+# Authored household order, not alphabetical or HashMap iteration order.
+order="$(echo "$out" | sed -n 's/^--- \[[0-9]*\] \([^ ]*\) .*/\1/p' | tr '\n' ',' )"
+[ "$order" = "agent-zeta,agent-alpha,agent-kappa," ] || loud_fail "roster order wrong: got '$order'"
 
 # No token ever leaks into the printed plan.
 if echo "$out" | grep -q "dummy-token"; then
     loud_fail "bot token leaked into standup output"
 fi
 
-# Each voice's header emoji/name is present (family voice, not bot ids alone).
-echo "$out" | grep -q "Nora 🥗"       || loud_fail "Nora header missing"
-echo "$out" | grep -q "Coach Mira 💪" || loud_fail "Coach Mira header missing"
-echo "$out" | grep -q "Otto 📋"       || loud_fail "Otto header missing"
+# Each household-authored name/emoji is present; no presentation was inferred
+# from the opaque ids.
+echo "$out" | grep -q "North Star 🌙"     || loud_fail "North Star header missing"
+echo "$out" | grep -q "Garden Lantern 🏮" || loud_fail "Garden Lantern header missing"
+echo "$out" | grep -q "Quiet Harbor 🧭"   || loud_fail "Quiet Harbor header missing"
 
-echo "PASS: /standup produced 4 posts in roster order (nora, bruno, mira, otto)"
+# A multi-bot config with no authored roster must fail closed. It must never
+# recover by sorting or iterating the bot map.
+missing="$(make_scratch)"
+mkdir -p "$missing/.wg"
+cp "$scratch/.wg/notify.toml" "$missing/.wg/notify.toml"
+if missing_out="$(cd "$missing" && wg telegram standup --dry-run 2>&1)"; then
+    loud_fail "multi-bot standup succeeded without household.toml: $missing_out"
+fi
+echo "$missing_out" | grep -q "failed to read household roster" \
+    || loud_fail "missing-roster failure was not explicit: $missing_out"
+
+# A malformed roster fails in the same direction.
+malformed="$(make_scratch)"
+mkdir -p "$malformed/.wg"
+cp "$scratch/.wg/notify.toml" "$malformed/.wg/notify.toml"
+printf 'not = [valid\n' >"$malformed/household.toml"
+if malformed_out="$(cd "$malformed" && wg telegram standup --dry-run 2>&1)"; then
+    loud_fail "multi-bot standup succeeded with malformed household.toml: $malformed_out"
+fi
+echo "$malformed_out" | grep -q "invalid household roster" \
+    || loud_fail "malformed-roster failure was not explicit: $malformed_out"
+
+echo "PASS: /standup used ordered household identities with opaque agent ids"

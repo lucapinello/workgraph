@@ -31,7 +31,35 @@ scratch="$(make_scratch)"
     wg agency human confirm 8905220378 >/dev/null 2>&1
 )
 
-# The four family voices, so the round has a roster (nora, bruno, mira, otto).
+# The project-local source of roster order, presentation, and coordination
+# ownership. These are test-fixture names; production has no compiled roster.
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "nora"
+name = "Nora"
+emoji = "🥗"
+domains = ["meals", "nutrition"]
+
+[[agent]]
+id = "bruno"
+name = "Bruno"
+emoji = "🍳"
+domains = ["meals", "cooking", "recipes"]
+
+[[agent]]
+id = "mira"
+name = "Coach Mira"
+emoji = "💪"
+domains = ["workouts"]
+
+[[agent]]
+id = "otto"
+name = "Otto"
+emoji = "📋"
+domains = ["calendar", "coordination", "shopping"]
+TOML
+
+# Matching dummy bots. Roster order still comes from household.toml.
 cat >"$scratch/.wg/notify.toml" <<'TOML'
 [telegram.bots.nora]
 bot_token = "0000000000:nora-dummy-token"

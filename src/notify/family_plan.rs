@@ -10,7 +10,8 @@
 //!
 //! * the week's date range (`**Week of Monday 2026-07-13 → Sunday 2026-07-19**`)
 //!   and its publish `Status`,
-//! * the **meal plan** table (`## 1. Meal plan`) as one [`Meal`] per day,
+//! * the **dinners** table (`## 1. Dinners (…)`) as one [`Meal`] per day
+//!   (`## 1. Meals` remains a supported legacy alias),
 //! * the **shopping list** (`## 4. Shopping list`) as [`ShoppingSection`]s
 //!   (one per `###` store heading) with their bullet items,
 //! * the **workouts** (`## 2. Workouts`) as [`WorkoutDay`]s per person.
@@ -25,6 +26,16 @@
 use std::path::Path;
 
 use chrono::{Datelike, NaiveDate, Weekday};
+
+/// True when an H2 title names the weekly meals table. Production plans use a
+/// numbered `Dinners` heading while older fixtures and hand-written plans use
+/// `Meal plan` or `Meals`; every reader and writer must share this predicate.
+pub fn is_meals_section_heading(heading: &str) -> bool {
+    heading
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| matches!(word, "meal" | "meals" | "dinner" | "dinners"))
+}
 
 /// One dinner slot from the meal-plan table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +170,7 @@ impl PlanDoc {
             // --- Section headings ---------------------------------------------
             if let Some(h2) = line.strip_prefix("## ") {
                 let low = h2.to_ascii_lowercase();
-                section = if low.contains("meal") {
+                section = if is_meals_section_heading(h2) {
                     Section::Meals
                 } else if low.contains("shopping") {
                     Section::Shopping
@@ -183,12 +194,7 @@ impl PlanDoc {
                     }),
                     Section::Workouts => {
                         // "Luca — strength focus (…)" → person = "Luca".
-                        let person = h3
-                            .split(['—', '-'])
-                            .next()
-                            .unwrap_or(h3)
-                            .trim()
-                            .to_string();
+                        let person = h3.split(['—', '-']).next().unwrap_or(h3).trim().to_string();
                         workout_person = Some(person);
                     }
                     _ => {}
@@ -242,8 +248,7 @@ impl PlanDoc {
                     }
                 }
                 Section::Workouts => {
-                    if let (Some(person), Some(cells)) =
-                        (workout_person.as_ref(), table_row(line))
+                    if let (Some(person), Some(cells)) = (workout_person.as_ref(), table_row(line))
                     {
                         // Columns: Day | Session | Structure
                         if cells.len() >= 2 && !is_header_or_rule(&cells) {
@@ -407,7 +412,9 @@ fn is_header_or_rule(cells: &[String]) -> bool {
     cells
         .iter()
         .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '))
-        || cells.iter().any(|c| c.chars().all(|ch| ch == '-') && !c.is_empty())
+        || cells
+            .iter()
+            .any(|c| c.chars().all(|ch| ch == '-') && !c.is_empty())
 }
 
 /// Parse a day cell like `"Mon 07-13"` into (`"Mon"`, date). The date is
@@ -483,14 +490,43 @@ mod tests {
     }
 
     #[test]
-    fn parses_seven_meals_in_day_order() {
+    fn parses_live_dinners_heading_in_day_order() {
+        assert!(
+            W29.contains("## 1. Dinners ("),
+            "canonical fixture must keep the live numbered Dinners heading"
+        );
         let doc = PlanDoc::parse("2026-W29", W29);
         assert_eq!(doc.meals.len(), 7, "one dinner per day");
         assert_eq!(doc.meals[0].weekday, "Mon");
         assert_eq!(doc.meals[0].date, Some(date(2026, 7, 13)));
         assert_eq!(doc.meals[0].dish, "Chickpea & spinach curry, brown rice");
         assert_eq!(doc.meals[0].prep, "~35 min");
-        assert_eq!(doc.meals[1].dish, "Baked salmon, roasted potatoes, green beans");
+        assert_eq!(
+            doc.meals[1].dish,
+            "Baked salmon, roasted potatoes, green beans"
+        );
+    }
+
+    #[test]
+    fn legacy_meals_heading_remains_supported() {
+        let legacy = W29
+            .lines()
+            .map(|line| {
+                if line
+                    .strip_prefix("## ")
+                    .map(is_meals_section_heading)
+                    .unwrap_or(false)
+                {
+                    "## 1. Meals"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let doc = PlanDoc::parse("2026-W29", &legacy);
+        assert_eq!(doc.meals.len(), 7, "legacy Meals alias lost dinner rows");
+        assert_eq!(doc.meals[0].dish, "Chickpea & spinach curry, brown rice");
     }
 
     #[test]

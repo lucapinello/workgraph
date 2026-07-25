@@ -59,9 +59,10 @@ use serde::Deserialize;
 
 use crate::notify::daily_digest::{DigestPolicy, DigestStore, Nudge, NudgeKind, Offer};
 use crate::notify::family_plan::{CalendarEvent, PlanDoc};
+use crate::notify::ownership::OwnerMap;
 use crate::notify::reminder::{
-    decide, first_member, hash64, normalize_bot, parse_clock, FireDecision, FiredLog, FirePolicy,
-    Outcome,
+    FireDecision, FirePolicy, FiredLog, Outcome, decide, first_member, hash64, parse_clock,
+    resolve_plan_source,
 };
 
 /// The shopping-cart emoji that marks an errand row in the plan and prefixes the
@@ -145,6 +146,7 @@ impl ErrandReminder {
         week_code: &str,
         ev: &CalendarEvent,
         members: &[String],
+        owners: &OwnerMap,
         lead: Duration,
     ) -> Option<ErrandReminder> {
         if !is_errand_event(&ev.event) {
@@ -155,7 +157,7 @@ impl ErrandReminder {
         let errand_at = date.and_time(time);
         let due = errand_at - lead;
         let recipient = first_member(&ev.event, members).unwrap_or_default();
-        let bot = normalize_bot(&ev.source);
+        let bot = resolve_plan_source(&ev.source, owners)?;
         let label = clean_errand_label(&ev.event);
         // Stable id: week + date + time + label hash. NOT a function of `lead`, so
         // changing the lead reuses the same id (one nudge per errand, always).
@@ -215,11 +217,14 @@ impl ErrandReminder {
 pub fn errands_from_plan(
     plan: &PlanDoc,
     members: &[String],
+    owners: &OwnerMap,
     lead: Duration,
 ) -> Vec<ErrandReminder> {
     plan.calendar
         .iter()
-        .filter_map(|ev| ErrandReminder::from_calendar_event(&plan.week_code, ev, members, lead))
+        .filter_map(|ev| {
+            ErrandReminder::from_calendar_event(&plan.week_code, ev, members, owners, lead)
+        })
         .collect()
 }
 
@@ -440,6 +445,16 @@ mod tests {
         vec!["Luca".to_string(), "Nadin".to_string()]
     }
 
+    fn owners() -> OwnerMap {
+        OwnerMap::casa_default()
+    }
+
+    fn owners_from_toml(body: &str) -> OwnerMap {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("household.toml"), body).unwrap();
+        OwnerMap::from_household_toml(dir.path()).expect("valid household fixture")
+    }
+
     fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, mo, d)
             .unwrap()
@@ -463,6 +478,7 @@ mod tests {
             "2026-W29",
             &errand_row(),
             &members(),
+            &owners(),
             Duration::minutes(15),
         )
         .expect("errand-shaped")
@@ -487,7 +503,10 @@ mod tests {
                     "Fishmonger / market",
                     &["Salmon fillets ×2 (Tue)", "Fresh sardines, ~400 g (Sat)"],
                 ),
-                mk("Greengrocer / produce", &["Swiss chard, 1 bunch", "Lemons ×3"]),
+                mk(
+                    "Greengrocer / produce",
+                    &["Swiss chard, 1 bunch", "Lemons ×3"],
+                ),
             ],
         }
     }
@@ -503,15 +522,48 @@ mod tests {
     }
 
     #[test]
+    fn renamed_source_resolves_unique_stable_owner() {
+        let owners = owners_from_toml(
+            r#"
+[[agent]]
+id = "shopping-anchor-8"
+name = "Market Lantern Renamed"
+domains = ["shopping", "coordination"]
+"#,
+        );
+        let row = CalendarEvent {
+            source: "Market Lantern Renamed \u{2192} \u{a7}4".into(),
+            ..errand_row()
+        };
+        let errand = ErrandReminder::from_calendar_event(
+            "2026-W29",
+            &row,
+            &members(),
+            &owners,
+            Duration::minutes(15),
+        )
+        .expect("renamed authored source resolves");
+        assert_eq!(
+            errand.bot, "shopping-anchor-8",
+            "routing must retain the stable id instead of deriving one from the display name",
+        );
+    }
+
+    #[test]
     fn errand_lead_is_configurable() {
         let e = ErrandReminder::from_calendar_event(
             "2026-W29",
             &errand_row(),
             &members(),
+            &owners(),
             Duration::minutes(30),
         )
         .unwrap();
-        assert_eq!(e.due, dt(2026, 7, 18, 8, 30), "a 30-min lead nudges at 08:30");
+        assert_eq!(
+            e.due,
+            dt(2026, 7, 18, 8, 30),
+            "a 30-min lead nudges at 08:30"
+        );
     }
 
     #[test]
@@ -521,10 +573,14 @@ mod tests {
             "2026-W29",
             &errand_row(),
             &members(),
+            &owners(),
             Duration::minutes(45), // different lead …
         )
         .unwrap();
-        assert_eq!(a.id, b.id, "same row → same id regardless of lead (one nudge)");
+        assert_eq!(
+            a.id, b.id,
+            "same row → same id regardless of lead (one nudge)"
+        );
         assert!(a.id.starts_with("errand:2026-W29:"));
     }
 
@@ -539,8 +595,14 @@ mod tests {
             source: "Bruno".into(),
         };
         assert!(
-            ErrandReminder::from_calendar_event("2026-W29", &cook, &members(), Duration::minutes(15))
-                .is_none()
+            ErrandReminder::from_calendar_event(
+                "2026-W29",
+                &cook,
+                &members(),
+                &owners(),
+                Duration::minutes(15),
+            )
+            .is_none()
         );
         // A ⏰ reminder row is NOT an errand (the two engines never overlap).
         let reminder = CalendarEvent {
@@ -555,6 +617,7 @@ mod tests {
                 "2026-W29",
                 &reminder,
                 &members(),
+                &owners(),
                 Duration::minutes(15)
             )
             .is_none()
@@ -565,15 +628,24 @@ mod tests {
     fn renders_remaining_grouped_by_store_section() {
         // Cross off one fish item; everything else remains.
         let msg = errand().render(&model(&["Salmon fillets ×2 (Tue)"]));
-        assert!(msg.starts_with("\u{1f6d2} Still needed at the market:"), "{msg}");
+        assert!(
+            msg.starts_with("\u{1f6d2} Still needed at the market:"),
+            "{msg}"
+        );
         // Grouped by store, compact (parentheticals dropped).
-        assert!(msg.contains("Fishmonger / market: Fresh sardines, ~400 g"), "{msg}");
+        assert!(
+            msg.contains("Fishmonger / market: Fresh sardines, ~400 g"),
+            "{msg}"
+        );
         assert!(
             msg.contains("Greengrocer / produce: Swiss chard, 1 bunch, Lemons ×3"),
             "{msg}"
         );
         // The crossed-off item is gone.
-        assert!(!msg.contains("Salmon"), "crossed item must not appear: {msg}");
+        assert!(
+            !msg.contains("Salmon"),
+            "crossed item must not appear: {msg}"
+        );
     }
 
     #[test]
@@ -588,8 +660,14 @@ mod tests {
 
         // Later, Luca crossed the salmon off at the kiosk. Re-render the SAME errand.
         let late = e.render(&model(&["Salmon fillets ×2 (Tue)"]));
-        assert!(!late.contains("Salmon"), "fire-time render reflects the crossing: {late}");
-        assert_ne!(early, late, "body is computed at fire time, not at schedule time");
+        assert!(
+            !late.contains("Salmon"),
+            "fire-time render reflects the crossing: {late}"
+        );
+        assert_ne!(
+            early, late,
+            "body is computed at fire time, not at schedule time"
+        );
     }
 
     #[test]
@@ -653,7 +731,9 @@ mod tests {
 
     #[test]
     fn errand_nudge_is_time_critical_and_counts_against_the_standalone_cap() {
-        use crate::notify::daily_digest::{DigestPolicy, DigestStore, Offer, PersonOverride, Urgency};
+        use crate::notify::daily_digest::{
+            DigestPolicy, DigestStore, Offer, PersonOverride, Urgency,
+        };
 
         let now = dt(2026, 7, 18, 8, 45); // at the errand's due time
         // Cap Luca at ONE standalone DM/day so the accounting is crisp.
@@ -669,7 +749,12 @@ mod tests {
         // Fire the errand and render its body from live shopping state.
         let e = errand();
         let mut log = FiredLog::default();
-        let fired = errand_tick(std::slice::from_ref(&e), &mut log, now, &FirePolicy::default());
+        let fired = errand_tick(
+            std::slice::from_ref(&e),
+            &mut log,
+            now,
+            &FirePolicy::default(),
+        );
         assert_eq!(fired.len(), 1);
         let firing = &fired[0];
 
@@ -750,7 +835,12 @@ mod tests {
         let mut log = FiredLog::default();
 
         // Scheduler comes back 1h late (09:45) → still nudge, tagged late.
-        let late = errand_tick(std::slice::from_ref(&e), &mut log, dt(2026, 7, 18, 9, 45), &policy);
+        let late = errand_tick(
+            std::slice::from_ref(&e),
+            &mut log,
+            dt(2026, 7, 18, 9, 45),
+            &policy,
+        );
         assert_eq!(late.len(), 1);
         assert!(late[0].late, "a missed-recent errand nudges with (late)");
 
@@ -763,12 +853,16 @@ mod tests {
             "2026-W29",
             &stale_row,
             &members(),
+            &owners(),
             Duration::minutes(15),
         )
         .unwrap(); // due 05:45
         let mut log2 = FiredLog::default();
         let dropped = errand_tick(&[stale.clone()], &mut log2, dt(2026, 7, 18, 9, 0), &policy);
-        assert!(dropped.is_empty(), "3h+ stale errand is dropped, not nudged");
+        assert!(
+            dropped.is_empty(),
+            "3h+ stale errand is dropped, not nudged"
+        );
         assert_eq!(log2.outcome(&stale.id), Some(Outcome::Dropped));
     }
 
@@ -798,7 +892,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let es = errands_from_plan(&plan, &members(), Duration::minutes(15));
+        let es = errands_from_plan(&plan, &members(), &owners(), Duration::minutes(15));
         assert_eq!(es.len(), 1, "only the errand row, not the cook slot");
         assert_eq!(es[0].recipient, "Luca");
     }

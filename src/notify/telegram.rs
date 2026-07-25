@@ -330,8 +330,10 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!(
-            "https://api.telegram.org/bot{}/{}",
-            self.bot.bot_token, method
+            "{}/bot{}/{}",
+            telegram_api_base(),
+            self.bot.bot_token,
+            method,
         )
     }
 
@@ -373,7 +375,10 @@ impl TelegramChannel {
     /// as the Bot API requires. Every bot registers the full shared set so any
     /// bot can receive a `/command`; the listener's election then decides who
     /// actually answers. Returns the raw API response (contains no token).
-    pub async fn set_my_commands(&self, commands: &[(String, String)]) -> Result<serde_json::Value> {
+    pub async fn set_my_commands(
+        &self,
+        commands: &[(String, String)],
+    ) -> Result<serde_json::Value> {
         let cmds: Vec<serde_json::Value> = commands
             .iter()
             .map(|(name, desc)| serde_json::json!({ "command": name, "description": desc }))
@@ -484,11 +489,7 @@ impl TelegramChannel {
     /// bot that received the recording. Both URLs embed the bot token, so any
     /// transport error is scrubbed through [`redact_bot_token`] before it can be
     /// returned/logged — the token never leaks.
-    pub async fn download_file_bytes(
-        &self,
-        file_id: &str,
-        max_file_size: u64,
-    ) -> Result<Vec<u8>> {
+    pub async fn download_file_bytes(&self, file_id: &str, max_file_size: u64) -> Result<Vec<u8>> {
         // 1. Resolve the on-server file path (and its declared size).
         let resp = self
             .api_call("getFile", &serde_json::json!({ "file_id": file_id }))
@@ -808,6 +809,40 @@ impl TelegramChannel {
 /// resilience tests can point [`get_updates_once`] at a local mock server.
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
+/// Optional loopback-only Telegram API base used by hermetic real-binary
+/// scenarios. The production default remains Telegram itself; an override is
+/// accepted only for plain HTTP on an exact loopback IP, so a stray environment
+/// value cannot redirect bot credentials to another host.
+const TELEGRAM_API_BASE_OVERRIDE: &str = "WG_TELEGRAM_API_BASE";
+
+fn validated_telegram_api_base(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    if url.scheme() != "http"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(
+            url.host_str(),
+            Some("127.0.0.1") | Some("::1") | Some("[::1]")
+        )
+    {
+        return None;
+    }
+    let mut base = url.to_string();
+    while base.ends_with('/') {
+        base.pop();
+    }
+    Some(base)
+}
+
+fn telegram_api_base() -> String {
+    std::env::var(TELEGRAM_API_BASE_OVERRIDE)
+        .ok()
+        .and_then(|value| validated_telegram_api_base(&value))
+        .unwrap_or_else(|| TELEGRAM_API_BASE.to_string())
+}
+
 /// Server-side long-poll timeout (seconds) sent to `getUpdates`. Telegram holds
 /// the request open up to this long when no update is pending, so the loop
 /// blocks cheaply instead of hot-spinning.
@@ -1115,8 +1150,7 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             .get("entities")
             .or_else(|| message.get("caption_entities"))
             .unwrap_or(&serde_json::Value::Null);
-        let mention_usernames =
-            super::telegram_group::parse_mention_usernames(&body, entities);
+        let mention_usernames = super::telegram_group::parse_mention_usernames(&body, entities);
         // A genuine leading `/slash` command carries a `bot_command` entity at
         // offset 0 — the ONLY signal we treat as "this is a command". A bare `?`
         // or ordinary chatter has none. See `fix-command-leaks`.
@@ -1167,7 +1201,10 @@ fn load_offset(path: &std::path::Path) -> i64 {
 fn save_offset(path: &std::path::Path, offset: i64) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("Failed to create Telegram offset dir {}: {e}", parent.display());
+            eprintln!(
+                "Failed to create Telegram offset dir {}: {e}",
+                parent.display()
+            );
             return;
         }
     }
@@ -1323,6 +1360,31 @@ chat_id = "456"
             ch.api_url("sendMessage"),
             "https://api.telegram.org/bot123:ABC/sendMessage"
         );
+    }
+
+    #[test]
+    fn telegram_api_override_accepts_only_plain_http_loopback() {
+        assert_eq!(
+            validated_telegram_api_base("http://127.0.0.1:7788/").as_deref(),
+            Some("http://127.0.0.1:7788"),
+        );
+        assert_eq!(
+            validated_telegram_api_base("http://[::1]:7788/").as_deref(),
+            Some("http://[::1]:7788"),
+        );
+        for rejected in [
+            "https://127.0.0.1:7788",
+            "http://localhost:7788",
+            "http://192.0.2.8:7788",
+            "http://user:pass@127.0.0.1:7788",
+            "not-a-url",
+        ] {
+            assert_eq!(
+                validated_telegram_api_base(rejected),
+                None,
+                "unsafe test endpoint was accepted: {rejected}",
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1630,8 +1692,14 @@ agent_id = "nora"
             }
         });
         let msg = decode_update(&update, "telegram:nora").unwrap();
-        assert!(!msg.has_bot_command, "a bare `?` after a mention is conversation");
-        assert_eq!(msg.mention_usernames, vec!["nora_casapinello_bot".to_string()]);
+        assert!(
+            !msg.has_bot_command,
+            "a bare `?` after a mention is conversation"
+        );
+        assert_eq!(
+            msg.mention_usernames,
+            vec!["nora_casapinello_bot".to_string()]
+        );
     }
 
     #[test]
@@ -1676,15 +1744,25 @@ agent_id = "nora"
             }
         });
         let msg = decode_update(&update, "telegram:bruno").unwrap();
-        assert_eq!(msg.photo_file_id.as_deref(), Some("biggest"), "largest size chosen");
+        assert_eq!(
+            msg.photo_file_id.as_deref(),
+            Some("biggest"),
+            "largest size chosen"
+        );
         assert_eq!(msg.media_group_id.as_deref(), Some("AG9"));
-        assert_eq!(msg.body, "@bruno_casapinello_bot what do we still need?", "caption is the body");
+        assert_eq!(
+            msg.body, "@bruno_casapinello_bot what do we still need?",
+            "caption is the body"
+        );
         assert_eq!(
             msg.mention_usernames,
             vec!["bruno_casapinello_bot".to_string()],
             "caption @mention parsed from caption_entities"
         );
-        assert!(!msg.has_bot_command, "a captioned photo is conversation, not a command");
+        assert!(
+            !msg.has_bot_command,
+            "a captioned photo is conversation, not a command"
+        );
     }
 
     #[test]
@@ -1733,7 +1811,10 @@ agent_id = "nora"
         assert_eq!(msg.voice_mime.as_deref(), Some("audio/ogg"));
         assert_eq!(msg.body, "", "a recording carries no text body yet");
         assert!(msg.photo_file_id.is_none(), "a voice note is not a photo");
-        assert!(!msg.has_bot_command, "a voice note is conversation, not a command");
+        assert!(
+            !msg.has_bot_command,
+            "a voice note is conversation, not a command"
+        );
     }
 
     #[test]
@@ -1784,7 +1865,12 @@ agent_id = "nora"
         // their decoded messages into ONE shared receiver. The single pipeline
         // must see all of them, tagged per bot.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
-        let bots = ["telegram:nora", "telegram:bruno", "telegram:mira", "telegram:otto"];
+        let bots = [
+            "telegram:nora",
+            "telegram:bruno",
+            "telegram:mira",
+            "telegram:otto",
+        ];
         for tag in bots {
             let tx = tx.clone();
             let tag = tag.to_string();
@@ -1811,7 +1897,10 @@ agent_id = "nora"
         seen.sort();
         let mut expected: Vec<String> = bots.iter().map(|s| s.to_string()).collect();
         expected.sort();
-        assert_eq!(seen, expected, "every bot's message reached the one receiver");
+        assert_eq!(
+            seen, expected,
+            "every bot's message reached the one receiver"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1832,7 +1921,11 @@ agent_id = "nora"
         assert_eq!(poll_backoff(5), Duration::from_secs(16));
         assert_eq!(poll_backoff(6), Duration::from_secs(32));
         assert_eq!(poll_backoff(7), Duration::from_secs(60), "capped at 60s");
-        assert_eq!(poll_backoff(100), Duration::from_secs(60), "huge streak stays capped");
+        assert_eq!(
+            poll_backoff(100),
+            Duration::from_secs(60),
+            "huge streak stays capped"
+        );
         // A pathological streak must never panic on the shift overflow.
         assert_eq!(poll_backoff(u32::MAX), Duration::from_secs(60));
     }
@@ -1846,11 +1939,17 @@ agent_id = "nora"
         // Failures 1–4: growing backoff, no rebuild yet.
         assert_eq!(
             s.on_failure(),
-            FailureAction { backoff: Duration::from_secs(1), rebuild_client: false }
+            FailureAction {
+                backoff: Duration::from_secs(1),
+                rebuild_client: false
+            }
         );
         assert_eq!(
             s.on_failure(),
-            FailureAction { backoff: Duration::from_secs(2), rebuild_client: false }
+            FailureAction {
+                backoff: Duration::from_secs(2),
+                rebuild_client: false
+            }
         );
         assert!(!s.on_failure().rebuild_client); // #3
         assert!(!s.on_failure().rebuild_client); // #4
@@ -1858,13 +1957,20 @@ agent_id = "nora"
         // Failure 5: rebuild fires (5 % POLL_REBUILD_AFTER == 0).
         let a5 = s.on_failure();
         assert_eq!(a5.backoff, Duration::from_secs(16));
-        assert!(a5.rebuild_client, "client rebuilds after {POLL_REBUILD_AFTER} consecutive failures");
+        assert!(
+            a5.rebuild_client,
+            "client rebuilds after {POLL_REBUILD_AFTER} consecutive failures"
+        );
         assert_eq!(s.consecutive_failures, 5);
 
         // Recovery: the ended streak length is reported, then the state resets.
         assert_eq!(s.on_success(), Some(5));
         assert_eq!(s.consecutive_failures, 0);
-        assert_eq!(s.on_success(), None, "already recovered — no duplicate breadcrumb");
+        assert_eq!(
+            s.on_success(),
+            None,
+            "already recovered — no duplicate breadcrumb"
+        );
 
         // A fresh failure restarts the streak from 1s with no immediate rebuild.
         let b1 = s.on_failure();
@@ -1890,7 +1996,10 @@ agent_id = "nora"
         let mut byte = [0u8; 1];
         loop {
             if stream.read(&mut byte)? == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "peer closed"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed",
+                ));
             }
             header.push(byte[0]);
             if header.ends_with(b"\r\n\r\n") {
@@ -2002,7 +2111,9 @@ agent_id = "nora"
 
         // Warm up so pool + runtime FDs are established before the baseline.
         for _ in 0..5 {
-            get_updates_once(&client, &base, "SOAKTOKEN", 0, 0).await.unwrap();
+            get_updates_once(&client, &base, "SOAKTOKEN", 0, 0)
+                .await
+                .unwrap();
         }
         let baseline_fds = open_fd_count();
         eprintln!("soak baseline: open_fds={baseline_fds}");
@@ -2010,7 +2121,9 @@ agent_id = "nora"
         const ITERS: u32 = 5000;
         let mut max_fds = baseline_fds;
         for i in 1..=ITERS {
-            get_updates_once(&client, &base, "SOAKTOKEN", 0, 0).await.unwrap();
+            get_updates_once(&client, &base, "SOAKTOKEN", 0, 0)
+                .await
+                .unwrap();
             if i % 1000 == 0 {
                 let fds = open_fd_count();
                 max_fds = max_fds.max(fds);
@@ -2022,7 +2135,9 @@ agent_id = "nora"
         }
 
         let total_conns = conns.load(Ordering::SeqCst);
-        eprintln!("soak done: baseline_fds={baseline_fds} max_fds={max_fds} total_conns={total_conns}");
+        eprintln!(
+            "soak done: baseline_fds={baseline_fds} max_fds={max_fds} total_conns={total_conns}"
+        );
         assert!(
             max_fds <= baseline_fds + 5,
             "poll loop leaked FDs over {ITERS} iters: baseline={baseline_fds} max={max_fds}"
@@ -2040,7 +2155,9 @@ agent_id = "nora"
             r#"{"ok":true,"result":[{"update_id":42,"message":{"message_id":1}}]}"#,
         );
         let client = build_poll_client();
-        let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await.unwrap();
+        let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0)
+            .await
+            .unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0]["update_id"].as_i64(), Some(42));
     }
@@ -2050,7 +2167,10 @@ agent_id = "nora"
         let base = spawn_keepalive_json_server("<html>502 bad gateway</html>");
         let client = build_poll_client();
         let err = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await;
-        assert!(err.is_err(), "a non-JSON body must surface as an error the loop can back off on");
+        assert!(
+            err.is_err(),
+            "a non-JSON body must surface as an error the loop can back off on"
+        );
     }
 
     /// The core FD-leak regression guard: many poll iterations against a
@@ -2066,13 +2186,17 @@ agent_id = "nora"
         // Warm up so the pooled connection + runtime FDs are established before
         // we take the baseline.
         for _ in 0..5 {
-            let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await.unwrap();
+            let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0)
+                .await
+                .unwrap();
             assert!(updates.is_empty());
         }
 
         let before = open_fd_count();
         for _ in 0..50 {
-            let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0).await.unwrap();
+            let updates = get_updates_once(&client, &base, "TESTTOKEN", 0, 0)
+                .await
+                .unwrap();
             assert!(updates.is_empty());
         }
 

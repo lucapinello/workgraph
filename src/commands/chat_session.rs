@@ -347,18 +347,7 @@ fn run_status(workgraph_dir: &Path, session: &str) -> Result<()> {
 fn run_list(workgraph_dir: &Path, json: bool, short: bool) -> Result<()> {
     let sessions = worksgood::chat_sessions::list(workgraph_dir)?;
     if json {
-        let value: Vec<_> = sessions
-            .iter()
-            .map(|(uuid, meta)| {
-                serde_json::json!({
-                    "uuid": uuid,
-                    "kind": format!("{:?}", meta.kind).to_lowercase(),
-                    "created": meta.created,
-                    "aliases": meta.aliases,
-                    "label": meta.label,
-                })
-            })
-            .collect();
+        let value = session_list_json_value(&sessions);
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
@@ -402,6 +391,26 @@ fn run_list(workgraph_dir: &Path, json: bool, short: bool) -> Result<()> {
     Ok(())
 }
 
+fn session_list_json_value(
+    sessions: &[(String, worksgood::chat_sessions::SessionMeta)],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        sessions
+            .iter()
+            .map(|(uuid, meta)| {
+                serde_json::json!({
+                    "uuid": uuid,
+                    "kind": format!("{:?}", meta.kind).to_lowercase(),
+                    "created": meta.created,
+                    "aliases": meta.aliases,
+                    "label": meta.label,
+                    "agent_id": meta.agent_id,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn run_fork(workgraph_dir: &Path, source: &str, alias: Option<String>) -> Result<()> {
     let fork_uuid = worksgood::chat_sessions::fork_session(workgraph_dir, source, alias.clone())?;
     let reg = worksgood::chat_sessions::load(workgraph_dir)?;
@@ -421,6 +430,65 @@ fn run_fork(workgraph_dir: &Path, source: &str, alias: Option<String>) -> Result
     eprintln!("\x1b[2m  Resume it with: \x1b[0mwg nex --chat {}", handle);
     println!("{}", fork_uuid);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use worksgood::chat_sessions::{bind_agent, create_session, list};
+
+    #[test]
+    fn session_list_json_includes_bound_agent_id() {
+        let dir = tempdir().unwrap();
+        let bound = create_session(
+            dir.path(),
+            SessionKind::Interactive,
+            &["household-slot-a".to_string()],
+            None,
+        )
+        .unwrap();
+        bind_agent(
+            dir.path(),
+            "a4f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500001",
+            &bound,
+        )
+        .unwrap();
+        create_session(
+            dir.path(),
+            SessionKind::Other,
+            &["unbound-slot".to_string()],
+            None,
+        )
+        .unwrap();
+
+        let value = session_list_json_value(&list(dir.path()).unwrap());
+        let rows = value.as_array().unwrap();
+        let bound_row = rows
+            .iter()
+            .find(|row| {
+                row["aliases"]
+                    .as_array()
+                    .is_some_and(|aliases| aliases.iter().any(|a| a == "household-slot-a"))
+            })
+            .unwrap();
+        assert_eq!(
+            bound_row["agent_id"],
+            "a4f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500001",
+        );
+        let unbound_row = rows
+            .iter()
+            .find(|row| {
+                row["aliases"]
+                    .as_array()
+                    .is_some_and(|aliases| aliases.iter().any(|a| a == "unbound-slot"))
+            })
+            .unwrap();
+        assert!(
+            unbound_row["agent_id"].is_null(),
+            "nullable field must be present for an unbound session: {unbound_row}",
+        );
+    }
 }
 
 fn run_new(workgraph_dir: &Path, alias: &str, label: Option<String>) -> Result<()> {

@@ -41,7 +41,11 @@
 //! - **No tokens or secrets** are ever logged; the bot token lives only on the
 //!   send channel.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -58,7 +62,6 @@ use crate::notify::parity;
 
 use super::NotificationChannel;
 use super::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
-use super::telegram_group::CONCIERGE_BOT;
 
 /// Which entry point produced a conversational message. Carried for logging so
 /// every handled inbound records *how* it was addressed.
@@ -262,10 +265,14 @@ pub fn glitch_line() -> String {
 /// Resolve the bot id that should answer, from an elected/receiving
 /// `channel_type` ("telegram" or "telegram:<bot_id>").
 ///
-/// The bare/`default`/legacy channel maps to the concierge ([`CONCIERGE_BOT`])
-/// when configured, else the first bot. A named channel maps to that bot,
-/// falling back to the first configured bot so a reply always has a sender.
-pub fn bot_id_for_channel(config: &TelegramConfig, channel_type: &str) -> Option<String> {
+/// The bare/`default`/legacy channel maps to `default_bot` when configured. A
+/// named channel maps only to that bot. Ambiguous or unknown routing fails
+/// closed rather than selecting an arbitrary HashMap entry.
+pub fn bot_id_for_channel_with_default(
+    config: &TelegramConfig,
+    channel_type: &str,
+    default_bot: Option<&str>,
+) -> Option<String> {
     let stripped = channel_type
         .strip_prefix("telegram:")
         .unwrap_or(channel_type);
@@ -274,19 +281,28 @@ pub fn bot_id_for_channel(config: &TelegramConfig, channel_type: &str) -> Option
         return None;
     }
     if stripped.is_empty() || stripped == "telegram" || stripped == "default" {
-        return bots
-            .iter()
-            .find(|(id, _)| id == CONCIERGE_BOT)
-            .or_else(|| bots.first())
-            .map(|(id, _)| id.clone());
+        if let Some(want) = default_bot {
+            return bots
+                .iter()
+                .find(|(id, bot)| {
+                    id.eq_ignore_ascii_case(want)
+                        || bot
+                            .agent_id
+                            .as_deref()
+                            .is_some_and(|agent| agent.eq_ignore_ascii_case(want))
+                })
+                .map(|(id, _)| id.clone());
+        }
+        return (bots.len() == 1).then(|| bots[0].0.clone());
     }
-    Some(
-        bots.iter()
-            .find(|(id, _)| id == stripped)
-            .or_else(|| bots.first())
-            .map(|(id, _)| id.clone())
-            .unwrap(),
-    )
+    bots.iter()
+        .find(|(id, _)| id == stripped)
+        .map(|(id, _)| id.clone())
+}
+
+/// Resolve a channel with no project-local default owner available.
+pub fn bot_id_for_channel(config: &TelegramConfig, channel_type: &str) -> Option<String> {
+    bot_id_for_channel_with_default(config, channel_type, None)
 }
 
 /// The agency agent a bot fronts (its `agent_id`), falling back to the bot id
@@ -309,38 +325,109 @@ pub fn agent_for_channel(config: &TelegramConfig, channel_type: &str) -> Option<
     Some(agent_for_bot(config, &bot_id))
 }
 
-/// Resolve a roster agent handle (the notify.toml `agent_id`, which for the
-/// Casa family bots is a human-friendly NAME like `"otto"`) to the **canonical
-/// agency agent id** that `wg agent session` uses as the session-binding key.
+/// Resolve the addressed agent with a caller-supplied project-local default.
+pub fn agent_for_channel_with_default(
+    config: &TelegramConfig,
+    channel_type: &str,
+    default_bot: Option<&str>,
+) -> Option<String> {
+    let bot_id = bot_id_for_channel_with_default(config, channel_type, default_bot)?;
+    Some(agent_for_bot(config, &bot_id))
+}
+
+/// Resolve a configured household persona reference to the one agent id whose
+/// bound session may receive the turn.
 ///
-/// This is the fix for the `dedupe-key-fix` converse-hang: `wg agent session
-/// <persona>` binds a session under the agent's full 64-hex id (e.g.
-/// `c10fe2fb…`), but the election/roster surface addresses the persona by name
-/// (`agent_for_bot` returns `"otto"`). Looking a session up by the bare name
-/// therefore missed every real binding — nora/bruno/mira resolved to `None`
-/// (→ generic Sessionless reply, no memory) and otto matched only a stray
-/// name-keyed session with no live agent (→ a full `reply_timeout` hang). By
-/// canonicalising the handle first, the lookup lands on the session `wg agent
-/// session` actually bound.
+/// Session aliases are the stable identity surface. Agent names are mutable
+/// display metadata, so an exact case-sensitive alias is authoritative: it
+/// resolves only when exactly one session owns it, that row carries a nonblank
+/// agent id, and exactly one session is bound to that id. Invalid alias state
+/// fails closed and never falls through to a coincidentally matching name.
 ///
-/// Resolution order: an exact/prefix match on an agency agent **id** wins (so a
-/// config that already uses the canonical id is untouched), then a
-/// case-insensitive match on the agent **name**. Falls back to the input
-/// unchanged when nothing matches — a bot fronting no agency agent, or a test
-/// fixture that binds by the literal handle, both keep working.
-pub fn canonical_agent_id(workgraph_dir: &Path, agent_ref: &str) -> String {
+/// With no exact alias, direct full agent ids and unique id prefixes are
+/// accepted only when exactly one session is bound to the resolved full id. A
+/// uniquely bound raw literal preserves legacy hermetic fixtures. Finally, a
+/// unique case-insensitive Agent.name match is retained as a bounded migration
+/// path, again only with exactly one bound session. Unknown, unbound, duplicate,
+/// or ambiguous references return `None` so the caller plans sessionless.
+pub fn canonical_agent_id(workgraph_dir: &Path, agent_ref: &str) -> Option<String> {
+    if agent_ref.trim().is_empty() {
+        return None;
+    }
+
+    let registry = chat_sessions::load(workgraph_dir).unwrap_or_default();
+    let uniquely_bound = |candidate: &str| {
+        if candidate.is_empty() || candidate != candidate.trim() {
+            return None;
+        }
+        let count = registry
+            .sessions
+            .values()
+            .filter(|meta| meta.agent_id.as_deref() == Some(candidate))
+            .count();
+        (count == 1).then(|| candidate.to_string())
+    };
+
+    let alias_matches: Vec<_> = registry
+        .sessions
+        .values()
+        .filter(|meta| meta.aliases.iter().any(|alias| alias == agent_ref))
+        .collect();
+    if !alias_matches.is_empty() {
+        if alias_matches.len() != 1 {
+            return None;
+        }
+        return alias_matches[0]
+            .agent_id
+            .as_deref()
+            .and_then(uniquely_bound);
+    }
+
     let agents_dir = workgraph_dir.join("agency").join("cache/agents");
     let agents = crate::agency::load_all_agents_or_warn(&agents_dir);
-    if let Some(a) = agents
+    let exact_ids: Vec<_> = agents
         .iter()
-        .find(|a| a.id == agent_ref || a.id.starts_with(agent_ref))
-    {
-        return a.id.clone();
+        .filter(|agent| agent.id == agent_ref)
+        .collect();
+    if !exact_ids.is_empty() {
+        return if exact_ids.len() == 1 {
+            uniquely_bound(&exact_ids[0].id)
+        } else {
+            None
+        };
     }
-    if let Some(a) = agents.iter().find(|a| a.name.eq_ignore_ascii_case(agent_ref)) {
-        return a.id.clone();
+
+    let prefix_ids: Vec<_> = agents
+        .iter()
+        .filter(|agent| agent.id.starts_with(agent_ref))
+        .collect();
+    if !prefix_ids.is_empty() {
+        return if prefix_ids.len() == 1 {
+            uniquely_bound(&prefix_ids[0].id)
+        } else {
+            None
+        };
     }
-    agent_ref.to_string()
+
+    let literal_bindings = registry
+        .sessions
+        .values()
+        .filter(|meta| meta.agent_id.as_deref() == Some(agent_ref))
+        .count();
+    match literal_bindings {
+        1 => return Some(agent_ref.to_string()),
+        2.. => return None,
+        0 => {}
+    }
+
+    let name_matches: Vec<_> = agents
+        .iter()
+        .filter(|agent| agent.name.eq_ignore_ascii_case(agent_ref))
+        .collect();
+    if name_matches.len() == 1 {
+        return uniquely_bound(&name_matches[0].id);
+    }
+    None
 }
 
 /// Is this Telegram sender a *confirmed* human? Unknown or unconfirmed senders
@@ -389,12 +476,16 @@ pub fn plan_conversation(
     sender: &str,
     entry: Entry,
 ) -> ConversationPlan {
-    let bot_id = bot_id_for_channel(config, route_channel).unwrap_or_else(|| {
-        route_channel
-            .strip_prefix("telegram:")
-            .unwrap_or(route_channel)
-            .to_string()
-    });
+    let root = project_root_of(workgraph_dir);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let coordination_owner = owner_map.owner_for_domain(ownership::Domain::Coordination);
+    let bot_id = bot_id_for_channel_with_default(config, route_channel, coordination_owner)
+        .unwrap_or_else(|| {
+            route_channel
+                .strip_prefix("telegram:")
+                .unwrap_or(route_channel)
+                .to_string()
+        });
     let route = ReplyRoute {
         bot_id: bot_id.clone(),
         chat_id: reply_chat.to_string(),
@@ -405,16 +496,17 @@ pub fn plan_conversation(
     }
 
     let agent_id = agent_for_bot(config, &bot_id);
-    // The roster addresses the persona by name ("otto"), but `wg agent session`
-    // binds under the canonical agency id — canonicalise before the lookup so we
-    // find the session that was actually bound (see `canonical_agent_id`).
-    let session_key = canonical_agent_id(workgraph_dir, &agent_id);
+    // Stable household aliases and bounded legacy references resolve to a full
+    // id only when exactly one session binding exists. Any unsafe state plans
+    // sessionless rather than guessing from mutable display metadata.
+    let session_ref = canonical_agent_id(workgraph_dir, &agent_id)
+        .and_then(|session_key| chat_sessions::session_for_agent(workgraph_dir, &session_key));
     let requester = requester_display_name(workgraph_dir, sender);
     let channel = match entry {
         Entry::Direct => crate::graph::OriginChannel::TelegramDirect,
         Entry::GroupElected => crate::graph::OriginChannel::TelegramGroup,
     };
-    match chat_sessions::session_for_agent(workgraph_dir, &session_key) {
+    match session_ref {
         Some(session_ref) => ConversationPlan::Converse {
             session_ref,
             agent_id,
@@ -502,6 +594,631 @@ pub trait ReplySink: Send + Sync {
         let _ = message_id;
         self.send(bot_id, chat_id, text).await.map(|_| ())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Durable physical-turn delivery guard
+// ---------------------------------------------------------------------------
+
+/// Prefix stored on every durable Telegram digest.
+///
+/// The prefix is part of the persisted request-id / delivery-ledger contract:
+/// a future encoding or hash change must use a new prefix instead of silently
+/// reinterpreting existing claims.
+pub const DURABLE_TELEGRAM_DIGEST_PREFIX: &str = "b3-v1";
+
+/// Version-stable BLAKE3 digest for durable Telegram turn identities.
+///
+/// Encoding is explicit and platform-independent: a fixed v1 preamble, then
+/// the domain and each UTF-8 field as an unsigned 64-bit big-endian byte length
+/// followed by the bytes (with the field count encoded the same way). The full
+/// 256-bit digest is hex-encoded and prefixed with [`DURABLE_TELEGRAM_DIGEST_PREFIX`].
+///
+/// Listener-local [`crate::notify::telegram_dedupe::DedupeKey`] hashing does not
+/// use this helper because that set never survives a process restart.
+pub fn durable_telegram_digest_v1(domain: &str, fields: &[&str]) -> String {
+    fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"worksgood.telegram.durable-digest.v1\0");
+    update_sized(&mut hasher, domain.as_bytes());
+    hasher.update(&(fields.len() as u64).to_be_bytes());
+    for field in fields {
+        update_sized(&mut hasher, field.as_bytes());
+    }
+    format!(
+        "{DURABLE_TELEGRAM_DIGEST_PREFIX}-{}",
+        hasher.finalize().to_hex(),
+    )
+}
+
+fn delivery_claim_path(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+) -> Option<PathBuf> {
+    if delivery_id.trim().is_empty() {
+        return None;
+    }
+    // The filename itself starts with `b3-v1-`, making its encoding version
+    // explicit on disk. Hash all routing fields with a length-delimited
+    // canonical encoding so the ledger exposes no household or bot ids.
+    let digest =
+        durable_telegram_digest_v1("telegram-delivery-claim", &[delivery_id, bot_id, chat_id]);
+    Some(
+        workgraph_dir
+            .join("telegram-deliveries")
+            .join(format!("{digest}.sent")),
+    )
+}
+
+/// Local state for one logical family-visible reply.
+///
+/// The filesystem claim is the cross-process authority. This state only keeps
+/// one invocation from calling its inner transport twice (for example, if an
+/// acknowledgement send returned no editable message id).
+#[derive(Debug, Clone)]
+enum TurnDeliveryState {
+    Fresh,
+    Owned(Option<String>),
+    Duplicate(Option<String>),
+}
+
+/// A restart-stable, record-before-send guard around one logical reply.
+///
+/// Session outboxes already make successful composed turns idempotent, but
+/// sessionless/onboarding replies, the legacy outbox-poll path, discussion
+/// takes, and compose failures do not all leave an outbox reply. Those paths
+/// therefore share this transport-level guard. The caller supplies an opaque
+/// physical-turn-derived id; bot and chat routing are folded into the claim so
+/// two configured voices never suppress one another.
+struct TurnDeliverySink<'a> {
+    inner: &'a dyn ReplySink,
+    claim_path: Option<PathBuf>,
+    retry_path: Option<PathBuf>,
+    state: Mutex<TurnDeliveryState>,
+}
+
+impl<'a> TurnDeliverySink<'a> {
+    fn new(
+        workgraph_dir: &Path,
+        delivery_id: &str,
+        bot_id: &str,
+        chat_id: &str,
+        inner: &'a dyn ReplySink,
+    ) -> Self {
+        let claim_path = delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id);
+        let retry_path = claim_path.as_ref().map(|path| path.with_extension("retry"));
+        Self {
+            inner,
+            claim_path,
+            retry_path,
+            state: Mutex::new(TurnDeliveryState::Fresh),
+        }
+    }
+
+    /// A completed or in-flight claim means another invocation owns this
+    /// physical reply. This early check keeps legacy polling/composition from
+    /// running again; the atomic `create_new` in [`claim`] remains the race-safe
+    /// authority when two processes reach this check together.
+    fn already_claimed(&self) -> bool {
+        self.claim_path.as_ref().is_some_and(|path| path.exists())
+    }
+
+    /// A prior transport call failed after the reply bytes were persisted to a
+    /// session outbox. The next attempt should reuse those canonical bytes
+    /// rather than compose and append a second same-request draft.
+    fn has_failed_attempt(&self) -> bool {
+        self.retry_path.as_ref().is_some_and(|path| path.exists())
+    }
+
+    fn failed_edit_message_id(&self) -> Option<String> {
+        let path = self.retry_path.as_ref()?;
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .strip_prefix("edit:")
+            .map(str::trim)
+            .filter(|message_id| !message_id.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Atomically claim this logical reply. The claim is created and synced
+    /// before transport, so a listener restart cannot resend an already-started
+    /// physical turn. A confirmed Telegram message id replaces the empty
+    /// pending marker after send, allowing a racing invocation to preserve the
+    /// acknowledgement/edit shape without sending again.
+    fn claim(&self) -> Result<TurnDeliveryState> {
+        let Some(path) = self.claim_path.as_ref() else {
+            return Ok(TurnDeliveryState::Owned(None));
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create Telegram delivery ledger {}",
+                    parent.display()
+                )
+            })?;
+        }
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(b"pending\n").and_then(|_| file.sync_all()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(path);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to persist Telegram delivery claim {}",
+                            path.display()
+                        )
+                    });
+                }
+                if let Some(retry_path) = self.retry_path.as_ref() {
+                    let _ = std::fs::remove_file(retry_path);
+                }
+                Ok(TurnDeliveryState::Owned(None))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let message_id = std::fs::read_to_string(path)
+                    .ok()
+                    .map(|body| body.trim().to_string())
+                    .filter(|body| !body.is_empty() && body != "pending");
+                Ok(TurnDeliveryState::Duplicate(message_id))
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to claim Telegram delivery {}", path.display())),
+        }
+    }
+
+    fn persist_message_id(&self, message_id: Option<&str>) {
+        let Some(path) = self.claim_path.as_ref() else {
+            return;
+        };
+        let body = message_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("sent");
+        if let Err(error) = crate::atomic_file::write_atomic(path, format!("{body}\n").as_bytes()) {
+            // The record-before-send claim still prevents a duplicate. Losing
+            // only the transport-local id is safe because a replay exits before
+            // composing; keep the confirmed delivery successful.
+            eprintln!(
+                "[{}] Telegram delivery ledger could not store message id: {error}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+    }
+
+    fn rearm(&self, retry_state: &str) {
+        if let Some(path) = self.claim_path.as_ref()
+            && let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "[{}] Telegram delivery ledger could not re-arm failed send: {error}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+        if let Some(retry_path) = self.retry_path.as_ref()
+            && let Err(error) =
+                crate::atomic_file::write_atomic(retry_path, format!("{retry_state}\n").as_bytes())
+        {
+            eprintln!(
+                "[{}] Telegram delivery ledger could not mark failed delivery retryable: {error}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+        *self.state.lock().unwrap() = TurnDeliveryState::Fresh;
+    }
+
+    fn rearm_after_send_failure(&self) {
+        self.rearm("send");
+    }
+
+    fn rearm_after_edit_failure(&self, message_id: &str) {
+        self.rearm(&format!("edit:{message_id}"));
+    }
+
+    fn rearm_incomplete_ack(&self) {
+        let state = self.state.lock().unwrap().clone();
+        match state {
+            TurnDeliveryState::Owned(Some(message_id)) => {
+                self.rearm_after_edit_failure(&message_id);
+            }
+            TurnDeliveryState::Owned(None) => self.rearm_after_send_failure(),
+            TurnDeliveryState::Fresh | TurnDeliveryState::Duplicate(_) => {}
+        }
+    }
+
+    fn duplicate_outcome(plan: &ConversationPlan) -> TurnOutcome {
+        match plan {
+            ConversationPlan::Onboard { .. } => TurnOutcome::Onboarded,
+            ConversationPlan::Sessionless { .. } => TurnOutcome::Sessionless,
+            ConversationPlan::Converse { .. } => TurnOutcome::Replied { acked: false },
+        }
+    }
+}
+
+#[async_trait]
+impl ReplySink for TurnDeliverySink<'_> {
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
+        let state = {
+            let mut state = self.state.lock().unwrap();
+            match &*state {
+                TurnDeliveryState::Fresh => {
+                    let claimed = self.claim()?;
+                    *state = claimed.clone();
+                    claimed
+                }
+                existing => existing.clone(),
+            }
+        };
+
+        match state {
+            TurnDeliveryState::Duplicate(Some(message_id))
+            | TurnDeliveryState::Owned(Some(message_id)) => Ok(Some(message_id)),
+            TurnDeliveryState::Duplicate(None) => Ok(None),
+            TurnDeliveryState::Owned(None) => match self.inner.send(bot_id, chat_id, text).await {
+                Ok(message_id) => {
+                    self.persist_message_id(message_id.as_deref());
+                    *self.state.lock().unwrap() = TurnDeliveryState::Owned(message_id.clone());
+                    Ok(message_id)
+                }
+                Err(error) => {
+                    self.rearm_after_send_failure();
+                    Err(error)
+                }
+            },
+            TurnDeliveryState::Fresh => unreachable!("fresh delivery must be claimed before send"),
+        }
+    }
+
+    async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        let state = self.state.lock().unwrap().clone();
+        match state {
+            TurnDeliveryState::Duplicate(_) => Ok(()),
+            TurnDeliveryState::Owned(_) => {
+                match self.inner.edit(bot_id, chat_id, message_id, text).await {
+                    Ok(()) => {
+                        self.persist_message_id(Some(message_id));
+                        *self.state.lock().unwrap() =
+                            TurnDeliveryState::Owned(Some(message_id.to_string()));
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.rearm_after_edit_failure(message_id);
+                        Err(error)
+                    }
+                }
+            }
+            TurnDeliveryState::Fresh => {
+                // Defensive: current conversation paths always send before edit.
+                // If a future caller edits directly, claim it with the same
+                // record-before-act discipline.
+                let claimed = self.claim()?;
+                *self.state.lock().unwrap() = claimed.clone();
+                match claimed {
+                    TurnDeliveryState::Duplicate(_) => Ok(()),
+                    TurnDeliveryState::Owned(_) => {
+                        match self.inner.edit(bot_id, chat_id, message_id, text).await {
+                            Ok(()) => {
+                                self.persist_message_id(Some(message_id));
+                                *self.state.lock().unwrap() =
+                                    TurnDeliveryState::Owned(Some(message_id.to_string()));
+                                Ok(())
+                            }
+                            Err(error) => {
+                                self.rearm_after_edit_failure(message_id);
+                                Err(error)
+                            }
+                        }
+                    }
+                    TurnDeliveryState::Fresh => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+/// Send one explicitly identified logical reply at most once across listener
+/// restarts. A later household turn must pass a different `delivery_id`, even
+/// when its words are identical.
+pub async fn send_reply_once(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+    sink: &dyn ReplySink,
+) -> Result<Option<String>> {
+    let guarded = TurnDeliverySink::new(workgraph_dir, delivery_id, bot_id, chat_id, sink);
+    guarded.send(bot_id, chat_id, text).await
+}
+
+/// Durable state for a family-visible reply whose exact guarded bytes are
+/// persisted alongside the physical-turn delivery claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalDeliveryState {
+    /// No canonical bytes and no transport state exist; composition may run.
+    Missing,
+    /// An empty canonical marker records a first-writer compose/timeout skip.
+    /// It is never sent, but prevents a same-turn replay from resurrecting the
+    /// skipped logical reply with newly composed words.
+    Skipped,
+    /// Canonical bytes exist but have not been confirmed by transport yet.
+    Ready(String),
+    /// Canonical bytes and a confirmed transport claim both exist.
+    Confirmed(String),
+    /// A process owns a pending record-before-transport claim. The bytes must
+    /// not enter downstream discussion context until confirmation is durable.
+    Pending,
+    /// A transport claim/retry exists without canonical bytes (legacy or
+    /// corrupt state). Fail closed: do not recompose or expose unknown words.
+    Unavailable,
+}
+
+fn read_optional_canonical(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to read canonical Telegram delivery {}",
+                path.display(),
+            )
+        }),
+    }
+}
+
+/// Read canonical bytes and their transport state without claiming or sending.
+///
+/// Callers use this before composition: [`CanonicalDeliveryState::Confirmed`]
+/// and [`CanonicalDeliveryState::Ready`] both carry the first writer's exact
+/// guarded bytes, while only `Missing` permits a fresh draft.
+pub fn canonical_delivery_state(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+) -> Result<CanonicalDeliveryState> {
+    let Some(claim_path) = delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id) else {
+        return Ok(CanonicalDeliveryState::Missing);
+    };
+    let canonical_path = claim_path.with_extension("canonical");
+    let retry_path = claim_path.with_extension("retry");
+    let canonical = read_optional_canonical(&canonical_path)?;
+    let claim = match std::fs::read_to_string(&claim_path) {
+        Ok(body) => Some(!body.trim().is_empty() && body.trim() != "pending"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to read Telegram delivery claim {}",
+                    claim_path.display(),
+                )
+            });
+        }
+    };
+    let retry_exists = retry_path.try_exists().with_context(|| {
+        format!(
+            "Failed to inspect Telegram delivery retry {}",
+            retry_path.display(),
+        )
+    })?;
+
+    Ok(match (canonical, claim, retry_exists) {
+        (Some(text), None, false) if text.is_empty() => CanonicalDeliveryState::Skipped,
+        (Some(text), Some(true), _) if !text.is_empty() => CanonicalDeliveryState::Confirmed(text),
+        (Some(text), Some(false), _) if !text.is_empty() => CanonicalDeliveryState::Pending,
+        (Some(text), None, _) if !text.is_empty() => CanonicalDeliveryState::Ready(text),
+        (None, None, false) => CanonicalDeliveryState::Missing,
+        _ => CanonicalDeliveryState::Unavailable,
+    })
+}
+
+static NEXT_CANONICAL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn create_canonical_temp_file(
+    parent: &Path,
+    file_name: &str,
+    process_id: u32,
+    next_id: &AtomicU64,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+    loop {
+        let sequence = next_id.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(".{file_name}.tmp.{process_id}.{sequence}",));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            // A process can crash after staging but before cleanup, and a later
+            // process may eventually reuse its pid. Never delete or trust that
+            // orphan; advance to a fresh no-clobber candidate.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Atomically publish the first canonical byte sequence for a delivery.
+///
+/// A fully written and synced same-directory temp file is hard-linked into the
+/// canonical path. `hard_link` is the no-clobber commit point: concurrent
+/// composers may race, but every caller reads and sends the same winning bytes,
+/// and readers can never observe a partial file.
+fn persist_canonical_reply_once(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+) -> Result<String> {
+    let Some(claim_path) = delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id) else {
+        return Ok(text.to_string());
+    };
+    let canonical_path = claim_path.with_extension("canonical");
+    if let Some(existing) = read_optional_canonical(&canonical_path)? {
+        return Ok(existing);
+    }
+
+    let parent = canonical_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("canonical delivery path has no parent"))?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create Telegram delivery ledger {}",
+            parent.display(),
+        )
+    })?;
+    let file_name = canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("canonical");
+    let (temp_path, mut file) = create_canonical_temp_file(
+        parent,
+        file_name,
+        std::process::id(),
+        &NEXT_CANONICAL_TEMP_ID,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to stage canonical Telegram delivery {}",
+            canonical_path.display(),
+        )
+    })?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to stage canonical Telegram delivery {}",
+                canonical_path.display(),
+            )
+        });
+    }
+
+    let published = match std::fs::hard_link(&temp_path, &canonical_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to publish canonical Telegram delivery {}",
+                    canonical_path.display(),
+                )
+            });
+        }
+    };
+    let _ = std::fs::remove_file(&temp_path);
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+
+    if published {
+        Ok(text.to_string())
+    } else {
+        read_optional_canonical(&canonical_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "canonical Telegram delivery disappeared after concurrent publish: {}",
+                canonical_path.display(),
+            )
+        })
+    }
+}
+
+/// Persist guarded reply bytes before transport and deliver the winning
+/// canonical sequence at most once.
+///
+/// A returned transport error keeps the canonical file and re-arms the existing
+/// retry marker, so the next invocation sends byte-for-byte the original draft.
+/// `Pending` is conservative: another process may still be sending, and callers
+/// must not use those words as delivered discussion context yet.
+pub async fn send_canonical_reply_once(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+    sink: &dyn ReplySink,
+) -> Result<CanonicalDeliveryState> {
+    if delivery_id.trim().is_empty() {
+        if text.is_empty() {
+            return Ok(CanonicalDeliveryState::Skipped);
+        }
+        send_reply_once(workgraph_dir, delivery_id, bot_id, chat_id, text, sink).await?;
+        return Ok(CanonicalDeliveryState::Confirmed(text.to_string()));
+    }
+
+    // Inspect legacy/transport state before publishing anything. In particular,
+    // a claim or retry without canonical bytes represents words this process
+    // cannot know; attaching a newly composed draft would falsely bless those
+    // bytes as already delivered.
+    match canonical_delivery_state(workgraph_dir, delivery_id, bot_id, chat_id)? {
+        CanonicalDeliveryState::Confirmed(text) => {
+            return Ok(CanonicalDeliveryState::Confirmed(text));
+        }
+        CanonicalDeliveryState::Skipped => {
+            return Ok(CanonicalDeliveryState::Skipped);
+        }
+        CanonicalDeliveryState::Pending => {
+            return Ok(CanonicalDeliveryState::Pending);
+        }
+        CanonicalDeliveryState::Unavailable => {
+            return Ok(CanonicalDeliveryState::Unavailable);
+        }
+        CanonicalDeliveryState::Missing => {
+            persist_canonical_reply_once(workgraph_dir, delivery_id, bot_id, chat_id, text)?;
+        }
+        CanonicalDeliveryState::Ready(_) => {}
+    }
+
+    let canonical = match canonical_delivery_state(workgraph_dir, delivery_id, bot_id, chat_id)? {
+        CanonicalDeliveryState::Confirmed(text) => {
+            return Ok(CanonicalDeliveryState::Confirmed(text));
+        }
+        CanonicalDeliveryState::Skipped => {
+            return Ok(CanonicalDeliveryState::Skipped);
+        }
+        CanonicalDeliveryState::Pending => {
+            return Ok(CanonicalDeliveryState::Pending);
+        }
+        CanonicalDeliveryState::Unavailable | CanonicalDeliveryState::Missing => {
+            return Ok(CanonicalDeliveryState::Unavailable);
+        }
+        CanonicalDeliveryState::Ready(text) => text,
+    };
+
+    send_reply_once(
+        workgraph_dir,
+        delivery_id,
+        bot_id,
+        chat_id,
+        &canonical,
+        sink,
+    )
+    .await?;
+    Ok(
+        match canonical_delivery_state(workgraph_dir, delivery_id, bot_id, chat_id)? {
+            CanonicalDeliveryState::Confirmed(text) => CanonicalDeliveryState::Confirmed(text),
+            CanonicalDeliveryState::Pending => CanonicalDeliveryState::Pending,
+            CanonicalDeliveryState::Skipped
+            | CanonicalDeliveryState::Missing
+            | CanonicalDeliveryState::Ready(_)
+            | CanonicalDeliveryState::Unavailable => CanonicalDeliveryState::Unavailable,
+        },
+    )
 }
 
 /// Production sink: resolves `bot_id` against the config and sends via that
@@ -967,8 +1684,7 @@ impl ReplyComposer for OneshotComposer {
         agent_id: &str,
         human_message: &str,
     ) -> Result<String> {
-        let prompt =
-            build_compose_prompt(workgraph_dir, session_ref, agent_id, human_message);
+        let prompt = build_compose_prompt(workgraph_dir, session_ref, agent_id, human_message);
         let config = self.config.clone();
         let model = self.model_spec.clone();
         let timeout = self.timeout_secs;
@@ -1041,12 +1757,12 @@ fn read_new_reply(
     session_ref: &str,
     baseline: u64,
     request_id: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<chat::ChatMessage>> {
     let msgs = chat::read_outbox_since_ref(workgraph_dir, session_ref, baseline)?;
     if let Some(m) = msgs.iter().find(|m| m.request_id == request_id) {
-        return Ok(Some(m.content.clone()));
+        return Ok(Some(m.clone()));
     }
-    Ok(msgs.into_iter().next().map(|m| m.content))
+    Ok(msgs.into_iter().next())
 }
 
 /// Run a single conversational turn per `plan`, sending via `sink`.
@@ -1065,19 +1781,115 @@ pub async fn run_conversation_turn(
     composer: Option<&dyn ReplyComposer>,
     sink: &dyn ReplySink,
 ) -> Result<TurnOutcome> {
+    let route = plan.route();
+    let durable_sink = TurnDeliverySink::new(
+        workgraph_dir,
+        request_id,
+        &route.bot_id,
+        &route.chat_id,
+        sink,
+    );
+    if durable_sink.already_claimed() {
+        println!(
+            "[{}] conversation delivery already claimed — skipping physical-turn replay",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+        return Ok(TurnDeliverySink::duplicate_outcome(plan));
+    }
+    let retry_persisted_reply = durable_sink.has_failed_attempt();
+    let retry_ack_message_id = durable_sink.failed_edit_message_id();
+    // Backward compatibility for projects upgraded from before the transport
+    // ledger: composed replies used the matching session outbox row itself as
+    // durable proof that the physical request had already been answered. Keep
+    // honoring that proof so an upgrade replay cannot recompose or repeat task,
+    // correction, inbox, or transport side effects. An explicit retry marker
+    // wins: those rows were persisted before a failed delivery and still need
+    // to be sent or edited by the retry path below.
+    if !retry_persisted_reply
+        && composer.is_some()
+        && !request_id.trim().is_empty()
+        && let ConversationPlan::Converse { session_ref, .. } = plan
+        && chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
+            .map(|outbox| {
+                outbox
+                    .iter()
+                    .any(|message| message.request_id == request_id)
+            })
+            .unwrap_or(false)
+    {
+        println!(
+            "[{}] conversation outbox already records this request — skipping upgrade replay",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+        return Ok(TurnDeliverySink::duplicate_outcome(plan));
+    }
+    // Capture the retry poll baseline before checking for an already-persisted
+    // reply. If the original session answers between that check and the resumed
+    // poll, its outbox row is still newer than this baseline and cannot be
+    // missed. Only the legacy path needs this: composed replies are persisted
+    // by this process before their transport attempt.
+    let retry_legacy_baseline = if retry_persisted_reply && composer.is_none() {
+        match plan {
+            ConversationPlan::Converse { session_ref, .. } => {
+                Some(outbox_baseline(workgraph_dir, session_ref))
+            }
+            ConversationPlan::Onboard { .. } | ConversationPlan::Sessionless { .. } => None,
+        }
+    } else {
+        None
+    };
+    if retry_persisted_reply
+        && !request_id.trim().is_empty()
+        && let ConversationPlan::Converse {
+            session_ref, route, ..
+        } = plan
+        && let Some(reply) = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
+            .ok()
+            .and_then(|out| {
+                out.into_iter()
+                    .rev()
+                    .find(|message| message.request_id == request_id)
+            })
+    {
+        // Composer-owned rows contain their canonical, already-guarded bytes,
+        // including any narrowly authorized owner handoff; do not guard those
+        // a second time. A legacy session row is different: its best-effort
+        // rewrite may have failed before transport did. Reapply the context-free
+        // family guard so a still-dirty row can never bypass it on retry.
+        let reply_text = if composer.is_none() {
+            let family_roster =
+                grounding::load_family_voice_roster(&project_root_of(workgraph_dir), workgraph_dir);
+            guard_legacy_reply_and_sync_outbox(workgraph_dir, session_ref, &reply, &family_roster)
+        } else {
+            reply.content.clone()
+        };
+        deliver_persisted_reply(
+            &durable_sink,
+            route,
+            retry_ack_message_id.as_deref(),
+            &reply_text,
+        )
+        .await?;
+        return Ok(TurnOutcome::Replied {
+            acked: retry_ack_message_id.is_some(),
+        });
+    }
+
     match plan {
         ConversationPlan::Onboard { route, .. } => {
             let inviter = family_inviter_name(workgraph_dir);
-            sink.send(
-                &route.bot_id,
-                &route.chat_id,
-                &onboarding_line(inviter.as_deref()),
-            )
-            .await?;
+            durable_sink
+                .send(
+                    &route.bot_id,
+                    &route.chat_id,
+                    &onboarding_line(inviter.as_deref()),
+                )
+                .await?;
             Ok(TurnOutcome::Onboarded)
         }
         ConversationPlan::Sessionless { route, .. } => {
-            sink.send(&route.bot_id, &route.chat_id, &sessionless_line())
+            durable_sink
+                .send(&route.bot_id, &route.chat_id, &sessionless_line())
                 .await?;
             Ok(TurnOutcome::Sessionless)
         }
@@ -1111,9 +1923,11 @@ pub async fn run_conversation_turn(
                     request_id,
                     timing,
                     route,
-                    sink,
+                    &durable_sink,
                     composer,
                     &origin,
+                    retry_ack_message_id.as_deref(),
+                    retry_persisted_reply,
                 )
                 .await
             }
@@ -1122,69 +1936,90 @@ pub async fn run_conversation_turn(
             // produces. Retained for callers/tests that supply their own
             // outbox producer.
             None => {
-                let baseline = outbox_baseline(workgraph_dir, session_ref);
-                chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id)?;
-                await_session_reply(
+                // Any returned transport failure belongs to the inbox turn
+                // already appended by the first attempt. A failed ack send has
+                // no message id, but must still resume rather than enqueue the
+                // same physical turn twice. Only an edit retry carries an id.
+                let resuming_failed_attempt = retry_persisted_reply;
+                let baseline = retry_legacy_baseline
+                    .unwrap_or_else(|| outbox_baseline(workgraph_dir, session_ref));
+                if !resuming_failed_attempt {
+                    chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id)?;
+                }
+                let outcome = await_session_reply(
                     workgraph_dir,
                     session_ref,
                     baseline,
                     request_id,
                     timing,
                     route,
-                    sink,
+                    &durable_sink,
+                    retry_ack_message_id.as_deref(),
                 )
-                .await
+                .await?;
+                if matches!(outcome, TurnOutcome::TimedOut { acked: true }) {
+                    // The ack landed, but the logical reply did not. Preserve
+                    // its message id as retry state so a same-key attempt edits
+                    // that ack when the session eventually answers.
+                    durable_sink.rearm_incomplete_ack();
+                }
+                Ok(outcome)
             }
         },
     }
 }
 
+/// Deliver bytes that were already family-voice guarded before being persisted
+/// to the session outbox. Do not guard them again: a composed reply may contain
+/// a narrowly authorized owner handoff that a context-free second pass would
+/// remove.
+async fn deliver_persisted_reply(
+    sink: &dyn ReplySink,
+    route: &ReplyRoute,
+    ack_mid: Option<&str>,
+    text: &str,
+) -> Result<()> {
+    match ack_mid {
+        Some(mid) if !mid.is_empty() => sink.edit(&route.bot_id, &route.chat_id, mid, text).await,
+        _ => sink
+            .send(&route.bot_id, &route.chat_id, text)
+            .await
+            .map(|_| ()),
+    }
+}
+
 /// Deliver `text` to the human: edit the latency ack in place when one was sent
 /// (turning the hourglass into the final answer), else send a fresh message.
-///
-/// THE FAMILY-VOICE CHOKE POINT (task p1-engine-reply-guards). Every engine-sent
-/// reply — the composed answer, the graph-read status line, the graceful "glitch"
-/// follow-up, the legacy outbox reply — funnels through here, and here is the ONLY
-/// place the engine can hold them all to the same rules. The gateway applies six
-/// finalize rules at `familyVoice.gateComposedReply` (no self-attribution prefix,
-/// no off-roster human name, no hand-off tail, no infrastructure narration, no ops
-/// jargon, no markdown), but an engine-composed reply NEVER passes through that
-/// seam: it is sent by this process's own `ReplySink` and written to the feed by
-/// `FeedMirrorSink` in this process. So the rules are re-stated in Rust
-/// ([`grounding::gate_family_voice`]) and applied right before the bytes leave.
-///
-/// The gate is idempotent, so a caller that already gated its draft (to keep the
-/// session outbox and the sent message identical — see
-/// [`finalize_composed_reply`]) pays nothing here.
 async fn deliver_reply(
     sink: &dyn ReplySink,
     route: &ReplyRoute,
     ack_mid: Option<&str>,
     text: &str,
-    voice: &grounding::FamilyVoice,
+    roster: &grounding::FamilyVoiceRoster,
     authorized_handoff: Option<&str>,
 ) -> Result<()> {
-    let gated = grounding::gate_family_voice_with(
+    // Engine-originated replies never pass through the gateway finalizer:
+    // The scoped family-reply sink mirrors the bytes sent here. Keep this as the single
+    // dynamic-delivery choke point so composed replies, graph status, graceful
+    // glitches, and legacy session replies all receive the same guard.
+    let guarded = grounding::enforce_family_voice_with(
         text,
-        voice,
-        grounding::GateOptions { authorized_handoff },
+        roster,
+        grounding::FamilyVoiceOptions { authorized_handoff },
     );
-    if gated != text {
+    if guarded != text {
         eprintln!(
-            "[{}] family-voice gate: rewrote the reply before sending via {} (was {} chars, now {})",
+            "[{}] family-voice guard: cleaned a dynamic reply before delivery",
             chrono::Utc::now().format("%H:%M:%S"),
-            route.bot_id,
-            text.chars().count(),
-            gated.chars().count(),
         );
     }
-    let text = gated.as_str();
     match ack_mid {
         Some(mid) if !mid.is_empty() => {
-            sink.edit(&route.bot_id, &route.chat_id, mid, text).await
+            sink.edit(&route.bot_id, &route.chat_id, mid, &guarded)
+                .await
         }
         _ => sink
-            .send(&route.bot_id, &route.chat_id, text)
+            .send(&route.bot_id, &route.chat_id, &guarded)
             .await
             .map(|_| ()),
     }
@@ -1323,6 +2158,29 @@ fn amend_origin_task(
     Ok(())
 }
 
+/// Persist the guarded fallback before transport so a failed send/edit can
+/// reuse the same canonical bytes on a same-key retry without invoking the
+/// composer again.
+async fn persist_and_deliver_glitch(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    request_id: &str,
+    route: &ReplyRoute,
+    sink: &TurnDeliverySink<'_>,
+    ack_mid: Option<&str>,
+    family_roster: &grounding::FamilyVoiceRoster,
+) -> Result<()> {
+    let reply = grounding::enforce_family_voice(&glitch_line(), family_roster);
+    if let Err(error) = chat::append_outbox_ref(workgraph_dir, session_ref, &reply, request_id) {
+        // If an acknowledgement already landed, release its in-flight claim so
+        // a later same-key attempt can resume and replace it after storage
+        // recovers. With no acknowledgement there is no transport claim yet.
+        sink.rearm_incomplete_ack();
+        return Err(error);
+    }
+    deliver_reply(sink, route, ack_mid, &reply, family_roster, None).await
+}
+
 /// Drive a bounded compose turn: race the composer against the ack/timeout
 /// clock. Emits the latency ack once past `ack_after`; on success relays the
 /// answer (editing the ack in place); on failure OR at `reply_timeout` sends the
@@ -1338,38 +2196,17 @@ async fn run_composed_turn(
     request_id: &str,
     timing: AckTiming,
     route: &ReplyRoute,
-    sink: &dyn ReplySink,
+    sink: &TurnDeliverySink<'_>,
     composer: &dyn ReplyComposer,
     origin: &crate::graph::TaskOrigin,
+    retry_ack_message_id: Option<&str>,
+    retrying_delivery: bool,
 ) -> Result<TurnOutcome> {
-    // The household's live roster, loaded ONCE per turn: the family-voice gate at
-    // the delivery choke point matches persona names (self-attribution, hand-off
-    // tails) and allowed human names (off-roster ghosts) against it. Best-effort —
-    // a household with no `household.toml` falls back to the shipped persona ids,
-    // and a missing binding map simply contributes no human names.
-    let voice = grounding::FamilyVoice::load(&project_root_of(workgraph_dir), workgraph_dir);
-
-    // ONE REPLY PER TURN (idempotency). A single turn is keyed by `request_id`,
-    // and every reply we send is also appended to the outbox under that id. If an
-    // outbox reply for this exact request already exists, this turn has already
-    // been answered — a re-fire (a listener re-poll, a gateway retry, a
-    // restart-replay) must NOT post a second message. This is the guard against
-    // the back-to-back double-post Luca saw from Otto: one ask, two messages. We
-    // return without composing or sending again. Best-effort read — a missing
-    // outbox simply means "not answered yet".
-    if !request_id.trim().is_empty() {
-        let already_answered = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
-            .map(|out| out.iter().any(|m| m.request_id == request_id))
-            .unwrap_or(false);
-        if already_answered {
-            println!(
-                "[{}] convo idempotency: request {request_id} already answered for {agent_id} — \
-                 skipping duplicate reply",
-                chrono::Utc::now().format("%H:%M:%S"),
-            );
-            return Ok(TurnOutcome::Replied { acked: false });
-        }
-    }
+    // Load the authoritative project-local roster once for every dynamic send
+    // this turn. The delivery choke point reuses it for graph answers, compose
+    // failures/timeouts, and the finalized answer.
+    let family_roster =
+        grounding::load_family_voice_roster(&project_root_of(workgraph_dir), workgraph_dir);
 
     // "Are they done yet?" — a status question from someone with recent
     // origin-stamped tasks is answered from LIVE graph state, not a generic chat
@@ -1377,9 +2214,13 @@ async fn run_composed_turn(
     // persona's voice, without spinning up the model.
     if !origin.requester.trim().is_empty() && lifecycle::is_status_question(human_message) {
         if let Some(answer) = answer_status_from_graph(workgraph_dir, &origin.requester) {
-            let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+            let answer = grounding::enforce_family_voice(&answer, &family_roster);
+            if !retrying_delivery {
+                let _ =
+                    chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+            }
             let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &answer, request_id);
-            deliver_reply(sink, route, None, &answer, &voice, None).await?;
+            deliver_reply(sink, route, None, &answer, &family_roster, None).await?;
             return Ok(TurnOutcome::Replied { acked: false });
         }
     }
@@ -1388,15 +2229,10 @@ async fn run_composed_turn(
     // ("Nadin is not logged so ignore this"), persist it BEFORE we compose so
     // the very reply to this turn honours it (`build_compose_prompt` replays
     // every recorded correction), and so does every future turn. Best-effort.
-    if let Some(correction) = grounding::detect_correction(human_message) {
+    if !retrying_delivery && let Some(correction) = grounding::detect_correction(human_message) {
         let root = project_root_of(workgraph_dir);
         let stored = format!("{}{}", grounding::CORRECTION_PREFIX, correction);
-        match parity::PreferenceStore::record(
-            &root,
-            &stored,
-            &origin.requester,
-            &origin.persona,
-        ) {
+        match parity::PreferenceStore::record(&root, &stored, &origin.requester, &origin.persona) {
             Ok(_) => println!(
                 "[{}] conversation recorded correction (chat {})",
                 chrono::Utc::now().format("%H:%M:%S"),
@@ -1412,14 +2248,16 @@ async fn run_composed_turn(
     // Persist the human turn so a live nex session and the TUI stay consistent
     // with the answer we compose here (best-effort — a write failure must not
     // block the reply).
-    let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+    if !retrying_delivery {
+        let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+    }
 
     let compose = composer.compose(workgraph_dir, session_ref, agent_id, human_message);
     tokio::pin!(compose);
 
     let start = Instant::now();
-    let mut acked = false;
-    let mut ack_mid: Option<String> = None;
+    let mut acked = retry_ack_message_id.is_some();
+    let mut ack_mid = retry_ack_message_id.map(str::to_string);
 
     loop {
         let elapsed = start.elapsed();
@@ -1454,7 +2292,7 @@ async fn run_composed_turn(
                             ack_mid.as_deref(),
                             acked,
                             text,
-                            &voice,
+                            &family_roster,
                         )
                         .await;
                     }
@@ -1465,7 +2303,16 @@ async fn run_composed_turn(
                             "[{}] convo compose failed for {agent_id}: {e:#}",
                             chrono::Utc::now().format("%H:%M:%S"),
                         );
-                        deliver_reply(sink, route, ack_mid.as_deref(), &glitch_line(), &voice, None).await?;
+                        persist_and_deliver_glitch(
+                            workgraph_dir,
+                            session_ref,
+                            request_id,
+                            route,
+                            sink,
+                            ack_mid.as_deref(),
+                            &family_roster,
+                        )
+                        .await?;
                         return Ok(TurnOutcome::Glitched { acked });
                     }
                 }
@@ -1482,7 +2329,16 @@ async fn run_composed_turn(
                         chrono::Utc::now().format("%H:%M:%S"),
                         timing.reply_timeout,
                     );
-                    deliver_reply(sink, route, ack_mid.as_deref(), &glitch_line(), &voice, None).await?;
+                    persist_and_deliver_glitch(
+                        workgraph_dir,
+                        session_ref,
+                        request_id,
+                        route,
+                        sink,
+                        ack_mid.as_deref(),
+                        &family_roster,
+                    )
+                    .await?;
                     return Ok(TurnOutcome::Glitched { acked });
                 }
             }
@@ -1521,35 +2377,30 @@ async fn finalize_composed_reply(
     ack_mid: Option<&str>,
     acked: bool,
     first_text: String,
-    voice: &grounding::FamilyVoice,
+    family_roster: &grounding::FamilyVoiceRoster,
 ) -> Result<TurnOutcome> {
     let directive = lifecycle::extract_task_directive(first_text.trim());
     let mut reply_text = directive.reply.clone();
     // Audit the human-facing reply (with the machine tail already stripped).
     let audit = parity::audit_promise(&reply_text);
     let mut created: Option<String> = None;
-    // Set when the single-owner rule makes this voice defer out loud; the
-    // family-voice gate treats that tail as authorized (see below).
     let mut authorized_handoff: Option<String> = None;
 
-    // SINGLE-OWNER RULE. Before any creation, resolve who OWNS this ask's domain
-    // (from `household.toml`, else the Casa default). Exactly one persona — the
-    // owner — mints the task; every other voice in a collective turn defers. This
-    // is the fix for Luca's tofu bug: one group ask electing the whole roster no
-    // longer mints one task per persona (with Coach Mira taking on a cooking task).
-    let decision = {
-        let root = project_root_of(workgraph_dir);
-        ownership::OwnerMap::load(&root).decide_owner(&origin.persona, human_message)
-    };
+    // SINGLE-OWNER RULE. Before any creation, resolve who owns this ask's domain
+    // from `household.toml`. Exactly one configured persona mints the task; every
+    // other voice in a collective turn defers. With no valid project owner the
+    // decision fails open so a real ask is not dropped.
+    let root = project_root_of(workgraph_dir);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let decision = owner_map.decide_owner(&origin.persona, human_message);
 
-    // DEFER DISCIPLINE (morning-taco-bugs): the defer line ("Bruno's got this
-    // one 🍳") must NEVER appear on the OWNER's own reply. `decide_owner` keys on
+    // DEFER DISCIPLINE: the defer line must never appear on the owner's own
+    // reply. `decide_owner` keys on
     // `origin.persona`, but a group-elected turn stamps that from the bot's
     // agent id — and a bot with no configured `agent_id` falls back to its bot id
-    // ("bruno_casapinello_bot"), which does not textually equal the owner id
-    // ("bruno"). That mismatch made Bruno defer to *himself* out loud. Correct a
-    // Defer back to Owner whenever the speaking voice actually IS the owner (by
-    // persona or bot id), so only a genuinely off-domain voice ever defers.
+    // (which need not textually equal the owner id). Correct a Defer back to
+    // Owner whenever the speaking voice actually is the owner by persona or bot
+    // id, so only a genuinely off-domain voice ever defers.
     let decision = match decision {
         ownership::OwnerDecision::Defer { owner } if speaker_is_owner(origin, &owner) => {
             ownership::OwnerDecision::Owner
@@ -1582,11 +2433,10 @@ async fn finalize_composed_reply(
                 let owner_origin = origin_as_persona(origin, &owner);
                 created =
                     try_create_origin_task(workgraph_dir, human_message, &title, &owner_origin);
-                let line = ownership::defer_line(&owner, domain);
-                // The family-voice gate strips a trailing hand-off to another
-                // persona (rule 2) — but THIS one is the engine's own ownership
-                // notice, not the composer passing the buck, so it is declared
-                // authorized and survives the gate verbatim.
+                let line = ownership::defer_line(&owner_map, &owner, domain);
+                // This exact suffix is authored here, after composition, to
+                // show where a re-routed ask landed. It is the only terminal
+                // handoff the family-voice guard may preserve.
                 authorized_handoff = Some(line.clone());
                 if reply_text.is_empty() {
                     reply_text = line;
@@ -1675,7 +2525,15 @@ async fn finalize_composed_reply(
     // Read this persona's prior replies (this turn's outbox is not appended
     // yet) for the repetition and style guards.
     let prior_replies: Vec<String> = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
-        .map(|out| out.into_iter().map(|m| m.content).collect())
+        .map(|out| {
+            out.into_iter()
+                // A transport-failed attempt is retried under the same request
+                // id. Its persisted draft is this turn, not prior conversation;
+                // excluding it preserves the intended bytes on retry.
+                .filter(|m| m.request_id != request_id)
+                .map(|m| m.content)
+                .collect()
+        })
         .unwrap_or_default();
 
     // STYLE (rule 4): at most one formulaic "Anything specific…?" tail per
@@ -1708,7 +2566,7 @@ async fn finalize_composed_reply(
     // ONLY the trailing deferral clause, never emptying the reply. The persona
     // IS the delivering voice; there is no one to defer to.
     {
-        let deferred = grounding::enforce_no_deferral(&reply_text);
+        let deferred = grounding::enforce_no_deferral(&reply_text, &family_roster);
         if deferred != reply_text {
             eprintln!(
                 "[{}] deferral guard: stripped a dangling-promise tail from {agent_id}'s draft",
@@ -1729,7 +2587,11 @@ async fn finalize_composed_reply(
     // calendar is strict — any schedule claim is then a fabrication.
     {
         let now = chrono::Local::now().naive_local();
-        let sched = grounding::fetch_schedule_grounding(&project_root_of(workgraph_dir), now, human_message);
+        let sched = grounding::fetch_schedule_grounding(
+            &project_root_of(workgraph_dir),
+            now,
+            human_message,
+        );
         let unsourced = grounding::find_unsourced_schedule_claims(&reply_text, &sched);
         if !unsourced.is_empty() {
             eprintln!(
@@ -1749,7 +2611,7 @@ async fn finalize_composed_reply(
     // that asserts a planned day is empty (and doesn't already name the dish) is
     // rewritten to the honest answer. Runs on EVERY reply (like anti-fabrication)
     // and only when the env carries a table — unset → no-op. MUST live here in the
-    // ENGINE process: engine-composed replies write to the feed via FeedMirrorSink
+    // ENGINE process: engine-composed replies write through the scoped family-reply sink
     // here, so the gateway's own never-claim-empty guard never sees them.
     if let Ok(raw) = std::env::var("WG_WEEK_CONTEXT") {
         let wc = grounding::parse_week_context(&raw);
@@ -1758,7 +2620,10 @@ async fn finalize_composed_reply(
             eprintln!(
                 "[{}] never-claim-empty guard: {agent_id}'s draft claims planned day(s) {:?} are empty — rewriting to the honest dish",
                 chrono::Utc::now().format("%H:%M:%S"),
-                false_empty.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(),
+                false_empty
+                    .iter()
+                    .map(|(d, _)| d.as_str())
+                    .collect::<Vec<_>>(),
             );
             reply_text = grounding::week_grounding_rewrite(&false_empty);
         }
@@ -1780,32 +2645,40 @@ async fn finalize_composed_reply(
         }
     }
 
-    // FAMILY-VOICE GATE (task p1-engine-reply-guards) — the six gateway finalize
-    // rules an engine-composed reply used to bypass entirely (no self-attribution
-    // prefix, no off-roster human name, no hand-off tail, no infrastructure
-    // narration, no ops jargon, no markdown). Applied HERE, before the outbox
-    // append, so the session outbox / TUI / casa feed carry EXACTLY the words the
-    // family was sent — the delivery choke point re-applies it (idempotently) for
-    // every other engine send.
+    // FAMILY-VISIBLE COPY GUARD. This is intentionally the LAST transform
+    // before both persistence and delivery: engine replies flow from here into
+    // the session outbox and the listener's scoped family-reply sink, so the gateway's
+    // JavaScript finalizer never sees them. Load names only from this project's
+    // household personas + live/fallback human roster, then remove self-attribution,
+    // terminal persona handoffs, plumbing/process narration, machine jargon,
+    // plain-text markdown, and strongly-shaped off-roster addressees.
     {
-        let gated = grounding::gate_family_voice_with(
+        let guarded = grounding::enforce_family_voice_with(
             &reply_text,
-            voice,
-            grounding::GateOptions {
+            family_roster,
+            grounding::FamilyVoiceOptions {
                 authorized_handoff: authorized_handoff.as_deref(),
             },
         );
-        if gated != reply_text {
+        if guarded != reply_text {
             eprintln!(
-                "[{}] family-voice gate: cleaned {agent_id}'s draft before delivery",
+                "[{}] family-voice guard: cleaned {agent_id}'s draft before delivery",
                 chrono::Utc::now().format("%H:%M:%S"),
             );
-            reply_text = gated;
+            reply_text = guarded;
         }
     }
 
     let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &reply_text, request_id);
-    deliver_reply(sink, route, ack_mid, &reply_text, voice, authorized_handoff.as_deref()).await?;
+    deliver_reply(
+        sink,
+        route,
+        ack_mid,
+        &reply_text,
+        family_roster,
+        authorized_handoff.as_deref(),
+    )
+    .await?;
     Ok(TurnOutcome::Replied { acked })
 }
 
@@ -1827,17 +2700,17 @@ fn try_create_origin_task(
 
     // AUTHORITATIVE OFF-DOMAIN GUARD — the round-2 fix. EVERY conversationally
     // created task funnels through this choke point: a collective round, a
-    // single-voice/concierge turn (Otto answering 1:1-style in the group), a
-    // parity retry, a fallback — and a restart-replayed sibling of any of them.
+    // single-voice turn in the group, a parity retry, a fallback — and a
+    // restart-replayed sibling of any of them.
     // finalize_composed_reply already routes the COLLECTIVE case, but its guard
     // keys on the election shape; a single-voice turn that reaches creation with
-    // the answering voice as `origin.persona` would otherwise land a meals task on
-    // Otto (Luca, 2026-07-14: "why is otto dealing with dishes"). So ownership is
-    // decided HERE, next to the intent dedupe, independent of who called: whatever
-    // persona the caller stamped, re-route ownership to the ask's DOMAIN OWNER
-    // from household.toml (Casa default as fallback). A voice that already owns the
-    // domain, or an ask whose owner cannot be resolved, is left untouched
-    // (fail-open — a real ask is never dropped; the intent ledger still dedupes).
+    // the answering voice as `origin.persona` could otherwise land a task on an
+    // off-domain voice. So ownership is decided HERE, next to the intent dedupe,
+    // independent of who called: whatever persona the caller stamped, re-route
+    // ownership to the ask's configured domain owner. A voice that already owns
+    // the domain, or an ask whose owner cannot be resolved from project config,
+    // is left untouched (fail-open — a real ask is never dropped; the intent
+    // ledger still dedupes).
     let owned_origin = match ownership::OwnerMap::load(&root)
         .decide_owner(&origin.persona, human_message)
     {
@@ -1846,7 +2719,11 @@ fn try_create_origin_task(
             eprintln!(
                 "[{}] creation choke-point off-domain guard: {} does not own a {} task — re-stamping ownership to {}",
                 chrono::Utc::now().format("%H:%M:%S"),
-                if origin.persona.is_empty() { "an unnamed voice" } else { origin.persona.as_str() },
+                if origin.persona.is_empty() {
+                    "an unnamed voice"
+                } else {
+                    origin.persona.as_str()
+                },
                 ownership::classify_domain(human_message).slug(),
                 owner,
             );
@@ -1972,10 +2849,7 @@ fn try_create_origin_task(
 /// guard to create a re-routed task under the domain owner while keeping the
 /// chat/requester the ask arrived with, so the lifecycle loop still reports back
 /// to the right conversation.
-fn origin_as_persona(
-    origin: &crate::graph::TaskOrigin,
-    persona: &str,
-) -> crate::graph::TaskOrigin {
+fn origin_as_persona(origin: &crate::graph::TaskOrigin, persona: &str) -> crate::graph::TaskOrigin {
     let mut owned = origin.clone();
     owned.persona = persona.trim().to_string();
     owned
@@ -1993,21 +2867,14 @@ fn speaker_is_owner(origin: &crate::graph::TaskOrigin, owner: &str) -> bool {
     }
     let matches_owner = |id: &str| {
         let id = id.trim().to_ascii_lowercase();
-        id == owner
-            || id.starts_with(&format!("{owner}_"))
-            || id.starts_with(&format!("{owner}-"))
+        id == owner || id.starts_with(&format!("{owner}_")) || id.starts_with(&format!("{owner}-"))
     };
-    matches_owner(&origin.persona)
-        || origin.bot_id.as_deref().map(matches_owner).unwrap_or(false)
+    matches_owner(&origin.persona) || origin.bot_id.as_deref().map(matches_owner).unwrap_or(false)
 }
 
 /// Persist a standing preference to the durable store under the project's
 /// `.casa/`, best-effort (a write failure must never block the reply).
-fn record_standing_preference(
-    workgraph_dir: &Path,
-    text: &str,
-    origin: &crate::graph::TaskOrigin,
-) {
+fn record_standing_preference(workgraph_dir: &Path, text: &str, origin: &crate::graph::TaskOrigin) {
     let root = project_root_of(workgraph_dir);
     match parity::PreferenceStore::record(&root, text, &origin.requester, &origin.persona) {
         Ok(_) => println!(
@@ -2046,22 +2913,38 @@ async fn await_session_reply(
     timing: AckTiming,
     route: &ReplyRoute,
     sink: &dyn ReplySink,
+    initial_ack_message_id: Option<&str>,
 ) -> Result<TurnOutcome> {
-    // Same household roster the composed path loads — the legacy outbox reply is
-    // still a reply a person reads, so it is held to the same family-voice rules
-    // (task p1-engine-reply-guards). Loaded once, outside the poll loop.
-    let voice = grounding::FamilyVoice::load(&project_root_of(workgraph_dir), workgraph_dir);
+    let family_roster =
+        grounding::load_family_voice_roster(&project_root_of(workgraph_dir), workgraph_dir);
     let start = Instant::now();
-    let mut acked = false;
+    let mut acked = initial_ack_message_id.is_some();
+    let mut ack_mid = initial_ack_message_id.map(str::to_string);
     loop {
-        if let Some(text) = read_new_reply(workgraph_dir, session_ref, baseline, request_id)? {
-            deliver_reply(sink, route, None, &text, &voice, None).await?;
+        if let Some(reply) = read_new_reply(workgraph_dir, session_ref, baseline, request_id)? {
+            let guarded = guard_legacy_reply_and_sync_outbox(
+                workgraph_dir,
+                session_ref,
+                &reply,
+                &family_roster,
+            );
+            deliver_reply(
+                sink,
+                route,
+                ack_mid.as_deref(),
+                &guarded,
+                &family_roster,
+                None,
+            )
+            .await?;
             return Ok(TurnOutcome::Replied { acked });
         }
         let elapsed = start.elapsed();
         if !acked && elapsed >= timing.ack_after {
             // The turn is running long — break the silence immediately.
-            sink.send(&route.bot_id, &route.chat_id, &ack_line()).await?;
+            ack_mid = sink
+                .send(&route.bot_id, &route.chat_id, &ack_line())
+                .await?;
             acked = true;
         }
         if elapsed >= timing.reply_timeout {
@@ -2069,6 +2952,33 @@ async fn await_session_reply(
         }
         tokio::time::sleep(timing.poll).await;
     }
+}
+
+/// Guard a reply authored by a legacy session and keep its persisted summary in
+/// sync when possible. Unlike composer-owned rows, legacy rows cannot carry an
+/// authorized owner handoff, so retrying this context-free guard is safe and
+/// required when a previous best-effort rewrite did not land.
+fn guard_legacy_reply_and_sync_outbox(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    reply: &chat::ChatMessage,
+    family_roster: &grounding::FamilyVoiceRoster,
+) -> String {
+    let guarded = grounding::enforce_family_voice(&reply.content, family_roster);
+    if guarded != reply.content {
+        // A legacy session produced the outbox entry before this bridge saw it.
+        // Rewrite that exact entry so the persisted/TUI copy matches the
+        // guarded scoped family-reply send.
+        if let Err(error) =
+            chat::edit_outbox_message_ref(workgraph_dir, session_ref, reply.id, &guarded)
+        {
+            eprintln!(
+                "[{}] family-voice guard: could not update legacy outbox copy: {error:#}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+    }
+    guarded
 }
 
 #[cfg(test)]
@@ -2080,6 +2990,36 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[test]
+    fn durable_delivery_digest_has_versioned_stable_vector() {
+        let digest = durable_telegram_digest_v1(
+            "telegram-delivery-claim",
+            &["physical-turn-42", "voice-7", "-100700"],
+        );
+        let expected = "b3-v1-4b104375ef8b7da0364f0eed5c0d3d89892964585c454af7859842b60ec24db9";
+        assert_eq!(digest, expected);
+
+        let dir = tempdir().unwrap();
+        let inner = RecSink::default();
+        let sink =
+            TurnDeliverySink::new(dir.path(), "physical-turn-42", "voice-7", "-100700", &inner);
+        assert_eq!(
+            sink.claim_path
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some(format!("{expected}.sent").as_str()),
+            "the on-disk ledger filename must carry the digest version",
+        );
+        assert_eq!(
+            sink.retry_path
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some(format!("{expected}.retry").as_str()),
+        );
+    }
 
     /// Recording sink: captures every (bot_id, chat_id, text) send so tests can
     /// assert *which bot* replied *in which chat* with *what text*. Sends return
@@ -2095,10 +3035,11 @@ mod tests {
     #[async_trait]
     impl ReplySink for RecSink {
         async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
-            self.sent
-                .lock()
-                .unwrap()
-                .push((bot_id.to_string(), chat_id.to_string(), text.to_string()));
+            self.sent.lock().unwrap().push((
+                bot_id.to_string(),
+                chat_id.to_string(),
+                text.to_string(),
+            ));
             let mut n = self.next_id.lock().unwrap();
             *n += 1;
             Ok(Some(n.to_string()))
@@ -2126,6 +3067,74 @@ mod tests {
         fn edits(&self) -> Vec<(String, String, String, String)> {
             self.edited.lock().unwrap().clone()
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_claim_or_retry_without_canonical_never_publishes_new_bytes() {
+        for (case, extension, body) in [
+            ("confirmed", "sent", "message-1\n"),
+            ("pending", "sent", "pending\n"),
+            ("retry", "retry", "send\n"),
+        ] {
+            let dir = tempdir().unwrap();
+            let delivery_id = format!("legacy-{case}");
+            let claim_path =
+                delivery_claim_path(dir.path(), &delivery_id, "voice-fixture", "-100-fixture")
+                    .unwrap();
+            std::fs::create_dir_all(claim_path.parent().unwrap()).unwrap();
+            std::fs::write(claim_path.with_extension(extension), body).unwrap();
+            let canonical_path = claim_path.with_extension("canonical");
+            let sink = RecSink::default();
+
+            let state = send_canonical_reply_once(
+                dir.path(),
+                &delivery_id,
+                "voice-fixture",
+                "-100-fixture",
+                "A newly composed draft.",
+                &sink,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                state,
+                CanonicalDeliveryState::Unavailable,
+                "{case} legacy state must fail closed",
+            );
+            assert!(
+                !canonical_path.exists(),
+                "{case} legacy state must never acquire newly composed canonical bytes",
+            );
+            assert!(
+                sink.calls().is_empty(),
+                "{case} legacy state must never reach transport",
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_temp_creation_skips_a_crash_orphan_candidate() {
+        let dir = tempdir().unwrap();
+        let sequence = AtomicU64::new(7);
+        let process_id = 4242;
+        let file_name = "fixture.canonical";
+        let orphan = dir.path().join(format!(".{file_name}.tmp.{process_id}.7"));
+        std::fs::write(&orphan, b"orphaned partial bytes").unwrap();
+
+        let (path, file) =
+            create_canonical_temp_file(dir.path(), file_name, process_id, &sequence).unwrap();
+        drop(file);
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(format!(".{file_name}.tmp.{process_id}.8").as_str()),
+        );
+        assert_eq!(
+            std::fs::read(&orphan).unwrap(),
+            b"orphaned partial bytes",
+            "the orphan is left intact for diagnosis; a fresh candidate is used",
+        );
     }
 
     /// Fake composer for the round-trip / failure / slow tests — no live model.
@@ -2226,6 +3235,31 @@ mod tests {
         }
     }
 
+    fn write_owner_fixture(wg: &Path) {
+        let root = project_root_of(wg);
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "nora"
+domains = ["meals", "nutrition"]
+
+[[agent]]
+id = "bruno"
+domains = ["meals", "cooking", "recipes"]
+
+[[agent]]
+id = "mira"
+domains = ["workouts"]
+
+[[agent]]
+id = "otto"
+domains = ["calendar", "coordination", "shopping"]
+"#,
+        )
+        .unwrap();
+    }
+
     fn confirm_human(wg: &Path, sender: &str, agent_id: &str, bot_id: &str) {
         let agency_dir = wg.join("agency");
         let mut map = TelegramBindingMap::load(&agency_dir).unwrap();
@@ -2273,11 +3307,12 @@ mod tests {
             bot_id_for_channel(&cfg, "telegram:bruno").as_deref(),
             Some("bruno")
         );
-        // Bare/legacy channel prefers the concierge.
+        // Bare/legacy channel uses the caller's configured coordination owner.
         assert_eq!(
-            bot_id_for_channel(&cfg, "telegram").as_deref(),
+            bot_id_for_channel_with_default(&cfg, "telegram", Some("otto")).as_deref(),
             Some("otto")
         );
+        assert_eq!(bot_id_for_channel(&cfg, "telegram"), None);
     }
 
     #[test]
@@ -2348,12 +3383,29 @@ mod tests {
         // `wg agent session <canonical_id>` binds under the full id, NOT "otto".
         bind_agent(wg, canonical, &uuid).unwrap();
 
-        // The resolver: name → canonical id, id-prefix → canonical id, and an
-        // unknown handle falls through unchanged (bot with no agency agent).
-        assert_eq!(canonical_agent_id(wg, "otto"), canonical);
-        assert_eq!(canonical_agent_id(wg, "OTTO"), canonical, "case-insensitive");
-        assert_eq!(canonical_agent_id(wg, "c10fe2fb"), canonical, "id prefix");
-        assert_eq!(canonical_agent_id(wg, "ghost"), "ghost", "unknown falls through");
+        // The resolver accepts a uniquely bound full id, name, and id prefix.
+        // Unknown handles fail closed instead of inventing a session identity.
+        assert_eq!(
+            canonical_agent_id(wg, canonical).as_deref(),
+            Some(canonical),
+            "full id",
+        );
+        assert_eq!(canonical_agent_id(wg, "otto").as_deref(), Some(canonical),);
+        assert_eq!(
+            canonical_agent_id(wg, "OTTO").as_deref(),
+            Some(canonical),
+            "case-insensitive",
+        );
+        assert_eq!(
+            canonical_agent_id(wg, "c10fe2fb").as_deref(),
+            Some(canonical),
+            "id prefix",
+        );
+        assert_eq!(
+            canonical_agent_id(wg, "ghost"),
+            None,
+            "unknown fails closed",
+        );
 
         // The plan lands on the canonical-bound session — Converse, not the
         // pre-fix Sessionless miss.
@@ -2363,6 +3415,157 @@ mod tests {
         match plan {
             ConversationPlan::Converse { session_ref, .. } => assert_eq!(session_ref, uuid),
             other => panic!("expected Converse via the canonical-bound session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_household_alias_resolves_unrelated_agent_name() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path();
+        let alias = "household-slot-a";
+        let canonical = "a4f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500001";
+        let tempting_name_id = "b5f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500002";
+        write_agent(wg, canonical, "Unrelated Display Metadata");
+        write_agent(wg, tempting_name_id, alias);
+
+        let expected_session =
+            create_session(wg, SessionKind::Interactive, &[alias.to_string()], None).unwrap();
+        bind_agent(wg, canonical, &expected_session).unwrap();
+        let tempting_session = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(wg, tempting_name_id, &tempting_session).unwrap();
+
+        assert_eq!(
+            canonical_agent_id(wg, alias).as_deref(),
+            Some(canonical),
+            "an exact session alias must beat a tempting mutable Agent.name",
+        );
+
+        let cfg = cfg_with_bots(&[("voice-router", Some(alias))]);
+        confirm_human(wg, "member-fixture", "human-fixture", "voice-router");
+        let first = plan_conversation(
+            wg,
+            &cfg,
+            "telegram:voice-router",
+            "chat-fixture",
+            "member-fixture",
+            Entry::Direct,
+        );
+        assert!(
+            matches!(
+                &first,
+                ConversationPlan::Converse {
+                    session_ref,
+                    ..
+                } if session_ref == &expected_session
+            ),
+            "alias routed to the wrong session: {first:?}",
+        );
+
+        write_agent(wg, canonical, "Renamed Display Metadata");
+        assert_eq!(canonical_agent_id(wg, alias).as_deref(), Some(canonical),);
+        let renamed = plan_conversation(
+            wg,
+            &cfg,
+            "telegram:voice-router",
+            "chat-fixture",
+            "member-fixture",
+            Entry::Direct,
+        );
+        assert!(
+            matches!(
+                &renamed,
+                ConversationPlan::Converse {
+                    session_ref,
+                    ..
+                } if session_ref == &expected_session
+            ),
+            "renaming display metadata changed alias routing: {renamed:?}",
+        );
+    }
+
+    #[test]
+    fn unbound_or_ambiguous_household_alias_fails_closed() {
+        fn assert_sessionless(wg: &Path, alias: &str) {
+            let cfg = cfg_with_bots(&[("voice-router", Some(alias))]);
+            confirm_human(wg, "member-fixture", "human-fixture", "voice-router");
+            let plan = plan_conversation(
+                wg,
+                &cfg,
+                "telegram:voice-router",
+                "chat-fixture",
+                "member-fixture",
+                Entry::Direct,
+            );
+            assert!(
+                matches!(&plan, ConversationPlan::Sessionless { .. }),
+                "unsafe alias state must not fall through to Agent.name: {plan:?}",
+            );
+        }
+
+        // An exact but unbound alias is authoritative invalid state. A uniquely
+        // bound Agent whose mutable name happens to equal it must not win.
+        {
+            let dir = tempdir().unwrap();
+            let wg = dir.path();
+            let alias = "household-slot-unbound";
+            let tempting = "c6f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500003";
+            write_agent(wg, tempting, alias);
+            create_session(wg, SessionKind::Interactive, &[alias.to_string()], None).unwrap();
+            let tempting_session = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, tempting, &tempting_session).unwrap();
+            assert_sessionless(wg, alias);
+        }
+
+        // A corrupt duplicate alias is ambiguous even when every row is bound.
+        {
+            let dir = tempdir().unwrap();
+            let wg = dir.path();
+            let alias = "household-slot-duplicate";
+            let first_id = "d7f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500004";
+            let tempting = "e8f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500005";
+            write_agent(wg, first_id, "First Unrelated Display");
+            write_agent(wg, tempting, alias);
+            let first =
+                create_session(wg, SessionKind::Interactive, &[alias.to_string()], None).unwrap();
+            bind_agent(wg, first_id, &first).unwrap();
+            let second = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, tempting, &second).unwrap();
+            let mut registry = crate::chat_sessions::load(wg).unwrap();
+            registry
+                .sessions
+                .get_mut(&second)
+                .unwrap()
+                .aliases
+                .push(alias.to_string());
+            crate::chat_sessions::save(wg, &registry).unwrap();
+            assert_sessionless(wg, alias);
+        }
+
+        // A unique alias whose agent id is corruptly bound to two sessions is
+        // also ambiguous and must not migrate through an unrelated name.
+        {
+            let dir = tempdir().unwrap();
+            let wg = dir.path();
+            let alias = "household-slot-ambiguous";
+            let target = "f9f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500006";
+            let tempting = "0af74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500007";
+            write_agent(wg, target, "Second Unrelated Display");
+            write_agent(wg, tempting, alias);
+            let aliased =
+                create_session(wg, SessionKind::Interactive, &[alias.to_string()], None).unwrap();
+            bind_agent(wg, target, &aliased).unwrap();
+            let duplicate_binding =
+                create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            let tempting_session = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, tempting, &tempting_session).unwrap();
+            let mut registry = crate::chat_sessions::load(wg).unwrap();
+            registry
+                .sessions
+                .get_mut(&duplicate_binding)
+                .unwrap()
+                .agent_id = Some(target.to_string());
+            crate::chat_sessions::save(wg, &registry).unwrap();
+            assert_sessionless(wg, alias);
         }
     }
 
@@ -2475,8 +3678,14 @@ mod tests {
         bind_agent(&wg, "bruno", &uuid).unwrap();
         confirm_human(&wg, "luca-1", "human-luca", "otto");
 
-        let plan =
-            plan_conversation(&wg, &cfg, "telegram:bruno", "-100777", "luca-1", Entry::GroupElected);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:bruno",
+            "-100777",
+            "luca-1",
+            Entry::GroupElected,
+        );
         let sink = RecSink::default();
 
         let wg2 = wg.clone();
@@ -2493,10 +3702,17 @@ mod tests {
             }
         });
 
-        let outcome =
-            run_conversation_turn(&wg, &plan, "bruno what's for dinner?", "req-2", fast_timing(), None, &sink)
-                .await
-                .unwrap();
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "bruno what's for dinner?",
+            "req-2",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
         responder.await.unwrap();
 
         assert!(matches!(outcome, TurnOutcome::Replied { .. }));
@@ -2523,8 +3739,14 @@ mod tests {
         bind_agent(&wg, "bruno", &uuid).unwrap();
         confirm_human(&wg, "luca-1", "human-luca", "otto");
 
-        let plan =
-            plan_conversation(&wg, &cfg, "telegram:bruno", "-100777", "luca-1", Entry::GroupElected);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:bruno",
+            "-100777",
+            "luca-1",
+            Entry::GroupElected,
+        );
         // Sanity: the plan itself routed to bruno.
         assert_eq!(plan.route().bot_id, "bruno");
 
@@ -2546,75 +3768,1050 @@ mod tests {
         assert!(matches!(outcome, TurnOutcome::Replied { acked: true }));
         // EVERY send (the ack) went out via bruno, in the group — never otto.
         for (bot, chat_id, _text) in sink.calls() {
-            assert_eq!(bot, "bruno", "composed group reply must send via the ELECTED bot");
-            assert_eq!(chat_id, "-100777", "composed group reply lands in the GROUP");
+            assert_eq!(
+                bot, "bruno",
+                "composed group reply must send via the ELECTED bot"
+            );
+            assert_eq!(
+                chat_id, "-100777",
+                "composed group reply lands in the GROUP"
+            );
         }
         // The final answer edits the ack in place — also via bruno.
         for (bot, chat_id, _mid, text) in sink.edits() {
-            assert_eq!(bot, "bruno", "the final answer edit must also use the ELECTED bot");
+            assert_eq!(
+                bot, "bruno",
+                "the final answer edit must also use the ELECTED bot"
+            );
             assert_eq!(chat_id, "-100777");
             assert_eq!(text, "Dinner's at seven.");
         }
         // The elected bot's token is distinct from the concierge's, so a wrong-bot
         // send would have surfaced a different token — pin the mapping explicitly.
-        let bruno_token = cfg.all_bots().into_iter().find(|(id, _)| id == "bruno").unwrap().1.bot_token;
+        let bruno_token = cfg
+            .all_bots()
+            .into_iter()
+            .find(|(id, _)| id == "bruno")
+            .unwrap()
+            .1
+            .bot_token;
         assert_eq!(bruno_token, "token-bruno");
         assert_ne!(
             bruno_token,
-            cfg.all_bots().into_iter().find(|(id, _)| id == "otto").unwrap().1.bot_token,
+            cfg.all_bots()
+                .into_iter()
+                .find(|(id, _)| id == "otto")
+                .unwrap()
+                .1
+                .bot_token,
             "bruno and otto must carry distinct tokens for this test to be meaningful"
         );
     }
 
-    /// ONE REPLY PER TURN (Luca, 2026-07-17): Otto posted two messages
-    /// back-to-back for a single ask. A re-fire of the SAME turn (same
-    /// `request_id`) — a listener re-poll, a gateway retry, a restart-replay —
-    /// must NOT compose or send a second time. The first turn answers; the
-    /// second is a no-op, so the human sees exactly one message.
+    /// A re-fire of the SAME physical turn (same `request_id`) — a listener
+    /// re-poll, a gateway retry, or a restart replay — must not compose or send
+    /// a second time. A distinct occurrence id admits later identical words.
     #[tokio::test]
-    async fn same_request_id_never_double_posts() {
+    async fn same_request_id_does_not_send_twice() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
-        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "otto", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "otto");
-
-        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let plan = ConversationPlan::Converse {
+            session_ref: uuid,
+            agent_id: "persona-7".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-7".to_string(),
+                chat_id: "-100700".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-4".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
         let sink = RecSink::default();
-        let composer = FakeComposer::ok("Yeah, today's Friday the 17th.");
+        let composer = FakeComposer::ok("Dinner is at seven.");
 
         // First delivery of the turn.
         let out1 = run_conversation_turn(
-            &wg, &plan, "what day is it?", "req-dup", fast_timing(), Some(&composer), &sink,
+            &wg,
+            &plan,
+            "what time is dinner?",
+            "physical-turn-a",
+            fast_timing(),
+            Some(&composer),
+            &sink,
         )
         .await
         .unwrap();
         assert!(matches!(out1, TurnOutcome::Replied { .. }));
 
-        // Same request id fires again (the double-post trigger).
+        // A fresh invocation simulates a listener restart. The same request id
+        // finds the durable claim and produces no transport call.
         let out2 = run_conversation_turn(
-            &wg, &plan, "what day is it?", "req-dup", fast_timing(), Some(&composer), &sink,
+            &wg,
+            &plan,
+            "what time is dinner?",
+            "physical-turn-a",
+            fast_timing(),
+            Some(&composer),
+            &sink,
         )
         .await
         .unwrap();
         assert!(matches!(out2, TurnOutcome::Replied { .. }));
 
-        // Exactly ONE human-visible message across BOTH invocations: the fast
-        // compose sends no ack, so the total send count is one and there are no
-        // edits. The second turn produced nothing.
+        // Identical words in a later physical occurrence remain answerable.
+        let out3 = run_conversation_turn(
+            &wg,
+            &plan,
+            "what time is dinner?",
+            "physical-turn-b",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out3, TurnOutcome::Replied { .. }));
+
+        assert_eq!(
+            sink.calls().len(),
+            2,
+            "one send per physical occurrence; refire is silent and later identical words send: {:?}",
+            sink.calls()
+        );
+        assert!(sink.edits().is_empty());
+        assert!(sink.calls().iter().all(|call| call.0 == "voice-7"));
+    }
+
+    /// Before the transport ledger existed, a matching composed outbox row was
+    /// the durable proof that a request had already been answered. An upgrade
+    /// replay must continue to honor that row when no explicit failed-delivery
+    /// marker exists; otherwise it would compose, repeat lifecycle side effects,
+    /// and send the old physical turn again.
+    #[tokio::test]
+    async fn preledger_composed_outbox_reply_remains_authoritative_on_upgrade() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        std::fs::write(
+            wg.join("household.toml"),
+            r#"
+[[agent]]
+id = "archive-voice"
+name = "Archive Voice"
+domains = ["calendar", "coordination"]
+"#,
+        )
+        .unwrap();
+        let session_ref = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        let request_id = "physical-turn-from-before-ledger";
+        let human_message = "The red calendar is not correct; use the blue calendar and update it.";
+        chat::append_inbox_ref(&wg, &session_ref, human_message, request_id).unwrap();
+        chat::append_outbox_ref(
+            &wg,
+            &session_ref,
+            "The calendar update was already delivered.",
+            request_id,
+        )
+        .unwrap();
+        assert!(
+            !wg.join("telegram-deliveries").exists(),
+            "the fixture must model a successful reply from before the ledger",
+        );
+
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "archive-voice".to_string(),
+            route: ReplyRoute {
+                bot_id: "archive-bot".to_string(),
+                chat_id: "-1001500".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "archive-member".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = RecSink::default();
+        let composer = SequenceComposer::new(&[
+            "I will update it again.\nTASK_CREATE: update the blue calendar",
+        ]);
+
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            human_message,
+            request_id,
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, TurnOutcome::Replied { acked: false });
+
+        assert_eq!(
+            composer.call_count(),
+            0,
+            "a pre-ledger successful outbox row must suppress recomposition",
+        );
+        assert!(sink.calls().is_empty(), "upgrade replay must stay silent");
+        assert!(sink.edits().is_empty(), "upgrade replay must not edit");
+
+        let inbox = chat::read_inbox_ref(&wg, &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == request_id)
+                .count(),
+            1,
+            "upgrade replay must not append a second inbox turn",
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &session_ref, 0).unwrap();
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|message| message.request_id == request_id)
+                .count(),
+            1,
+            "upgrade replay must not append a second outbox reply",
+        );
+
+        let task_count = crate::parser::load_graph(wg.join("graph.jsonl"))
+            .map(|graph| graph.tasks().count())
+            .unwrap_or(0);
+        assert_eq!(task_count, 0, "upgrade replay must not create a task");
+        let correction_count = parity::PreferenceStore::all(&wg)
+            .into_iter()
+            .filter(|entry| entry.text.starts_with(grounding::CORRECTION_PREFIX))
+            .count();
+        assert_eq!(
+            correction_count, 0,
+            "upgrade replay must not record the correction a second time",
+        );
+    }
+
+    /// Reservation is not a tombstone for a failed transport. The exact same
+    /// key retries after a confirmed send error, then becomes durable only
+    /// after the retry succeeds.
+    #[tokio::test]
+    async fn failed_send_rearms_same_request_id_then_confirmed_send_deduplicates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailOnceSink {
+            attempts: AtomicUsize,
+            delivered: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailOnceSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub transport failure");
+                }
+                self.delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("stub-{}", attempt + 1)))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let session_ref = create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-9".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-9".to_string(),
+                chat_id: "-100900".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-9".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailOnceSink::default();
+        let composer = FakeComposer::ok("I heard you.");
+
+        let first = run_conversation_turn(
+            dir.path(),
+            &plan,
+            "hello household",
+            "physical-turn-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the stub's first transport call must fail");
+
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "hello household",
+            "physical-turn-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "hello household",
+            "physical-turn-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+        let persisted = chat::read_outbox_since_ref(dir.path(), &session_ref, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.request_id == "physical-turn-retry")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "a failed send and retry share one canonical persisted reply: {persisted:?}",
+        );
+        assert_eq!(persisted[0].content, "I heard you.");
+    }
+
+    /// If the latency acknowledgement itself fails, the composer future is
+    /// dropped before it can persist a final reply. A same-key retry may
+    /// recompose, but must not repeat the already-recorded human turn or
+    /// correction side effects.
+    #[tokio::test]
+    async fn failed_composed_ack_retry_keeps_one_inbox_turn_and_correction() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstAckSink {
+            sends: AtomicUsize,
+            edits: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstAckSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                let attempt = self.sends.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub acknowledgement failure");
+                }
+                Ok(Some("ack-retry-message".to_string()))
+            }
+
+            async fn edit(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                message_id: &str,
+                _text: &str,
+            ) -> Result<()> {
+                assert_eq!(message_id, "ack-retry-message");
+                self.edits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let session_ref = create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-13".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-13".to_string(),
+                chat_id: "-1001300".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-13".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailFirstAckSink::default();
+        let composer =
+            FakeComposer::ok_after("The blue calendar is current.", Duration::from_millis(150));
+        let human_message = "The red calendar is not correct; use the blue calendar.";
+
+        let first = run_conversation_turn(
+            dir.path(),
+            &plan,
+            human_message,
+            "physical-turn-ack-send-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first acknowledgement must fail");
+
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            human_message,
+            "physical-turn-ack-send-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            human_message,
+            "physical-turn-ack-send-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.edits.load(Ordering::SeqCst), 1);
+        let inbox = chat::read_inbox_ref(dir.path(), &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-ack-send-retry")
+                .count(),
+            1,
+            "the retry must reuse the already-persisted composed inbox turn",
+        );
+        let corrections = parity::PreferenceStore::all(dir.path())
+            .into_iter()
+            .filter(|entry| entry.text.starts_with(grounding::CORRECTION_PREFIX))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            corrections.len(),
+            1,
+            "the retry must not record the same correction twice",
+        );
+    }
+
+    /// Composer failures use a stable guarded fallback. Persist it before the
+    /// transport attempt so a same-key retry reuses those bytes without
+    /// invoking the composer or appending another session row.
+    #[tokio::test]
+    async fn failed_glitch_send_reuses_canonical_reply_without_recomposing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingFailComposer {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplyComposer for CountingFailComposer {
+            async fn compose(
+                &self,
+                _workgraph_dir: &Path,
+                _session_ref: &str,
+                _agent_id: &str,
+                _human_message: &str,
+            ) -> Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("stub composer failure")
+            }
+        }
+
+        #[derive(Default)]
+        struct FailFirstGlitchSink {
+            attempts: AtomicUsize,
+            delivered: AtomicUsize,
+            texts: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstGlitchSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                self.texts.lock().unwrap().push(text.to_string());
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub fallback transport failure");
+                }
+                self.delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("glitch-retry-message".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let session_ref = create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-14".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-14".to_string(),
+                chat_id: "-1001400".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-14".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailFirstGlitchSink::default();
+        let composer = CountingFailComposer::default();
+
+        let first = run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check this?",
+            "physical-turn-glitch-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first fallback send must fail");
+
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check this?",
+            "physical-turn-glitch-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check this?",
+            "physical-turn-glitch-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            composer.calls.load(Ordering::SeqCst),
+            1,
+            "the persisted fallback makes retry composition unnecessary",
+        );
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+        let texts = sink.texts.lock().unwrap().clone();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0], texts[1], "retry must reuse canonical bytes");
+
+        let inbox = chat::read_inbox_ref(dir.path(), &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-glitch-retry")
+                .count(),
+            1,
+        );
+        let outbox = chat::read_outbox_since_ref(dir.path(), &session_ref, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.request_id == "physical-turn-glitch-retry")
+            .collect::<Vec<_>>();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].content, texts[0]);
+    }
+
+    /// The legacy session-poll path persists its reply before transport too.
+    /// After a send failure, the same-key retry reuses that reply immediately;
+    /// it neither appends a duplicate inbox turn nor waits for the session to
+    /// answer a second time.
+    #[tokio::test]
+    async fn failed_legacy_send_reuses_persisted_reply_then_deduplicates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailOnceSink {
+            attempts: AtomicUsize,
+            delivered: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailOnceSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub legacy transport failure");
+                }
+                self.delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("legacy-message-2".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let workgraph_dir = dir.path().to_path_buf();
+        let session_ref =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-10".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-10".to_string(),
+                chat_id: "-1001000".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-10".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailOnceSink::default();
+
+        let responder_dir = workgraph_dir.clone();
+        let responder_session = session_ref.clone();
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let inbox =
+                    chat::read_inbox_ref(&responder_dir, &responder_session).unwrap_or_default();
+                if let Some(message) = inbox
+                    .iter()
+                    .find(|message| message.request_id == "physical-turn-legacy-retry")
+                {
+                    chat::append_outbox_ref(
+                        &responder_dir,
+                        &responder_session,
+                        "The session already answered.",
+                        &message.request_id,
+                    )
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("legacy fixture did not receive its inbox turn");
+        });
+
+        let first = run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "is anyone there?",
+            "physical-turn-legacy-retry",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await;
+        responder.await.unwrap();
+        assert!(first.is_err());
+
+        run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "is anyone there?",
+            "physical-turn-legacy-retry",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "is anyone there?",
+            "physical-turn-legacy-retry",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+        let inbox = chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-legacy-retry")
+                .count(),
+            1,
+            "same-key retry must not append a second legacy inbox turn",
+        );
+        let outbox = chat::read_outbox_since_ref(&workgraph_dir, &session_ref, 0).unwrap();
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-legacy-retry")
+                .count(),
+            1,
+        );
+    }
+
+    /// When the latency acknowledgement send itself fails, the failed-attempt
+    /// marker still represents an already-enqueued legacy turn. A same-key
+    /// retry must resume that turn without appending a second inbox row (and
+    /// inviting the live session to produce a second, orphaned reply).
+    #[tokio::test]
+    async fn failed_legacy_ack_send_retry_keeps_one_inbox_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstSendSink {
+            attempts: AtomicUsize,
+            delivered: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstSendSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub acknowledgement transport failure");
+                }
+                self.delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("legacy-final-message".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let workgraph_dir = dir.path().to_path_buf();
+        let session_ref =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-ack-retry".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-ack-retry".to_string(),
+                chat_id: "-1001400".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-ack-retry".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailFirstSendSink::default();
+        let first_timing = AckTiming {
+            ack_after: Duration::from_millis(15),
+            reply_timeout: Duration::from_millis(250),
+            poll: Duration::from_millis(5),
+        };
+
+        let first = run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check?",
+            "physical-turn-legacy-ack-send-retry",
+            first_timing,
+            None,
+            &sink,
+        )
+        .await;
+        assert!(
+            first.is_err(),
+            "the first latency acknowledgement must fail"
+        );
+
+        let responder_dir = workgraph_dir.clone();
+        let responder_session = session_ref.clone();
+        let responder = tokio::spawn(async move {
+            // Give the retry enough time to append a duplicate inbox row if it
+            // incorrectly treats a failed ack send as a brand-new turn.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let inbox =
+                chat::read_inbox_ref(&responder_dir, &responder_session).unwrap_or_default();
+            let matching = inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-legacy-ack-send-retry")
+                .collect::<Vec<_>>();
+            for (index, message) in matching.iter().enumerate() {
+                chat::append_outbox_ref(
+                    &responder_dir,
+                    &responder_session,
+                    &format!("Session answer {}.", index + 1),
+                    &message.request_id,
+                )
+                .unwrap();
+            }
+        });
+
+        let retry_timing = AckTiming {
+            ack_after: Duration::from_secs(1),
+            reply_timeout: Duration::from_millis(500),
+            poll: Duration::from_millis(5),
+        };
+        run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check?",
+            "physical-turn-legacy-ack-send-retry",
+            retry_timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+        let inbox = chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| { message.request_id == "physical-turn-legacy-ack-send-retry" })
+                .count(),
+            1,
+            "the failed ack already belongs to the original inbox turn",
+        );
+        let outbox = chat::read_outbox_since_ref(&workgraph_dir, &session_ref, 0).unwrap();
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|message| { message.request_id == "physical-turn-legacy-ack-send-retry" })
+                .count(),
+            1,
+            "one physical turn must not leave an orphaned second session reply",
+        );
+    }
+
+    /// A latency acknowledgement can outlive the first polling window while the
+    /// original session is still working. A same-key retry resumes that wait
+    /// and edits the existing acknowledgement; it must not enqueue the same
+    /// human turn a second time.
+    #[tokio::test]
+    async fn timed_out_legacy_retry_resumes_one_inbox_turn_and_edits_original_ack() {
+        let dir = tempdir().unwrap();
+        let workgraph_dir = dir.path().to_path_buf();
+        let session_ref =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-12".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-12".to_string(),
+                chat_id: "-1001200".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-12".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = RecSink::default();
+        let first_timing = AckTiming {
+            ack_after: Duration::from_millis(15),
+            reply_timeout: Duration::from_millis(70),
+            poll: Duration::from_millis(5),
+        };
+
+        let first = run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check the plan?",
+            "physical-turn-timeout-retry",
+            first_timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, TurnOutcome::TimedOut { acked: true });
+        assert_eq!(sink.calls().len(), 1, "the first attempt sends one ack");
+        assert!(sink.edits().is_empty());
+
+        let responder_dir = workgraph_dir.clone();
+        let responder_session = session_ref.clone();
+        let responder = tokio::spawn(async move {
+            // Land the answer after the retry has entered its resumed poll.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let inbox =
+                chat::read_inbox_ref(&responder_dir, &responder_session).unwrap_or_default();
+            let matching = inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-timeout-retry")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "the same physical turn must occupy one legacy inbox row",
+            );
+            chat::append_outbox_ref(
+                &responder_dir,
+                &responder_session,
+                "The original session finished.",
+                &matching[0].request_id,
+            )
+            .unwrap();
+        });
+
+        let retry_timing = AckTiming {
+            ack_after: Duration::from_millis(15),
+            reply_timeout: Duration::from_millis(300),
+            poll: Duration::from_millis(5),
+        };
+        let second = run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check the plan?",
+            "physical-turn-timeout-retry",
+            retry_timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        assert_eq!(second, TurnOutcome::Replied { acked: true });
+
+        // A later refire sees the completed delivery record and stays silent.
+        run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check the plan?",
+            "physical-turn-timeout-retry",
+            retry_timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let inbox = chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-timeout-retry")
+                .count(),
+            1,
+        );
         assert_eq!(
             sink.calls().len(),
             1,
-            "one turn must post one message; a re-fired request must not double-post: {:?}",
-            sink.calls()
+            "retry edits the original acknowledgement; it never sends another",
         );
-        assert!(
-            sink.edits().is_empty(),
-            "no ack/edit expected on a fast turn: {:?}",
-            sink.edits()
+        let edits = sink.edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].2, "1", "the retry edits the first ack message");
+        assert_eq!(edits[0].3, "The original session finished.");
+    }
+
+    /// A delivered latency acknowledgement is not the completed logical reply.
+    /// If replacing it with the final answer fails, the same-key retry edits the
+    /// original acknowledgement instead of sending a second message or being
+    /// suppressed by the pending claim.
+    #[tokio::test]
+    async fn failed_ack_edit_retries_same_message_then_confirmed_edit_deduplicates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstEditSink {
+            sends: AtomicUsize,
+            edit_attempts: AtomicUsize,
+            edited: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstEditSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("ack-message-7".to_string()))
+            }
+
+            async fn edit(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                message_id: &str,
+                _text: &str,
+            ) -> Result<()> {
+                assert_eq!(message_id, "ack-message-7");
+                let attempt = self.edit_attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub edit failure");
+                }
+                self.edited.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let session_ref = create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-11".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-11".to_string(),
+                chat_id: "-1001100".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-11".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailFirstEditSink::default();
+        let composer = FakeComposer::ok_after("The answer is ready.", Duration::from_millis(150));
+
+        let first = run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check that?",
+            "physical-turn-edit-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first final-answer edit must fail");
+
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check that?",
+            "physical-turn-edit-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check that?",
+            "physical-turn-edit-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sink.sends.load(Ordering::SeqCst),
+            1,
+            "retry edits the original acknowledgement; it never posts another",
         );
-        assert_eq!(sink.calls()[0].0, "otto");
+        assert_eq!(sink.edit_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.edited.load(Ordering::SeqCst), 1);
+        let persisted = chat::read_outbox_since_ref(dir.path(), &session_ref, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.request_id == "physical-turn-edit-retry")
+            .collect::<Vec<_>>();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].content, "The answer is ready.");
     }
 
     /// A 1:1 ask that the persona turns into work stamps the created task with
@@ -2721,13 +4918,12 @@ mod tests {
         // The human sees the confirming reply, never the machine directive.
         let (_bot, _chat, text) = sink.calls().last().cloned().unwrap_or_default();
         // Delivery may edit the ack in place; check both channels for the reply.
-        let last = sink
-            .edits()
-            .last()
-            .map(|e| e.3.clone())
-            .unwrap_or(text);
+        let last = sink.edits().last().map(|e| e.3.clone()).unwrap_or(text);
         assert!(!last.contains("TASK_CREATE"), "directive leaked: {last}");
-        assert!(!last.to_lowercase().contains("snag"), "no correction expected: {last}");
+        assert!(
+            !last.to_lowercase().contains("snag"),
+            "no correction expected: {last}"
+        );
     }
 
     /// PARITY, fallback path: a stubborn composer promises action on BOTH the
@@ -2785,7 +4981,10 @@ mod tests {
             .map(|e| e.3.clone())
             .or_else(|| sink.calls().last().map(|c| c.2.clone()))
             .unwrap();
-        assert!(last.to_lowercase().contains("snag"), "expected correction: {last}");
+        assert!(
+            last.to_lowercase().contains("snag"),
+            "expected correction: {last}"
+        );
     }
 
     /// PARITY, no false positive: a purely non-committal reply (no promise)
@@ -2816,7 +5015,11 @@ mod tests {
         .unwrap();
 
         // No retry, no task.
-        assert_eq!(composer.call_count(), 1, "no retry for a non-committal reply");
+        assert_eq!(
+            composer.call_count(),
+            1,
+            "no retry for a non-committal reply"
+        );
         let graph = crate::parser::load_graph(wg.join("graph.jsonl")).ok();
         let any_task = graph.map(|g| g.tasks().next().is_some()).unwrap_or(false);
         assert!(!any_task, "no task should be created for small talk");
@@ -2826,6 +5029,7 @@ mod tests {
     /// `GroupElected` plan for that voice resolves to `Converse`. Returns the
     /// four-bot config the collective tests share.
     fn setup_collective(wg: &Path) -> TelegramConfig {
+        write_owner_fixture(wg);
         let cfg = cfg_with_bots(&[
             ("nora", Some("nora")),
             ("bruno", Some("bruno")),
@@ -2838,6 +5042,52 @@ mod tests {
         }
         confirm_human(wg, "luca-1", "human-luca", "otto");
         cfg
+    }
+
+    /// A self-contained, household-independent roster for ownership regression
+    /// tests. The returned ids are routing keys; assertions read the expected
+    /// owner and family-visible label back from the authored configuration.
+    fn setup_opaque_collective(wg: &Path) -> (TelegramConfig, Vec<String>) {
+        std::fs::write(
+            project_root_of(wg).join("household.toml"),
+            r#"
+[[agent]]
+id = "meal-7"
+name = "Copper Ladle"
+domains = ["meals", "nutrition"]
+
+[[agent]]
+id = "recipe-4"
+name = "Kitchen Lantern"
+domains = ["cooking", "recipes"]
+
+[[agent]]
+id = "motion-2"
+name = "Bright Steps"
+domains = ["workouts"]
+
+[[agent]]
+id = "coord-9"
+name = "Home Compass"
+domains = ["calendar", "coordination", "shopping"]
+"#,
+        )
+        .unwrap();
+        let personas: Vec<String> = ["meal-7", "recipe-4", "motion-2", "coord-9"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let bot_specs: Vec<(&str, Option<&str>)> = personas
+            .iter()
+            .map(|id| (id.as_str(), Some(id.as_str())))
+            .collect();
+        let cfg = cfg_with_bots(&bot_specs);
+        for persona in &personas {
+            let uuid = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, persona, &uuid).unwrap();
+        }
+        add_binding_for_bot(wg, "member-1", "Household Member", true, "coord-9");
+        (cfg, personas)
     }
 
     /// Run one collective voice's turn: it emits a reply with a `TASK_CREATE`
@@ -2873,39 +5123,94 @@ mod tests {
         .unwrap();
     }
 
-    /// THE REGRESSION FIXTURE (Luca, 2026-07-13). A single collective ask ("swap
-    /// Thursday dinner to grilled tofu") elects the WHOLE roster; each voice
-    /// composes a reply that would create its own task — exactly the path that
-    /// minted FOUR duplicates, one per persona, including Coach Mira (workouts)
-    /// taking on a cooking task. With the single-owner rule + intent dedupe,
-    /// exactly ONE task survives, owned by Nora (the dietitian — her domain), and
-    /// the off-domain voices defer out loud.
+    async fn run_voice_as(
+        wg: &Path,
+        cfg: &TelegramConfig,
+        persona: &str,
+        chat: &str,
+        requester: &str,
+        ask: &str,
+        reply_with_tail: &str,
+        sink: &RecSink,
+    ) {
+        let plan = plan_conversation(
+            wg,
+            cfg,
+            &format!("telegram:{persona}"),
+            chat,
+            requester,
+            Entry::GroupElected,
+        );
+        let composer = FakeComposer::ok(reply_with_tail);
+        run_conversation_turn(
+            wg,
+            &plan,
+            ask,
+            &format!("req-collective-{persona}"),
+            fast_timing(),
+            Some(&composer),
+            sink,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A single collective meal ask elects the whole configured roster; each
+    /// voice composes a reply that would create its own task. With the
+    /// single-owner rule + intent dedupe, exactly one task survives under the
+    /// configured meal owner, and off-domain voices name only the roster-authored
+    /// family label.
     #[tokio::test]
-    async fn collective_tofu_ask_creates_exactly_one_task_owned_by_nora() {
+    async fn collective_meal_ask_uses_configured_owner() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
-        let cfg = setup_collective(&wg);
+        let (cfg, personas) = setup_opaque_collective(&wg);
         let chat = "-100999";
         let ask = "swap Thursday dinner to grilled tofu";
 
-        // Roster order: nora (owner) runs first, then three off-domain voices —
-        // each with a DIFFERENT title to prove dedupe keys on the ASK, not the
-        // title. Mira's would have been the impossible "add grilled tofu" card.
-        let nora_sink = RecSink::default();
-        run_voice(&wg, &cfg, "nora", chat, ask,
-            "Grilled tofu Thursday it is 🥗\nTASK_CREATE: swap Thursday dinner to grilled tofu",
-            &nora_sink).await;
-        let bruno_sink = RecSink::default();
-        run_voice(&wg, &cfg, "bruno", chat, ask,
-            "Sounds tasty!\nTASK_CREATE: prep grilled tofu for Thursday", &bruno_sink).await;
-        let mira_sink = RecSink::default();
-        run_voice(&wg, &cfg, "mira", chat, ask,
-            "Nice protein swap.\nTASK_CREATE: add grilled tofu", &mira_sink).await;
-        let otto_sink = RecSink::default();
-        run_voice(&wg, &cfg, "otto", chat, ask,
-            "Noted!\nTASK_CREATE: put tofu on the Thursday plan", &otto_sink).await;
+        let owner_map = ownership::OwnerMap::load(&project_root_of(&wg));
+        let expected_owner = owner_map
+            .owner_for_ask(ask)
+            .expect("the opaque roster configures a meal owner")
+            .to_string();
+        let expected_label = owner_map
+            .display_names()
+            .find(|(id, _)| id.eq_ignore_ascii_case(&expected_owner))
+            .map(|(_, name)| name.to_string())
+            .expect("the configured owner has an authored display name");
 
-        // Exactly ONE task exists, and it is Nora's.
+        // Run the configured owner first, then every off-domain voice with a
+        // different title. This proves dedupe keys on the ask rather than title.
+        let owner_sink = RecSink::default();
+        run_voice_as(
+            &wg,
+            &cfg,
+            &expected_owner,
+            chat,
+            "member-1",
+            ask,
+            "Grilled tofu Thursday it is 🥗\nTASK_CREATE: swap Thursday dinner to grilled tofu",
+            &owner_sink,
+        )
+        .await;
+        let mut first_off_domain_delivery = None;
+        for (index, persona) in personas
+            .iter()
+            .filter(|persona| !persona.eq_ignore_ascii_case(&expected_owner))
+            .enumerate()
+        {
+            let sink = RecSink::default();
+            let reply = format!(
+                "That sounds good.\nTASK_CREATE: alternate meal update {}",
+                index + 1
+            );
+            run_voice_as(&wg, &cfg, persona, chat, "member-1", ask, &reply, &sink).await;
+            if first_off_domain_delivery.is_none() {
+                first_off_domain_delivery = sink.calls().last().map(|call| call.2.clone());
+            }
+        }
+
+        // Exactly one task exists, owned by the configured meal owner.
         let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
         let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
         assert_eq!(
@@ -2916,20 +5221,30 @@ mod tests {
             stamped.iter().map(|t| &t.title).collect::<Vec<_>>()
         );
         let owner = stamped[0].origin.as_ref().unwrap();
-        assert_eq!(owner.persona, "nora", "the meal-plan owner (dietitian) owns it");
+        assert_eq!(
+            owner.persona, expected_owner,
+            "the configured meal-domain owner owns the task",
+        );
         assert_eq!(stamped[0].title, "swap Thursday dinner to grilled tofu");
 
-        // Coach Mira never owns a cooking task — the impossible card is impossible.
+        // No off-domain voice can own a meal task.
         assert!(
-            !graph.tasks().any(|t| t.origin.as_ref().map(|o| o.persona.as_str()) == Some("mira")),
-            "Coach Mira must never own a meals/cooking task"
+            graph.tasks().all(|task| task
+                .origin
+                .as_ref()
+                .is_none_or(|origin| origin.persona == expected_owner)),
+            "an off-domain persona acquired the configured meal task",
         );
 
-        // The off-domain voices defer out loud so the ask visibly lands with Nora.
-        let mira_last = mira_sink.calls().last().map(|c| c.2.clone()).unwrap_or_default();
+        // The handoff uses authored family presentation, never the routing id.
+        let handoff = first_off_domain_delivery.expect("an off-domain voice replied");
         assert!(
-            mira_last.contains("Nora"),
-            "an off-domain voice should defer to the owner by name, got: {mira_last:?}"
+            handoff.contains(&expected_label),
+            "the handoff must use the configured owner label: {handoff:?}",
+        );
+        assert!(
+            !handoff.contains(&expected_owner),
+            "the family-visible handoff leaked the opaque routing id: {handoff:?}",
         );
     }
 
@@ -2945,6 +5260,7 @@ mod tests {
     fn choke_point_restamps_off_domain_meal_task_to_owner_nora() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
+        write_owner_fixture(&wg);
         let origin = crate::graph::TaskOrigin::new(
             crate::graph::OriginChannel::TelegramGroup,
             "-100555",
@@ -3109,6 +5425,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn missing_household_never_invents_an_owner_handoff() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        confirm_human(&wg, "member-1", "human-member", "hearth");
+
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:hearth",
+            "-100404",
+            "member-1",
+            Entry::GroupElected,
+        );
+        let composer =
+            FakeComposer::ok("Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup");
+        let sink = RecSink::default();
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Thursday dinner to soup",
+            "req-no-household-owner",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let delivered = sink
+            .edits()
+            .last()
+            .map(|edit| edit.3.clone())
+            .or_else(|| sink.calls().last().map(|call| call.2.clone()))
+            .unwrap_or_default();
+        assert_eq!(delivered, "Thursday soup is noted.");
+        assert!(
+            !delivered.contains("got this one"),
+            "no project roster means no named owner handoff: {delivered:?}",
+        );
+
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let created = graph
+            .tasks()
+            .find(|task| task.origin.is_some())
+            .expect("the real ask still creates one task");
+        assert_eq!(
+            created.origin.as_ref().unwrap().persona,
+            "hearth",
+            "missing ownership config fails open to the speaking persona",
+        );
+    }
+
     /// THE ROUND-2 REGRESSION FIXTURE (Luca, 2026-07-14): Otto answers a meal ask
     /// 1:1-style in the group — a single [`Election::One`] turn, NOT a collective
     /// round — and the composer emits a `TASK_CREATE` tail. The created task must
@@ -3124,7 +5496,11 @@ mod tests {
         let ask = "update Friday dinner to carbonara instead";
         let sink = RecSink::default();
         run_voice(
-            &wg, &cfg, "otto", chat, ask,
+            &wg,
+            &cfg,
+            "otto",
+            chat,
+            ask,
             "On it!\nTASK_CREATE: update Friday dinner to carbonara",
             &sink,
         )
@@ -3149,10 +5525,26 @@ mod tests {
         // (ask, task title, expected owner). One Otto turn per row, separate chats
         // so the intent ledger never cross-dedupes distinct asks.
         let cases: &[(&str, &str, &str)] = &[
-            ("update Friday dinner to carbonara", "update Friday dinner", "nora"),
-            ("what's a good recipe for the tofu?", "share a tofu recipe", "bruno"),
-            ("can we move my gym session to Friday?", "reschedule gym to Friday", "mira"),
-            ("book a dentist appointment next week", "book the dentist", "otto"),
+            (
+                "update Friday dinner to carbonara",
+                "update Friday dinner",
+                "nora",
+            ),
+            (
+                "what's a good recipe for the tofu?",
+                "share a tofu recipe",
+                "bruno",
+            ),
+            (
+                "can we move my gym session to Friday?",
+                "reschedule gym to Friday",
+                "mira",
+            ),
+            (
+                "book a dentist appointment next week",
+                "book the dentist",
+                "otto",
+            ),
             ("add oat milk to the shopping list", "add oat milk", "otto"),
             ("who is picking up the kids?", "arrange kid pickup", "otto"),
         ];
@@ -3163,7 +5555,11 @@ mod tests {
             let chat = format!("-1006{i:02}");
             let sink = RecSink::default();
             run_voice(
-                &wg, &cfg, "otto", &chat, ask,
+                &wg,
+                &cfg,
+                "otto",
+                &chat,
+                ask,
                 &format!("On it!\nTASK_CREATE: {title}"),
                 &sink,
             )
@@ -3193,9 +5589,15 @@ mod tests {
         let ask = "can we all move my gym session to Friday?";
 
         for (persona, reply) in [
-            ("nora", "I'll flag it.\nTASK_CREATE: move the gym session to Friday"),
+            (
+                "nora",
+                "I'll flag it.\nTASK_CREATE: move the gym session to Friday",
+            ),
             ("bruno", "Sure.\nTASK_CREATE: shift gym to Friday"),
-            ("mira", "On it — Friday works 💪\nTASK_CREATE: reschedule gym session to Friday"),
+            (
+                "mira",
+                "On it — Friday works 💪\nTASK_CREATE: reschedule gym session to Friday",
+            ),
             ("otto", "Noted.\nTASK_CREATE: gym Friday"),
         ] {
             let sink = RecSink::default();
@@ -3263,7 +5665,7 @@ mod tests {
     /// return a wrong answer if it were called, so a correct status line proves
     /// the short-circuit.
     #[tokio::test]
-    async fn lifecycle_status_question_answers_from_graph_not_the_model() {
+    async fn family_voice_guard_cleans_graph_status_delivery() {
         use crate::graph::{Node, OriginChannel, Status, Task, TaskOrigin, WorkGraph};
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
@@ -3272,11 +5674,13 @@ mod tests {
         bind_agent(&wg, "otto", &uuid).unwrap();
         confirm_human(&wg, "luca-1", "human-luca", "otto");
 
-        // Seed an in-progress task Luca asked for.
+        // Seed an in-progress task whose family-facing title contains markdown.
+        // Status copy is assembled after the composer finalizer, so only the
+        // dynamic-delivery choke point can clean it.
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(Task {
             id: "tweak-w29-meals".into(),
-            title: "tweak this week's meals".into(),
+            title: "**weekly refresh**".into(),
             status: Status::InProgress,
             origin: Some(TaskOrigin::new(
                 OriginChannel::TelegramDirect,
@@ -3308,6 +5712,20 @@ mod tests {
         let (_bot, _chat, text) = sink.calls().last().unwrap().clone();
         assert!(text.contains("on it now"), "status answer, got: {text}");
         assert!(!text.contains("WRONG"), "must not use the model: {text}");
+        assert!(
+            !text.contains("**"),
+            "status markdown bypassed delivery: {text}"
+        );
+        assert!(
+            text.contains("weekly refresh"),
+            "status title was lost: {text}"
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(text.as_str()),
+            "graph status must persist the same guarded bytes it sends"
+        );
     }
 
     /// An explicit "let me know when…" is acknowledged out loud, appended to the
@@ -3339,7 +5757,10 @@ mod tests {
 
         let (_bot, _chat, text) = sink.calls().last().unwrap().clone();
         assert!(text.starts_with("Sure — I'll get it sorted."), "{text}");
-        assert!(text.contains(lifecycle::FOLLOW_ACK), "follow ack appended: {text}");
+        assert!(
+            text.contains(lifecycle::FOLLOW_ACK),
+            "follow ack appended: {text}"
+        );
     }
 
     #[test]
@@ -3393,21 +5814,34 @@ mod tests {
             chat::append_outbox_ref(&wg2, &uuid2, "here at last", &m.request_id).unwrap();
         });
 
-        let outcome =
-            run_conversation_turn(&wg, &plan, "you there?", "req-3", fast_timing(), None, &sink)
-                .await
-                .unwrap();
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "you there?",
+            "req-3",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
         responder.await.unwrap();
 
         assert_eq!(outcome, TurnOutcome::Replied { acked: true });
         let calls = sink.calls();
-        assert!(calls.len() >= 2, "expected ack + reply, got {calls:?}");
-        // First send is the ack, in the same chat via the same bot.
+        assert_eq!(calls.len(), 1, "the ack is the only fresh send: {calls:?}");
         assert_eq!(calls[0].0, "otto");
         assert_eq!(calls[0].1, "555");
         assert!(calls[0].2.contains("On it"));
-        // Last send is the actual reply.
-        assert_eq!(calls.last().unwrap().2, "here at last");
+        let edits = sink.edits();
+        assert_eq!(
+            edits.len(),
+            1,
+            "the final reply replaces the ack: {edits:?}"
+        );
+        assert_eq!(edits[0].0, "otto");
+        assert_eq!(edits[0].1, "555");
+        assert_eq!(edits[0].3, "here at last");
     }
 
     #[tokio::test]
@@ -3499,7 +5933,10 @@ mod tests {
         // The composed reply is also persisted to the outbox for TUI/feed parity.
         if let ConversationPlan::Converse { session_ref, .. } = &plan {
             let out = chat::read_outbox_since_ref(&wg, session_ref, 0).unwrap();
-            assert_eq!(out.last().unwrap().content, "Yep — dinner's at seven, see you there!");
+            assert_eq!(
+                out.last().unwrap().content,
+                "Yep — dinner's at seven, see you there!"
+            );
         }
     }
 
@@ -3508,7 +5945,7 @@ mod tests {
     /// graceful "glitched" follow-up fast — never a permanent hourglass, never
     /// silence.
     #[tokio::test]
-    async fn compose_failure_sends_glitch_follow_up_fast() {
+    async fn family_voice_guard_preserves_clean_glitch_delivery() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
         let (_cfg, plan) = converse_fixture(&wg);
@@ -3528,11 +5965,18 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(start.elapsed() < Duration::from_secs(1), "must fail fast, not hang");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must fail fast, not hang"
+        );
         assert_eq!(outcome, TurnOutcome::Glitched { acked: false });
         let calls = sink.calls();
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].2.contains("glitched"), "got: {:?}", calls[0].2);
+        assert_eq!(
+            calls[0].2,
+            glitch_line(),
+            "the clean glitch line survives the delivery guard byte-for-byte"
+        );
     }
 
     /// A slow compose (past `ack_after`) sends the ack, then EDITS it in place
@@ -3545,7 +5989,8 @@ mod tests {
         let (_cfg, plan) = converse_fixture(&wg);
         let sink = RecSink::default();
         // fast_timing ack_after is 80ms; delay 200ms so the ack fires first.
-        let composer = FakeComposer::ok_after("Here at last — all sorted!", Duration::from_millis(200));
+        let composer =
+            FakeComposer::ok_after("Here at last — all sorted!", Duration::from_millis(200));
 
         let outcome = run_conversation_turn(
             &wg,
@@ -3601,7 +6046,11 @@ mod tests {
         assert!(calls[0].2.contains("On it"));
         let edits = sink.edits();
         assert_eq!(edits.len(), 1);
-        assert!(edits[0].3.contains("glitched"), "ack edited into glitch: {:?}", edits[0].3);
+        assert!(
+            edits[0].3.contains("glitched"),
+            "ack edited into glitch: {:?}",
+            edits[0].3
+        );
     }
 
     /// DEFER DISCIPLINE (morning-taco-bugs): the owner never defers to itself. The
@@ -3625,7 +6074,10 @@ mod tests {
         assert!(speaker_is_owner(&origin("bruno", None), "bruno"));
         assert!(speaker_is_owner(&origin("Bruno", None), "bruno"));
         // Persona fell back to the bot id (no configured agent_id).
-        assert!(speaker_is_owner(&origin("bruno_casapinello_bot", None), "bruno"));
+        assert!(speaker_is_owner(
+            &origin("bruno_casapinello_bot", None),
+            "bruno"
+        ));
         assert!(speaker_is_owner(&origin("bruno-bot", None), "bruno"));
         // Owner recognised via the bot_id channel even when persona is a bot id.
         assert!(speaker_is_owner(
@@ -3633,7 +6085,10 @@ mod tests {
             "bruno"
         ));
         // A different voice is NOT the owner — it still defers.
-        assert!(!speaker_is_owner(&origin("mira", Some("mira_casapinello_bot")), "bruno"));
+        assert!(!speaker_is_owner(
+            &origin("mira", Some("mira_casapinello_bot")),
+            "bruno"
+        ));
         assert!(!speaker_is_owner(&origin("otto", None), "bruno"));
         // No owner resolved → never a self-owner.
         assert!(!speaker_is_owner(&origin("bruno", None), ""));
@@ -3657,7 +6112,7 @@ mod tests {
 **Week of Monday 2026-07-13 to Sunday 2026-07-19**
 **Status:** DRAFT
 
-## 1. Meals
+## 1. Dinners (planner → cook)
 
 | Day | Slot | Dinner | Prep |
 |-----|------|--------|------|
@@ -3694,27 +6149,57 @@ mod tests {
             .unwrap()
             .and_hms_opt(12, 0, 0)
             .unwrap();
-        let grounded =
-            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now, ForwardedContext::default());
+        let grounded = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "Plans for tomorrow?",
+            now,
+            ForwardedContext::default(),
+        );
         assert!(
             grounded.contains("Dentist"),
             "tomorrow's appointment missing from prompt:\n{grounded}"
         );
         assert!(grounded.contains("Thursday"));
         // The answer-first instruction header is present.
-        assert!(grounded.to_lowercase().contains("answer the question directly"));
+        assert!(
+            grounded
+                .to_lowercase()
+                .contains("answer the question directly")
+        );
         // Other days must NOT bleed into a scoped "tomorrow" ask.
-        assert!(!grounded.contains("Baked salmon"), "Tue meal leaked:\n{grounded}");
-        assert!(!grounded.contains("Chickpea"), "Mon meal leaked:\n{grounded}");
+        assert!(
+            !grounded.contains("Baked salmon"),
+            "Tue meal leaked:\n{grounded}"
+        );
+        assert!(
+            !grounded.contains("Chickpea"),
+            "Mon meal leaked:\n{grounded}"
+        );
 
         // A whole-week ask still surfaces the full week's meals.
-        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now, ForwardedContext::default());
+        let week = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "how's the week?",
+            now,
+            ForwardedContext::default(),
+        );
         assert!(week.contains("Baked salmon"));
         assert!(week.contains("Luca PT check-in"));
         assert!(week.to_lowercase().contains("do not stall"));
 
         // Small talk carries no read-shaped WEEK block (no meal dump)...
-        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now, ForwardedContext::default());
+        let plain = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "morning!",
+            now,
+            ForwardedContext::default(),
+        );
         assert!(!plain.contains("Baked salmon"));
         // ...but it DOES now carry the always-on anti-fabrication calendar-truth
         // line (rule 5, §6.7). Wed 07-15 has no calendar events → the model is
@@ -3732,8 +6217,18 @@ mod tests {
             .unwrap()
             .and_hms_opt(15, 0, 0)
             .unwrap();
-        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon, ForwardedContext::default());
-        assert!(greet.contains("PT check-in"), "real event missing from greeting prompt:\n{greet}");
+        let greet = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "how's your day?",
+            tue_noon,
+            ForwardedContext::default(),
+        );
+        assert!(
+            greet.contains("PT check-in"),
+            "real event missing from greeting prompt:\n{greet}"
+        );
         assert!(greet.to_lowercase().contains("do not invent"), "{greet}");
     }
 
@@ -3768,7 +6263,10 @@ mod tests {
             "otto",
             "tell me the calories",
             now,
-            ForwardedContext { thread: Some(thread), ..Default::default() },
+            ForwardedContext {
+                thread: Some(thread),
+                ..Default::default()
+            },
         );
         assert!(
             followup.contains("pasta pomodoro"),
@@ -3776,15 +6274,27 @@ mod tests {
         );
         assert!(
             followup.to_lowercase().contains("follow-up")
-                && followup.to_lowercase().contains("do not ask what they mean"),
+                && followup
+                    .to_lowercase()
+                    .contains("do not ask what they mean"),
             "compose-not-clarify instruction missing from the prompt:\n{followup}"
         );
 
         // WITHOUT thread context: the same ambiguous ask carries no referent and
         // no follow-up instruction — this is exactly the state that made the engine
         // clarify instead of answer.
-        let bare = build_compose_prompt_at(&wg, &uuid, "otto", "tell me the calories", now, ForwardedContext::default());
-        assert!(!bare.contains("pasta pomodoro"), "referent leaked without a thread:\n{bare}");
+        let bare = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "tell me the calories",
+            now,
+            ForwardedContext::default(),
+        );
+        assert!(
+            !bare.contains("pasta pomodoro"),
+            "referent leaked without a thread:\n{bare}"
+        );
         assert!(
             !bare.to_lowercase().contains("do not ask what they mean"),
             "follow-up instruction present without a thread:\n{bare}"
@@ -3797,9 +6307,15 @@ mod tests {
             "otto",
             "tell me the calories",
             now,
-            ForwardedContext { thread: Some("   "), ..Default::default() },
+            ForwardedContext {
+                thread: Some("   "),
+                ..Default::default()
+            },
         );
-        assert!(!blank.to_lowercase().contains("do not ask what they mean"), "{blank}");
+        assert!(
+            !blank.to_lowercase().contains("do not ask what they mean"),
+            "{blank}"
+        );
     }
 
     /// WEEK CONTEXT (task week-grounding-engine): the gateway forwards the parsed
@@ -3836,7 +6352,10 @@ mod tests {
             "nora",
             "what's for dinner tomorrow?",
             now,
-            ForwardedContext { week: Some(week), ..Default::default() },
+            ForwardedContext {
+                week: Some(week),
+                ..Default::default()
+            },
         );
         assert!(
             grounded.contains("Baked white fish with tomato, olives & capers"),
@@ -3898,7 +6417,10 @@ mod tests {
         // A family correction, which outranks distilled memory (docs/39 §5.2).
         parity::PreferenceStore::record(
             dir.path(),
-            &format!("{}Nadin is not logged so ignore this", grounding::CORRECTION_PREFIX),
+            &format!(
+                "{}Nadin is not logged so ignore this",
+                grounding::CORRECTION_PREFIX
+            ),
             "luca",
             "nora",
         )
@@ -3948,11 +6470,15 @@ mod tests {
         let week_pos = prompt
             .find("THIS WEEK'S DINNERS")
             .expect("forwarded week block present");
-        let plan_pos = prompt.find("Chickpea").expect("read-shaped week grounding present");
+        let plan_pos = prompt
+            .find("Chickpea")
+            .expect("read-shaped week grounding present");
         let corr_pos = prompt
             .find("Nadin is not logged")
             .expect("corrections block present");
-        let msg_pos = prompt.find("Message: ").expect("the human message tail is present");
+        let msg_pos = prompt
+            .find("Message: ")
+            .expect("the human message tail is present");
         for (label, pos) in [
             ("the calendar-truth line", calendar_pos),
             ("the read-shaped week grounding", plan_pos),
@@ -4000,7 +6526,10 @@ mod tests {
             "otto",
             "what's for dinner?",
             now,
-            ForwardedContext { memory: Some("  \n \n"), ..Default::default() },
+            ForwardedContext {
+                memory: Some("  \n \n"),
+                ..Default::default()
+            },
         );
         assert_eq!(
             none, blank,
@@ -4019,7 +6548,10 @@ mod tests {
             "otto",
             "what's for dinner?",
             now,
-            ForwardedContext { memory: Some(sample_memory_block()), ..Default::default() },
+            ForwardedContext {
+                memory: Some(sample_memory_block()),
+                ..Default::default()
+            },
         );
         assert_ne!(with, none, "the memory block is not being injected at all");
         assert!(with.contains("FAMILY MEMORY"), "{with}");
@@ -4052,7 +6584,10 @@ mod tests {
             "otto",
             "what's for dinner?",
             now,
-            ForwardedContext { memory: Some(&huge), ..Default::default() },
+            ForwardedContext {
+                memory: Some(&huge),
+                ..Default::default()
+            },
         );
         assert!(
             prompt.contains("Nina is allergic to peanuts"),
@@ -4100,7 +6635,10 @@ mod tests {
             "nora",
             "tell me the calories",
             now,
-            ForwardedContext { thread: Some(thread), ..Default::default() },
+            ForwardedContext {
+                thread: Some(thread),
+                ..Default::default()
+            },
         );
 
         // The recency instruction is present: lead with the most recent, close
@@ -4117,8 +6655,13 @@ mod tests {
         // The instruction must land AFTER the raw thread block (the model reads
         // the discipline after seeing the turns it applies to).
         let thread_pos = followup.find("duck breast").expect("thread block present");
-        let recency_pos = followup.find("the LAST message in that list").expect("recency instr present");
-        assert!(recency_pos > thread_pos, "recency instruction placed before the thread block:\n{followup}");
+        let recency_pos = followup
+            .find("the LAST message in that list")
+            .expect("recency instr present");
+        assert!(
+            recency_pos > thread_pos,
+            "recency instruction placed before the thread block:\n{followup}"
+        );
     }
 
     /// RULE 3 (corrections stick): "Nadin is not logged so ignore this" is
@@ -4153,10 +6696,10 @@ mod tests {
         let root = dir.path();
         let prefs = parity::PreferenceStore::all(root);
         assert!(
-            prefs.iter().any(|p| p
-                .text
-                .starts_with(grounding::CORRECTION_PREFIX)
-                && p.text.contains("Nadin")),
+            prefs
+                .iter()
+                .any(|p| p.text.starts_with(grounding::CORRECTION_PREFIX)
+                    && p.text.contains("Nadin")),
             "correction not persisted: {prefs:?}"
         );
 
@@ -4186,23 +6729,48 @@ mod tests {
         let sink1 = RecSink::default();
         let c1 = FakeComposer::ok(stall);
         run_conversation_turn(
-            &wg, &plan, "Plans for tomorrow?", "req-1", fast_timing(), Some(&c1), &sink1,
+            &wg,
+            &plan,
+            "Plans for tomorrow?",
+            "req-1",
+            fast_timing(),
+            Some(&c1),
+            &sink1,
         )
         .await
         .unwrap();
-        assert!(sink1.calls().last().unwrap().2.contains("waiting on confirmations"));
+        assert!(
+            sink1
+                .calls()
+                .last()
+                .unwrap()
+                .2
+                .contains("waiting on confirmations")
+        );
 
         // Turn 2: the SAME stall is drafted again → guard answers honestly.
         let sink2 = RecSink::default();
         let c2 = FakeComposer::ok(stall);
         run_conversation_turn(
-            &wg, &plan, "walk me through it", "req-2", fast_timing(), Some(&c2), &sink2,
+            &wg,
+            &plan,
+            "walk me through it",
+            "req-2",
+            fast_timing(),
+            Some(&c2),
+            &sink2,
         )
         .await
         .unwrap();
         let last = sink2.calls().last().unwrap().2.clone();
-        assert!(!last.contains("waiting on confirmations"), "stall repeated: {last}");
-        assert!(last.to_lowercase().contains("read"), "not the honest fallback: {last}");
+        assert!(
+            !last.contains("waiting on confirmations"),
+            "stall repeated: {last}"
+        );
+        assert!(
+            last.to_lowercase().contains("read"),
+            "not the honest fallback: {last}"
+        );
     }
 
     /// RULE 5 (§6.7 anti-fabrication): a composed reply that INVENTS a schedule
@@ -4231,7 +6799,13 @@ mod tests {
         let sink = RecSink::default();
         let c = FakeComposer::ok(fabricated);
         run_conversation_turn(
-            &wg, &plan, "how's your day?", "req-fab", fast_timing(), Some(&c), &sink,
+            &wg,
+            &plan,
+            "how's your day?",
+            "req-fab",
+            fast_timing(),
+            Some(&c),
+            &sink,
         )
         .await
         .unwrap();
@@ -4250,6 +6824,591 @@ mod tests {
         assert!(lc.contains("calendar"), "not the honest fallback: {last}");
     }
 
+    /// ENGINE DELIVERY-SEAM REGRESSION: a composed reply is cleaned on the
+    /// actual `run_conversation_turn → finalize → outbox + ReplySink` path.
+    /// The household uses fixture-only names to prove every name decision comes
+    /// from `household.toml`, not a roster compiled into the engine.
+    #[tokio::test]
+    async fn family_voice_guard_cleans_the_real_delivery_path() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[household]
+members = ["Household Member"]
+
+[[agent]]
+id = "hearth"
+name = "The Hearth"
+domains = ["coordination"]
+
+[[agent]]
+id = "wayfinder"
+name = "The Wayfinder"
+domains = ["calendar"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        add_binding_for_bot(
+            &wg,
+            "member-1",
+            "Household Member",
+            true,
+            "coordination-lantern",
+        );
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:hearth",
+            "555",
+            "member-1",
+            Entry::Direct,
+        );
+
+        let raw = "**The Hearth** 💬 **Dinner is ready.** Check with **Zephyra** before serving. \
+                   That lives over in the pipeline. **Service:** dispatcher healthy — 2 agents. \
+                   🧭 The Wayfinder's got this one.";
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok(raw);
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "req-family-voice",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Replied { .. }));
+        let delivered = sink.calls().last().unwrap().2.clone();
+        assert_eq!(delivered, "Dinner is ready. Check before serving.");
+
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|m| m.content.as_str()),
+            Some(delivered.as_str()),
+            "the guarded copy is persisted before the scoped reply sink can mirror it"
+        );
+    }
+
+    #[tokio::test]
+    async fn family_voice_guard_replaces_unauthorized_handoff_only_composed_reply() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "hearth"
+name = "The Hearth"
+domains = ["coordination"]
+
+[[agent]]
+id = "wayfinder"
+name = "The Wayfinder"
+domains = ["calendar"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        add_binding(&wg, "member-1", "Household Member", true);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:hearth",
+            "555",
+            "member-1",
+            Entry::Direct,
+        );
+
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok("The Wayfinder's got this one.");
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "req-handoff-only",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sink.calls().last().map(|call| call.2.as_str()),
+            Some(grounding::family_voice_fallback_line().as_str()),
+            "a composer-authored handoff-only reply must become neutral copy"
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(grounding::family_voice_fallback_line().as_str())
+        );
+    }
+
+    /// The no-composer compatibility path reads a reply that another session
+    /// already wrote to the outbox. It must enter the same delivery choke point,
+    /// and its persisted summary must be rewritten to the exact guarded send.
+    #[tokio::test]
+    async fn family_voice_guard_cleans_legacy_session_reply_and_outbox() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[household]
+members = ["Quillon Vale"]
+
+[[agent]]
+id = "hearth"
+name = "The Hearth"
+
+[[agent]]
+id = "wayfinder"
+name = "The Wayfinder"
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        add_binding(&wg, "member-1", "Household Member", true);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:hearth",
+            "555",
+            "member-1",
+            Entry::Direct,
+        );
+
+        let raw = "**The Hearth** 💬 **Dinner is ready.** We're waiting on you and \
+                   **Quillon Vale** to confirm. 🧭 The Wayfinder's got this one.";
+        let responder_wg = wg.clone();
+        let responder_session = uuid.clone();
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let inbox =
+                    chat::read_inbox_ref(&responder_wg, &responder_session).unwrap_or_default();
+                if let Some(message) = inbox.iter().find(|message| message.role == "user") {
+                    chat::append_outbox_ref(
+                        &responder_wg,
+                        &responder_session,
+                        raw,
+                        &message.request_id,
+                    )
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("legacy fixture never received the inbox turn");
+        });
+
+        let sink = RecSink::default();
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "req-legacy-family-voice",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Replied { acked: false });
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 1, "the legacy bridge emits one guarded send");
+        assert_eq!(calls[0].2, "Dinner is ready.");
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(calls[0].2.as_str()),
+            "the legacy outbox summary must match the guarded send byte-for-byte"
+        );
+    }
+
+    /// A legacy session row is not canonical until the engine guard has run.
+    /// If rewriting the guarded bytes to the outbox fails and transport then
+    /// fails too, a same-key retry must guard the still-dirty row again rather
+    /// than relaying it through the persisted-reply fast path.
+    #[tokio::test]
+    async fn legacy_retry_guards_dirty_outbox_when_rewrite_and_transport_fail() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstRecordingSink {
+            attempts: AtomicUsize,
+            texts: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstRecordingSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                self.texts.lock().unwrap().push(text.to_string());
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub guarded transport failure");
+                }
+                Ok(Some("guarded-legacy-message".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[household]
+members = ["Fixture Member"]
+
+[[agent]]
+id = "fixture-voice"
+name = "Fixture Voice"
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("fixture-voice", Some("fixture-voice"))]);
+        let session_ref = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "fixture-voice", &session_ref).unwrap();
+        add_binding(&wg, "fixture-member", "Household Member", true);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:fixture-voice",
+            "555",
+            "fixture-member",
+            Entry::Direct,
+        );
+
+        // `edit_outbox_message_ref` writes this sibling path before renaming it.
+        // A directory at that exact path deterministically forces the rewrite
+        // to fail while leaving the original outbox readable for retry.
+        let rewrite_blocker = chat::outbox_path_ref(&wg, &session_ref).with_extension("jsonl.tmp");
+        std::fs::create_dir_all(&rewrite_blocker).unwrap();
+
+        let raw = "**Fixture Voice** says dinner is ready for **Fixture Member**.";
+        let family_roster = grounding::load_family_voice_roster(&project_root_of(&wg), &wg);
+        let expected = grounding::enforce_family_voice(raw, &family_roster);
+        assert_ne!(
+            expected, raw,
+            "the fixture must contain bytes that the family guard changes",
+        );
+        let responder_wg = wg.clone();
+        let responder_session = session_ref.clone();
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let inbox =
+                    chat::read_inbox_ref(&responder_wg, &responder_session).unwrap_or_default();
+                if let Some(message) = inbox
+                    .iter()
+                    .find(|message| message.request_id == "legacy-dirty-retry")
+                {
+                    chat::append_outbox_ref(
+                        &responder_wg,
+                        &responder_session,
+                        raw,
+                        &message.request_id,
+                    )
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("legacy fixture never received the inbox turn");
+        });
+
+        let sink = FailFirstRecordingSink::default();
+        let timing = AckTiming {
+            ack_after: Duration::from_secs(1),
+            reply_timeout: Duration::from_millis(500),
+            poll: Duration::from_millis(5),
+        };
+        let first = run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "legacy-dirty-retry",
+            timing,
+            None,
+            &sink,
+        )
+        .await;
+        responder.await.unwrap();
+        assert!(first.is_err(), "the first guarded transport must fail");
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "legacy-dirty-retry",
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "legacy-dirty-retry",
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let texts = sink.texts.lock().unwrap().clone();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(
+            texts,
+            vec![expected.clone(), expected],
+            "both attempts must use guarded bytes even while the persisted row stays dirty",
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &session_ref, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(raw),
+            "the blocker must prove the retry read an unguarded persisted row",
+        );
+    }
+
+    /// The single-owner path appends one trusted authored-name handoff after
+    /// composition. That exact engine-authored suffix survives; a composer
+    /// cannot grant itself the same exception. A transport retry must relay the
+    /// already-guarded outbox bytes verbatim rather than stripping that suffix
+    /// in a second context-free guard pass.
+    #[tokio::test]
+    async fn family_voice_guard_preserves_owner_handoff_bytes_on_transport_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstHandoffSink {
+            attempts: AtomicUsize,
+            texts: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstHandoffSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                self.texts.lock().unwrap().push(text.to_string());
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub handoff transport failure");
+                }
+                Ok(Some("handoff-retry-message".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "coordination-lantern"
+name = "Evening Lantern"
+domains = ["coordination"]
+
+[[agent]]
+id = "meal-cairn"
+name = "Cedar Table"
+domains = ["meals"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[
+            ("coordination-lantern", Some("coordination-lantern")),
+            ("meal-cairn", Some("meal-cairn")),
+        ]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "coordination-lantern", &uuid).unwrap();
+        add_binding(&wg, "member-1", "Household Member", true);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:coordination-lantern",
+            "555",
+            "member-1",
+            Entry::Direct,
+        );
+
+        let sink = FailFirstHandoffSink::default();
+        let composer =
+            FakeComposer::ok("Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup");
+        let first = run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Thursday dinner to soup",
+            "req-owner-handoff",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first transport attempt must fail");
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Thursday dinner to soup",
+            "req-owner-handoff",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Thursday dinner to soup",
+            "req-owner-handoff",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        let attempted = sink.texts.lock().unwrap().clone();
+        assert_eq!(attempted.len(), 2);
+        assert_eq!(
+            attempted[0], attempted[1],
+            "the persisted retry must preserve the exact authorized bytes",
+        );
+        let delivered = attempted[1].clone();
+        let owner_map = ownership::OwnerMap::load(dir.path());
+        let trusted =
+            ownership::defer_line(&owner_map, "meal-cairn", ownership::Domain::MealPlanning);
+        assert_eq!(
+            delivered,
+            format!("Thursday soup is noted.\n\n{trusted}"),
+            "the exact ownership notice must survive after the guarded body"
+        );
+        assert!(
+            delivered.contains("Cedar Table"),
+            "the family sees the authored multiword display name: {delivered}",
+        );
+        assert!(
+            !delivered.contains("meal-cairn"),
+            "the opaque routing id must not become family-visible copy: {delivered}",
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(delivered.as_str()),
+            "the ownership exception must produce identical outbox/send bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_handoff_without_a_safe_display_name_is_name_free() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "coordination-lantern"
+name = "Evening Lantern"
+domains = ["coordination"]
+
+[[agent]]
+id = "meal-cairn"
+domains = ["meals"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[
+            ("coordination-lantern", Some("coordination-lantern")),
+            ("meal-cairn", Some("meal-cairn")),
+        ]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "coordination-lantern", &uuid).unwrap();
+        add_binding_for_bot(
+            &wg,
+            "member-2",
+            "Household Member",
+            true,
+            "coordination-lantern",
+        );
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:coordination-lantern",
+            "556",
+            "member-2",
+            Entry::Direct,
+        );
+
+        let sink = RecSink::default();
+        let composer =
+            FakeComposer::ok("Saturday stew is noted.\nTASK_CREATE: move Saturday dinner to stew");
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Saturday dinner to stew",
+            "req-name-free-owner-handoff",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let delivered = sink.calls().last().unwrap().2.clone();
+        assert_eq!(
+            delivered, "Saturday stew is noted.\n\nThis one's for the right person 🥗",
+            "a missing authored name gets grounded name-free copy",
+        );
+        assert!(
+            !delivered.contains("meal-cairn"),
+            "the routing id must stay private even when no display name exists: {delivered}",
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(delivered.as_str()),
+            "the name-free ownership notice must match persisted and sent bytes",
+        );
+    }
+
     /// Seed a confirmed OR unconfirmed binding under `name` so the inviter
     /// resolver has a roster to read.
     fn add_binding(wg: &Path, sender: &str, name: &str, confirmed: bool) {
@@ -4260,6 +7419,22 @@ mod tests {
             &format!("agent-{sender}"),
             name,
             Some("otto".to_string()),
+            Utc::now(),
+        );
+        b.confirmed = confirmed;
+        b.confirmed_at = confirmed.then(Utc::now);
+        map.add(b).unwrap();
+        map.save(&agency_dir).unwrap();
+    }
+
+    fn add_binding_for_bot(wg: &Path, sender: &str, name: &str, confirmed: bool, bot_id: &str) {
+        let agency_dir = wg.join("agency");
+        let mut map = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+        let mut b = crate::agency::TelegramBinding::new(
+            sender,
+            &format!("agent-{sender}"),
+            name,
+            Some(bot_id.to_string()),
             Utc::now(),
         );
         b.confirmed = confirmed;
@@ -4325,143 +7500,5 @@ mod tests {
             Some("Robin"),
             "confirmed member should be the inviter"
         );
-    }
-
-    /// THE FINDING, end to end (task p1-engine-reply-guards). An engine-composed
-    /// reply is sent by THIS process's `ReplySink` and written to the feed by
-    /// `FeedMirrorSink` in THIS process — it never passes through the gateway's
-    /// `familyVoice.gateComposedReply` seam, so all six of that seam's rules were
-    /// unenforced on the real delivery path.
-    ///
-    /// This drives the LIVE path in a scratch project with a stub send: a real
-    /// household.toml roster, a confirmed human, a `plan_conversation` 1:1 route,
-    /// and a composer whose draft carries every one of the six leaks at once
-    /// (self-attribution prefix, markdown, a machine week number, a dispatcher
-    /// telemetry clause, infrastructure narration, a retired teammate's name, a
-    /// hand-off tail). What the RecSink records is what a person would have read,
-    /// and it must be clean — plus the session outbox (the TUI / casa feed's copy)
-    /// must carry EXACTLY the same words, so no surface renders the raw draft.
-    ///
-    /// Named for the `grounding` module the rules live in so the engine's
-    /// family-voice contract is covered by `cargo test grounding`.
-    #[tokio::test]
-    async fn grounding_gate_cleans_the_engine_sent_reply_and_the_outbox() {
-        let dir = tempdir().unwrap();
-        let wg = dir.path().to_path_buf();
-        // A real household roster, so the guards are roster-driven off the
-        // family's own file rather than any hardcoded name.
-        std::fs::write(
-            wg.join("household.toml"),
-            r#"
-[household]
-name = "Casa Rossi"
-members = ["Luca"]
-
-[[agent]]
-id = "nora"
-name = "Nora"
-domains = ["meals", "nutrition"]
-
-[[agent]]
-id = "otto"
-name = "Otto"
-domains = ["calendar", "coordination", "shopping"]
-"#,
-        )
-        .unwrap();
-
-        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
-        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "nora", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "nora");
-        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
-
-        // The dirty draft: all six leaks, no promise tail and no schedule claim
-        // (so the parity/anti-fabrication guards don't pre-empt what is under
-        // test here — the family-voice gate).
-        const DIRTY: &str = "Nora \u{1F4AC} **W29** is still a draft. The dispatcher has 3 agents alive. \
-                             Meals are set \u{2014} waiting on you and Nadin to confirm. \
-                             I'd need to pull from the live gateway for the rest. \
-                             \u{1F986} Otto's got this one.";
-
-        let sink = RecSink::default();
-        let composer = FakeComposer::ok(DIRTY);
-        let outcome = run_conversation_turn(
-            &wg,
-            &plan,
-            "hey",
-            "req-voice",
-            fast_timing(),
-            Some(&composer),
-            &sink,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, TurnOutcome::Replied { .. }));
-
-        // The roster the gate was built from — the same load the delivery path does.
-        let voice = grounding::FamilyVoice::load(&wg, &wg);
-        let personas = voice.persona_names().to_vec();
-
-        // NON-VACUOUS: the draft really does carry every leak. Without the gate,
-        // this is exactly what the family would have read.
-        assert!(grounding::has_self_attribution(DIRTY, &personas));
-        assert!(grounding::mentions_non_roster(DIRTY, &voice));
-        assert!(grounding::has_handoff_tail(DIRTY, &personas));
-        assert!(grounding::has_infra_narration(DIRTY));
-        assert!(grounding::has_ops_jargon(DIRTY));
-        assert!(grounding::has_markdown(DIRTY));
-
-        // What the stub sink actually received — the bytes a person reads.
-        let (bot, chat_id, sent) = sink.calls().last().expect("a reply was sent").clone();
-        assert_eq!(bot, "nora");
-        assert_eq!(chat_id, "555");
-
-        assert!(!sent.trim().is_empty(), "the engine must never send an empty reply");
-        assert!(!grounding::has_self_attribution(&sent, &personas), "attribution reached the family: {sent}");
-        assert!(!grounding::mentions_non_roster(&sent, &voice), "a retired teammate reached the family: {sent}");
-        assert!(!sent.to_lowercase().contains("nadin"), "{sent}");
-        assert!(!grounding::has_handoff_tail(&sent, &personas), "a hand-off tail reached the family: {sent}");
-        assert!(!grounding::has_infra_narration(&sent), "plumbing reached the family: {sent}");
-        assert!(!grounding::has_ops_jargon(&sent), "telemetry reached the family: {sent}");
-        assert!(!grounding::has_markdown(&sent), "raw markdown reached the family: {sent}");
-        assert!(!sent.contains("W29"), "a machine week number reached the family: {sent}");
-        assert!(!sent.contains('*') && !sent.contains('`'), "{sent}");
-        assert!(sent.contains("next week"), "the week ref was humanized, not deleted: {sent}");
-
-        // ONE TRUTH ACROSS SURFACES: the session outbox (what the TUI and the casa
-        // feed replay) must be the SAME cleaned words, not the raw draft.
-        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
-        let recorded = outbox
-            .iter()
-            .rev()
-            .find(|m| m.request_id == "req-voice")
-            .expect("the turn was recorded in the outbox");
-        assert_eq!(recorded.content.trim(), sent.trim(), "the outbox and the sent message diverged");
-        assert!(!recorded.content.contains("dispatcher"), "{}", recorded.content);
-    }
-
-    /// A CLEAN engine reply is delivered byte-for-byte. The gate sits in front of
-    /// every engine send, so this no-op is load-bearing: it is why adding it could
-    /// not change what an already-well-behaved persona says.
-    #[tokio::test]
-    async fn grounding_gate_leaves_a_clean_engine_reply_byte_for_byte() {
-        let dir = tempdir().unwrap();
-        let wg = dir.path().to_path_buf();
-        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
-        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "nora", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "nora");
-        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
-
-        const CLEAN: &str = "Dinner's chicken and rice tonight \u{1F957}";
-        let sink = RecSink::default();
-        let composer = FakeComposer::ok(CLEAN);
-        run_conversation_turn(&wg, &plan, "hey", "req-clean", fast_timing(), Some(&composer), &sink)
-            .await
-            .unwrap();
-
-        let (_bot, _chat, sent) = sink.calls().last().expect("a reply was sent").clone();
-        assert_eq!(sent, CLEAN, "the gate rewrote a clean reply");
     }
 }

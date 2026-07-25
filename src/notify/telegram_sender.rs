@@ -76,7 +76,10 @@ pub fn identity_from_message(message: &Value) -> SenderIdentity {
 
 /// Read a raw Telegram `from` object into a [`SenderIdentity`].
 pub fn identity_from_from(from: &Value) -> SenderIdentity {
-    let user_id = from.get("id").and_then(|i| i.as_i64()).map(|i| i.to_string());
+    let user_id = from
+        .get("id")
+        .and_then(|i| i.as_i64())
+        .map(|i| i.to_string());
     let username = from
         .get("username")
         .and_then(|u| u.as_str())
@@ -155,7 +158,10 @@ pub fn resolve_inbound_summary(update: &Value, bindings: &TelegramBindingMap) ->
     let r = resolve_inbound(update, bindings);
     let resolved = match (&r.agent_id, &r.name) {
         (Some(agent), Some(name)) => {
-            format!("{agent}({name}){}", if r.confirmed { "" } else { " unconfirmed" })
+            format!(
+                "{agent}({name}){}",
+                if r.confirmed { "" } else { " unconfirmed" }
+            )
         }
         _ => "unrecognized".to_string(),
     };

@@ -454,9 +454,7 @@ pub fn reset_due_legacy_crons(
     // resetting — `reset_cron_task` clears `completed_at`.
     let due: Vec<(String, DateTime<Utc>)> = graph
         .tasks()
-        .filter(|t| {
-            t.cron_enabled && !t.cron_template && t.status == crate::graph::Status::Done
-        })
+        .filter(|t| t.cron_enabled && !t.cron_template && t.status == crate::graph::Status::Done)
         .map(|t| {
             let completed_at = t
                 .completed_at
@@ -479,7 +477,12 @@ pub fn reset_due_legacy_crons(
             continue;
         }
         reset_ids.push(cron_id.clone());
-        satisfied.extend(satisfy_reset_cron_dependents(graph, &cron_id, completed_at, now));
+        satisfied.extend(satisfy_reset_cron_dependents(
+            graph,
+            &cron_id,
+            completed_at,
+            now,
+        ));
     }
     (reset_ids, satisfied)
 }
@@ -1680,7 +1683,10 @@ mod tests {
 
         // Distinct, readable id bound to the run.
         assert_eq!(inst.id, "weekly-plan-sunday-2026-W28");
-        assert_ne!(inst.id, template.id, "instance id must differ from template");
+        assert_ne!(
+            inst.id, template.id,
+            "instance id must differ from template"
+        );
         // A plain, dispatchable Open task — NOT itself a cron.
         assert_eq!(inst.status, Status::Open);
         assert!(!inst.cron_enabled, "instance is not cron-enabled");
@@ -1741,7 +1747,10 @@ mod tests {
         let inst_id = minted[0].clone();
         assert!(graph.get_task(&inst_id).is_some());
         // Template is no longer due (next fire advanced to the future).
-        assert!(!is_cron_due(graph.get_task("weekly-plan-sunday").unwrap(), Utc::now()));
+        assert!(!is_cron_due(
+            graph.get_task("weekly-plan-sunday").unwrap(),
+            Utc::now()
+        ));
 
         // Second tick with the template not due: nothing new minted.
         let again = mint_due_cron_instances(&mut graph, Utc::now());
@@ -1799,13 +1808,18 @@ mod tests {
 
         // NEXT week fires: force the template due again and tick. A NEW instance
         // id is minted — the re-registration.
-        graph.get_task_mut("weekly-plan-sunday").unwrap().next_cron_fire =
-            Some(week2_fire.to_rfc3339());
+        graph
+            .get_task_mut("weekly-plan-sunday")
+            .unwrap()
+            .next_cron_fire = Some(week2_fire.to_rfc3339());
         let minted2 = mint_due_cron_instances(&mut graph, week2_fire + Duration::minutes(5));
         assert_eq!(minted2.len(), 1, "next week mints a fresh instance");
         let run2 = minted2[0].clone();
         assert_eq!(run2, "weekly-plan-sunday-2026-W29");
-        assert_ne!(run1, run2, "re-registration uses a DISTINCT id, not the same one");
+        assert_ne!(
+            run1, run2,
+            "re-registration uses a DISTINCT id, not the same one"
+        );
 
         // THE FIX: the child is STILL not blocked. Its `--after run1` edge binds
         // to the finished run, so the new firing (run2) cannot re-block it —
@@ -1847,7 +1861,10 @@ mod tests {
         // Reset-in-place flips the SAME id Done→Open → child re-blocks. This is
         // exactly the deadlock; the template model above does not exhibit it.
         reset_cron_task(graph.get_task_mut("legacy-weekly").unwrap());
-        assert_eq!(graph.get_task("legacy-weekly").unwrap().status, Status::Open);
+        assert_eq!(
+            graph.get_task("legacy-weekly").unwrap().status,
+            Status::Open
+        );
         assert!(
             !crate::query::after(&graph, "legacy-child").is_empty(),
             "legacy reset re-blocks the child — the bug template mode fixes"

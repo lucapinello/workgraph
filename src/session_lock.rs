@@ -791,7 +791,10 @@ pub fn reconcile_session_locks(chat_root: &Path, policy: &ReconcilePolicy) -> Ve
 
         eprintln!(
             "[session-lock] reconcile: reaped {} lock (pid={}, kind={}, reason={}{})",
-            chat_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            chat_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
             pid,
             kind.map(|k| k.label()).unwrap_or("unknown"),
             reason.label(),
@@ -1232,7 +1235,10 @@ mod tests {
             .collect();
         assert_eq!(reasons.get(&a), Some(&ReapReason::DeadPid));
         assert_eq!(reasons.get(&b), Some(&ReapReason::Unparseable));
-        assert!(!reasons.contains_key(&c), "live current handler must be spared");
+        assert!(
+            !reasons.contains_key(&c),
+            "live current handler must be spared"
+        );
         assert!(!SessionLock::lock_path(&a).exists(), "dead lock removed");
         assert!(!SessionLock::lock_path(&b).exists(), "corrupt lock removed");
         assert!(SessionLock::lock_path(&c).exists(), "live lock preserved");
@@ -1260,7 +1266,10 @@ mod tests {
         let reaped = reconcile_session_locks(root.path(), &policy);
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].reason, ReapReason::StaleGeneration);
-        assert!(!reaped[0].killed, "kill_orphans=false → holder not signalled");
+        assert!(
+            !reaped[0].killed,
+            "kill_orphans=false → holder not signalled"
+        );
         assert!(!SessionLock::lock_path(&dir).exists());
     }
 
@@ -1276,7 +1285,10 @@ mod tests {
             kill_orphans: true,
         };
         let reaped = reconcile_session_locks(root.path(), &policy);
-        assert!(reaped.is_empty(), "a handler started after the cutoff is current");
+        assert!(
+            reaped.is_empty(),
+            "a handler started after the cutoff is current"
+        );
         assert!(SessionLock::lock_path(&dir).exists());
     }
 

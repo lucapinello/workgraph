@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Smoke: photo → shopping-list vision pipeline (task photo-to-shopping).
 #
-# "Snap the fridge, the kitchen adjusts the pickup list." Pins the
-# credential-free, network-free core of the pipeline by driving the REAL binary
-# through `wg telegram photo-plan` (the scripted-test seam, sibling of `wg
-# telegram decide` / `elect`):
+# "Snap the fridge, the configured cooking voice adjusts the pickup list." Pins
+# the credential-free, network-free core of the pipeline by driving the REAL
+# binary through `wg telegram photo-plan` (the scripted-test seam, sibling of
+# `wg telegram decide` / `elect`):
 #
 #   0. ENGINE BINDING    — the binary exercised is the one the caller REQUESTED
 #                          ($WG_BIN, honoured strictly, absolute path), proven
@@ -34,18 +34,10 @@
 #                          what separates "routing reads the household" from
 #                          "routing recognised a shipped name".
 #
-# WHY THE CAST IS OPAQUE. This scenario used to configure the SHIPPED voices
-# (bruno / otto) and assert "an uncaptioned photo falls to the concierge (otto)".
-# `otto` is a compiled default the resolvers carry as a last-resort fallback, so
-# that assertion passed even when nothing about the household's declared
-# ownership was consulted — it proved a NAME, not the contract, and a household
-# that composed its own family was left ungated (its uncaptioned photos went to
-# `Silence(NoVoicesConfigured)` — nobody answered at all). The cast here (`wren`
-# the kitchen, `tally` the day) is on NO shipped list and carries no domain word
-# inside its ids, so `domains = [...]` in household.toml is the ONLY ownership
-# signal available. It matches the human-flow fixture cast
-# (tests/human-flows/fixtures/configured-household.mjs in the casa repo) so both
-# suites describe the same composed family.
+# WHY THE CAST IS OPAQUE. The ids and authored display labels below carry no
+# built-in role meaning. Only `domains = [...]` in household.toml says who owns
+# cooking and coordination, so the domain-swap differential cannot pass by
+# recognizing one of today's helper names.
 #
 # The fixture image (fridge_photo.png) is the payload a live vision turn would
 # download-and-attach; here we assert it is a real, valid image so the fixture
@@ -119,37 +111,51 @@ mkdir -p "$scratch/.wg"
 
 # ── The configured household ────────────────────────────────────────
 # Ids are opaque; the transport carries dummy tokens only.
-COOK="wren"            # declares cooking/recipes
-COORD="tally"          # declares coordination — the persona who fronts the group
-SHIPPED_COOK="bruno"   # the shipped ids this fixture must never lean on
-SHIPPED_COORD="otto"
+COOK="lattice-7"
+COOK_NAME="Copper Finch"
+COOK_HANDLE="lattice_7_house_bot"
+COORD="orbit-4"
+COORD_NAME="Indigo Kite"
+COORD_HANDLE="orbit_4_house_bot"
 
 cat >"$scratch/.wg/notify.toml" <<TOML
 [telegram.bots.$COOK]
-bot_token = "0000000000:$COOK-dummy-token"
+bot_token = "0000000000:$COOK-fixture-token"
 chat_id   = "-1000000000001"
-username  = "${COOK}_house_bot"
+username  = "$COOK_HANDLE"
+agent_id  = "$COOK"
 
 [telegram.bots.$COORD]
-bot_token = "0000000000:$COORD-dummy-token"
+bot_token = "0000000000:$COORD-fixture-token"
 chat_id   = "-1000000000001"
-username  = "${COORD}_house_bot"
+username  = "$COORD_HANDLE"
+agent_id  = "$COORD"
 TOML
 
 # Ownership is WRITTEN DOWN, exactly as a real household.toml writes it. The
 # graph dir is "$scratch/.wg", so the project root the engine reads is "$scratch".
 write_household() {
     local cooking_owner="$1" coordination_owner="$2"
+    local cook_domains coord_domains
+    if [ "$cooking_owner" = "$COOK" ] && [ "$coordination_owner" = "$COORD" ]; then
+        cook_domains='["meals", "cooking", "recipes"]'
+        coord_domains='["calendar", "coordination", "shopping"]'
+    elif [ "$cooking_owner" = "$COORD" ] && [ "$coordination_owner" = "$COOK" ]; then
+        cook_domains='["calendar", "coordination", "shopping"]'
+        coord_domains='["meals", "cooking", "recipes"]'
+    else
+        loud_fail "test household needs two distinct configured owners"
+    fi
     cat >"$scratch/household.toml" <<TOML
 [[agent]]
-id = "$cooking_owner"
-role = "the kitchen"
-domains = ["meals", "cooking", "recipes"]
+id = "$COOK"
+name = "$COOK_NAME"
+domains = $cook_domains
 
 [[agent]]
-id = "$coordination_owner"
-role = "the day"
-domains = ["calendar", "coordination", "shopping"]
+id = "$COORD"
+name = "$COORD_NAME"
+domains = $coord_domains
 TOML
 }
 write_household "$COOK" "$COORD"
@@ -157,12 +163,12 @@ write_household "$COOK" "$COORD"
 # A captioned fridge photo addressing the CONFIGURED cooking label (largest size
 # last, smaller first — like the wire).
 cat >"$scratch/update.json" <<JSON
-{"update_id":1,"message":{"message_id":58,"date":1720000000,"chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"housemate"},"caption":"$COOK what do we still need?","photo":[{"file_id":"thumb","width":90,"height":60,"file_size":900},{"file_id":"biggest","width":1280,"height":720,"file_size":90000}]}}
+{"update_id":1,"message":{"message_id":58,"date":1720000000,"chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"housemate"},"caption":"$COOK_NAME, what do we still need?","photo":[{"file_id":"thumb","width":90,"height":60,"file_size":900},{"file_id":"biggest","width":1280,"height":720,"file_size":90000}]}}
 JSON
 
 # An album: three frames sharing one media_group_id; caption only on the first.
 cat >"$scratch/album.json" <<JSON
-[{"update_id":1,"message":{"message_id":58,"date":1720000000,"media_group_id":"AG9","chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"housemate"},"caption":"$COOK what do we still need?","photo":[{"file_id":"f1","width":1280,"height":720,"file_size":90000}]}},
+[{"update_id":1,"message":{"message_id":58,"date":1720000000,"media_group_id":"AG9","chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"housemate"},"caption":"$COOK_NAME, what do we still need?","photo":[{"file_id":"f1","width":1280,"height":720,"file_size":90000}]}},
 {"update_id":2,"message":{"message_id":59,"date":1720000001,"media_group_id":"AG9","chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"housemate"},"photo":[{"file_id":"f2","width":1280,"height":720,"file_size":90000}]}},
 {"update_id":3,"message":{"message_id":60,"date":1720000002,"media_group_id":"AG9","chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"housemate"},"photo":[{"file_id":"f3","width":1280,"height":720,"file_size":90000}]}}]
 JSON
@@ -180,7 +186,7 @@ JSON
 
 # A plain text update — not a photo at all.
 cat >"$scratch/text.json" <<JSON
-{"update_id":1,"message":{"message_id":62,"date":1720000000,"chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"housemate"},"text":"hey $COOK"}}
+{"update_id":1,"message":{"message_id":62,"date":1720000000,"chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"housemate"},"text":"hello $COOK_NAME"}}
 JSON
 
 # The current shopping list, as GET /shopping.json would return it.
@@ -240,7 +246,7 @@ echo "2. album coalescing — 3 frames → ONE turn, all frames gathered:"
 out="$(plan @album.json)"
 expect_grep "one turn" "$out" "1 turn(s), 3 image(s)"
 expect_grep "album group" "$out" "album group AG9"
-expect_grep "album caption carried" "$out" "$COOK what do we still need?"
+expect_grep "album caption carried" "$out" "$COOK_NAME, what do we still need?"
 
 echo "3. vision → mutation — SHOPPING_UPDATE tail maps to endpoint calls:"
 reply="You still need lemons and chard; you already have chickpeas — crossing them off.
@@ -260,7 +266,7 @@ JSON
 out="$(plan @update.json --reply $'ok\nSHOPPING_UPDATE: have=[]; need=[milk]' --list @list_crossed.json)"
 expect_grep "restore crossed item" "$out" "restore 'Milk'"
 
-echo "4. routing rules — resolved by CONFIGURED ROLE, never by a shipped id:"
+echo "4. routing rules — resolved by configured role:"
 expect_grep "text is not a photo" "$(plan @text.json)" "not a photo"
 
 # An uncaptioned photo names nobody, so it goes to the persona household.toml
@@ -269,7 +275,6 @@ uncap_out="$(plan @uncaptioned.json)"
 expect_grep "uncaptioned → configured coordination role ($COORD)" "$uncap_out" "routes to: $COORD"
 refute_grep "an uncaptioned photo must not be name-routed to the cook" \
     "$uncap_out" "routes to: $COOK"
-refute_grep "no shipped concierge id may appear" "$uncap_out" "$SHIPPED_COORD"
 refute_grep "an uncaptioned photo must never go silent when a coordinator is configured" \
     "$uncap_out" "silence"
 
@@ -277,12 +282,12 @@ refute_grep "an uncaptioned photo must never go silent when a coordinator is con
 # configured cook answers it — not the coordinator.
 food_out="$(plan @food_caption.json)"
 expect_grep "food-shaped caption → configured cooking role ($COOK)" "$food_out" "routes to: $COOK"
-refute_grep "no shipped cook id may appear" "$food_out" "$SHIPPED_COOK"
 
 echo "5. config, not name — swapping the roster swaps who answers:"
-# Same two bots, same fixtures: only household.toml changes. If routing were
-# recognising an id (or leaning on a compiled default) this would not move.
-write_household "$COORD" "$COOK"   # cooking → tally, coordination → wren
+# Same two bots in the same order, with the same neutral labels and fixtures:
+# only their domain arrays change. If routing were positional, recognising an
+# id, or leaning on a compiled default, this would not move.
+write_household "$COORD" "$COOK"
 swapped_out="$(plan @uncaptioned.json)"
 expect_grep "uncaptioned follows the reassigned coordination owner ($COOK)" \
     "$swapped_out" "routes to: $COOK"
@@ -290,10 +295,10 @@ refute_grep "the previous coordinator must not still answer" "$swapped_out" "rou
 swapped_food="$(plan @food_caption.json)"
 expect_grep "food-shaped caption follows the reassigned cook ($COORD)" \
     "$swapped_food" "routes to: $COORD"
-write_household "$COOK" "$COORD"   # restore the declared roster
+write_household "$COOK" "$COORD"
 
 echo "6. no token ever leaks into the diagnostic output:"
 refute_grep "bot token leaked into photo-plan output" \
-    "$(plan @update.json --reply "$reply" --list @list.json)" "dummy-token"
+    "$(plan @update.json --reply "$reply" --list @list.json)" "fixture-token"
 
 echo "PASS: photo→shopping (configured-role routing / album-coalesce / vision→toggle+add / restore / limits)"

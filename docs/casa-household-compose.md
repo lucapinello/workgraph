@@ -7,10 +7,9 @@ persona identity**; see `docs/18-compose-your-family.md` in poietic-family-team
 for the full spec, the shipped four-persona example, and the `casa household
 apply` command.
 
-This note is the **wg-side contract**: it documents where the workgraph Telegram
-code currently hardcodes persona identity, and how each of those points relates
-to `household.toml` so the two stay in sync (and so a future change can make them
-read the derived artifact directly).
+This note is the **wg-side contract**: it documents how the workgraph Telegram
+code joins persona identity to bot delivery without putting secrets in
+`household.toml`.
 
 ## The join key is the agent `id`
 
@@ -56,15 +55,17 @@ Each should read from `household.toml` (directly, or via the derived snapshot
    the derived `owners` map here would let a family reassign a command by editing
    `domains`, no code change.
 
-3. **/standup voices** — `src/notify/telegram_standup.rs`. `DEFAULT_ROSTER`
-   hardcodes the ordered persona ids (`["nora", "bruno", "mira", "otto"]`) and a
-   `id → (display name, emoji)` match arm. Both are exactly the ordered
-   `household.toml` `[[agent]]` list with its `name` + `emoji` fields; the roster
-   order is the file order. Seeding `DEFAULT_ROSTER` and the name/emoji lookup
-   from the derived snapshot would keep standup in step with a renamed or added
-   persona.
+3. **Standup, collective, and discussion voices** —
+   `src/notify/telegram_standup.rs` loads the ordered `household.toml`
+   `[[agent]]` list directly and joins each `id` to
+   `[telegram.bots.<id>]`. The file order is speaking order; `name` and `emoji`
+   are the presentation. A configured bot outside the household roster is not
+   promoted to a voice. A missing, malformed, duplicate, or incomplete
+   multi-voice roster fails closed instead of falling back to bot-map order or
+   compiled names. The legacy top-level single bot is accepted only for a
+   one-person household, where its identity is unambiguous.
 
-## Migration shape (for a future wg-side task)
+## Generated snapshot
 
 `casa household apply` already writes `.casa/household.generated.json`:
 
@@ -77,8 +78,8 @@ Each should read from `household.toml` (directly, or via the derived snapshot
 }
 ```
 
-A wg-side change would read this snapshot (path relative to the project root,
-next to `.wg/`) at startup and use it to seed the three consumers above, keeping
-the hardcoded tables as the fallback for a checkout with no snapshot. Because the
-snapshot is keyed by the same `id` used in `notify.toml`, no token ever needs to
-be read from the composition file, and renaming stays display-only.
+Telegram roster consumers intentionally read the authored `household.toml`
+instead of requiring this generated snapshot, so a fresh checkout cannot drift
+between the authored roster and an old `.casa` runtime artifact. The join remains
+the same `id` used in `notify.toml`; no token is read from the composition file,
+and renaming stays display-only.

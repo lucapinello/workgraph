@@ -4,7 +4,7 @@
 //! to the filesystem and the plan parser so the listener / gateway (and tests)
 //! can drive the loop end to end:
 //!
-//! * `wg feedback ask`     — compose Bruno's rate-limited "how was dinner?" line
+//! * `wg feedback ask`     — compose the rate-limited "how was dinner?" line
 //!   for tonight's dish (from the plan), and record that the ask went out.
 //! * `wg feedback record`  — route a family reply/reaction into a structured
 //!   rating and append it to `plans/feedback.jsonl` (the durable memory).

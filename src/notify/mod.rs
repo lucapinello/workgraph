@@ -17,11 +17,11 @@ pub mod fast_lane;
 pub mod grounding;
 pub mod lifecycle;
 pub mod listener_health;
+#[cfg(feature = "matrix-lite")]
+pub mod matrix;
 pub mod meal_feedback;
 pub mod ownership;
 pub mod parity;
-#[cfg(feature = "matrix-lite")]
-pub mod matrix;
 pub mod push;
 pub mod reminder;
 pub mod slack;
@@ -32,6 +32,7 @@ pub mod telegram_dedupe;
 pub mod telegram_discussion;
 pub mod telegram_family_commands;
 pub mod telegram_group;
+pub mod telegram_occurrence;
 pub mod telegram_pacing;
 pub mod telegram_photo;
 pub mod telegram_sender;

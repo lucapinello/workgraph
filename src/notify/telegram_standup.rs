@@ -1,15 +1,15 @@
-//! `/standup` orchestration for the Casa Pinello family group (Telegram).
+//! `/standup` orchestration for a configured household group (Telegram).
 //!
 //! Typing `/standup` once in the family group must produce **exactly one post
-//! per named voice, in a fixed roster order** (`nora, bruno, mira, otto`), each
-//! in family voice (docs/04), 1–3 sentences, grounded in that persona's *live*
+//! per named voice, in the ordered roster authored in `household.toml`, each in
+//! family voice (docs/04), 1–3 sentences, grounded in that persona's *live*
 //! graph state (its open / in-progress tasks). See docs/09 §3.
 //!
 //! ## Why the listener orchestrates (design decision)
 //!
 //! Telegram delivers a `/command` to **every** bot in a group even under
 //! privacy mode, so a naive "each bot answers when it sees `/standup`" design
-//! is possible — but it guarantees neither **order** (four bots replying
+//! is possible — but it guarantees neither **order** (multiple bots replying
 //! concurrently race) nor **no-duplicates** (nothing stops two from posting).
 //! Instead the single `wg telegram listen` process — which already owns the
 //! long-poll for the whole multi-bot config — acts as the sole orchestrator:
@@ -23,17 +23,74 @@
 //! make — no network, no tokens in the output text — and a thin async driver
 //! ([`run_standup`], in `commands::telegram`) that actually sends them. The
 //! pure core is what the scripted test asserts against ("`/standup` → exactly
-//! four posts in roster order"). Bot tokens live only on the [`StandupMember`]
-//! for the send path and are NEVER placed in a [`StandupPost`], a log, or the
-//! graph.
+//! one post per configured roster member, in authored order"). Bot tokens live
+//! only on the [`StandupMember`] for the send path and are NEVER placed in a
+//! [`StandupPost`], a log, or the graph.
+
+use std::collections::HashSet;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 
 use super::telegram::{TelegramBotConfig, TelegramConfig};
 use crate::graph::{Status, WorkGraph};
 
-/// Canonical family roster order. `/standup` posts in exactly this order; any
-/// configured bot not named here is appended after these, in sorted order, so
-/// no configured voice is silently dropped.
-pub const DEFAULT_ROSTER: &[&str] = &["nora", "bruno", "mira", "otto"];
+/// One public persona record from the ordered project-local `[[agent]]` list.
+///
+/// Tokens never belong here. `id` joins this committable presentation record to
+/// the secret-bearing `[telegram.bots.<id>]` table in notify configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HouseholdPersona {
+    pub id: String,
+    pub display_name: String,
+    pub emoji: String,
+}
+
+/// Load the ordered household roster from `<project_root>/household.toml`.
+///
+/// The whole file fails closed for roster purposes when it is missing,
+/// malformed, has no agents, has a duplicate id, or any agent lacks the three
+/// identity fields used by Telegram. Callers must not recover by iterating the
+/// configured-bot `HashMap`: that would make speaking order process-dependent.
+pub fn load_household_personas(project_root: &Path) -> Result<Vec<HouseholdPersona>> {
+    let path = project_root.join("household.toml");
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read household roster {}", path.display()))?;
+    let value: toml::Value = body
+        .parse()
+        .with_context(|| format!("invalid household roster {}", path.display()))?;
+    let agents = value
+        .get("agent")
+        .and_then(toml::Value::as_array)
+        .context("household.toml must contain at least one [[agent]]")?;
+    if agents.is_empty() {
+        bail!("household.toml must contain at least one [[agent]]");
+    }
+
+    let mut seen = HashSet::new();
+    let mut personas = Vec::with_capacity(agents.len());
+    for (index, agent) in agents.iter().enumerate() {
+        let field = |name: &str| -> Result<String> {
+            let value = agent
+                .get(name)
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("household.toml [[agent]] #{index} needs `{name}`"))?;
+            Ok(value.to_string())
+        };
+        let id = field("id")?;
+        if !seen.insert(id.to_lowercase()) {
+            bail!("household.toml has duplicate agent id `{id}`");
+        }
+        personas.push(HouseholdPersona {
+            id,
+            display_name: field("name")?,
+            emoji: field("emoji")?,
+        });
+    }
+    Ok(personas)
+}
 
 /// True when `text` is the `/standup` command. Accepts the bare command, the
 /// Telegram group-suffixed form (`/standup@otto_casapinello_bot`), a leading
@@ -60,6 +117,8 @@ pub fn is_standup_command(text: &str) -> bool {
 /// the send path only) — never serialize or log this whole struct.
 #[derive(Debug, Clone)]
 pub struct StandupMember {
+    /// Stable persona id from the matching `household.toml` entry.
+    pub persona_id: String,
     /// The `[telegram.bots.<id>]` key — the persona id, e.g. `"nora"`.
     pub bot_id: String,
     /// Per-bot config (token + chat id + optional agent binding).
@@ -73,15 +132,19 @@ pub struct StandupMember {
 impl StandupMember {
     /// The graph agent id whose tasks ground this persona's report. Uses the
     /// bot's explicit `agent_id` binding when set, otherwise falls back to the
-    /// persona id itself (so a task `assigned` to `"nora"` grounds Nora's
-    /// report even without an explicit binding).
+    /// project-local household persona id.
     pub fn agent_id(&self) -> &str {
-        self.bot.agent_id.as_deref().unwrap_or(&self.bot_id)
+        self.bot.agent_id.as_deref().unwrap_or(&self.persona_id)
     }
 
-    /// The routing discriminator for this bot (`"telegram:<bot_id>"`).
+    /// The routing discriminator (`telegram:<bot_id>`, or bare `telegram` for
+    /// the legacy single bot).
     pub fn channel_type(&self) -> String {
-        format!("telegram:{}", self.bot_id)
+        if self.bot_id == "default" {
+            "telegram".to_string()
+        } else {
+            format!("telegram:{}", self.bot_id)
+        }
     }
 }
 
@@ -98,75 +161,78 @@ pub struct StandupPost {
     pub text: String,
 }
 
-/// Presentation (display name + emoji) for a known persona. Falls back to a
-/// title-cased id and a neutral emoji for any unknown bot so a mis-named or
-/// newly-added bot still reports rather than panicking.
-fn persona_presentation(bot_id: &str) -> (String, String) {
-    match bot_id.to_ascii_lowercase().as_str() {
-        "nora" => ("Nora".to_string(), "🥗".to_string()),
-        "bruno" => ("Bruno".to_string(), "👨\u{200d}🍳".to_string()),
-        "mira" => ("Coach Mira".to_string(), "💪".to_string()),
-        "otto" => ("Otto".to_string(), "📋".to_string()),
-        _ => (title_case(bot_id), "💬".to_string()),
-    }
-}
-
-/// Title-case an id (`"jane"` → `"Jane"`), ASCII-only; leaves non-ASCII intact.
-fn title_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-/// Build the ordered roster from the configured bots.
+/// Join an already-parsed ordered household roster to configured Telegram bots.
 ///
-/// The order is [`DEFAULT_ROSTER`] first (only the entries that are actually
-/// configured), then any remaining configured bots in sorted order so nothing
-/// is dropped. De-duplicated: each bot appears at most once. The legacy
-/// `"default"` single-bot is excluded — the standup is a *named-voice* feature.
-pub fn plan_roster(config: &TelegramConfig, order: &[&str]) -> Vec<StandupMember> {
-    let bots = config.all_bots();
-    let mut out: Vec<StandupMember> = Vec::new();
-    let mut used: Vec<String> = Vec::new();
-
-    let mut push = |bot_id: &str, bot: &TelegramBotConfig, out: &mut Vec<StandupMember>| {
-        let (display_name, emoji) = persona_presentation(bot_id);
-        out.push(StandupMember {
-            bot_id: bot_id.to_string(),
-            bot: bot.clone(),
-            display_name,
-            emoji,
-        });
-    };
-
-    // Canonical roster order first.
-    for want in order {
-        if used.iter().any(|u| u.eq_ignore_ascii_case(want)) {
-            continue;
+/// Only the intersection is eligible: an extra configured bot is not silently
+/// promoted to a household voice, and an agent without a bot is skipped. The
+/// household file supplies order, display name, and emoji; bot-map iteration
+/// order supplies none of them.
+///
+/// A legacy top-level bot is supported only when the household roster has
+/// exactly one persona. With multiple personas it is ambiguous which identity
+/// that one bot represents, so the join fails closed.
+pub fn plan_roster(
+    config: &TelegramConfig,
+    personas: &[HouseholdPersona],
+) -> Result<Vec<StandupMember>> {
+    if config.bots.is_empty() {
+        if config.bot_token.is_empty() || config.chat_id.is_empty() {
+            return Ok(Vec::new());
         }
-        if let Some((id, bot)) = bots
+        let [persona] = personas else {
+            bail!(
+                "one legacy Telegram bot cannot represent {} household personas",
+                personas.len()
+            );
+        };
+        return Ok(vec![StandupMember {
+            persona_id: persona.id.clone(),
+            bot_id: "default".to_string(),
+            bot: TelegramBotConfig {
+                bot_token: config.bot_token.clone(),
+                chat_id: config.chat_id.clone(),
+                agent_id: Some(persona.id.clone()),
+                username: None,
+            },
+            display_name: persona.display_name.clone(),
+            emoji: persona.emoji.clone(),
+        }]);
+    }
+
+    let mut normalized_bot_ids = HashSet::new();
+    for bot_id in config.bots.keys() {
+        if !normalized_bot_ids.insert(bot_id.to_lowercase()) {
+            bail!("Telegram bot ids differ only by case: `{bot_id}`");
+        }
+    }
+
+    let mut out = Vec::new();
+    for persona in personas {
+        let Some((bot_id, bot)) = config
+            .bots
             .iter()
-            .find(|(id, _)| id.eq_ignore_ascii_case(want) && id != "default")
-        {
-            push(id, bot, &mut out);
-            used.push(id.clone());
-        }
+            .find(|(bot_id, _)| bot_id.eq_ignore_ascii_case(&persona.id))
+        else {
+            continue;
+        };
+        out.push(StandupMember {
+            persona_id: persona.id.clone(),
+            bot_id: bot_id.clone(),
+            bot: bot.clone(),
+            display_name: persona.display_name.clone(),
+            emoji: persona.emoji.clone(),
+        });
     }
+    Ok(out)
+}
 
-    // Any remaining named bots, sorted, so no configured voice is dropped.
-    let mut remaining: Vec<&(String, TelegramBotConfig)> = bots
-        .iter()
-        .filter(|(id, _)| id != "default" && !used.iter().any(|u| u.eq_ignore_ascii_case(id)))
-        .collect();
-    remaining.sort_by(|a, b| a.0.cmp(&b.0));
-    for (id, bot) in remaining {
-        push(id, bot, &mut out);
-        used.push(id.clone());
-    }
-
-    out
+/// Load and join the project-local household roster in one fail-closed step.
+pub fn load_project_roster(
+    project_root: &Path,
+    config: &TelegramConfig,
+) -> Result<Vec<StandupMember>> {
+    let personas = load_household_personas(project_root)?;
+    plan_roster(config, &personas)
 }
 
 /// Render one persona's family-voice report from its live task lists.
@@ -312,16 +378,12 @@ pub fn agent_task_lines(graph: &WorkGraph, agent_id: &str) -> (Vec<String>, Vec<
 /// Plan the full standup: the ordered list of posts to make, one per roster
 /// member, each grounded in that member's live graph state. This is the pure
 /// function the scripted test asserts against.
-pub fn plan_standup(
-    graph: &WorkGraph,
-    config: &TelegramConfig,
-    order: &[&str],
-) -> Vec<StandupPost> {
-    plan_roster(config, order)
-        .into_iter()
+pub fn plan_standup(graph: &WorkGraph, roster: &[StandupMember]) -> Vec<StandupPost> {
+    roster
+        .iter()
         .map(|member| {
             let (in_progress, open) = agent_task_lines(graph, member.agent_id());
-            render_report(&member, &in_progress, &open)
+            render_report(member, &in_progress, &open)
         })
         .collect()
 }
@@ -360,16 +422,12 @@ pub fn render_conversational(
 /// hello per named voice, in roster order, each grounded in that voice's live
 /// graph state. The collective-address analogue of [`plan_standup`]; the pure
 /// function the collective-address test asserts against.
-pub fn plan_group_reply(
-    graph: &WorkGraph,
-    config: &TelegramConfig,
-    order: &[&str],
-) -> Vec<StandupPost> {
-    plan_roster(config, order)
-        .into_iter()
+pub fn plan_group_reply(graph: &WorkGraph, roster: &[StandupMember]) -> Vec<StandupPost> {
+    roster
+        .iter()
         .map(|member| {
             let (in_progress, open) = agent_task_lines(graph, member.agent_id());
-            render_conversational(&member, &in_progress, &open)
+            render_conversational(member, &in_progress, &open)
         })
         .collect()
 }
@@ -397,14 +455,33 @@ mod tests {
         }
     }
 
-    fn casa_config() -> TelegramConfig {
+    fn fixture_personas() -> Vec<HouseholdPersona> {
+        vec![
+            HouseholdPersona {
+                id: "voice-zeta".to_string(),
+                display_name: "North Star".to_string(),
+                emoji: "🌙".to_string(),
+            },
+            HouseholdPersona {
+                id: "voice-alpha".to_string(),
+                display_name: "Green Lantern".to_string(),
+                emoji: "🌿".to_string(),
+            },
+            HouseholdPersona {
+                id: "voice-kappa".to_string(),
+                display_name: "Quiet Harbor".to_string(),
+                emoji: "🧭".to_string(),
+            },
+        ]
+    }
+
+    fn fixture_config() -> TelegramConfig {
         let mut bots = HashMap::new();
         // Insert deliberately OUT of roster order to prove ordering is imposed
         // by plan_roster, not by HashMap iteration.
-        bots.insert("otto".to_string(), bot("-100", None));
-        bots.insert("nora".to_string(), bot("-100", None));
-        bots.insert("mira".to_string(), bot("-100", None));
-        bots.insert("bruno".to_string(), bot("-100", None));
+        bots.insert("voice-kappa".to_string(), bot("-100", None));
+        bots.insert("voice-alpha".to_string(), bot("-100", None));
+        bots.insert("voice-zeta".to_string(), bot("-100", None));
         TelegramConfig {
             bot_token: String::new(),
             chat_id: String::new(),
@@ -412,32 +489,41 @@ mod tests {
         }
     }
 
+    fn fixture_roster() -> Vec<StandupMember> {
+        plan_roster(&fixture_config(), &fixture_personas()).unwrap()
+    }
+
     #[test]
-    fn roster_is_in_canonical_order_regardless_of_config_order() {
-        let cfg = casa_config();
-        let roster = plan_roster(&cfg, DEFAULT_ROSTER);
+    fn roster_uses_household_order_regardless_of_bot_map_order() {
+        let roster = fixture_roster();
         let ids: Vec<&str> = roster.iter().map(|m| m.bot_id.as_str()).collect();
-        assert_eq!(ids, vec!["nora", "bruno", "mira", "otto"]);
+        assert_eq!(ids, vec!["voice-zeta", "voice-alpha", "voice-kappa"]);
+        assert_eq!(roster[0].display_name, "North Star");
+        assert_eq!(roster[1].emoji, "🌿");
     }
 
     // Fix #3 regression: each roster member must carry its OWN bot token and
-    // channel_type. A cross-wired roster (mira's slot pointing at bruno's config)
-    // is exactly how a voice would send via — and log — another voice's identity
-    // ("mira logs bruno's id"). This locks the 1:1 pairing at the planning layer,
-    // where every send/log loop reads member.bot / member.bot_id.
+    // channel_type. This locks the 1:1 pairing at the planning layer, where
+    // every send/log loop reads member.bot / member.bot_id.
     #[test]
     fn each_roster_member_carries_its_own_token_and_channel() {
         let mut bots = HashMap::new();
-        bots.insert("nora".to_string(), bot_tok("-100", Some("nora"), "TOK-NORA"));
-        bots.insert("bruno".to_string(), bot_tok("-100", Some("bruno"), "TOK-BRUNO"));
-        bots.insert("mira".to_string(), bot_tok("-100", Some("mira"), "TOK-MIRA"));
-        bots.insert("otto".to_string(), bot_tok("-100", Some("otto"), "TOK-OTTO"));
+        for persona in fixture_personas() {
+            bots.insert(
+                persona.id.clone(),
+                bot_tok(
+                    "-100",
+                    Some(&persona.id),
+                    &format!("TOK-{}", persona.id.to_ascii_uppercase()),
+                ),
+            );
+        }
         let cfg = TelegramConfig {
             bot_token: String::new(),
             chat_id: String::new(),
             bots,
         };
-        let roster = plan_roster(&cfg, DEFAULT_ROSTER);
+        let roster = plan_roster(&cfg, &fixture_personas()).unwrap();
         for member in &roster {
             let want = format!("TOK-{}", member.bot_id.to_ascii_uppercase());
             assert_eq!(
@@ -450,31 +536,29 @@ mod tests {
     }
 
     #[test]
-    fn standup_produces_exactly_four_posts_in_roster_order() {
-        let cfg = casa_config();
+    fn standup_produces_one_post_per_joined_household_persona() {
+        let roster = fixture_roster();
         let graph = WorkGraph::new();
-        let posts = plan_standup(&graph, &cfg, DEFAULT_ROSTER);
-        assert_eq!(posts.len(), 4, "one post per configured named bot");
+        let posts = plan_standup(&graph, &roster);
+        assert_eq!(posts.len(), 3, "one post per configured roster persona");
         let ids: Vec<&str> = posts.iter().map(|p| p.bot_id.as_str()).collect();
-        assert_eq!(ids, vec!["nora", "bruno", "mira", "otto"]);
+        assert_eq!(ids, vec!["voice-zeta", "voice-alpha", "voice-kappa"]);
         // Each post is a distinct bot — no duplicates.
         let channels: Vec<&str> = posts.iter().map(|p| p.channel_type.as_str()).collect();
         assert_eq!(
             channels,
             vec![
-                "telegram:nora",
-                "telegram:bruno",
-                "telegram:mira",
-                "telegram:otto"
+                "telegram:voice-zeta",
+                "telegram:voice-alpha",
+                "telegram:voice-kappa"
             ]
         );
     }
 
     #[test]
     fn every_post_has_a_nonempty_family_voice_body() {
-        let cfg = casa_config();
         let graph = WorkGraph::new();
-        let posts = plan_standup(&graph, &cfg, DEFAULT_ROSTER);
+        let posts = plan_standup(&graph, &fixture_roster());
         for p in &posts {
             // Header line + body.
             let (header, body) = p.text.split_once('\n').expect("header + body");
@@ -491,37 +575,119 @@ mod tests {
     }
 
     #[test]
-    fn display_names_and_emoji_match_personas() {
-        let cfg = casa_config();
-        let posts = plan_standup(&WorkGraph::new(), &cfg, DEFAULT_ROSTER);
-        assert!(posts[0].text.starts_with("Nora 🥗"));
-        assert!(posts[1].text.starts_with("Bruno "));
-        assert!(posts[2].text.starts_with("Coach Mira 💪"));
-        assert!(posts[3].text.starts_with("Otto 📋"));
+    fn display_names_and_emoji_come_from_household_roster() {
+        let posts = plan_standup(&WorkGraph::new(), &fixture_roster());
+        assert!(posts[0].text.starts_with("North Star 🌙"));
+        assert!(posts[1].text.starts_with("Green Lantern 🌿"));
+        assert!(posts[2].text.starts_with("Quiet Harbor 🧭"));
     }
 
     #[test]
-    fn extra_named_bot_is_appended_not_dropped() {
-        let mut cfg = casa_config();
-        cfg.bots.insert("zoe".to_string(), bot("-100", None));
-        let roster = plan_roster(&cfg, DEFAULT_ROSTER);
+    fn configured_bot_outside_household_is_not_promoted_to_voice() {
+        let mut cfg = fixture_config();
+        cfg.bots
+            .insert("unlisted-service".to_string(), bot("-100", None));
+        let roster = plan_roster(&cfg, &fixture_personas()).unwrap();
         let ids: Vec<&str> = roster.iter().map(|m| m.bot_id.as_str()).collect();
-        assert_eq!(ids, vec!["nora", "bruno", "mira", "otto", "zoe"]);
+        assert_eq!(ids, vec!["voice-zeta", "voice-alpha", "voice-kappa"]);
     }
 
     #[test]
-    fn legacy_default_bot_is_excluded_from_standup() {
-        let mut cfg = casa_config();
-        cfg.bot_token = "LEGACY".to_string();
-        cfg.chat_id = "123".to_string();
-        let roster = plan_roster(&cfg, DEFAULT_ROSTER);
-        assert!(roster.iter().all(|m| m.bot_id != "default"));
-        assert_eq!(roster.len(), 4);
+    fn single_legacy_bot_is_unambiguous_only_for_one_persona() {
+        let cfg = TelegramConfig {
+            bot_token: "LEGACY".to_string(),
+            chat_id: "-100".to_string(),
+            bots: HashMap::new(),
+        };
+        let one = vec![fixture_personas().remove(0)];
+        let roster = plan_roster(&cfg, &one).unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].bot_id, "default");
+        assert_eq!(roster[0].persona_id, "voice-zeta");
+        assert_eq!(roster[0].channel_type(), "telegram");
+        assert!(plan_roster(&cfg, &fixture_personas()).is_err());
+    }
+
+    #[test]
+    fn household_loader_preserves_opaque_ids_names_emoji_and_order() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "agent-7f3"
+name = "Morning Compass"
+emoji = "🧭"
+
+[[agent]]
+id = "agent-a91"
+name = "Garden Lamp"
+emoji = "🏮"
+"#,
+        )
+        .unwrap();
+        let personas = load_household_personas(root.path()).unwrap();
+        assert_eq!(
+            personas,
+            vec![
+                HouseholdPersona {
+                    id: "agent-7f3".to_string(),
+                    display_name: "Morning Compass".to_string(),
+                    emoji: "🧭".to_string(),
+                },
+                HouseholdPersona {
+                    id: "agent-a91".to_string(),
+                    display_name: "Garden Lamp".to_string(),
+                    emoji: "🏮".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_malformed_or_duplicate_household_roster_fails_closed() {
+        let missing = tempfile::tempdir().unwrap();
+        assert!(load_household_personas(missing.path()).is_err());
+
+        let malformed = tempfile::tempdir().unwrap();
+        std::fs::write(malformed.path().join("household.toml"), "not = [valid").unwrap();
+        assert!(load_household_personas(malformed.path()).is_err());
+
+        let incomplete = tempfile::tempdir().unwrap();
+        std::fs::write(
+            incomplete.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "agent-x"
+name = "Missing Emoji"
+"#,
+        )
+        .unwrap();
+        assert!(load_household_personas(incomplete.path()).is_err());
+
+        let duplicate = tempfile::tempdir().unwrap();
+        std::fs::write(
+            duplicate.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "agent-x"
+name = "First"
+emoji = "1"
+
+[[agent]]
+id = "AGENT-X"
+name = "Second"
+emoji = "2"
+"#,
+        )
+        .unwrap();
+        assert!(load_household_personas(duplicate.path()).is_err());
     }
 
     #[test]
     fn report_reflects_in_progress_and_open_tasks() {
         let member = StandupMember {
+            persona_id: "voice-zeta".to_string(),
             bot_id: "nora".to_string(),
             bot: bot("-100", None),
             display_name: "Nora".to_string(),
@@ -539,6 +705,7 @@ mod tests {
     #[test]
     fn empty_plate_reports_all_caught_up() {
         let member = StandupMember {
+            persona_id: "voice-kappa".to_string(),
             bot_id: "otto".to_string(),
             bot: bot("-100", None),
             display_name: "Otto".to_string(),
@@ -578,6 +745,7 @@ mod tests {
     #[test]
     fn agent_binding_overrides_persona_id_for_grounding() {
         let member = StandupMember {
+            persona_id: "voice-zeta".to_string(),
             bot_id: "nora".to_string(),
             bot: bot("-100", Some("agent-42")),
             display_name: "Nora".to_string(),

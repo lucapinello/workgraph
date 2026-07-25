@@ -2773,9 +2773,7 @@ fn run_inner(
     // idempotent and a benign no-op when the disposable has no bound spawner.
     // See docs/14-disposable-lifecycle.md §ingest. Skipped when the task only
     // transitioned to PendingEval — it is not yet Done.
-    if !transitioned_to_pending_eval
-        && let Some(ref task) = disposable_ingest_snapshot
-    {
+    if !transitioned_to_pending_eval && let Some(ref task) = disposable_ingest_snapshot {
         match worksgood::disposable_ingest::ingest_disposable_into_spawner(dir, task) {
             Ok(Some(report)) => {
                 let note = if report.already_present {

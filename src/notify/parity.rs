@@ -487,8 +487,16 @@ impl PreferenceStore {
                 let v: serde_json::Value = serde_json::from_str(line).ok()?;
                 Some(PreferenceRecord {
                     ts: v.get("ts")?.as_str()?.to_string(),
-                    requester: v.get("requester").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    persona: v.get("persona").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    requester: v
+                        .get("requester")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    persona: v
+                        .get("persona")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     text: v.get("text")?.as_str()?.to_string(),
                 })
             })

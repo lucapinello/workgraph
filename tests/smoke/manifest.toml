@@ -17,6 +17,16 @@
 # introduced the regression and the task that fixed it.
 
 [[scenario]]
+name = "session_list_json_no_warning"
+script = "scenarios/session_list_json_no_warning.sh"
+owners = [
+    "p2-session-list-json-warning",
+    "smoke-gate-is",
+]
+description = "Real-binary terminal regression: `wg session list --json` must emit a parseable JSON array for a scratch session and must not print the contradictory unsupported/ignored warning on stderr."
+timeout_seconds = 30
+
+[[scenario]]
 name = "protected_cron_survives_cleanup_sweep"
 script = "scenarios/protected_cron_survives_cleanup_sweep.sh"
 owners = [
@@ -2122,12 +2132,30 @@ description = "Pins the disposable ingest step from docs/14-disposable-lifecycle
 timeout_seconds = 60
 
 [[scenario]]
+name = "telegram_household_conversation_matrix"
+script = "scenarios/telegram_household_conversation_matrix.sh"
+owners = [
+    "full-pass-conversation-matrix",
+]
+description = "Runs three hermetic rounds of typical household conversation through the real engine CLI using only opaque persona ids and authored display names: group routing (name, handle, reply chain, meal/recipe/workout domains, coordinator fallback, chatter silence, solo greeting, private passthrough); grounded family reads from the live numbered `## 1. Dinners (...)` plan shape; and unknown-member/private/group session delivery. It asserts config-derived owners, exact destination bot/chat, generic onboarding copy, grounded plan facts, and no fixture-token leak. Credential-free: all plans, bindings, replies, and bot tokens are scratch fixtures; sends are recording-only."
+timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_plan_source_stable_identity"
+script = "scenarios/telegram_plan_source_stable_identity.sh"
+owners = [
+    "p1-engine-plan-source-stable-identity",
+]
+description = "Runs the real review binary against a scratch numbered `## 1. Dinners (...)` and Calendar plan. A multiword authored Source resolves to one opaque stable household id for both a reminder and an errand, wins over the recipient's unrelated bot binding, remains unchanged in the plan, and routes identically after the roster order is reversed. Shopping is served by a loopback fixture; Telegram delivery is dry-run only."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_standup_roster_order"
 script = "scenarios/telegram_standup_roster_order.sh"
 owners = [
     "group-standup",
 ]
-description = "Pins the /standup contract from docs/09 §3: `wg telegram standup --dry-run` (the on-demand equivalent of the group listener's /standup intercept) emits EXACTLY four posts — nora, bruno, mira, otto — in that fixed roster order regardless of config/HashMap insertion order, with no duplicate and no token leak. Each post carries its family-voice header (Nora 🥗, Coach Mira 💪, Otto 📋). Additionally pinned by the notify::telegram_standup::standup_produces_exactly_four_posts_in_roster_order unit test. Credential-free: dry-run prints the plan instead of sending, so no live group or real tokens are needed."
+description = "Pins the /standup composition contract: `wg telegram standup --dry-run` (the on-demand equivalent of the group listener's /standup intercept) reads an opaque-id `household.toml`, emits exactly one post per joined `[telegram.bots.<id>]` voice in authored `[[agent]]` order (deliberately not alphabetical or bot-map order), and renders the household-authored display name + emoji. It also asserts no duplicate and no token leak. Unit tests pin missing/malformed/duplicate roster fail-closed behavior, exclusion of unlisted bots, and the one-person legacy-bot exception. Credential-free: dry-run prints the real plan instead of sending, so no live group or real tokens are needed."
 timeout_seconds = 30
 
 [[scenario]]
@@ -2211,7 +2239,7 @@ script = "scenarios/telegram_conversation_swallow.sh"
 owners = [
     "fix-conversation-swallow",
 ]
-description = "Pins the pr51-auth conversational SWALLOW regression Luca hit live (fix-conversation-swallow): after the pr51-auth deploy, EVERY group message from a confirmed human — 'otto, are you there?', collective greetings — was consumed with NO reply and NO log line. The hardened awaiting-human-task router (route_inbound_reply, PR #51) authorizes the inbound sender against their CONFIRMED Telegram binding, and in Casa the human speaks THROUGH an AI-persona bot, so its defense-in-depth check (a per-agent bot must front the same human the sender is bound to) REJECTS the turn. That hardening is correct for recording a reply onto a TASK, but a confirmed human's ordinary chat turn must fall through to the conversational composer, never be silently swallowed. Drives the real binary via `wg telegram classify` — the dry-run of the exact classify_inbound_message the live `wg telegram listen` loop invokes once a message survives dedupe + election. Locks: confirmed human + persona bot + hardened rejection → classifies `unmatched` (⇒ composer), never `routed`/`confirmed`; the server-side log names the pr51 hardened-auth rejection so the swallow path is really exercised; an unknown sender is `unmatched` too (onboarded), never mis-recorded as a human's reply; no bot token leaks. Complements telegram_conversation.sh (the composer dry-run) and the commands::telegram unit test hardened_auth_rejection_falls_through_to_conversation. Credential-free: nothing is ever sent."
+description = "Pins the hardened-auth conversational SWALLOW regression (fix-conversation-swallow): ordinary group messages from a confirmed household member were consumed with no reply and no useful diagnostic. The awaiting-human-task router (route_inbound_reply, PR #51) authorizes the inbound sender against their CONFIRMED Telegram binding, while ordinary household chat arrives through an AI-persona bot. That hardening is correct for recording a reply onto a TASK, but a confirmed member's ordinary chat turn must fall through to the conversational composer, never be silently swallowed or mislabeled as a security rejection. Drives the real binary via `wg telegram classify` — the dry-run of the exact classify_inbound_message the live `wg telegram listen` loop invokes once a message survives dedupe + election. Uses opaque member and bot identities and locks both branches without depending on a persona display name: confirmed member + persona bot + benign hardened decline classifies `unmatched` (⇒ composer), never `routed`/`confirmed`, and the neutral log says the turn continues; an unknown sender also classifies `unmatched` for onboarding but still emits the true authorization-rejection diagnostic. Complements telegram_conversation.sh (the composer dry-run) and the commands::telegram unit test hardened_auth_rejection_falls_through_to_conversation. Credential-free: nothing is ever sent."
 timeout_seconds = 30
 
 [[scenario]]
@@ -2220,7 +2248,7 @@ script = "scenarios/telegram_discussion_round.sh"
 owners = [
     "group-chat-discussion",
 ]
-description = "Pins task group-chat-discussion: a confirmed-human group message elected COLLECTIVE that ALSO reads as an opinion/discussion ask ('can you guys discuss this and find consensus', 'tell me what you all think', 'what do you all think?', 'thoughts?') runs a DISCUSSION ROUND — each persona a short in-voice take in roster order (nora→bruno→mira→otto), then Otto synthesizes — rather than four independent replies. Drives the real binary via `wg telegram discuss --json` (the exact `elect_responders` + `is_discussion_ask` gate the live `Election::All` handler branches on) and asserts: a discussion ask classifies `discussion-round` with is_discussion_ask=true, synthesizer=otto, and the whole roster as voices; a PLAIN collective greeting ('hey guys are you around?', 'hi everyone!', 'goodnight all') classifies `collective-greeting` (today's brief independent hellos, is_discussion_ask=false) and does NOT start a round; and a concierge/named single-voice ask ('what is on the menu tomorrow?', 'nora, can you help?') classifies `single-voice`, never a round. The round runner itself (sequenced reacting takes, dead-session skip, synthesis-only-when-≥2 threshold) is unit-tested in notify::telegram_discussion. Credential-free: the subcommand only reads local config/bindings; nothing is sent."
+description = "Pins task group-chat-discussion: a confirmed-human group message elected COLLECTIVE that ALSO reads as an opinion/discussion ask ('can you guys discuss this and find consensus', 'tell me what you all think', 'what do you all think?', 'thoughts?') runs a DISCUSSION ROUND — each configured persona gives a short in-voice take in household.toml order, then the configured coordination owner synthesizes — rather than independent replies. Drives the real binary via `wg telegram discuss --json` (the exact `elect_responders` + `is_discussion_ask` gate the live `Election::All` handler branches on) and asserts: a discussion ask classifies `discussion-round` with is_discussion_ask=true and the configured roster/synthesizer; a PLAIN collective greeting classifies `collective-greeting` and does NOT start a round; and a concierge/named single-voice ask classifies `single-voice`, never a round. The round runner itself pins configured display names in prior-take prompts, sequenced reacting takes, dead-session skip, and synthesis-only-when-≥2 threshold. Credential-free: the subcommand only reads local config/bindings; nothing is sent."
 timeout_seconds = 30
 
 [[scenario]]
@@ -2228,9 +2256,20 @@ name = "telegram_web_inbound"
 script = "scenarios/telegram_web_inbound.sh"
 owners = [
     "web-chat-first",
+    "p1-engine-web-inbound-opaque-smoke",
 ]
-description = "Pins task web-chat-first: a message typed in the casa kiosk conversation pane is a FIRST-CLASS group turn, not just a bot-relayed line the family never sees. The live gap (Luca, 'the constellation chat may not work'): the kiosk send box only RELAYED the message into the family Telegram group via a bot, and Telegram bots never see other bots' messages, so the listener's election/conversation pipeline NEVER ran on it — it was posted ('💬 Luca (kiosk): …') and never answered, while the SAME words typed on a phone got four replies. The fix is `wg telegram web-inbound`, which runs the EXACT `elect_responders` table the live listener runs and dispatches through the SAME senders + composer (run_group_collective / run_group_discussion / single-voice plan_conversation+run_conversation_turn), posting each elected persona's reply to the group via its OWN bot AND into .casa/group-feed.jsonl so the kiosk pane shows it; the gateway shells out to it on POST /conversation/send. Drives the real binary via `wg telegram web-inbound --dry-run --json` (the credential-free seam that runs the real election + planning and reports WHO would answer without sending) and asserts a web-origin message routes IDENTICALLY to a Telegram message: a collective ask ('hey all, are you around?') elects the whole roster (nora/bruno/mira/otto); a discussion ask runs a `discussion-round`; a named ask ('nora, …') is `single-voice` nora; and a web humanId ('luca') resolves to the confirmed human's binding key (auth_sender=8905220378) so the composer answers grounded, not the onboarding line. Double-reply is prevented by bot-authorship: the gateway's own Telegram mirror of the kiosk line is bot-sent, so the listener's bot-loop guard drops it before election. Credential-free: the subcommand only reads local config/bindings; nothing is sent."
+description = "Pins task web-chat-first: a message typed in the casa kiosk conversation pane is a FIRST-CLASS group turn, not just a bot-relayed line the family never sees. The live gap reported by the household ('the constellation chat may not work'): the kiosk send box only RELAYED the message into the family Telegram group via a bot, and Telegram bots never see other bots' messages, so the listener's election/conversation pipeline NEVER ran on it — it was posted ('💬 <member> (kiosk): …') and never answered, while the SAME words typed on a phone got four replies. The fix is `wg telegram web-inbound`, which runs the EXACT `elect_responders` table the live listener runs and dispatches through the SAME senders + composer (run_group_collective / run_group_discussion / single-voice plan_conversation+run_conversation_turn), posting each elected persona's reply to the group via its OWN bot AND into .casa/group-feed.jsonl so the kiosk pane shows it; the gateway shells out to it on POST /conversation/send. Drives the real binary via `wg telegram web-inbound --dry-run --json` (the credential-free seam that runs the real election + planning and reports WHO would answer without sending) over an OPAQUE scratch household — agent ids that carry no domain word, authored display names, matching bot handles and a confirmed human binding, none of which has ever shipped as a default — so a pass proves routing reads the configured roster rather than recognising a built-in persona (p1-engine-web-inbound-opaque-smoke). Asserts a web-origin message routes IDENTICALLY to a Telegram message: a collective ask ('hey all, are you around?') elects every configured id; a discussion ask runs a `discussion-round`; an ask addressed by a configured display name is `single-voice` answered by the id that name is bound to, and a SECOND authored name lands on a different configured id so the pass cannot come from one fixed winner; and a web humanId resolves to the confirmed human's stored binding key (auth_sender) so the composer answers grounded, not the onboarding line. Double-reply is prevented by bot-authorship: the gateway's own Telegram mirror of the kiosk line is bot-sent, so the listener's bot-loop guard drops it before election. Credential-free: the subcommand only reads local config/bindings; nothing is sent."
 timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_web_fast_lane_replay"
+script = "scenarios/telegram_web_fast_lane_replay.sh"
+owners = [
+    "p1-web-fast-lane-replay",
+    "smoke-gate-is",
+]
+description = "Pins web fast-lane restart safety through fresh invocations of the real wg binary against an opaque scratch household, a live-shaped numbered Dinners plan, and a loopback Telegram API stub. The first stubbed send fails after a shopping edit; a same-occurrence restart must retry the stored canonical reply and original route without touching the plan or graph again, a completed refire must send nothing, and a later occurrence id with identical words must be admitted. It also requires versioned digest-only journal filenames and exact persisted applied/delivered states. No live plan, bot, token, or Telegram chat is used."
+timeout_seconds = 45
 
 [[scenario]]
 name = "telegram_photo_shopping"
@@ -2239,7 +2278,16 @@ owners = [
     "photo-to-shopping",
     "p1-engine-photo-config-fixture",
 ]
-description = "Pins task photo-to-shopping (snap the fridge, the kitchen adjusts the pickup list): a PHOTO sent to a family voice is a vision turn that updates the shared shopping list, and it is routed by CONFIGURED ROLE rather than by a name compiled into the binary. Drives the real binary via `wg telegram photo-plan` (the credential-free, network-free scripted-test seam, sibling of `wg telegram decide`/`elect`) which decodes a raw getUpdates element through the SAME `decode_update` boundary the listener uses (largest photo file_id, caption-as-body, media_group_id), coalesces album frames via `coalesce_album` (one vision turn per album — no loops), runs the real `elect_responders_with_owners` decision on the caption against the scratch household’s OWN roster, and — with a fixture `--reply` + `--list` — parses the model’s `SHOPPING_UPDATE: have=[…]; need=[…]` structured tail and prints the exact gateway mutations that WOULD apply. The scratch project declares an OPAQUE household in `household.toml` — two personas whose ids are on no shipped list and contain no domain word (`wren` = the kitchen, `domains = [meals, cooking, recipes]`; `tally` = the day, `domains = [calendar, coordination, shopping]`) — so `domains` is the only ownership signal any resolver can read. Asserts: (1) a captioned fridge photo naming the CONFIGURED cooking label decodes as a photo, picks the largest frame, and elects that persona; (2) three frames sharing a media_group_id collapse to ONE turn carrying all frames + the album caption; (3) the vision tail maps deterministically to endpoint calls — cross off what we already have (Chickpeas → POST /shopping/toggle checked=true), add what is missing (chard → POST /shopping/add), leave an already-listed uncrossed item alone (Lemons), restore a crossed-off needed item (Milk → toggle checked=false) — and the machine marker is stripped from the family-facing reply; (4) a non-photo update yields no photo turn, an UNCAPTIONED photo names nobody and so resolves to the persona the roster gives `coordination` (never the shipped `otto`, never silence), and an unaddressed but FOOD-shaped caption resolves to the persona the roster gives `cooking` (never the shipped `bruno`); (5) config beats name — re-running the SAME fixtures against a roster that swaps `cooking` and `coordination` between the two personas moves who answers, which a compiled-default fallback could not do. That last check is the regression this fixture exists for: the scenario previously configured the shipped `bruno`/`otto` ids and asserted that an uncaptioned photo falls to the concierge (otto), which passed on the compiled fallback alone and left a composed-your-own-family household ungated. The fixture image (fixtures/fridge_photo.png) is asserted to be a real PNG — the payload a live vision turn download-and-attaches. Step 0 pins WHICH binary decides all of this: `WG_BIN` is honoured strictly (absolutised, set-but-unusable is a loud FAIL, no quiet PATH fallback), the engine is checked for the `telegram photo-plan` subcommand so a pre-photo-to-shopping build fails in one line instead of a cascade of usage errors, and PATH is poisoned with a `wg` that refuses to run — and stays poisoned — so every routing/album/mutation assertion is proven to execute on the requested build rather than on whatever `wg` PATH holds (task p1-photo-smoke-review-binary). Credential-free: the transport carries dummy tokens only, nothing is downloaded and nothing is sent; the download/vision/HTTP seams (`PhotoDownloader`/`VisionComposer`/`ShoppingGateway`) are proven by the notify::telegram_photo unit tests with fakes."
+description = "Pins task photo-to-shopping (snap the fridge, the configured cooking voice adjusts the pickup list): a PHOTO sent to a persona is a vision turn that updates the shared shopping list. Drives the requested real binary via `wg telegram photo-plan` (the credential-free, network-free scripted-test seam, sibling of `wg telegram decide`/`elect`), resolves explicit WG_BIN strictly, and poisons PATH so the gate cannot silently exercise a stale installed engine. The command decodes a raw getUpdates element through the SAME `decode_update` boundary the listener uses (largest photo file_id, caption-as-body, media_group_id), coalesces album frames via `coalesce_album` (one vision turn per album — no loops), runs the real `elect_responders_with_owner_map` decision on the caption, and — with a fixture `--reply` + `--list` — parses the model's `SHOPPING_UPDATE: have=[…]; need=[…]` structured tail and prints the exact gateway mutations that WOULD apply. The fixture uses unfamiliar household ids and display names with explicit cooking and coordination domains, so passing proves routing comes from project configuration rather than compiled persona defaults. Asserts: (1) a captioned fridge photo naming the cooking voice decodes as a photo, picks the largest frame, and elects that configured voice by name; (2) three frames sharing a media_group_id collapse to ONE turn carrying all frames + the album caption; (3) the vision tail maps deterministically to endpoint calls — cross off what we already have (Chickpeas → POST /shopping/toggle checked=true), add what's missing (chard → POST /shopping/add), leave an already-listed uncrossed item alone (Lemons), restore a crossed-off needed item (Milk → toggle checked=false) — and the machine marker is stripped from the family-facing reply; (4) a non-photo update yields no photo turn, an uncaptioned/unaddressed photo falls to the configured coordination owner, and an unaddressed food-shaped caption falls to the configured cooking owner; (5) swapping only those two domain assignments swaps both responders, proving config rather than label controls routing. The fixture image (fixtures/fridge_photo.png) is asserted to be a real PNG — the payload a live vision turn download-and-attaches. Credential-free: nothing is downloaded and nothing is sent; the download/vision/HTTP seams (`PhotoDownloader`/`VisionComposer`/`ShoppingGateway`) are proven by the notify::telegram_photo unit tests with fakes."
+timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_photo_turn_replay"
+script = "scenarios/telegram_photo_turn_replay.sh"
+owners = [
+    "p1-engine-photo-turn-replay",
+]
+description = "Pins photo-shopping restart safety through four fresh invocations of the real wg binary against an opaque scratch household, a production-shaped multi-bot notify TOML, confirmed-human binding, live Bot API album updates, a real PNG, and the live GET /shopping.json response shape. The hidden seam runs production decode, configured election, the complete photo-turn orchestrator (download → vision reply → shopping gateway mutations), family-voice guard, shared occurrence journal, and delivery ledger while replacing those three I/O seams and Telegram sends with scratch-only fixtures/JSONL artifacts. The first album frame mutates once and its stubbed send fails; restart on a later captionless frame from the same media_group_id must deliver only the stored canonical reply, a completed refire must stay silent, and a different later album with identical words must mutate and deliver once. Also requires versioned digest-only journal filenames and no bot-token leakage. No network, live plan, bot, token, chat, or runtime state is touched."
 timeout_seconds = 30
 
 [[scenario]]
@@ -2570,3 +2618,23 @@ owners = [
 ]
 description = "Regression (lifecycle-voice-honesty, Luca 2026-07-24): three rapid pizza messages minted three tasks, dedupe abandoned two as duplicates, and each abandon reached the family as 'Ran into a snag — I'll take another crack at it' — twice, from two personas, promising a retry no machinery performs, when nothing had failed. Drives the real engine tick through the real `wg telegram lifecycle --dry-run` CLI over a scratch graph built from the live task shapes and pins four rules: a duplicate-abandon produces NO family line at all; a retries-exhausted failure uses the honest final copy AND raises an operator alert so the ask is not a dead end; a failure with a real rescue behind it still keeps the retry promise; a genuinely dropped (non-duplicate) abandon is reported honestly without a retry claim."
 timeout_seconds = 60
+
+[[scenario]]
+name = "tracked_paths_case_unique"
+script = "scenarios/tracked_paths_case_unique.sh"
+owners = [
+    "p2-engine-case-colliding-paths",
+    "smoke-gate-is",
+]
+description = "Prevents a fresh clone on a case-insensitive filesystem from starting dirty or silently replacing one tracked file with another. The real Git index is normalized and checked for duplicate portable path names."
+timeout_seconds = 15
+
+[[scenario]]
+name = "household_agent_alias_live"
+script = "scenarios/household_agent_alias_live.sh"
+owners = [
+    "p1-engine-household-session-alias",
+    "smoke-gate-is",
+]
+description = "Credential-free scratch-project proof that a configured opaque household alias resolves one bound full \"agent_id\", remains stable when mutable \"name\" metadata changes, and exposes the binding through session-list JSON. The real candidate binary plans two ordinary conversation turns and writes both to the same persistent session without contacting Telegram or an LLM."
+timeout_seconds = 30

@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 /// Plain-language operator alert emitted when the provider pause trips. Mirrors
 /// the spawn breaker's alert voice: no jargon, says what happened and that it
 /// will recover on its own.
-pub const PROVIDER_PAUSED_ALERT_TEXT: &str =
-    "⚠️ The family team can't reach its AI right now — usually a login issue. \
+pub const PROVIDER_PAUSED_ALERT_TEXT: &str = "⚠️ The family team can't reach its AI right now — usually a login issue. \
 The task runner has paused and will keep checking; it resumes on its own once the connection is back.";
 
 /// Plain-language operator alert emitted when the provider pause auto-resumes.
@@ -403,6 +402,11 @@ pub struct ProviderHealth {
     /// emit the operator alert (mirrors the spawn breaker's one-shot alert).
     #[serde(default)]
     pub pending_pause_alert: bool,
+    /// Armed only when the daemon's reachability probe auto-resumes a paused
+    /// service. A failed private delivery leaves this set across reloads so the
+    /// recovery notice is retried without replaying the pause transition.
+    #[serde(default)]
+    pub pending_resume_alert: bool,
     /// RFC3339 timestamp of the last auto-probe attempt while paused. Drives the
     /// probe cadence so we probe at most once per configured interval.
     #[serde(default)]
@@ -519,6 +523,9 @@ impl ProviderHealth {
         if self.service_paused && !was_service_paused {
             self.pause_generation = self.pause_generation.saturating_add(1);
             self.pending_pause_alert = true;
+            // A fresh outage supersedes an undelivered recovery notice from the
+            // preceding window; reporting "back" after a re-pause would be stale.
+            self.pending_resume_alert = false;
             // A fresh pause window starts fresh: the next probe should fire
             // after one interval, not immediately reuse a stale probe stamp.
             self.last_probe_at = None;
@@ -537,6 +544,7 @@ impl ProviderHealth {
         // pause starts from a clean slate. `pause_generation` is monotonic and
         // deliberately preserved (episode ids must never repeat).
         self.pending_pause_alert = false;
+        self.pending_resume_alert = false;
         self.last_probe_at = None;
 
         // Also resume all paused providers. resume() resets each provider's
@@ -561,6 +569,22 @@ impl ProviderHealth {
         }
     }
 
+    /// Arm the recovery notice after an automatic probe-driven resume.
+    pub fn arm_resume_alert(&mut self) {
+        self.pending_resume_alert = true;
+    }
+
+    /// Consume the automatic recovery notice only after its alert helper reports
+    /// a confirmed/durable outcome.
+    pub fn take_resume_alert(&mut self) -> Option<u32> {
+        if self.pending_resume_alert {
+            self.pending_resume_alert = false;
+            Some(self.pause_generation)
+        } else {
+            None
+        }
+    }
+
     /// How long the service has been paused, in seconds, relative to `now`.
     /// `None` if not paused or the stamp is unparseable.
     pub fn pause_duration_secs(&self, now: chrono::DateTime<Utc>) -> Option<i64> {
@@ -579,9 +603,7 @@ impl ProviderHealth {
         match self.last_probe_at.as_deref() {
             None => true,
             Some(stamp) => match chrono::DateTime::parse_from_rfc3339(stamp) {
-                Ok(last) => {
-                    now.signed_duration_since(last).num_seconds() >= interval_secs as i64
-                }
+                Ok(last) => now.signed_duration_since(last).num_seconds() >= interval_secs as i64,
                 // Unparseable stamp → don't get stuck; probe now.
                 Err(_) => true,
             },
@@ -934,8 +956,7 @@ mod tests {
     /// not a provider failure — the agent ran fine, the graph declined it.
     #[test]
     fn test_wg_done_blocked_refusal_is_task_logic_not_provider() {
-        let refusal =
-            "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
+        let refusal = "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
              parent-y (failed_pending_eval)";
         assert_eq!(
             classify_error(Some(1), refusal),
@@ -1034,8 +1055,7 @@ mod tests {
     fn test_done_refused_for_blocked_parent_never_pauses_provider() {
         let mut health = ProviderHealth::default();
         let provider_id = "claude";
-        let refusal =
-            "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
+        let refusal = "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
              parent-y (failed_pending_eval)";
 
         // The satellite's agent ran fine but was done-refused, five times — well
@@ -1052,7 +1072,10 @@ mod tests {
             provider.consecutive_failures, 0,
             "wg-done refusals for a blocked parent must not touch the provider counter"
         );
-        assert!(!provider.should_pause(3), "the provider must not be near pausing");
+        assert!(
+            !provider.should_pause(3),
+            "the provider must not be near pausing"
+        );
 
         let paused = health.check_and_apply_pauses(3, "pause");
         assert!(
@@ -1122,7 +1145,10 @@ mod tests {
         // A second triage pass while STILL paused must not re-arm the alert.
         health.record_failure("claude", ProviderErrorKind::FatalProvider, "auth".into());
         let paused2 = health.check_and_apply_pauses(3, "pause");
-        assert!(paused2.is_empty(), "already-paused provider does not re-pause");
+        assert!(
+            paused2.is_empty(),
+            "already-paused provider does not re-pause"
+        );
         assert_eq!(health.take_pause_alert(), None);
         assert_eq!(health.pause_generation, 1);
     }
@@ -1193,11 +1219,9 @@ mod tests {
         health.check_and_apply_pauses(3, "pause");
         assert_eq!(health.paused_provider_ids(), vec!["claude".to_string()]);
 
-        let paused_at = chrono::DateTime::parse_from_rfc3339(
-            health.paused_at.as_deref().unwrap(),
-        )
-        .unwrap()
-        .with_timezone(&Utc);
+        let paused_at = chrono::DateTime::parse_from_rfc3339(health.paused_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
         let later = paused_at + chrono::Duration::seconds(90);
         assert_eq!(health.pause_duration_secs(later), Some(90));
     }

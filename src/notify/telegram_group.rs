@@ -313,11 +313,6 @@ pub fn route_group_message(
     GroupRoute::Unaddressed { reply_chat }
 }
 
-/// The persona the group's concierge fallback routes to when a message names
-/// no one. Otto is the Family Assistant — the "keeps the trains running" voice
-/// (docs/01 §2.4) — so unaddressed group chatter lands with him.
-pub const CONCIERGE_BOT: &str = "otto";
-
 /// How a natural-routed group message picked its target agent. Carried on
 /// [`NaturalRoute::ToBot`] purely for logging and tests — it never changes what
 /// the downstream 1:1 router does with the message.
@@ -330,14 +325,14 @@ pub enum AddressedBy {
     Name,
     /// A reply to a message that bot itself posted in the group.
     ReplyChain,
-    /// Nobody was named — routed to the concierge ([`CONCIERGE_BOT`]).
+    /// Nobody was named — routed to the configured coordination owner.
     Concierge,
     /// Nobody was named, but the ask's CONTENT clearly falls in a household
     /// [`Domain`] whose owner is not the concierge — so the DOMAIN OWNER answers
     /// as the voice (meals → Nora/Bruno, workouts → Mira), the same classifier
     /// that decides task ownership. Carries the domain so `wg telegram elect` can
     /// show the reasoning. Calendar/shopping/coordination and genuinely ambiguous
-    /// asks stay [`Concierge`](AddressedBy::Concierge) (Otto).
+    /// asks stay [`Concierge`](AddressedBy::Concierge).
     Domain(crate::notify::ownership::Domain),
 }
 
@@ -360,7 +355,7 @@ impl std::fmt::Display for AddressedBy {
 /// even for a bot?"*, [`route_natural`] answers *"which of our family voices
 /// should this land on?"* — resolving, in order: an explicit `@mention`, the
 /// first family name in the text, the bot a reply is threaded onto, and finally
-/// the concierge ([`CONCIERGE_BOT`]) when no one is named. It assumes the
+/// the configured coordination owner when no one is named. It assumes the
 /// receiving bot is the concierge running with Telegram privacy mode **off**
 /// (so plain chatter actually reaches the listener); see docs/09 §natural-group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,20 +411,21 @@ pub fn first_named_bot(text: &str, config: &TelegramConfig) -> Option<ResolvedBo
 /// 3. **Reply-chain** — `reply_to_bot` is the `@username` of the bot whose own
 ///    message this is a reply to (Telegram delivers replies-to-a-bot even under
 ///    privacy mode), so a threaded "yes that works" lands on that bot.
-/// 4. **Concierge** — nobody was named, so it goes to [`CONCIERGE_BOT`] (otto),
-///    who fronts the group. This only fires for messages the listener actually
-///    received, i.e. the concierge bot's privacy mode is off.
+/// 4. **Concierge** — nobody was named, so it goes to the configured
+///    coordination owner. This only fires for messages the listener actually
+///    received, i.e. that bot's privacy mode is off.
 ///
 /// Non-group chats yield [`NaturalRoute::Private`]. A group message with no chat
 /// id — or one that names no one when the concierge bot is not configured —
 /// yields [`NaturalRoute::Drop`].
-pub fn route_natural(
+pub fn route_natural_with_owner_map(
     chat_type: Option<&str>,
     chat_id: Option<&str>,
     text: &str,
     mention_usernames: &[String],
     reply_to_bot: Option<&str>,
     config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
 ) -> NaturalRoute {
     let is_group = matches!(chat_type, Some("group") | Some("supergroup"));
     if !is_group {
@@ -456,7 +452,9 @@ pub fn route_natural(
     }
 
     // 2. First family name in the text.
-    if let Some(bot) = first_named_bot(text, config) {
+    if let Some(bot) = addressed_display_name_bot(text, config, owner_map)
+        .or_else(|| first_named_bot(text, config))
+    {
         return NaturalRoute::ToBot {
             bot,
             reply_chat,
@@ -477,8 +475,8 @@ pub fn route_natural(
         }
     }
 
-    // 4. Concierge fallback — otto.
-    if let Some(bot) = resolve_mentioned_bot(CONCIERGE_BOT, config) {
+    // 4. Concierge fallback — the project-local coordination owner.
+    if let Some(bot) = concierge_bot(config, owner_map) {
         return NaturalRoute::ToBot {
             bot,
             reply_chat,
@@ -488,6 +486,29 @@ pub fn route_natural(
     }
 
     NaturalRoute::Drop
+}
+
+/// Natural routing without a project-local owner map.
+///
+/// Explicit mentions, names, and reply chains still resolve; an unaddressed
+/// message is dropped rather than attributed to a compiled household persona.
+pub fn route_natural(
+    chat_type: Option<&str>,
+    chat_id: Option<&str>,
+    text: &str,
+    mention_usernames: &[String],
+    reply_to_bot: Option<&str>,
+    config: &TelegramConfig,
+) -> NaturalRoute {
+    route_natural_with_owner_map(
+        chat_type,
+        chat_id,
+        text,
+        mention_usernames,
+        reply_to_bot,
+        config,
+        &crate::notify::ownership::OwnerMap::default(),
+    )
 }
 
 // ===========================================================================
@@ -565,15 +586,30 @@ pub const COLLECTIVE_TRIGGERS: &[&str] = &[
 /// tokens of 4+ chars (so "helo"/"ciap" still open), exact for the short ones
 /// ("hey"/"hi"/"yo") to avoid firing on unrelated 2–3 letter words. Tunable.
 pub const GREETING_TOKENS: &[&str] = &[
-    "hey", "hi", "hello", "hiya", "heya", "yo", "sup", "howdy", "ciao", "hola",
+    "hey",
+    "hi",
+    "hello",
+    "hiya",
+    "heya",
+    "yo",
+    "sup",
+    "howdy",
+    "ciao",
+    "hola",
     "hallo",
     // Time-of-day greetings, written as one word ("goodnight", "goodmorning").
     // The two-word forms ("good night", "good morning") are handled by
     // [`is_greeting_shaped`], which pairs a leading "good"/"g" with the
     // time-of-day word so bare "morning"/"night" don't count as greetings.
-    "goodnight", "goodmorning", "goodevening", "goodafternoon",
+    "goodnight",
+    "goodmorning",
+    "goodevening",
+    "goodafternoon",
     // Italian
-    "buongiorno", "buonasera", "buonanotte", "salve",
+    "buongiorno",
+    "buonasera",
+    "buonanotte",
+    "salve",
 ];
 
 /// Time-of-day words that turn a leading "good"/"g" into a greeting
@@ -589,8 +625,17 @@ pub const TIME_OF_DAY_WORDS: &[&str] = &["morning", "evening", "afternoon", "nig
 /// (see [`is_greeting_collective`]), so it can safely include the looser "guys"
 /// / "folks" / "all" that would over-fire on their own.
 pub const BROAD_ADDRESS_TOKENS: &[&str] = &[
-    "guys", "folks", "all", "y'all", "yall", "everyone", "everybody", "team",
-    "ragazzi", "ragazza", "tutti",
+    "guys",
+    "folks",
+    "all",
+    "y'all",
+    "yall",
+    "everyone",
+    "everybody",
+    "team",
+    "ragazzi",
+    "ragazza",
+    "tutti",
 ];
 
 /// Plural-you follower words: when one *immediately follows* "you"/"u" it turns
@@ -599,15 +644,38 @@ pub const BROAD_ADDRESS_TOKENS: &[&str] = &[
 /// a third-person "the guys"/"those guys" (no leading "you"), which stays
 /// concierge. Fuzzy-matched for 4+ chars. See [`is_plural_you_address`].
 pub const PLURAL_YOU_FOLLOWERS: &[&str] = &[
-    "guys", "all", "folks", "both", "two", "lot", "everyone", "everybody",
-    "team", "crew", "gang", "people", "ragazzi", "tutti", "yous",
+    "guys",
+    "all",
+    "folks",
+    "both",
+    "two",
+    "lot",
+    "everyone",
+    "everybody",
+    "team",
+    "crew",
+    "gang",
+    "people",
+    "ragazzi",
+    "tutti",
+    "yous",
 ];
 
 /// Nouns that, following "the whole …", name the family as one body — "the whole
 /// team/family/crew". Fuzzy-matched for 4+ chars. See [`is_plural_you_address`].
 pub const WHOLE_GROUP_NOUNS: &[&str] = &[
-    "team", "family", "crew", "gang", "group", "household", "fam", "bunch", "lot",
-    "squad", "gruppo", "famiglia",
+    "team",
+    "family",
+    "crew",
+    "gang",
+    "group",
+    "household",
+    "fam",
+    "bunch",
+    "lot",
+    "squad",
+    "gruppo",
+    "famiglia",
 ];
 
 /// Opening gratitude tokens ("thanks", "thank", "thx", "grazie", "cheers"). A
@@ -615,8 +683,8 @@ pub const WHOLE_GROUP_NOUNS: &[&str] = &[
 /// even when it names the family ("thanks everyone", "thank you all"). Fuzzy for
 /// 4+ chars. See [`is_gratitude_opener`].
 pub const GRATITUDE_OPENERS: &[&str] = &[
-    "thanks", "thank", "thankyou", "thanx", "thx", "ty", "tysm", "grazie",
-    "cheers", "gracias", "merci",
+    "thanks", "thank", "thankyou", "thanx", "thx", "ty", "tysm", "grazie", "cheers", "gracias",
+    "merci",
 ];
 
 /// Endearment verbs ("love you all", "miss you guys"). When one *opens* the
@@ -624,15 +692,26 @@ pub const GRATITUDE_OPENERS: &[&str] = &[
 /// is the object of affection — small-talk the bots stay out of — not an address
 /// asking the family to weigh in. Fuzzy for 4+ chars. See [`is_plural_you_address`].
 pub const ENDEARMENT_VERBS: &[&str] = &[
-    "love", "loved", "loves", "loving", "miss", "missed", "adore", "adored",
-    "appreciate", "bless", "cherish", "hug", "hugs",
+    "love",
+    "loved",
+    "loves",
+    "loving",
+    "miss",
+    "missed",
+    "adore",
+    "adored",
+    "appreciate",
+    "bless",
+    "cherish",
+    "hug",
+    "hugs",
 ];
 
 /// Interjections/verbs that, immediately before a family name, mark it as an
 /// *address* rather than narrative mention ("tell bruno", "hey nora"). Tunable.
 pub const ADDRESSING_CUES: &[&str] = &[
-    "tell", "ask", "hey", "hi", "hello", "get", "ping", "summon", "call", "tag",
-    "notify", "remind", "yo", "ciao",
+    "tell", "ask", "hey", "hi", "hello", "get", "ping", "summon", "call", "tag", "notify",
+    "remind", "yo", "ciao",
 ];
 
 /// Words that, immediately AFTER a leading family name, signal it is a vocative
@@ -642,9 +721,9 @@ pub const ADDRESSING_CUES: &[&str] = &[
 /// ("nora **from** work said hi") does NOT — the cheap fix for the
 /// name-about-a-human false positive. Tunable.
 pub const ADDRESS_FOLLOWERS: &[&str] = &[
-    "can", "could", "would", "will", "please", "pls", "plz", "what", "what's",
-    "whats", "when", "where", "why", "how", "do", "does", "did", "are", "is",
-    "you", "u", "help", "we", "let's", "lets", "i'm", "im", "i",
+    "can", "could", "would", "will", "please", "pls", "plz", "what", "what's", "whats", "when",
+    "where", "why", "how", "do", "does", "did", "are", "is", "you", "u", "help", "we", "let's",
+    "lets", "i'm", "im", "i",
 ];
 
 /// Indefinite-agent words that ask "someone in the group" rather than a named
@@ -655,22 +734,77 @@ pub const INDEFINITE_AGENTS: &[&str] = &["someone", "somebody", "anyone", "anybo
 /// these is plausibly *for the team* (the concierge) rather than idle chatter.
 /// Tunable — this is the heart of the e-vs-f (ask-vs-small-talk) boundary.
 pub const DOMAIN_KEYWORDS: &[&str] = &[
-    "dinner", "lunch", "breakfast", "meal", "meals", "menu", "food", "cook",
-    "cooking", "recipe",
-    "recipes", "grocery", "groceries", "shopping", "shop", "fridge", "pantry",
-    "plan", "planning", "schedule", "scheduling", "calendar", "remind", "reminder",
-    "reminders", "book", "booking", "appointment", "appointments", "week",
-    "weekend", "workout", "workouts", "exercise", "gym", "training", "chore",
-    "chores", "clean", "cleaning", "budget", "todo", "task", "tasks", "errand",
-    "errands", "dishes", "laundry",
+    "dinner",
+    "lunch",
+    "breakfast",
+    "meal",
+    "meals",
+    "menu",
+    "food",
+    "cook",
+    "cooking",
+    "recipe",
+    "recipes",
+    "grocery",
+    "groceries",
+    "shopping",
+    "shop",
+    "fridge",
+    "pantry",
+    "plan",
+    "planning",
+    "schedule",
+    "scheduling",
+    "calendar",
+    "remind",
+    "reminder",
+    "reminders",
+    "book",
+    "booking",
+    "appointment",
+    "appointments",
+    "week",
+    "weekend",
+    "workout",
+    "workouts",
+    "exercise",
+    "gym",
+    "training",
+    "chore",
+    "chores",
+    "clean",
+    "cleaning",
+    "budget",
+    "todo",
+    "task",
+    "tasks",
+    "errand",
+    "errands",
+    "dishes",
+    "laundry",
 ];
 
 /// Sentence-lead phrases that mark a request aimed at the group ("can we …",
 /// "let's …", "who can …") rather than a specific person.
 pub const REQUEST_LEADS: &[&str] = &[
-    "can we", "could we", "should we", "shall we", "let's", "lets ", "we need",
-    "we should", "who can", "who could", "who wants", "can someone", "can somebody",
-    "could someone", "could somebody", "can anyone", "does anyone", "is anyone",
+    "can we",
+    "could we",
+    "should we",
+    "shall we",
+    "let's",
+    "lets ",
+    "we need",
+    "we should",
+    "who can",
+    "who could",
+    "who wants",
+    "can someone",
+    "can somebody",
+    "could someone",
+    "could somebody",
+    "can anyone",
+    "does anyone",
+    "is anyone",
 ];
 
 /// Multi-word discussion/opinion phrases. A COLLECTIVELY-elected message that
@@ -707,10 +841,22 @@ pub const DISCUSSION_TRIGGERS: &[&[&str]] = &[
 /// Kept to words that a plain group *greeting* never contains, so gating a round
 /// on them can never turn "hey guys" into a deliberation. See [`is_discussion_ask`].
 pub const DISCUSSION_WORDS: &[&str] = &[
-    "discuss", "discussion", "debate", "consensus", "deliberate", "brainstorm",
-    "thoughts", "opinions", "opinion", "reckon", "disagree",
+    "discuss",
+    "discussion",
+    "debate",
+    "consensus",
+    "deliberate",
+    "brainstorm",
+    "thoughts",
+    "opinions",
+    "opinion",
+    "reckon",
+    "disagree",
     // Italian
-    "discutere", "consenso", "opinione", "opinioni",
+    "discutere",
+    "consenso",
+    "opinione",
+    "opinioni",
 ];
 
 /// Discussion *verbs* — the imperative/hortative core of a "let's talk this
@@ -719,16 +865,21 @@ pub const DISCUSSION_WORDS: &[&str] = &[
 /// ([`DISCUSSION_VERB_CUES`]), reads as a deliberation invitation even without a
 /// question mark. Fuzzy-matched for 4+ chars. See [`is_discussion_ask`].
 pub const DISCUSSION_VERBS: &[&str] = &[
-    "discuss", "debate", "deliberate", "brainstorm", "discutere", "dibattere",
+    "discuss",
+    "debate",
+    "deliberate",
+    "brainstorm",
+    "discutere",
+    "dibattere",
 ];
 
 /// Request/hortative cues that, immediately before a [`DISCUSSION_VERBS`] verb,
 /// mark it as an *ask to the group* ("let's **discuss**", "can you guys
 /// **debate**", "we should **brainstorm**"). Fuzzy-matched for 4+ chars.
 pub const DISCUSSION_VERB_CUES: &[&str] = &[
-    "let's", "lets", "let", "please", "pls", "plz", "can", "could", "would",
-    "will", "should", "you", "u", "guys", "we", "everyone", "all", "y'all",
-    "yall", "someone", "anyone", "gonna", "wanna",
+    "let's", "lets", "let", "please", "pls", "plz", "can", "could", "would", "will", "should",
+    "you", "u", "guys", "we", "everyone", "all", "y'all", "yall", "someone", "anyone", "gonna",
+    "wanna",
 ];
 
 /// Who should respond to a de-duplicated inbound group message.
@@ -799,7 +950,7 @@ impl std::fmt::Display for SilenceReason {
 /// ```
 ///
 /// * `rule` — which election rule fired, one of `mention` / `name` / `reply` /
-///   `otto-concierge` / `collective` / `silence:<reason>` / `private`.
+///   `concierge` / `collective` / `silence:<reason>` / `private`.
 /// * `target` — the elected agent id (or `<bot_id>(unbound)` when the bot fronts
 ///   no agent), `roster` for a collective address, `silence` when no one
 ///   answers, or `passthrough` for a private 1:1 chat.
@@ -822,7 +973,7 @@ pub fn election_decision_summary(
                 AddressedBy::Mention => "mention".to_string(),
                 AddressedBy::Name => "name".to_string(),
                 AddressedBy::ReplyChain => "reply".to_string(),
-                AddressedBy::Concierge => "otto-concierge".to_string(),
+                AddressedBy::Concierge => "concierge".to_string(),
                 // Show WHY a non-concierge voice was elected for an unaddressed
                 // ask: the domain the classifier read the content into.
                 AddressedBy::Domain(d) => format!("domain-{}", d.slug()),
@@ -872,7 +1023,11 @@ fn word_list(text: &str) -> Vec<String> {
 fn edit_distance_le_1(a: &str, b: &str) -> bool {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let (longer, shorter) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let (longer, shorter) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     let ldiff = longer.len() - shorter.len();
     if ldiff > 1 {
         return false;
@@ -962,7 +1117,10 @@ pub fn is_greeting_shaped(text: &str) -> bool {
         Some(f) => f.as_str(),
         None => return false,
     };
-    if GREETING_TOKENS.iter().any(|g| fuzzy_token_matches(first, g)) {
+    if GREETING_TOKENS
+        .iter()
+        .any(|g| fuzzy_token_matches(first, g))
+    {
         return true;
     }
     // "good <morning|night|…>" / "g'night" — a leading good-wish + time-of-day.
@@ -1231,6 +1389,74 @@ fn has_imperative_discussion_verb(tokens: &[String]) -> bool {
     false
 }
 
+/// Find the first household-authored display name in `text` that is used to
+/// *address* an agent.
+///
+/// Display names may be multi-word and need not resemble the opaque persona id
+/// or bot handle. The positioning rules mirror [`addressed_name_bot`]: a name
+/// must be a leading/trailing vocative or follow an addressing cue. A matching
+/// phrase buried in narration is deliberately ignored.
+fn addressed_display_name_bot(
+    text: &str,
+    config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
+) -> Option<ResolvedBot> {
+    let raw_words: Vec<&str> = text.split_whitespace().collect();
+    let clean = |raw: &str| {
+        raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
+            .to_lowercase()
+    };
+    let words: Vec<String> = raw_words.iter().map(|raw| clean(raw)).collect();
+
+    // Text order wins, just as it does for id/handle addressing. Roster order
+    // only breaks the impossible tie where two configured display names are
+    // byte-identical at the same position.
+    for start in 0..words.len() {
+        for (persona_id, display_name) in owner_map.display_names() {
+            let name_words: Vec<String> = display_name
+                .split_whitespace()
+                .map(clean)
+                .filter(|word| !word.is_empty())
+                .collect();
+            if name_words.is_empty() || start + name_words.len() > words.len() {
+                continue;
+            }
+            if words[start..start + name_words.len()] != name_words {
+                continue;
+            }
+
+            let end = start + name_words.len() - 1;
+            let last = raw_words[end]
+                .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '@');
+            let last_word =
+                last.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'');
+            let trailing = last.strip_prefix(last_word).unwrap_or_default();
+            let vocative_punct = trailing.starts_with([',', ':', '!', '?', '-', ';', '.']);
+            let is_first = start == 0;
+            let is_last = end + 1 == words.len();
+            let previous = start.checked_sub(1).and_then(|i| raw_words.get(i));
+            let previous_word = previous.map(|word| clean(word)).unwrap_or_default();
+            let previous_is_cue = ADDRESSING_CUES.contains(&previous_word.as_str());
+            let previous_ends_comma = previous
+                .map(|word| word.trim_end().ends_with(','))
+                .unwrap_or(false);
+            let next_word = words.get(end + 1).cloned().unwrap_or_default();
+            let next_is_request = ADDRESS_FOLLOWERS.contains(&next_word.as_str());
+
+            let addressed = (is_first
+                && (vocative_punct || name_words.len() == words.len() || next_is_request))
+                || previous_is_cue
+                || (is_last && previous_ends_comma);
+            if addressed {
+                if let Some(bot) = resolve_mentioned_bot(persona_id, config) {
+                    return Some(bot);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Find the first family name in `text` that is used to *address* an agent
 /// (not merely mentioned in passing) and resolve it to a configured bot.
 ///
@@ -1324,8 +1550,7 @@ pub fn is_team_directed_ask(text: &str) -> bool {
     let has_indefinite = INDEFINITE_AGENTS.iter().any(|w| words.contains(*w));
     let has_domain = DOMAIN_KEYWORDS.iter().any(|w| words.contains(*w));
     let request_lead = REQUEST_LEADS.iter().any(|p| lower.starts_with(p));
-    let human_directed =
-        words.contains("you") || words.contains("your") || words.contains("u");
+    let human_directed = words.contains("you") || words.contains("your") || words.contains("u");
 
     // Strongest signal: explicitly asking "someone/anyone" in the group.
     if has_indefinite && (is_question || has_domain || request_lead) {
@@ -1372,69 +1597,40 @@ pub fn is_team_directed_ask(text: &str) -> bool {
 /// never configured is never elected. Explicit addressing (mention / name / reply)
 /// is resolved BEFORE this in [`elect_responders`], so a named voice always wins.
 ///
-/// `owners` is the household's OWN roster (`household.toml` via
-/// [`OwnerMap::load`], the shipped Casa roster when a household declares none),
-/// so the VOICE that answers is the persona that household configured — not a
-/// name compiled into the binary.
-///
 /// [`ownership::classify_domain`]: crate::notify::ownership::classify_domain
-/// [`OwnerMap::load`]: crate::notify::ownership::OwnerMap::load
 fn domain_voice(
     text: &str,
     config: &TelegramConfig,
-    owners: &crate::notify::ownership::OwnerMap,
+    owner_map: &crate::notify::ownership::OwnerMap,
 ) -> Option<(ResolvedBot, crate::notify::ownership::Domain)> {
     use crate::notify::ownership::classify_domain;
     let domain = classify_domain(text);
-    let owner = owners.owner_for_domain(domain)?;
-    // A coordination-owned domain (calendar / shopping / coordination) or an
-    // ambiguous ask keeps the concierge rule — only a more-specific in-domain
-    // voice refines it.
-    if owner.eq_ignore_ascii_case(&coordination_voice_id(owners)) {
+    let owner = owner_map.owner_for_domain(domain)?;
+    // A concierge-owned domain keeps the concierge rule — only a more-specific
+    // in-domain voice refines it.
+    if owner_map
+        .owner_for_domain(crate::notify::ownership::Domain::Coordination)
+        .is_some_and(|concierge| owner.eq_ignore_ascii_case(concierge))
+    {
         return None;
     }
     let bot = resolve_mentioned_bot(owner, config)?;
     Some((bot, domain))
 }
 
-/// The persona id that fronts the group when a message names no one — resolved
-/// from the household's own roster, NOT compiled in.
+/// Resolve the project's coordination owner to a configured Telegram bot.
 ///
-/// [`CONCIERGE_BOT`] is the shipped Casa *default*, not a law. A household whose
-/// `household.toml` hands `coordination` to some other persona has that persona
-/// front its group; the compiled id is used only when the roster declares no
-/// coordination owner at all. For the shipped roster the two agree, so this
-/// changes nothing there.
-pub fn coordination_voice_id(owners: &crate::notify::ownership::OwnerMap) -> String {
-    use crate::notify::ownership::Domain;
-    owners
-        .owner_for_domain(Domain::Coordination)
-        .unwrap_or(CONCIERGE_BOT)
-        .to_string()
-}
-
-/// Resolve the bot that fronts the group's coordination role (see
-/// [`coordination_voice_id`]), falling back to the compiled [`CONCIERGE_BOT`]
-/// handle when the configured coordination persona has no bot of its own — a
-/// mixed config (roster renamed, notify.toml not yet) still answers instead of
-/// going silent.
-fn resolve_coordination_bot(
+/// Missing/malformed household configuration yields `None`; it never invents a
+/// persona id or silently chooses a different configured voice.
+fn concierge_bot(
     config: &TelegramConfig,
-    owners: &crate::notify::ownership::OwnerMap,
+    owner_map: &crate::notify::ownership::OwnerMap,
 ) -> Option<ResolvedBot> {
-    resolve_mentioned_bot(&coordination_voice_id(owners), config)
-        .or_else(|| resolve_mentioned_bot(CONCIERGE_BOT, config))
+    let owner = owner_map.owner_for_domain(crate::notify::ownership::Domain::Coordination)?;
+    resolve_mentioned_bot(owner, config)
 }
 
-/// Elect against the shipped Casa roster — the compatibility shape for callers
-/// that have no project root to read `household.toml` from (and for the unit
-/// tests, which assert the shipped roster's behaviour).
-///
-/// Live listener paths call [`elect_responders_with_owners`] with
-/// [`OwnerMap::load`] so a household's OWN roster decides who fronts the group.
-///
-/// [`OwnerMap::load`]: crate::notify::ownership::OwnerMap::load
-pub fn elect_responders(
+pub fn elect_responders_with_owner_map(
     chat_type: Option<&str>,
     chat_id: Option<&str>,
     text: &str,
@@ -1443,34 +1639,7 @@ pub fn elect_responders(
     sender_is_bot: bool,
     human_count: usize,
     config: &TelegramConfig,
-) -> Election {
-    elect_responders_with_owners(
-        chat_type,
-        chat_id,
-        text,
-        mention_usernames,
-        reply_to_bot,
-        sender_is_bot,
-        human_count,
-        config,
-        &crate::notify::ownership::OwnerMap::casa_default(),
-    )
-}
-
-/// [`elect_responders`], but with the household's own roster supplied so the
-/// domain voice and the group-fronting concierge are both CONFIGURED roles
-/// rather than compiled ids.
-#[allow(clippy::too_many_arguments)]
-pub fn elect_responders_with_owners(
-    chat_type: Option<&str>,
-    chat_id: Option<&str>,
-    text: &str,
-    mention_usernames: &[String],
-    reply_to_bot: Option<&str>,
-    sender_is_bot: bool,
-    human_count: usize,
-    config: &TelegramConfig,
-    owners: &crate::notify::ownership::OwnerMap,
+    owner_map: &crate::notify::ownership::OwnerMap,
 ) -> Election {
     // Fix #0 — the bot-loop guard. UNCONDITIONAL and first: a message sent by a
     // bot (ANY bot, including our own four seen on a sibling bot's poller) is
@@ -1503,7 +1672,9 @@ pub fn elect_responders_with_owners(
     }
 
     // a. Explicit addressed name.
-    if let Some(bot) = addressed_name_bot(text, config) {
+    if let Some(bot) = addressed_display_name_bot(text, config, owner_map)
+        .or_else(|| addressed_name_bot(text, config))
+    {
         return Election::One {
             bot,
             reply_chat,
@@ -1574,7 +1745,7 @@ pub fn elect_responders_with_owners(
         // whose owner is not the concierge (food → Bruno/Nora, workouts → Mira),
         // that owner ANSWERS as the voice. Otherwise the unaddressed ask is the
         // concierge's (Otto), exactly as before.
-        if let Some((bot, domain)) = domain_voice(text, config, owners) {
+        if let Some((bot, domain)) = domain_voice(text, config, owner_map) {
             return Election::One {
                 bot,
                 reply_chat,
@@ -1582,7 +1753,7 @@ pub fn elect_responders_with_owners(
                 addressed_by: AddressedBy::Domain(domain),
             };
         }
-        return match resolve_coordination_bot(config, owners) {
+        return match concierge_bot(config, owner_map) {
             Some(bot) => Election::One {
                 bot,
                 reply_chat,
@@ -1606,7 +1777,7 @@ pub fn elect_responders_with_owners(
     // yields, falling through to the domain routing below.
     if is_collective_address(text) {
         let explicit_broadcast = has_collective_trigger(text) || is_greeting_collective(text);
-        if explicit_broadcast || domain_voice(text, config, owners).is_none() {
+        if explicit_broadcast || domain_voice(text, config, owner_map).is_none() {
             return Election::All {
                 reply_chat,
                 body: text.to_string(),
@@ -1633,7 +1804,7 @@ pub fn elect_responders_with_owners(
         // NOT classifiable into a non-concierge domain (a bare "hey", "goodnight",
         // "hey guys are you around?") does the greeting shape earn a collective
         // whole-roster greeting.
-        let domain = domain_voice(text, config, owners);
+        let domain = domain_voice(text, config, owner_map);
         if domain.is_none() && is_greeting_shaped(text) {
             return Election::All {
                 reply_chat,
@@ -1651,7 +1822,7 @@ pub fn elect_responders_with_owners(
                 addressed_by: AddressedBy::Domain(domain),
             };
         }
-        return match resolve_coordination_bot(config, owners) {
+        return match concierge_bot(config, owner_map) {
             Some(bot) => Election::One {
                 bot,
                 reply_chat,
@@ -1664,6 +1835,36 @@ pub fn elect_responders_with_owners(
 
     // f. Pure human-to-human small talk (2+ humans present) — bots stay silent.
     Election::Silence(SilenceReason::SmallTalk)
+}
+
+/// Elect responders without a configured domain-owner map.
+///
+/// Explicit addressing, collective asks, concierge routing, and silence rules
+/// still work. Domain-specific routing requires callers to use
+/// [`elect_responders_with_owner_map`] with the current project's
+/// `household.toml`-derived map; this compatibility entry deliberately carries
+/// no compiled household identities.
+pub fn elect_responders(
+    chat_type: Option<&str>,
+    chat_id: Option<&str>,
+    text: &str,
+    mention_usernames: &[String],
+    reply_to_bot: Option<&str>,
+    sender_is_bot: bool,
+    human_count: usize,
+    config: &TelegramConfig,
+) -> Election {
+    elect_responders_with_owner_map(
+        chat_type,
+        chat_id,
+        text,
+        mention_usernames,
+        reply_to_bot,
+        sender_is_bot,
+        human_count,
+        config,
+        &crate::notify::ownership::OwnerMap::default(),
+    )
 }
 
 /// Elect responders for a WEB-ORIGIN (kiosk conversation-pane) inbound message,
@@ -1685,7 +1886,26 @@ pub fn elect_group_inbound(
     human_count: usize,
     config: &TelegramConfig,
 ) -> Election {
-    elect_responders(
+    elect_group_inbound_with_owner_map(
+        chat_id,
+        text,
+        mention_usernames,
+        human_count,
+        config,
+        &crate::notify::ownership::OwnerMap::default(),
+    )
+}
+
+/// Web-origin election using the current project's configured owner map.
+pub fn elect_group_inbound_with_owner_map(
+    chat_id: &str,
+    text: &str,
+    mention_usernames: &[String],
+    human_count: usize,
+    config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
+) -> Election {
+    elect_responders_with_owner_map(
         Some("supergroup"),
         Some(chat_id),
         text,
@@ -1694,6 +1914,7 @@ pub fn elect_group_inbound(
         false, // a human typed it; never bot-sent
         human_count,
         config,
+        owner_map,
     )
 }
 
@@ -2052,14 +2273,35 @@ mod tests {
         ])
     }
 
+    fn casa_test_roster(
+        config: &TelegramConfig,
+    ) -> Vec<crate::notify::telegram_standup::StandupMember> {
+        use crate::notify::telegram_standup::{HouseholdPersona, plan_roster};
+        let personas = [
+            ("nora", "Nora", "🥗"),
+            ("bruno", "Bruno", "🍳"),
+            ("mira", "Coach Mira", "💪"),
+            ("otto", "Otto", "📋"),
+        ]
+        .into_iter()
+        .map(|(id, name, emoji)| HouseholdPersona {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            emoji: emoji.to_string(),
+        })
+        .collect::<Vec<_>>();
+        plan_roster(config, &personas).unwrap()
+    }
+
     fn route(text: &str, reply_to_bot: Option<&str>) -> NaturalRoute {
-        route_natural(
+        route_natural_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             text,
             &[],
             reply_to_bot,
             &casa_config(),
+            &crate::notify::ownership::OwnerMap::casa_default(),
         )
     }
 
@@ -2216,11 +2458,18 @@ mod tests {
 
         // The three forms Telegram delivers `/standup` in a group.
         for text in ["/standup", "/standup@otto_casapinello_bot", "wg standup"] {
-            let body =
-                match route_natural(Some("supergroup"), Some("-100999"), text, &[], None, &cfg) {
-                    NaturalRoute::ToBot { body, .. } => body,
-                    other => panic!("expected ToBot for {text:?}, got {other:?}"),
-                };
+            let body = match route_natural_with_owner_map(
+                Some("supergroup"),
+                Some("-100999"),
+                text,
+                &[],
+                None,
+                &cfg,
+                &crate::notify::ownership::OwnerMap::casa_default(),
+            ) {
+                NaturalRoute::ToBot { body, .. } => body,
+                other => panic!("expected ToBot for {text:?}, got {other:?}"),
+            };
             assert!(
                 standup::is_standup_command(&body),
                 "listener must intercept {text:?} (routed body {body:?})"
@@ -2228,7 +2477,8 @@ mod tests {
         }
 
         // And the intercept posts exactly four voices in roster order.
-        let posts = standup::plan_standup(&WorkGraph::new(), &cfg, standup::DEFAULT_ROSTER);
+        let roster = casa_test_roster(&cfg);
+        let posts = standup::plan_standup(&WorkGraph::new(), &roster);
         let ids: Vec<&str> = posts.iter().map(|p| p.bot_id.as_str()).collect();
         assert_eq!(ids, vec!["nora", "bruno", "mira", "otto"]);
     }
@@ -2298,7 +2548,7 @@ mod tests {
         human_count: usize,
     ) -> Election {
         let mentions: Vec<String> = mentions.iter().map(|s| s.to_string()).collect();
-        elect_responders(
+        elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             text,
@@ -2307,6 +2557,7 @@ mod tests {
             false, // human sender in the a–f election tests
             human_count,
             &casa_config(),
+            &crate::notify::ownership::OwnerMap::casa_default(),
         )
     }
 
@@ -2428,7 +2679,11 @@ mod tests {
         ] {
             let resolved = resolve_mentioned_bot(handle, &cfg)
                 .unwrap_or_else(|| panic!("{handle} must resolve without a configured username"));
-            assert_eq!(resolved.agent_id.as_deref(), Some(agent), "handle {handle:?}");
+            assert_eq!(
+                resolved.agent_id.as_deref(),
+                Some(agent),
+                "handle {handle:?}"
+            );
         }
     }
 
@@ -2478,7 +2733,10 @@ mod tests {
     fn parse_at_mention_tokens_strips_trailing_punctuation() {
         // `@bruno?` must yield the clean handle `bruno` (not `bruno?`), so the
         // mention resolves instead of silently degrading.
-        assert_eq!(parse_at_mention_tokens("@bruno?"), vec!["bruno".to_string()]);
+        assert_eq!(
+            parse_at_mention_tokens("@bruno?"),
+            vec!["bruno".to_string()]
+        );
         assert_eq!(
             parse_at_mention_tokens("@nora_casapinello_bot what about you?"),
             vec!["nora_casapinello_bot".to_string()]
@@ -2525,10 +2783,11 @@ mod tests {
     #[test]
     fn elect_unaddressed_ask_routes_to_domain_owner_voice() {
         let cfg = casa_config();
+        let owner_map = crate::notify::ownership::OwnerMap::casa_default();
         // (text, expected voice agent, expected addressed_by). human_count = 1
         // (the Casa single-human group), so an unaddressed ask is answered.
         let expect_one = |text: &str, agent: &str, by: AddressedBy| {
-            let e = elect_responders(
+            let e = elect_responders_with_owner_map(
                 Some("supergroup"),
                 Some("-100999"),
                 text,
@@ -2537,9 +2796,12 @@ mod tests {
                 false,
                 1,
                 &cfg,
+                &owner_map,
             );
             match &e {
-                Election::One { bot, addressed_by, .. } => {
+                Election::One {
+                    bot, addressed_by, ..
+                } => {
                     assert_eq!(bot.agent_id.as_deref(), Some(agent), "voice for {text:?}");
                     assert_eq!(*addressed_by, by, "addressed_by for {text:?}");
                 }
@@ -2548,7 +2810,11 @@ mod tests {
         };
         use crate::notify::ownership::Domain;
         // Food → the chef (Bruno), not Otto.
-        expect_one("pizza on friday", "bruno", AddressedBy::Domain(Domain::Cooking));
+        expect_one(
+            "pizza on friday",
+            "bruno",
+            AddressedBy::Domain(Domain::Cooking),
+        );
         // Workouts → Coach Mira.
         expect_one(
             "am I training tomorrow?",
@@ -2558,6 +2824,98 @@ mod tests {
         // Calendar/logistics and genuinely ambiguous asks stay with the concierge.
         expect_one("when is the dentist?", "otto", AddressedBy::Concierge);
         expect_one("can you help me?", "otto", AddressedBy::Concierge);
+    }
+
+    #[test]
+    fn domain_voice_uses_project_owner_map_and_never_compiled_roster() {
+        let root = tempfile::tempdir().expect("temp project");
+        std::fs::write(
+            root.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "quartz"
+domains = ["cooking", "recipes"]
+
+[[agent]]
+id = "harbor"
+domains = ["coordination", "calendar"]
+"#,
+        )
+        .expect("write household fixture");
+        let map = crate::notify::ownership::OwnerMap::load(root.path());
+        let cfg = cfg_with_bots(&[
+            ("quartz", "-100999", Some("quartz"), Some("quartz_bot")),
+            ("harbor", "-100999", Some("harbor"), Some("harbor_bot")),
+        ]);
+
+        let configured = elect_responders_with_owner_map(
+            Some("supergroup"),
+            Some("-100999"),
+            "pizza on friday",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+            &map,
+        );
+        assert_one(
+            &configured,
+            "quartz",
+            AddressedBy::Domain(crate::notify::ownership::Domain::Cooking),
+        );
+
+        let no_project_roster = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "pizza on friday",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+        );
+        assert_eq!(
+            no_project_roster,
+            Election::Silence(SilenceReason::NoVoicesConfigured),
+            "without household.toml-derived ownership, election must not invent any owner"
+        );
+    }
+
+    #[test]
+    fn opaque_concierge_id_routes_unaddressed_turns() {
+        let owner_map = crate::notify::ownership::OwnerMap::from_pairs([
+            ("quartz", vec!["cooking"]),
+            ("harbor", vec!["coordination", "calendar"]),
+        ]);
+        let cfg = cfg_with_bots(&[
+            ("quartz", "-100999", Some("quartz"), Some("quartz_bot")),
+            ("harbor", "-100999", Some("harbor"), Some("harbor_bot")),
+        ]);
+
+        let election = elect_responders_with_owner_map(
+            Some("supergroup"),
+            Some("-100999"),
+            "can someone help with the schedule?",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+            &owner_map,
+        );
+        assert_one(&election, "harbor", AddressedBy::Concierge);
+
+        let route = route_natural_with_owner_map(
+            Some("supergroup"),
+            Some("-100999"),
+            "hello there",
+            &[],
+            None,
+            &cfg,
+            &owner_map,
+        );
+        assert_routed(&route, "harbor", AddressedBy::Concierge);
     }
 
     /// PRECEDENCE (morning-taco-bugs): a message that OPENS with a greeting word
@@ -2601,7 +2959,12 @@ mod tests {
         // BARE greetings — no domain ask — stay a warm whole-roster greeting, in
         // BOTH the single-human group and (for the explicit-broadcast forms) the
         // two-human group.
-        for t in ["hey", "hey guys are you around?", "morning everybody", "hello all"] {
+        for t in [
+            "hey",
+            "hey guys are you around?",
+            "morning everybody",
+            "hello all",
+        ] {
             assert!(
                 matches!(elect_solo(t, &[], None), Election::All { .. }),
                 "bare greeting {t:?} must stay collective, got {:?}",
@@ -2622,7 +2985,7 @@ mod tests {
     /// only ever applies to UNADDRESSED asks.
     #[test]
     fn elect_explicit_name_beats_domain_voice() {
-        let e = elect_responders(
+        let e = elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             "otto, sort out pizza for friday",
@@ -2631,9 +2994,12 @@ mod tests {
             false,
             1,
             &casa_config(),
+            &crate::notify::ownership::OwnerMap::casa_default(),
         );
         match &e {
-            Election::One { bot, addressed_by, .. } => {
+            Election::One {
+                bot, addressed_by, ..
+            } => {
                 assert_eq!(bot.agent_id.as_deref(), Some("otto"));
                 assert_eq!(*addressed_by, AddressedBy::Name);
             }
@@ -2646,7 +3012,7 @@ mod tests {
     /// see WHY the chef (not Otto) answered.
     #[test]
     fn election_summary_shows_domain_reasoning() {
-        let e = elect_responders(
+        let e = elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             "pizza on friday",
@@ -2655,6 +3021,7 @@ mod tests {
             false,
             1,
             &casa_config(),
+            &crate::notify::ownership::OwnerMap::casa_default(),
         );
         let summary = election_decision_summary(Some("m1"), Some("supergroup"), &e);
         assert!(
@@ -2673,7 +3040,7 @@ mod tests {
     fn single_meal_ask_elects_exactly_one_owner_not_the_roster() {
         let ask = "hey plan for branzino for tomorrow night";
         let elect = |humans: usize| {
-            elect_responders(
+            elect_responders_with_owner_map(
                 Some("supergroup"),
                 Some("-100999"),
                 ask,
@@ -2682,6 +3049,7 @@ mod tests {
                 false,
                 humans,
                 &casa_config(),
+                &crate::notify::ownership::OwnerMap::casa_default(),
             )
         };
 
@@ -2690,7 +3058,9 @@ mod tests {
         // roster (the four-bot bug), never the concierge (Otto).
         let single = elect(1);
         match &single {
-            Election::One { bot, addressed_by, .. } => {
+            Election::One {
+                bot, addressed_by, ..
+            } => {
                 assert_eq!(
                     bot.agent_id.as_deref(),
                     Some("nora"),
@@ -2724,9 +3094,10 @@ mod tests {
         // the mention rung. Order asserted: mention > name > reply > collective >
         // ask(otto) > silence.
         let cfg = casa_config_no_usernames();
+        let owner_map = crate::notify::ownership::OwnerMap::casa_default();
         let elect = |text: &str, mentions: &[&str], reply: Option<&str>| {
             let m: Vec<String> = mentions.iter().map(|s| s.to_string()).collect();
-            elect_responders(
+            elect_responders_with_owner_map(
                 Some("supergroup"),
                 Some("-100999"),
                 text,
@@ -2735,12 +3106,13 @@ mod tests {
                 false,
                 2,
                 &cfg,
+                &owner_map,
             )
         };
         let agent_of = |e: &Election| match e {
-            Election::One { bot, addressed_by, .. } => {
-                (bot.agent_id.clone(), Some(*addressed_by))
-            }
+            Election::One {
+                bot, addressed_by, ..
+            } => (bot.agent_id.clone(), Some(*addressed_by)),
             _ => (None, None),
         };
 
@@ -2764,7 +3136,10 @@ mod tests {
             (Some("otto".to_string()), Some(AddressedBy::ReplyChain))
         );
         // 4. collective greeting → the whole roster.
-        assert!(matches!(elect("hey everyone!", &[], None), Election::All { .. }));
+        assert!(matches!(
+            elect("hey everyone!", &[], None),
+            Election::All { .. }
+        ));
         // 5. unaddressed coordination ask → the concierge (otto). A food/workout
         //    ask instead reaches its domain owner (rung 5' below).
         assert_eq!(
@@ -2777,7 +3152,9 @@ mod tests {
             agent_of(&elect("what's for dinner tonight?", &[], None)),
             (
                 Some("nora".to_string()),
-                Some(AddressedBy::Domain(crate::notify::ownership::Domain::MealPlanning))
+                Some(AddressedBy::Domain(
+                    crate::notify::ownership::Domain::MealPlanning
+                ))
             )
         );
         // 6. pure small talk → silence.
@@ -2883,7 +3260,10 @@ mod tests {
         // Third-person "the guys" is NOT a second-person address — it stays a
         // single concierge answer, never a four-way broadcast.
         assert!(
-            !matches!(elect("tell the guys dinner is ready", &[], None), Election::All { .. }),
+            !matches!(
+                elect("tell the guys dinner is ready", &[], None),
+                Election::All { .. }
+            ),
             "third-person 'the guys' must not elect the roster"
         );
         assert!(
@@ -2938,7 +3318,10 @@ mod tests {
             "can you plan dinner?", // singular "you"
             "what's for dinner tonight?",
         ] {
-            assert!(!is_plural_you_address(t), "expected NOT plural-you for {t:?}");
+            assert!(
+                !is_plural_you_address(t),
+                "expected NOT plural-you for {t:?}"
+            );
         }
     }
 
@@ -2974,7 +3357,10 @@ mod tests {
             "hey folks what's for dinner tonight?", // a plain ask, not a debate
             "",
         ] {
-            assert!(!is_discussion_ask(t), "expected NOT discussion ask for {t:?}");
+            assert!(
+                !is_discussion_ask(t),
+                "expected NOT discussion ask for {t:?}"
+            );
         }
     }
 
@@ -2996,7 +3382,11 @@ mod tests {
             ("what do you all think?", true, true),
             // A discussion ask with NO second-person-plural address is promoted to
             // collective too (would otherwise be swallowed to the concierge).
-            ("let's discuss the weekend plan and find consensus", true, true),
+            (
+                "let's discuss the weekend plan and find consensus",
+                true,
+                true,
+            ),
             ("thoughts on the holiday plan everyone?", true, true),
             // Collective greeting → collective, but NOT a round.
             ("hey guys are you around?", true, false),
@@ -3030,9 +3420,10 @@ mod tests {
     #[test]
     fn collective_reply_plans_four_posts_in_roster_order() {
         use crate::graph::WorkGraph;
-        use crate::notify::telegram_standup::{DEFAULT_ROSTER, plan_group_reply};
+        use crate::notify::telegram_standup::plan_group_reply;
         let cfg = casa_config();
-        let posts = plan_group_reply(&WorkGraph::new(), &cfg, DEFAULT_ROSTER);
+        let roster = casa_test_roster(&cfg);
+        let posts = plan_group_reply(&WorkGraph::new(), &roster);
         let ids: Vec<&str> = posts.iter().map(|p| p.bot_id.as_str()).collect();
         assert_eq!(ids, vec!["nora", "bruno", "mira", "otto"], "roster order");
         // Conversational, not a status report — grounded "all quiet" line.
@@ -3131,8 +3522,16 @@ mod tests {
 
     #[test]
     fn elect_group_without_chat_id_is_silence_no_chat() {
-        let e =
-            elect_responders(Some("group"), None, "hey guys", &[], None, false, 2, &casa_config());
+        let e = elect_responders(
+            Some("group"),
+            None,
+            "hey guys",
+            &[],
+            None,
+            false,
+            2,
+            &casa_config(),
+        );
         assert_eq!(e, Election::Silence(SilenceReason::NoChatId));
     }
 
@@ -3288,7 +3687,10 @@ mod tests {
         // wrongly elected silence:small-talk. A human reads this as an
         // unambiguous group summon → the whole roster now answers.
         assert!(
-            matches!(elect("hey guyd are you aroind?", &[], None), Election::All { .. }),
+            matches!(
+                elect("hey guyd are you aroind?", &[], None),
+                Election::All { .. }
+            ),
             "Luca's typo'd greeting-question must elect the collective, not silence"
         );
     }
@@ -3309,8 +3711,14 @@ mod tests {
     fn elect_more_typo_summons_are_collective() {
         // Fuzzy trigger phrase ("hi guyz") and fuzzy greeting-question openers.
         assert!(matches!(elect("hi guyz!", &[], None), Election::All { .. }));
-        assert!(matches!(elect("hey are you all aroind?", &[], None), Election::All { .. }));
-        assert!(matches!(elect("helo everyone up yet?", &[], None), Election::All { .. }));
+        assert!(matches!(
+            elect("hey are you all aroind?", &[], None),
+            Election::All { .. }
+        ));
+        assert!(matches!(
+            elect("helo everyone up yet?", &[], None),
+            Election::All { .. }
+        ));
     }
 
     #[test]
@@ -3374,8 +3782,15 @@ mod tests {
         // Every greeting shape earns a brief roster greeting in a single-human
         // group, including typo'd and time-of-day forms.
         for t in [
-            "hi", "hey", "helo", "hey there", "goodnight", "goodmorning",
-            "good morning", "good night", "buongiorno",
+            "hi",
+            "hey",
+            "helo",
+            "hey there",
+            "goodnight",
+            "goodmorning",
+            "good morning",
+            "good night",
+            "buongiorno",
         ] {
             assert!(
                 matches!(elect_solo(t, &[], None), Election::All { .. }),
@@ -3406,7 +3821,11 @@ mod tests {
     fn elect_solo_still_honours_named_mention_and_ask_precedence() {
         // Membership only changes the d/e/f *fallback*. Explicit targets and
         // team-directed asks still win exactly as before, even in a solo group.
-        assert_one(&elect_solo("nora, hi", &[], None), "nora", AddressedBy::Name);
+        assert_one(
+            &elect_solo("nora, hi", &[], None),
+            "nora",
+            AddressedBy::Name,
+        );
         assert_one(
             &elect_solo("can someone sort out the logistics?", &[], None),
             "otto",
@@ -3546,12 +3965,76 @@ mod tests {
         assert!(addressed_name_bot("i saw bruno at the shop", &cfg).is_none());
         // But real addresses resolve:
         assert_eq!(
-            addressed_name_bot("nora, thanks", &cfg).unwrap().agent_id.as_deref(),
+            addressed_name_bot("nora, thanks", &cfg)
+                .unwrap()
+                .agent_id
+                .as_deref(),
             Some("nora")
         );
         assert_eq!(
-            addressed_name_bot("hey mira", &cfg).unwrap().agent_id.as_deref(),
+            addressed_name_bot("hey mira", &cfg)
+                .unwrap()
+                .agent_id
+                .as_deref(),
             Some("mira")
+        );
+    }
+
+    #[test]
+    fn authored_multiword_display_names_route_opaque_persona_ids() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "unit-7"
+name = "Cedar Keeper"
+domains = ["meals"]
+
+[[agent]]
+id = "unit-2"
+name = "Copper Ladle"
+domains = ["cooking"]
+"#,
+        )
+        .unwrap();
+        let owners = crate::notify::ownership::OwnerMap::from_household_toml(root.path()).unwrap();
+        let config = cfg_with_bots(&[
+            ("unit-7", "-100999", Some("unit-7"), Some("opaque_one_bot")),
+            ("unit-2", "-100999", Some("unit-2"), Some("opaque_two_bot")),
+        ]);
+
+        let elected = |text: &str| {
+            elect_responders_with_owner_map(
+                Some("supergroup"),
+                Some("-100999"),
+                text,
+                &[],
+                None,
+                false,
+                2,
+                &config,
+                &owners,
+            )
+        };
+        let assert_name = |text: &str, expected: &str| match elected(text) {
+            Election::One {
+                bot,
+                addressed_by: AddressedBy::Name,
+                ..
+            } => assert_eq!(bot.agent_id.as_deref(), Some(expected), "text={text:?}"),
+            other => panic!("expected authored-name election for {text:?}, got {other:?}"),
+        };
+
+        assert_name("Cedar Keeper, could you check dinner?", "unit-7");
+        assert_name("hey Copper Ladle", "unit-2");
+        assert_name("what do you think, Cedar Keeper?", "unit-7");
+        assert!(
+            matches!(
+                elected("Cedar Keeper from school called today"),
+                Election::Silence(SilenceReason::SmallTalk)
+            ),
+            "a display name buried in narration must not summon a bot"
         );
     }
 
@@ -3589,10 +4072,10 @@ mod tests {
     }
 
     #[test]
-    fn decision_line_for_otto_concierge() {
+    fn decision_line_for_configured_concierge() {
         // Unaddressed coordination ask with otto present → otto coordinates.
         let line = decision("can someone sort out the logistics?", &[], None);
-        assert_eq!(line, "msg=42 chat=supergroup rule=otto-concierge target=otto");
+        assert_eq!(line, "msg=42 chat=supergroup rule=concierge target=otto");
     }
 
     #[test]
@@ -3614,8 +4097,16 @@ mod tests {
 
     #[test]
     fn decision_line_for_silence_no_chat_id() {
-        let election =
-            elect_responders(Some("group"), None, "hey guys", &[], None, false, 2, &casa_config());
+        let election = elect_responders(
+            Some("group"),
+            None,
+            "hey guys",
+            &[],
+            None,
+            false,
+            2,
+            &casa_config(),
+        );
         let line = election_decision_summary(None, Some("group"), &election);
         // No transport message id → "none"; reason surfaced in the rule.
         assert_eq!(
@@ -3669,8 +4160,10 @@ mod tests {
     fn decision_line_targets_bot_id_when_agent_unbound() {
         // A bot fronting no agent falls back to "<bot_id>(unbound)" — the target
         // is never blank, so the log always names a landing point.
-        let cfg = cfg_with_bots(&[("otto", "-100999", None, Some("otto_bot"))]);
-        let election = elect_responders(
+        let cfg = cfg_with_bots(&[("harbor", "-100999", None, Some("harbor_bot"))]);
+        let owner_map =
+            crate::notify::ownership::OwnerMap::from_pairs([("harbor", vec!["coordination"])]);
+        let election = elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             "can someone help?",
@@ -3679,11 +4172,12 @@ mod tests {
             false,
             2,
             &cfg,
+            &owner_map,
         );
         let line = election_decision_summary(Some("3"), Some("supergroup"), &election);
         assert_eq!(
             line,
-            "msg=3 chat=supergroup rule=otto-concierge target=otto(unbound)"
+            "msg=3 chat=supergroup rule=concierge target=harbor(unbound)"
         );
     }
 
@@ -3758,15 +4252,18 @@ mod tests {
     fn fennel_web_inbound_elects_nora_not_otto() {
         use crate::notify::ownership::Domain;
         let cfg = casa_config();
-        let election = elect_group_inbound(
+        let election = elect_group_inbound_with_owner_map(
             "-100999",
             "hey can you swap tacod for grilled fennel",
             &[],
             1,
             &cfg,
+            &crate::notify::ownership::OwnerMap::casa_default(),
         );
         match &election {
-            Election::One { bot, addressed_by, .. } => {
+            Election::One {
+                bot, addressed_by, ..
+            } => {
                 assert_eq!(
                     bot.agent_id.as_deref(),
                     Some("nora"),
@@ -3780,8 +4277,8 @@ mod tests {
 
     // ---- Configured roles, not compiled ids (p1-engine-photo-config-fixture) --
     //
-    // A household that composes its OWN family gets no `otto` and no `bruno`.
-    // Election must read WHO OWNS WHAT from that household's roster, so a
+    // A household that composes its own family does not inherit starter ids.
+    // Election must read who owns what from that household's roster, so a
     // message naming nobody reaches the persona it declared for `coordination`
     // and a food-shaped ask reaches the one it declared for `cooking`.
 
@@ -3795,14 +4292,28 @@ mod tests {
     }
 
     fn opaque_owners(cooking: &str, coordination: &str) -> OwnerMap {
+        assert_ne!(cooking, coordination);
+        let domains_for = |persona_id: &str| {
+            if persona_id == cooking {
+                vec!["meals", "cooking", "recipes"]
+            } else if persona_id == coordination {
+                vec!["calendar", "coordination", "shopping"]
+            } else {
+                panic!("unexpected opaque test persona: {persona_id}");
+            }
+        };
+
+        // Keep author order fixed while ownership moves. Otherwise a broken
+        // positional router (first = cooking, second = coordination) could
+        // pass the reassignment assertions.
         OwnerMap::from_pairs(vec![
-            (cooking, vec!["meals", "cooking", "recipes"]),
-            (coordination, vec!["calendar", "coordination", "shopping"]),
+            ("wren", domains_for("wren")),
+            ("tally", domains_for("tally")),
         ])
     }
 
     fn elect_opaque(text: &str, owners: &OwnerMap) -> Election {
-        elect_responders_with_owners(
+        elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             text,
@@ -3823,38 +4334,15 @@ mod tests {
     }
 
     #[test]
-    fn coordination_voice_comes_from_the_household_not_the_compiled_default() {
-        // Declared coordination owner wins…
-        assert_eq!(
-            coordination_voice_id(&opaque_owners("wren", "tally")),
-            "tally"
-        );
-        // …and reassigning it in the roster moves who fronts the group.
-        assert_eq!(
-            coordination_voice_id(&opaque_owners("tally", "wren")),
-            "wren"
-        );
-        // The shipped roster still resolves to the shipped concierge, so nothing
-        // changes for a household that never renamed its cast.
-        assert_eq!(
-            coordination_voice_id(&OwnerMap::casa_default()),
-            CONCIERGE_BOT
-        );
-        // A roster that declares no coordination owner at all falls back to the
-        // compiled default rather than going silent.
-        assert_eq!(
-            coordination_voice_id(&OwnerMap::from_pairs(vec![("wren", vec!["cooking"])])),
-            CONCIERGE_BOT
-        );
-    }
-
-    #[test]
     fn unaddressed_message_reaches_the_configured_coordinator() {
         // Nobody is named and the content is not food/workouts — this is the
         // concierge rule, resolved against the household's own roster. Before the
-        // fix this went to `Silence(NoVoicesConfigured)` because the compiled
-        // `otto` had no bot in this config.
-        let election = elect_opaque("can someone take a look at this", &opaque_owners("wren", "tally"));
+        // fix this went to `Silence(NoVoicesConfigured)` because the configured
+        // coordinator was not resolved from this project.
+        let election = elect_opaque(
+            "can someone take a look at this",
+            &opaque_owners("wren", "tally"),
+        );
         assert_eq!(
             elected_agent(&election).as_deref(),
             Some("tally"),
@@ -3873,13 +4361,13 @@ mod tests {
     }
 
     #[test]
-    fn moving_coordination_in_the_roster_moves_who_answers() {
+    fn moving_coordination_domains_with_fixed_order_moves_who_answers() {
         let text = "can someone take a look at this";
         assert_eq!(
             elected_agent(&elect_opaque(text, &opaque_owners("wren", "tally"))).as_deref(),
             Some("tally")
         );
-        // Same config, same message: only the roster moved.
+        // Same bot config, author order, and message: only domain ownership moved.
         assert_eq!(
             elected_agent(&elect_opaque(text, &opaque_owners("tally", "wren"))).as_deref(),
             Some("wren"),
@@ -3901,34 +4389,5 @@ mod tests {
             elected_agent(&elect_opaque(text, &opaque_owners("tally", "wren"))).as_deref(),
             Some("tally")
         );
-    }
-
-    #[test]
-    fn shipped_roster_election_is_unchanged_by_the_owner_map_seam() {
-        // The compatibility entry point must keep behaving exactly as before:
-        // an unaddressed ask is the shipped concierge's, a food ask the cook's.
-        let cfg = casa_config();
-        let unaddressed = elect_responders(
-            Some("supergroup"),
-            Some("-100999"),
-            "can someone take a look at this",
-            &[],
-            None,
-            false,
-            1,
-            &cfg,
-        );
-        assert_eq!(elected_agent(&unaddressed).as_deref(), Some(CONCIERGE_BOT));
-        let food = elect_responders(
-            Some("supergroup"),
-            Some("-100999"),
-            "how do I cook this risotto?",
-            &[],
-            None,
-            false,
-            1,
-            &cfg,
-        );
-        assert_eq!(elected_agent(&food).as_deref(), Some("bruno"));
     }
 }

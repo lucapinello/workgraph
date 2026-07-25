@@ -34,9 +34,9 @@ use worksgood::graph::{
     LogEntry, Status, Task, TaskChoice, WaitCondition, WaitSpec, WorkGraph, is_system_task,
 };
 use worksgood::messages;
-use worksgood::notify::{Action, ActionStyle, NotificationChannel};
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
+use worksgood::notify::{Action, ActionStyle, NotificationChannel};
 use worksgood::query::ready_tasks_with_peers_cycle_aware;
 
 /// Separator between the task id and the button key in a generic inline-button
@@ -1066,8 +1066,13 @@ mod tests {
         // No parked task; persist an empty graph the router loads from disk.
         worksgood::parser::save_graph(&WorkGraph::new(), crate::commands::graph_path(dir)).unwrap();
 
-        let routed =
-            route_inbound_reply(dir, "telegram:otto", "luca-1", Some("luca-1"), "morning everyone!");
+        let routed = route_inbound_reply(
+            dir,
+            "telegram:otto",
+            "luca-1",
+            Some("luca-1"),
+            "morning everyone!",
+        );
 
         match routed {
             InboundReplyOutcome::NotParkedReply { persona } => {
@@ -1096,8 +1101,13 @@ mod tests {
 
         worksgood::parser::save_graph(&WorkGraph::new(), crate::commands::graph_path(dir)).unwrap();
 
-        let routed =
-            route_inbound_reply(dir, "telegram:nadin", "luca-1", Some("luca-1"), "answer for nadin");
+        let routed = route_inbound_reply(
+            dir,
+            "telegram:nadin",
+            "luca-1",
+            Some("luca-1"),
+            "answer for nadin",
+        );
 
         match routed {
             InboundReplyOutcome::Rejected(reason) => {
@@ -1233,11 +1243,23 @@ mod tests {
 
     #[test]
     fn slugify_choice_key_is_short_and_stable() {
-        assert_eq!(worksgood::graph::slugify_choice_key("Looks good"), "looks_good");
-        assert_eq!(worksgood::graph::slugify_choice_key("Change something!"), "change_something");
-        assert_eq!(worksgood::graph::slugify_choice_key("  Yes / No  "), "yes_no");
+        assert_eq!(
+            worksgood::graph::slugify_choice_key("Looks good"),
+            "looks_good"
+        );
+        assert_eq!(
+            worksgood::graph::slugify_choice_key("Change something!"),
+            "change_something"
+        );
+        assert_eq!(
+            worksgood::graph::slugify_choice_key("  Yes / No  "),
+            "yes_no"
+        );
         // TaskChoice::new derives the key when one isn't supplied.
-        assert_eq!(TaskChoice::new("", "Change something").key, "change_something");
+        assert_eq!(
+            TaskChoice::new("", "Change something").key,
+            "change_something"
+        );
     }
 
     #[test]
@@ -1314,15 +1336,25 @@ mod tests {
         worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
 
         // Unknown task id -> None, nothing recorded.
-        assert_eq!(route_button_callback(dir, "ghost#looks_good", "lucapinello"), None);
+        assert_eq!(
+            route_button_callback(dir, "ghost#looks_good", "lucapinello"),
+            None
+        );
         // Known task but a key it never declared (stale button) -> None.
         assert_eq!(
             route_button_callback(dir, "plan-review#delete_everything", "lucapinello"),
             None
         );
         // Legacy `<verb>:<task>` (no `#`) is not a button token here.
-        assert_eq!(route_button_callback(dir, "approve:plan-review", "lucapinello"), None);
-        assert!(messages::list_messages(dir, "plan-review").unwrap().is_empty());
+        assert_eq!(
+            route_button_callback(dir, "approve:plan-review", "lucapinello"),
+            None
+        );
+        assert!(
+            messages::list_messages(dir, "plan-review")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1382,8 +1414,7 @@ mod tests {
         graph.add_node(Node::Task(confirm_task("plan-review", Some("human-luca"))));
         worksgood::parser::save_graph(&graph, crate::commands::graph_path(dir)).unwrap();
 
-        let reloaded =
-            worksgood::parser::load_graph(&crate::commands::graph_path(dir)).unwrap();
+        let reloaded = worksgood::parser::load_graph(&crate::commands::graph_path(dir)).unwrap();
         assert_eq!(
             reloaded.get_task("plan-review").unwrap().choices,
             TaskChoice::confirmation_pair(),

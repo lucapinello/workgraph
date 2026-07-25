@@ -6636,11 +6636,12 @@ pub enum TelegramCommands {
 
     /// Post a family standup: one message per named voice, in roster order
     ///
-    /// Walks the roster (`nora, bruno, mira, otto`, then any other configured
-    /// bot) and posts each persona's family-voice check-in AS that bot,
-    /// grounded in its live graph state. This is the on-demand equivalent of
-    /// typing `/standup` in the group. Use `--dry-run` to print the posts in
-    /// roster order without sending (verifiable without a live group).
+    /// Walks the current project's ordered `household.toml` `[[agent]]` roster,
+    /// joins each id to `[telegram.bots.<id>]`, and posts each persona's
+    /// family-voice check-in AS that bot, grounded in its live graph state.
+    /// Missing or malformed multi-voice roster configuration fails closed.
+    /// This is the on-demand equivalent of typing `/standup` in the group. Use
+    /// `--dry-run` to print the posts in roster order without sending.
     Standup {
         /// Group chat ID to post to (defaults to the configured group chat)
         #[arg(long)]
@@ -6681,11 +6682,11 @@ pub enum TelegramCommands {
     ///
     /// Runs the exact `elect_responders` decision the `wg telegram listen`
     /// listener uses once a message survives cross-bot dedupe: @mention,
-    /// addressed name, reply-chain, collective-address (ALL four answer),
-    /// team-directed unaddressed ask (otto coordinates), else silence. Prints
-    /// who answers without sending anything — verify the election table
-    /// (docs/09 §natural-group) against your real `notify.toml`, no live group
-    /// needed.
+    /// addressed name, reply-chain, collective-address (the configured
+    /// household roster answers), team-directed unaddressed ask (the configured
+    /// coordination owner answers), else silence. Prints who answers without
+    /// sending anything — verify the election table (docs/09 §natural-group)
+    /// against your real `household.toml` + `notify.toml`, no live group needed.
     Elect {
         /// The group message text to elect on (e.g. "hey guys, dinner?")
         message: String,
@@ -6786,6 +6787,15 @@ pub enum TelegramCommands {
         /// have it reply with this text, exercising the full round-trip.
         #[arg(long)]
         session_reply: Option<String>,
+
+        /// Test-only composed-turn fixture: inject this draft through the real
+        /// finalize → outbox → delivery path without spawning a model.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["session_reply", "compose", "compose_error"]
+        )]
+        composed_reply: Option<String>,
 
         /// Real-turn mode: drive the converse turn through the production
         /// one-shot `claude` composer (no fixture), capturing an actual
@@ -7061,12 +7071,13 @@ pub enum TelegramCommands {
     ///
     /// Runs the exact `elect_responders` decision plus the `is_discussion_ask`
     /// gate the `wg telegram listen` listener uses to split a collective election
-    /// into a multi-voice discussion round (sequenced in-voice takes + an Otto
-    /// synthesis) vs today's four independent hellos. Prints the category —
-    /// `discussion-round`, `collective-greeting`, `single-voice`, or `silence` —
-    /// and, for a round, the voices in contribution order plus the synthesizer,
-    /// WITHOUT sending anything. Reads bots from the current project's
-    /// `notify.toml`.
+    /// into a multi-voice discussion round (sequenced in-voice takes plus a
+    /// synthesis from the configured coordination owner) vs independent roster
+    /// replies. Prints the category — `discussion-round`,
+    /// `collective-greeting`, `single-voice`, or `silence` — and, for a round,
+    /// the voices in contribution order plus the synthesizer, WITHOUT sending
+    /// anything. Reads presentation/order from the current project's
+    /// `household.toml` and bot bindings from `notify.toml`.
     Discuss {
         /// The group message text (e.g. "can you guys discuss dinner and find consensus?")
         message: String,
@@ -7156,9 +7167,9 @@ pub enum TelegramCommands {
         message: String,
 
         /// The persona whose voice the prompt is assembled for. Defaults to the
-        /// household concierge.
-        #[arg(long, default_value = "otto")]
-        agent: String,
+        /// project-local coordination owner from household.toml.
+        #[arg(long)]
+        agent: Option<String>,
 
         /// The bound chat session to read voice + recent turns from (a session
         /// uuid or a bound agent name). Defaults to `--agent`; an unknown ref
@@ -7194,6 +7205,37 @@ pub enum TelegramCommands {
         /// inline or `@path`. Defaults to an empty list.
         #[arg(long)]
         list: Option<String>,
+    },
+
+    /// Scratch-only replay harness for the durable photo mutation boundary
+    #[command(hide = true)]
+    PhotoReplay {
+        /// Raw Telegram update JSON, inline or `@path`.
+        update: String,
+
+        /// Fixture vision reply, including any `SHOPPING_UPDATE:` tail.
+        #[arg(long)]
+        reply: String,
+
+        /// Fixture `GET /shopping.json` body, inline or `@path`.
+        #[arg(long)]
+        list: String,
+
+        /// Local image copied by the stub downloader for each Telegram file id.
+        #[arg(long)]
+        mock_image: PathBuf,
+
+        /// JSONL artifact receiving one row per stubbed mutation turn.
+        #[arg(long)]
+        mock_mutation_log: PathBuf,
+
+        /// JSONL artifact receiving each successful stubbed send.
+        #[arg(long)]
+        mock_send_log: PathBuf,
+
+        /// Make this invocation's stub transport fail before recording a send.
+        #[arg(long)]
+        fail_send: bool,
     },
 }
 
@@ -7412,6 +7454,9 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Kill { .. }
             | Commands::Reap { .. }
             | Commands::Service { .. }
+            | Commands::Session {
+                command: SessionCommands::List { .. },
+            }
             | Commands::Screencast { .. }
             | Commands::Cost { .. }
             | Commands::Check

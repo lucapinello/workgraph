@@ -410,9 +410,9 @@ mod resolver_tests {
     #[test]
     fn parse_task_choices_skips_blanks_and_dedups_keys() {
         let raw = vec![
-            "  ".to_string(),              // blank label -> skipped
+            "  ".to_string(), // blank label -> skipped
             "dup=First".to_string(),
-            "dup=Second".to_string(),      // duplicate key -> first wins
+            "dup=Second".to_string(), // duplicate key -> first wins
         ];
         let choices = super::parse_task_choices(&raw, false);
         assert_eq!(choices.len(), 1);
@@ -1084,7 +1084,10 @@ fn main() -> Result<()> {
             // task's agent. The link is stored as a `spawned-by:<agent>` tag so
             // no Task field / construction site changes are needed.
             let mut tag = tag;
-            if !tag.iter().any(|t| t.starts_with(worksgood::graph::SPAWNED_BY_TAG_PREFIX)) {
+            if !tag
+                .iter()
+                .any(|t| t.starts_with(worksgood::graph::SPAWNED_BY_TAG_PREFIX))
+            {
                 let is_disposable = tag.iter().any(|t| t == worksgood::graph::DISPOSABLE_TAG);
                 let resolved_spawner = spawned_by.clone().or_else(|| {
                     if !is_disposable {
@@ -1405,7 +1408,13 @@ fn main() -> Result<()> {
             reason,
             superseded_by,
             force,
-        } => commands::abandon::run(&workgraph_dir, &id, reason.as_deref(), &superseded_by, force),
+        } => commands::abandon::run(
+            &workgraph_dir,
+            &id,
+            reason.as_deref(),
+            &superseded_by,
+            force,
+        ),
         Commands::Retry {
             id,
             preserve_session,
@@ -3852,6 +3861,7 @@ fn main() -> Result<()> {
                 chat_type,
                 chat_id,
             } => commands::telegram::run_route(
+                &workgraph_dir,
                 &message,
                 reply_to_bot.as_deref(),
                 &chat_type,
@@ -3889,6 +3899,7 @@ fn main() -> Result<()> {
                 message,
                 group,
                 session_reply,
+                composed_reply,
                 compose,
                 compose_error,
             } => commands::telegram::run_conversation_dryrun(
@@ -3899,6 +3910,7 @@ fn main() -> Result<()> {
                 &message,
                 group,
                 session_reply.as_deref(),
+                composed_reply.as_deref(),
                 compose,
                 compose_error,
                 cli.json,
@@ -3962,12 +3974,7 @@ fn main() -> Result<()> {
                 reply_text,
                 human,
                 dry_run,
-            } => commands::telegram::run_parity(
-                &reply_text,
-                human.as_deref(),
-                dry_run,
-                cli.json,
-            ),
+            } => commands::telegram::run_parity(&reply_text, human.as_deref(), dry_run, cli.json),
             TelegramCommands::Owner {
                 ask,
                 persona,
@@ -4019,7 +4026,7 @@ fn main() -> Result<()> {
             } => commands::telegram::run_compose_prompt(
                 &workgraph_dir,
                 &message,
-                &agent,
+                agent.as_deref(),
                 session.as_deref(),
                 cli.json,
             ),
@@ -4040,12 +4047,19 @@ fn main() -> Result<()> {
                         .ok()
                         .filter(|s| !s.trim().is_empty())
                 });
+                // The gateway creates one opaque occurrence id per accepted web
+                // turn. A true dispatcher refire preserves it; a later turn gets
+                // a new id even when the household repeats the same words.
+                let turn_id = std::env::var("WG_TURN_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty());
                 commands::telegram::run_web_inbound(
                     &workgraph_dir,
                     &sender,
                     &message,
                     chat_id.as_deref(),
                     owner_pin.as_deref(),
+                    turn_id.as_deref(),
                     dry_run,
                     cli.json,
                 )
@@ -4059,6 +4073,25 @@ fn main() -> Result<()> {
                 &update,
                 reply.as_deref(),
                 list.as_deref(),
+                cli.json,
+            ),
+            TelegramCommands::PhotoReplay {
+                update,
+                reply,
+                list,
+                mock_image,
+                mock_mutation_log,
+                mock_send_log,
+                fail_send,
+            } => commands::telegram::run_photo_replay(
+                &workgraph_dir,
+                &update,
+                &reply,
+                &list,
+                &mock_image,
+                &mock_mutation_log,
+                &mock_send_log,
+                fail_send,
                 cli.json,
             ),
         },

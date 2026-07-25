@@ -45,6 +45,10 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
+
+use super::telegram_standup::{HouseholdPersona, load_household_personas};
+
 /// The kind of a feed line: a human's group message, or an agent's reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedKind {
@@ -132,20 +136,35 @@ impl FeedEntry {
     }
 }
 
-/// The persona presentation (display name, identity emoji) for a known roster
-/// id, or `None` for any non-persona sender.
+/// Config-derived persona presentation used by every casa-feed writer.
 ///
-/// Mirrors `telegram_standup::persona_presentation` so a voice wears the same
-/// face in the standup, the group, and the conversation pane. `None` (rather
-/// than a title-cased fallback) is what lets [`group_entry`] write `agentId:
-/// null` for a human sender — a human is not a persona, so it has no id here.
-pub fn persona_identity(id: &str) -> Option<(String, String)> {
-    match id.trim().to_ascii_lowercase().as_str() {
-        "nora" => Some(("Nora".to_string(), "🥗".to_string())),
-        "bruno" => Some(("Bruno".to_string(), "👨\u{200d}🍳".to_string())),
-        "mira" => Some(("Coach Mira".to_string(), "💪".to_string())),
-        "otto" => Some(("Otto".to_string(), "📋".to_string())),
-        _ => None,
+/// The catalog deliberately contains no compiled household identities. Loading
+/// a missing or malformed roster returns an error; a caller that elects to keep
+/// delivery available may use [`PersonaCatalog::default`], which renders an
+/// agent with a neutral id-derived label and no emoji rather than inventing a
+/// household identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonaCatalog {
+    personas: Vec<HouseholdPersona>,
+}
+
+impl PersonaCatalog {
+    /// Build a catalog from an already-validated ordered household roster.
+    pub fn from_personas(personas: Vec<HouseholdPersona>) -> Self {
+        Self { personas }
+    }
+
+    /// Load the presentation catalog from `<project_root>/household.toml`.
+    pub fn load(project_root: &Path) -> Result<Self> {
+        Ok(Self::from_personas(load_household_personas(project_root)?))
+    }
+
+    /// The configured display name and emoji for `id`, matched case-insensitively.
+    pub fn identity(&self, id: &str) -> Option<(String, String)> {
+        self.personas
+            .iter()
+            .find(|persona| persona.id.eq_ignore_ascii_case(id.trim()))
+            .map(|persona| (persona.display_name.clone(), persona.emoji.clone()))
     }
 }
 
@@ -221,8 +240,14 @@ pub fn source_id(chat_id: &str, sender_id: &str, date_secs: i64, text: &str) -> 
 /// `src_id` is the opaque dedupe fingerprint (from [`source_id`]) for this
 /// inbound message, or `None` when the transport didn't surface enough to build
 /// one (a `null` srcId is unique-by-construction on the read side).
-pub fn group_entry(sender: &str, text: &str, ts: i64, src_id: Option<String>) -> FeedEntry {
-    match persona_identity(sender) {
+pub fn group_entry(
+    personas: &PersonaCatalog,
+    sender: &str,
+    text: &str,
+    ts: i64,
+    src_id: Option<String>,
+) -> FeedEntry {
+    match personas.identity(sender) {
         Some((name, emoji)) => FeedEntry {
             ts,
             sender: name,
@@ -257,9 +282,9 @@ pub fn group_entry(sender: &str, text: &str, ts: i64, src_id: Option<String>) ->
 /// source message and its `src_id` is `None` (unique by construction — the read
 /// side never collapses a null srcId). `origin` is still `"telegram"`: the line
 /// is physically written by the Telegram relay.
-pub fn agent_entry(agent_id: &str, text: &str, ts: i64) -> FeedEntry {
+pub fn agent_entry(personas: &PersonaCatalog, agent_id: &str, text: &str, ts: i64) -> FeedEntry {
     let id = agent_id.trim().to_ascii_lowercase();
-    let (sender, emoji) = match persona_identity(agent_id) {
+    let (sender, emoji) = match personas.identity(agent_id) {
         Some((name, emoji)) => (name, emoji),
         None => (title_case(&id), String::new()),
     };
@@ -310,10 +335,31 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn catalog() -> PersonaCatalog {
+        PersonaCatalog::from_personas(vec![
+            HouseholdPersona {
+                id: "harbor".to_string(),
+                display_name: "Harbor Voice".to_string(),
+                emoji: "🌊".to_string(),
+            },
+            HouseholdPersona {
+                id: "cedar".to_string(),
+                display_name: "Cedar Voice".to_string(),
+                emoji: "🌲".to_string(),
+            },
+        ])
+    }
+
     #[test]
     fn group_entry_human_has_null_agent_id_and_empty_emoji() {
-        let e = group_entry("nadin", "what's for dinner?", 1_720_000_000_000, None);
-        assert_eq!(e.sender, "nadin");
+        let e = group_entry(
+            &catalog(),
+            "guest",
+            "what's for dinner?",
+            1_720_000_000_000,
+            None,
+        );
+        assert_eq!(e.sender, "guest");
         assert_eq!(e.agent_id, None);
         assert_eq!(e.emoji, "");
         assert_eq!(e.kind, FeedKind::Group);
@@ -324,13 +370,13 @@ mod tests {
     #[test]
     fn group_entry_carries_the_passed_src_id() {
         let id = source_id("-100999", "555", 1_700_000_000, "hi");
-        let e = group_entry("nadin", "hi", 1, Some(id.clone()));
+        let e = group_entry(&catalog(), "guest", "hi", 1, Some(id.clone()));
         assert_eq!(e.src_id.as_deref(), Some(id.as_str()));
         // A persona-named group line carries the id too (both arms of the match).
-        let p = group_entry("nora", "hi", 1, Some(id.clone()));
+        let p = group_entry(&catalog(), "harbor", "hi", 1, Some(id.clone()));
         assert_eq!(p.src_id.as_deref(), Some(id.as_str()));
         // No id → null, unique-by-construction on the read side.
-        let n = group_entry("nadin", "hi", 1, None);
+        let n = group_entry(&catalog(), "guest", "hi", 1, None);
         assert_eq!(n.src_id, None);
     }
 
@@ -338,7 +384,7 @@ mod tests {
     fn agent_entry_has_null_src_id_and_telegram_origin() {
         // A relayed agent reply is locally composed: no upstream id, unique by
         // construction; still written via the Telegram relay so origin=telegram.
-        let e = agent_entry("nora", "pasta tonight", 0);
+        let e = agent_entry(&catalog(), "harbor", "pasta tonight", 0);
         assert_eq!(e.src_id, None);
         assert_eq!(e.origin, "telegram");
     }
@@ -350,7 +396,10 @@ mod tests {
         let b = source_id(chat, user, date, text);
         // (1) Stable: identical content → identical id (so a listener restart /
         // re-delivery of the same message hashes to the same token → deduped).
-        assert_eq!(a, b, "same content must yield the same source id across calls");
+        assert_eq!(
+            a, b,
+            "same content must yield the same source id across calls"
+        );
         // Distinct content → distinct id (no accidental over-collapse).
         assert_ne!(a, source_id(chat, user, date, "goodbye"));
         assert_ne!(a, source_id(chat, user, date + 1, text));
@@ -363,31 +412,76 @@ mod tests {
     }
 
     #[test]
-    fn agent_entry_maps_from_roster_lowercased() {
-        // Mixed-case id resolves to the roster face; agentId is lower-cased.
-        let e = agent_entry("Nora", "pasta tonight", 1_720_000_005_000);
-        assert_eq!(e.sender, "Nora");
-        assert_eq!(e.agent_id.as_deref(), Some("nora"));
-        assert_eq!(e.emoji, "🥗");
+    fn agent_entry_maps_from_configured_catalog_lowercased() {
+        // Mixed-case id resolves to the configured face; agentId is lower-cased.
+        let e = agent_entry(&catalog(), "HARBOR", "pasta tonight", 1_720_000_005_000);
+        assert_eq!(e.sender, "Harbor Voice");
+        assert_eq!(e.agent_id.as_deref(), Some("harbor"));
+        assert_eq!(e.emoji, "🌊");
         assert_eq!(e.kind, FeedKind::Agent);
 
-        let mira = agent_entry("mira", "let's move", 0);
-        assert_eq!(mira.sender, "Coach Mira");
-        assert_eq!(mira.agent_id.as_deref(), Some("mira"));
-        assert_eq!(mira.emoji, "💪");
+        let cedar = agent_entry(&catalog(), "cedar", "let's move", 0);
+        assert_eq!(cedar.sender, "Cedar Voice");
+        assert_eq!(cedar.agent_id.as_deref(), Some("cedar"));
+        assert_eq!(cedar.emoji, "🌲");
     }
 
     #[test]
     fn agent_entry_unknown_id_still_writes_a_line() {
-        let e = agent_entry("Zed", "hi", 0);
-        assert_eq!(e.sender, "Zed");
-        assert_eq!(e.agent_id.as_deref(), Some("zed"));
+        let e = agent_entry(&catalog(), "Quartz", "hi", 0);
+        assert_eq!(e.sender, "Quartz");
+        assert_eq!(e.agent_id.as_deref(), Some("quartz"));
         assert_eq!(e.emoji, "");
     }
 
     #[test]
+    fn catalog_loads_opaque_reordered_household_identities() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "cedar"
+name = "Second Voice"
+emoji = "②"
+
+[[agent]]
+id = "harbor"
+name = "First Voice"
+emoji = "①"
+"#,
+        )
+        .unwrap();
+
+        let loaded = PersonaCatalog::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.identity("CEDAR"),
+            Some(("Second Voice".to_string(), "②".to_string()))
+        );
+        assert_eq!(
+            loaded.identity("harbor"),
+            Some(("First Voice".to_string(), "①".to_string()))
+        );
+        assert_eq!(loaded.identity("unconfigured"), None);
+    }
+
+    #[test]
+    fn missing_or_malformed_catalog_has_neutral_explicit_fallback() {
+        let dir = tempdir().unwrap();
+        assert!(PersonaCatalog::load(dir.path()).is_err());
+        fs::write(dir.path().join("household.toml"), "not = [valid").unwrap();
+        assert!(PersonaCatalog::load(dir.path()).is_err());
+
+        let fallback = PersonaCatalog::default();
+        let entry = agent_entry(&fallback, "quartz", "hi", 0);
+        assert_eq!(entry.sender, "Quartz");
+        assert_eq!(entry.agent_id.as_deref(), Some("quartz"));
+        assert_eq!(entry.emoji, "");
+    }
+
+    #[test]
     fn json_line_has_exactly_the_contract_keys_and_null_agent_id() {
-        let line = group_entry("nadin", "hi", 42, None).to_json_line();
+        let line = group_entry(&catalog(), "guest", "hi", 42, None).to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         let obj = v.as_object().unwrap();
         let mut keys: Vec<&String> = obj.keys().collect();
@@ -409,7 +503,7 @@ mod tests {
     #[test]
     fn json_line_emits_src_id_when_present() {
         let id = source_id("-100999", "555", 1_700_000_000, "hi");
-        let line = group_entry("nadin", "hi", 42, Some(id.clone())).to_json_line();
+        let line = group_entry(&catalog(), "guest", "hi", 42, Some(id.clone())).to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v.get("srcId").unwrap(), &serde_json::Value::String(id));
         assert_eq!(v.get("origin").unwrap(), "telegram");
@@ -417,14 +511,19 @@ mod tests {
 
     #[test]
     fn text_newlines_collapse_to_single_space() {
-        let e = agent_entry("otto", "line one\n\n  line two  \nline three", 0);
+        let e = agent_entry(
+            &catalog(),
+            "harbor",
+            "line one\n\n  line two  \nline three",
+            0,
+        );
         assert_eq!(e.text, "line one line two line three");
     }
 
     #[test]
     fn text_is_capped_without_splitting_a_codepoint() {
         let long = "é".repeat(MAX_TEXT + 500);
-        let e = group_entry("luca", &long, 0, None);
+        let e = group_entry(&catalog(), "guest", &long, 0, None);
         assert_eq!(e.text.chars().count(), MAX_TEXT);
     }
 
@@ -445,8 +544,16 @@ mod tests {
 
         // A synthetic inbound group message and a relayed agent reply — the same
         // two writes the listener performs for one round-trip.
-        append_entry(&feed, &group_entry("nadin", "nora, what's for dinner?", 1, None)).unwrap();
-        append_entry(&feed, &agent_entry("nora", "pasta tonight 🍝", 2)).unwrap();
+        append_entry(
+            &feed,
+            &group_entry(&catalog(), "guest", "harbor, what's for dinner?", 1, None),
+        )
+        .unwrap();
+        append_entry(
+            &feed,
+            &agent_entry(&catalog(), "harbor", "pasta tonight 🍝", 2),
+        )
+        .unwrap();
 
         let contents = fs::read_to_string(&feed).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
@@ -458,7 +565,9 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             let obj = v.as_object().unwrap();
             assert_eq!(obj.len(), 8, "exactly eight fields: {line}");
-            for key in ["ts", "sender", "agentId", "emoji", "kind", "text", "srcId", "origin"] {
+            for key in [
+                "ts", "sender", "agentId", "emoji", "kind", "text", "srcId", "origin",
+            ] {
                 assert!(obj.contains_key(key), "missing {key} in {line}");
             }
             // Provenance is always the Telegram writer's tag.
@@ -471,12 +580,12 @@ mod tests {
         assert!(l1["agentId"].is_null());
         let l2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(l2["kind"], "agent");
-        assert_eq!(l2["agentId"], "nora");
+        assert_eq!(l2["agentId"], "harbor");
 
         // PRIVACY: none of the secrets a live listener handles may appear. These
         // are the exact token / chat_id / user_id shapes from a real Casa config.
         for secret in [
-            "0000000000:nora-dummy-token", // bot token
+            "0000000000:dummy-token", // bot token
             "bot_token",
             "-1000000000001", // group chat_id
             "chat_id",
@@ -509,12 +618,24 @@ mod tests {
         let sid = source_id(chat, user, date, text);
 
         // Two writes of the same physical message (the restart re-delivery).
-        append_entry(&feed, &group_entry("nadin", text, 10, Some(sid.clone()))).unwrap();
-        append_entry(&feed, &group_entry("nadin", text, 11, Some(sid.clone()))).unwrap();
+        append_entry(
+            &feed,
+            &group_entry(&catalog(), "guest", text, 10, Some(sid.clone())),
+        )
+        .unwrap();
+        append_entry(
+            &feed,
+            &group_entry(&catalog(), "guest", text, 11, Some(sid.clone())),
+        )
+        .unwrap();
 
         let contents = fs::read_to_string(&feed).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 2, "the append-only writer writes both physically");
+        assert_eq!(
+            lines.len(),
+            2,
+            "the append-only writer writes both physically"
+        );
 
         // Both carry the SAME non-null srcId → the reader's dedupeBySrcId collapses
         // them to one pane line. (On main both would be srcId:null → shown twice.)
@@ -525,7 +646,13 @@ mod tests {
 
         // PRIVACY still holds even though srcId is DERIVED from the chat/user ids:
         // the fingerprint is a hash, so neither raw id appears verbatim.
-        assert!(!contents.contains(chat), "chat id leaked via srcId: {contents}");
-        assert!(!contents.contains(user), "user id leaked via srcId: {contents}");
+        assert!(
+            !contents.contains(chat),
+            "chat id leaked via srcId: {contents}"
+        );
+        assert!(
+            !contents.contains(user),
+            "user id leaked via srcId: {contents}"
+        );
     }
 }

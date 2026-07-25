@@ -15,17 +15,17 @@ use worksgood::notify::casa_feed;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
 use worksgood::notify::fast_lane;
-use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
-use worksgood::notify::telegram_family_commands as family_commands;
-use worksgood::notify::telegram_voice;
-use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::ownership;
-use worksgood::notify::ownership::OwnerMap;
+use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
+use worksgood::notify::telegram_conversation::durable_telegram_digest_v1;
+use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
+use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_group::{
-    CONCIERGE_BOT, Election, NaturalRoute, elect_group_inbound,
-    elect_responders_with_owners, election_decision_summary, is_discussion_ask,
-    parse_at_mention_tokens, resolve_mentioned_bot, route_natural,
+    Election, NaturalRoute, elect_group_inbound_with_owner_map, elect_responders_with_owner_map,
+    election_decision_summary, is_discussion_ask, parse_at_mention_tokens, resolve_mentioned_bot,
+    route_natural_with_owner_map,
 };
+use worksgood::notify::telegram_voice;
 
 /// Whether an inbound listener message may fire a FAMILY command and/or the
 /// OPERATOR command reference.
@@ -188,7 +188,7 @@ struct RedeemResp {
 
 /// Outcome of a `/start login_<nonce>` confirm against the gateway. The founding
 /// window (item 1) needs to distinguish an EMPTY roster (offer ownership) from a
-/// genuinely unknown user (ask Otto to add you), so the handler branches on this
+/// genuinely unknown user (ask the household founder to add you), so the handler branches on this
 /// rather than only receiving a pre-baked reply string.
 /// The family-voice fallback label when the gateway did not carry a device
 /// descriptor (an older gateway, or a client with no User-Agent). NEVER a raw UA.
@@ -210,7 +210,7 @@ enum WebLoginOutcome {
     /// The roster is EMPTY (fresh deployment) — the handler runs the "are you
     /// the owner?" founding handshake instead of rejecting.
     EmptyRoster,
-    /// The id is not in a (non-empty) roster — ask Otto to add you.
+    /// The id is not in a (non-empty) roster — ask the household founder to add you.
     UnknownUser,
     /// The sign-in link EXPIRED / was unknown (a slow new-device round-trip blew past the pending window). Recovery: reopen the page + tap the fresh link.
     LinkExpired,
@@ -238,10 +238,14 @@ impl WebLoginOutcome {
                 format!("You're signed in on {label} ✋")
             }
             WebLoginOutcome::UnknownUser => {
-                "I don't recognise you yet — ask Otto to add you to the household.".to_string()
+                "I don't recognise you yet — ask someone already in the household to add you."
+                    .to_string()
             }
-            WebLoginOutcome::EmptyRoster | WebLoginOutcome::LinkExpired | WebLoginOutcome::NoSession => {
-                "That sign-in link expired — reopen the Casa page and tap the fresh link.".to_string()
+            WebLoginOutcome::EmptyRoster
+            | WebLoginOutcome::LinkExpired
+            | WebLoginOutcome::NoSession => {
+                "That sign-in link expired — reopen the Casa page and tap the fresh link."
+                    .to_string()
             }
         }
     }
@@ -313,11 +317,7 @@ fn parse_login_nonce(body: &str) -> Option<&str> {
         .split_whitespace()
         .next()
         .unwrap_or("");
-    if nonce.is_empty() {
-        None
-    } else {
-        Some(nonce)
-    }
+    if nonce.is_empty() { None } else { Some(nonce) }
 }
 
 /// Handle a 1:1 `/start login_<nonce>` web-identity deep link: POST the sender's
@@ -347,7 +347,14 @@ async fn confirm_web_login_outcome(
         },
         Some(c) if c.reason.as_deref() == Some("empty-roster") => WebLoginOutcome::EmptyRoster,
         Some(c) if c.reason.as_deref() == Some("unknown-user") => WebLoginOutcome::UnknownUser,
-        Some(c) if matches!(c.reason.as_deref(), Some("unknown-nonce") | Some("expired") | Some("used")) => WebLoginOutcome::LinkExpired,
+        Some(c)
+            if matches!(
+                c.reason.as_deref(),
+                Some("unknown-nonce") | Some("expired") | Some("used")
+            ) =>
+        {
+            WebLoginOutcome::LinkExpired
+        }
         _ => WebLoginOutcome::NoSession,
     }
 }
@@ -355,11 +362,7 @@ async fn confirm_web_login_outcome(
 /// Backward-compatible thin wrapper returning the family-voice reply string for
 /// the non-founding outcomes (used by the existing unit tests + the plain
 /// signed-in / unknown-user / no-session paths).
-async fn confirm_web_login(
-    client: &reqwest::Client,
-    nonce: &str,
-    telegram_id: &str,
-) -> String {
+async fn confirm_web_login(client: &reqwest::Client, nonce: &str, telegram_id: &str) -> String {
     confirm_web_login_outcome(client, nonce, telegram_id)
         .await
         .reply()
@@ -406,8 +409,14 @@ async fn redeem_invite(client: &reqwest::Client, nonce: &str, telegram_id: &str)
     };
     match redeemed {
         Some(r) if r.ok => {
-            let who = r.name.as_deref().filter(|s| !s.is_empty()).unwrap_or("friend");
-            format!("Welcome to the household, {who}! You're all set — sign in on any device. \u{1f3e0}")
+            let who = r
+                .name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("friend");
+            format!(
+                "Welcome to the household, {who}! You're all set — sign in on any device. \u{1f3e0}"
+            )
         }
         Some(r) if r.reason.as_deref() == Some("used") => {
             "That invite was already used — ask for a fresh one from Manage household.".to_string()
@@ -455,7 +464,8 @@ async fn found_household(
                  You're signed in on {label}; invite the rest of the family from Manage household."
             )
         }
-        _ => "I couldn't finish setting up — tap the sign-in link for a fresh one and try again.".to_string(),
+        _ => "I couldn't finish setting up — tap the sign-in link for a fresh one and try again."
+            .to_string(),
     }
 }
 
@@ -500,11 +510,9 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     // Start this run from a clean slate so a previous run's failure streak
     // cannot make a freshly started listener look deaf.
     let bot_ids: Vec<String> = channels.iter().map(|c| c.bot_id().to_string()).collect();
-    if let Err(e) = worksgood::notify::listener_health::reset_for_new_run(
-        dir,
-        &bot_ids,
-        chrono::Utc::now(),
-    ) {
+    if let Err(e) =
+        worksgood::notify::listener_health::reset_for_new_run(dir, &bot_ids, chrono::Utc::now())
+    {
         eprintln!("warning: could not initialize listener health state: {e:#}");
     }
 
@@ -517,13 +525,24 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     let all_bots = config.all_bots();
     worksgood::notify::telegram::warn_on_dm_chat_ids(&all_bots);
 
-    // Replies go out via one bot: the concierge (otto) when present, else the
-    // first configured bot. This matches the pre-existing single-channel reply
-    // behaviour — the poll fan-out below is the only change in scope here.
-    let reply_idx = channels
-        .iter()
-        .position(|c| c.bot_id() == CONCIERGE_BOT)
-        .unwrap_or(0);
+    // Generic replies go out through the project-local coordination owner.
+    // A single legacy bot is unambiguous; a multi-bot household with no
+    // configured coordination owner fails loudly rather than speaking as an
+    // arbitrary first HashMap entry.
+    let owner_map = ownership::OwnerMap::load(&project_root(dir));
+    let coordination_bot = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .and_then(|owner| resolve_mentioned_bot(owner, &config));
+    let reply_idx = match coordination_bot
+        .as_ref()
+        .and_then(|bot| channels.iter().position(|c| c.bot_id() == bot.bot_id))
+    {
+        Some(idx) => idx,
+        None if channels.len() == 1 => 0,
+        None => anyhow::bail!(
+            "household.toml must assign the coordination domain to one configured Telegram bot"
+        ),
+    };
 
     println!("Press Ctrl+C to stop\n");
 
@@ -544,33 +563,33 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     const LIFECYCLE_TICK_SECS: u64 = 15;
     {
         let lifecycle_dir = dir.to_path_buf();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(LIFECYCLE_TICK_SECS));
-            let graph_path = crate::commands::graph_path(&lifecycle_dir);
-            let graph = match worksgood::parser::load_graph(&graph_path) {
-                Ok(g) => g,
-                Err(_) => continue, // no graph yet — nothing to report
-            };
-            let root = project_root(&lifecycle_dir);
-            let fired = worksgood::notify::reminder::FiredLog::load(
-                &worksgood::notify::reminder::FiredLog::path(&root),
-            );
-            let pending = worksgood::notify::lifecycle::pending_fires(
-                graph.tasks(),
-                |id| fired.contains(id),
-            );
-            if pending.is_empty() {
-                continue; // no unreported transition — stay quiet
-            }
-            // Something transitioned: deliver every pending report-back (same code
-            // path as `wg telegram lifecycle`, real send). Exactly-once + pacing
-            // are enforced inside via the persisted FiredLog.
-            if let Err(e) = run_lifecycle(&lifecycle_dir, None, false, None, false, false) {
-                eprintln!(
-                    "[{}] lifecycle report-back tick failed: {}",
-                    chrono::Utc::now().format("%H:%M:%S"),
-                    worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
-                );
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(LIFECYCLE_TICK_SECS));
+                let graph_path = crate::commands::graph_path(&lifecycle_dir);
+                let graph = match worksgood::parser::load_graph(&graph_path) {
+                    Ok(g) => g,
+                    Err(_) => continue, // no graph yet — nothing to report
+                };
+                let root = project_root(&lifecycle_dir);
+                let log_path = worksgood::notify::reminder::FiredLog::path(&root);
+                let fired = worksgood::notify::reminder::FiredLog::load(&log_path);
+                let pending = worksgood::notify::lifecycle::pending_fires(graph.tasks(), |id| {
+                    fired.contains(id)
+                });
+                if pending.is_empty() && !lifecycle_reconciliation_needs_tick(&log_path) {
+                    continue; // no unreported transition — stay quiet
+                }
+                // Something transitioned: deliver every pending report-back (same code
+                // path as `wg telegram lifecycle`, real send). Exactly-once + pacing
+                // are enforced inside via the persisted FiredLog.
+                if let Err(e) = run_lifecycle(&lifecycle_dir, None, false, None, false, false) {
+                    eprintln!(
+                        "[{}] lifecycle report-back tick failed: {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                    );
+                }
             }
         });
     }
@@ -638,6 +657,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         // six display-safe fields — never a token, chat id, or user id. See
         // `notify::casa_feed` and docs/15 §chat-split.
         let feed_path = casa_feed::feed_path_for(&project_root(&workgraph_dir));
+        let family_delivery = FamilyReplyDelivery::load(&workgraph_dir, &route_config);
 
         // Fix #1 (startup stale-backlog) + Fix #2 (burst coalescing) state. The
         // start timestamp anchors the staleness test; `backlog_notified` ensures
@@ -755,8 +775,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // Telegram id a username-less person decodes to — task
                 // mirrored-telegram-sender). Unbound bare id → the neutral label.
                 let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
-                let entry =
-                    casa_feed::group_entry(&feed_sender, &msg.body, casa_feed::now_ms(), src_id);
+                let entry = casa_feed::group_entry(
+                    &family_delivery.personas,
+                    &feed_sender,
+                    &msg.body,
+                    casa_feed::now_ms(),
+                    src_id,
+                );
                 if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
                     eprintln!(
                         "[{}] casa feed: failed to mirror inbound group message: {e}",
@@ -773,6 +798,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 .clone()
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| effective_chat_id.clone());
+            let reply_scope = ReplyScope::from_chat_type(msg.chat_type.as_deref());
 
             // Fix #1 — startup stale-backlog policy. A text message sent well
             // before the listener came up is queued backlog, not a live turn: we
@@ -796,8 +822,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         );
                         if !backlog_notified {
                             backlog_notified = true;
-                            if let Err(e) = channel
-                                .send_text(&reply_target, &telegram_pacing::backlog_skipped_line())
+                            if let Err(e) = family_delivery
+                                .send(
+                                    reply_scope,
+                                    channel.bot_id(),
+                                    &reply_target,
+                                    &telegram_pacing::backlog_skipped_line(),
+                                )
                                 .await
                             {
                                 eprintln!("Failed to send backlog-skipped line: {e}");
@@ -821,7 +852,15 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // Action IDs follow the pattern "action:task_id" (e.g. "approve:my-task")
                 let response = handle_action(&workgraph_dir, action_id, &msg.sender);
 
-                if let Err(e) = channel.send_text(&reply_target, &response).await {
+                if let Err(e) = family_delivery
+                    .send(
+                        reply_scope,
+                        channel.bot_id(),
+                        &reply_target,
+                        &response,
+                    )
+                    .await
+                {
                     eprintln!("Failed to send response: {e}");
                 }
                 continue;
@@ -918,6 +957,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             // raw numeric id (task mirrored-telegram-sender).
                             let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
                             let entry = casa_feed::group_entry(
+                                &family_delivery.personas,
                                 &feed_sender,
                                 &spoken,
                                 casa_feed::now_ms(),
@@ -945,8 +985,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             msg.sender,
                             failure,
                         );
-                        if let Err(e) =
-                            receiving.send_text(&reply_target, failure.message()).await
+                        if let Err(e) = family_delivery
+                            .send(
+                                reply_scope,
+                                receiving.bot_id(),
+                                &reply_target,
+                                failure.message(),
+                            )
+                            .await
                         {
                             eprintln!(
                                 "Failed to send voice failure reply: {}",
@@ -965,8 +1011,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
                         );
                         // Never silent — send the honest "couldn't make it out" line.
-                        if let Err(e2) = receiving
-                            .send_text(
+                        if let Err(e2) = family_delivery
+                            .send(
+                                reply_scope,
+                                receiving.bot_id(),
                                 &reply_target,
                                 telegram_voice::TranscribeFailure::Unclear.message(),
                             )
@@ -1031,7 +1079,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                     "You're setting up this home, {name} — are you the owner? \
                                      Reply YES to make this your household, or NO to cancel."
                                 );
-                                if let Err(e) = channel.send_text(&reply_target, &q).await {
+                                if let Err(e) = family_delivery
+                                    .send(reply_scope, channel.bot_id(), &reply_target, &q)
+                                    .await
+                                {
                                     eprintln!("Failed to send founding prompt: {e}");
                                 }
                             } else {
@@ -1043,7 +1094,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                     msg.sender,
                                     outcome,
                                 );
-                                if let Err(e) = channel.send_text(&reply_target, &reply).await {
+                                if let Err(e) = family_delivery
+                                    .send(reply_scope, channel.bot_id(), &reply_target, &reply)
+                                    .await
+                                {
                                     eprintln!("Failed to send web sign-in reply: {e}");
                                 }
                             }
@@ -1051,7 +1105,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         // No numeric id to verify — cannot bind a session.
                         None => {
                             let reply = "That sign-in link expired — reopen the Casa page and tap the fresh link.";
-                            if let Err(e) = channel.send_text(&reply_target, reply).await {
+                            if let Err(e) = family_delivery
+                                .send(reply_scope, channel.bot_id(), &reply_target, reply)
+                                .await
+                            {
                                 eprintln!("Failed to send web sign-in reply: {e}");
                             }
                         }
@@ -1078,7 +1135,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         msg.sender,
                         if reply.starts_with("Welcome") { "joined" } else { "rejected" },
                     );
-                    if let Err(e) = channel.send_text(&reply_target, &reply).await {
+                    if let Err(e) = family_delivery
+                        .send(reply_scope, channel.bot_id(), &reply_target, &reply)
+                        .await
+                    {
                         eprintln!("Failed to send invite reply: {e}");
                     }
                     continue;
@@ -1111,7 +1171,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 pending.name,
                                 msg.sender,
                             );
-                            if let Err(e) = channel.send_text(&reply_target, &reply).await {
+                            if let Err(e) = family_delivery
+                                .send(reply_scope, channel.bot_id(), &reply_target, &reply)
+                                .await
+                            {
                                 eprintln!("Failed to send founding welcome: {e}");
                             }
                             continue;
@@ -1123,14 +1186,20 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 msg.sender,
                             );
                             let reply = "No problem — nothing was set up. Tap the tablet again whenever you're ready.";
-                            if let Err(e) = channel.send_text(&reply_target, reply).await {
+                            if let Err(e) = family_delivery
+                                .send(reply_scope, channel.bot_id(), &reply_target, reply)
+                                .await
+                            {
                                 eprintln!("Failed to send founding cancel: {e}");
                             }
                             continue;
                         } else {
                             // Ambiguous — re-prompt without consuming the window.
                             let reply = "Just reply YES to set up this home as yours, or NO to cancel.";
-                            if let Err(e) = channel.send_text(&reply_target, reply).await {
+                            if let Err(e) = family_delivery
+                                .send(reply_scope, channel.bot_id(), &reply_target, reply)
+                                .await
+                            {
                                 eprintln!("Failed to send founding re-prompt: {e}");
                             }
                             continue;
@@ -1201,7 +1270,8 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // the group back to the conservative silence rule without a restart.
             let human_count = human_agent_id_set(&workgraph_dir).len();
 
-            let election = elect_responders_with_owners(
+            let owner_map = ownership::OwnerMap::load(&project_root(&workgraph_dir));
+            let election = elect_responders_with_owner_map(
                 msg.chat_type.as_deref(),
                 msg.chat_id.as_deref(),
                 &msg.body,
@@ -1212,9 +1282,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 msg.sender_is_bot,
                 human_count,
                 &route_config,
-                // The household's OWN roster decides the domain voice and who
-                // fronts the group when nobody is named — never a compiled id.
-                &OwnerMap::load(&project_root(&workgraph_dir)),
+                &owner_map,
             );
 
             // Observability: exactly ONE decision line per consumed message —
@@ -1281,6 +1349,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             &feed_path,
                             body,
                             &auth_sender,
+                            &telegram_physical_turn_key(&msg),
                         )
                         .await
                     } else {
@@ -1300,6 +1369,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             &feed_path,
                             body,
                             &auth_sender,
+                            &telegram_physical_turn_key(&msg),
                         )
                         .await
                     };
@@ -1415,7 +1485,15 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     worksgood::telegram_commands::execute(&workgraph_dir, &cmd, &msg.sender);
 
                 // Send response back
-                if let Err(e) = channel.send_text(&reply_target, &response).await {
+                if let Err(e) = family_delivery
+                    .send(
+                        reply_scope,
+                        channel.bot_id(),
+                        &reply_target,
+                        &response,
+                    )
+                    .await
+                {
                     eprintln!("Failed to send response: {e}");
                 }
             } else {
@@ -1446,7 +1524,15 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             msg.sender
                         );
                         let welcome = format!("Welcome aboard, {}! You're all set. \u{2705}", name);
-                        if let Err(e) = channel.send_text(&reply_target, &welcome).await {
+                        if let Err(e) = family_delivery
+                            .send(
+                                reply_scope,
+                                channel.bot_id(),
+                                &reply_target,
+                                &welcome,
+                            )
+                            .await
+                        {
                             eprintln!("Failed to send welcome: {e}");
                         }
                         // A single message can be both a confirmation AND a
@@ -1458,8 +1544,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 msg.sender,
                                 task_id
                             );
-                            if let Err(e) = channel
-                                .send_text(
+                            if let Err(e) = family_delivery
+                                .send(
+                                    reply_scope,
+                                    channel.bot_id(),
                                     &reply_target,
                                     &format!("✓ Recorded your reply on task '{}'.", task_id),
                                 )
@@ -1480,8 +1568,10 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             msg.sender,
                             task_id
                         );
-                        if let Err(e) = channel
-                            .send_text(
+                        if let Err(e) = family_delivery
+                            .send(
+                                reply_scope,
+                                channel.bot_id(),
                                 &reply_target,
                                 &format!("✓ Recorded your reply on task '{}'.", task_id),
                             )
@@ -1512,21 +1602,34 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             &route_body,
                             chrono::Local::now().naive_local(),
                         ) {
-                            let bot_id = convo::bot_id_for_channel(&route_config, &route_channel)
-                                .unwrap_or_else(|| {
+                            let owner_map =
+                                ownership::OwnerMap::load(&project_root(&workgraph_dir));
+                            let coordination_owner = owner_map
+                                .owner_for_domain(ownership::Domain::Coordination);
+                            let bot_id = convo::bot_id_for_channel_with_default(
+                                &route_config,
+                                &route_channel,
+                                coordination_owner,
+                            )
+                            .unwrap_or_else(|| {
                                     route_channel
                                         .strip_prefix("telegram:")
                                         .unwrap_or(&route_channel)
                                         .to_string()
-                                });
-                            if let Some((_, bot)) = route_config
+                            });
+                            if route_config
                                 .all_bots()
                                 .into_iter()
-                                .find(|(id, _)| id == &bot_id)
+                                .any(|(id, _)| id == bot_id)
                             {
-                                let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
-                                if let Err(e) =
-                                    channel.send_text(&reply_target, &confirmation).await
+                                if let Err(e) = family_delivery
+                                    .send(
+                                        reply_scope,
+                                        &bot_id,
+                                        &reply_target,
+                                        &confirmation,
+                                    )
+                                    .await
                                 {
                                     eprintln!("Failed to send reminder confirmation: {e}");
                                 }
@@ -1627,18 +1730,37 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         let cfg_owned = route_config.clone();
                         let human_message = route_body.clone();
                         let sender = msg.sender.clone();
-                        let request_id = format!(
-                            "tg-{}-{}-{}",
-                            reply_target,
-                            msg.message_id.as_deref().unwrap_or("na"),
-                            sender,
-                        );
+                        let request_id = if matches!(entry, convo::Entry::GroupElected) {
+                            // A privacy-off group turn reaches every bot with a
+                            // transport-local message id. Key the elected reply
+                            // by the shared physical fingerprint, exactly like
+                            // collective voices, so a cross-bot/restart replay
+                            // cannot post twice.
+                            collective_request_id(
+                                &reply_target,
+                                &plan.route().bot_id,
+                                &telegram_physical_turn_key(&msg),
+                            )
+                        } else {
+                            // A direct message reaches one bot, so its Telegram
+                            // message id remains a stable occurrence key.
+                            format!(
+                                "tg-{}-{}-{}",
+                                reply_target,
+                                msg.message_id.as_deref().unwrap_or("na"),
+                                sender,
+                            )
+                        };
                         let timing = convo::AckTiming::from_env();
-                        // Mirror the persona's reply into the conversation pane's
-                        // feed ONLY for a group-elected turn — a 1:1 DM is private
-                        // and must never land in the shared group feed.
-                        let mirror_group = matches!(entry, convo::Entry::GroupElected);
-                        let feed_path_owned = feed_path.clone();
+                        // Every reply uses the same scoped final delivery seam:
+                        // group-elected answers mirror once; 1:1 replies remain
+                        // private.
+                        let delivery_scope = if matches!(entry, convo::Entry::GroupElected) {
+                            ReplyScope::Group
+                        } else {
+                            ReplyScope::Private
+                        };
+                        let family_delivery_owned = family_delivery.clone();
                         let wg_config_owned = wg_config.clone();
                         // Hand the coalescer + admitted agent into the spawn so it
                         // marks the reply *sent* when it finishes — ending the
@@ -1647,11 +1769,11 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         let coalesced_agent_spawn = coalesced_named_agent.clone();
                         tokio::spawn(async move {
                             let base = convo::BotReplySink::new(cfg_owned.clone());
-                            let sink: Box<dyn convo::ReplySink> = if mirror_group {
-                                Box::new(FeedMirrorSink::new(base, feed_path_owned, cfg_owned))
-                            } else {
-                                Box::new(base)
-                            };
+                            let sink = family_delivery_owned.wrap(
+                                base,
+                                delivery_scope,
+                                GuardPolicy::AlreadyGuarded,
+                            );
                             // The composer is the fix: it drives a bounded one-shot
                             // `claude` turn so the reply COMPLETES (or fails fast into
                             // the "glitched" follow-up) instead of the open-loop hang.
@@ -1667,7 +1789,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 &request_id,
                                 timing,
                                 composer_ref,
-                                sink.as_ref(),
+                                &sink,
                             )
                             .await
                             {
@@ -1723,7 +1845,13 @@ fn try_confirm_binding(workgraph_dir: &Path, sender: &str, body: &str) -> Option
     // `sender` is the already-resolved binding key (numeric id or @handle).
     // Passing it as both id and username satisfies Erik's `matches_sender`
     // contract for either key kind (numeric matches on id, handle on username).
-    let name = apply_confirmation(&mut bindings, sender, Some(sender), body, chrono::Utc::now())?;
+    let name = apply_confirmation(
+        &mut bindings,
+        sender,
+        Some(sender),
+        body,
+        chrono::Utc::now(),
+    )?;
     if let Err(e) = bindings.save(&agency_dir) {
         eprintln!("Failed to persist Telegram binding confirmation: {e}");
         return None;
@@ -1753,18 +1881,25 @@ fn try_register_reminder(
 
     let agency_dir = workgraph_dir.join("agency");
     let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+    let root = project_root(workgraph_dir);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let coordination_owner = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .unwrap_or_default()
+        .to_string();
     // The sender must be a confirmed human; resolve their display name + bot.
     let binding = bindings.find_by_identity(Some(sender), Some(sender_display));
     let (recipient, bot) = match binding {
         Some(b) if b.confirmed => (
             b.name.clone(),
-            b.bot_id.clone().unwrap_or_else(|| "otto".to_string()),
+            b.bot_id
+                .clone()
+                .unwrap_or_else(|| coordination_owner.clone()),
         ),
         _ => return None,
     };
 
     let rem = reminder::intent_to_reminder(&intent, &recipient, &bot);
-    let root = project_root(workgraph_dir);
     let path = AdHocStore::path(&root);
     let mut store = AdHocStore::load(&path);
     if store.add(rem) {
@@ -1883,32 +2018,50 @@ async fn handle_photo_shopping_turn(
     route_config: &TelegramConfig,
     wg_config: Option<&worksgood::config::Config>,
 ) -> Result<()> {
+    use worksgood::notify::grounding;
     use worksgood::notify::telegram_conversation as convo;
-    use worksgood::notify::telegram_conversation::ReplySink as _;
     use worksgood::notify::telegram_photo as photo;
 
-    // The photo `file_id` is only valid for the bot that received it, so we must
-    // download via THAT bot's channel.
-    let receiving = channels
-        .iter()
-        .find(|c| c.channel_type() == msg.channel)
-        .with_context(|| format!("no channel matches receiving bot {:?}", msg.channel))?;
-
-    let turn = match photo::coalesce_album(std::slice::from_ref(msg)).into_iter().next() {
+    let turn = match photo::coalesce_album(std::slice::from_ref(msg))
+        .into_iter()
+        .next()
+    {
         Some(t) => t,
         None => return Ok(()), // not a photo (shouldn't happen — caller gated)
     };
 
     let route = plan.route();
-    let sink = convo::BotReplySink::new(route_config.clone());
+    let family_roster =
+        grounding::load_family_voice_roster(&project_root(workgraph_dir), workgraph_dir);
+    let delivery = FamilyReplyDelivery::load(workgraph_dir, route_config);
+    // The occurrence helper applies the family-voice guard before it journals
+    // the canonical reply. Preserve those exact bytes through transport and
+    // feed mirroring; a replay must never re-finalize into different copy.
+    let sink = delivery.wrap(
+        convo::BotReplySink::new(route_config.clone()),
+        ReplyScope::from_chat_type(msg.chat_type.as_deref()),
+        GuardPolicy::AlreadyGuarded,
+    );
+    let physical_turn_key = telegram_photo_turn_key(msg);
 
     // No model config → we can't run vision. Acknowledge gracefully rather than
-    // going silent, and invite the human to say what they need in words.
+    // going silent, and invite the human to say what they need in words. This
+    // family-visible fallback is journaled too, so a dispatcher refire cannot
+    // post it twice.
     let Some(cfg) = wg_config else {
-        sink.send(
+        run_photo_shopping_occurrence(
+            workgraph_dir,
+            &physical_turn_key,
             &route.bot_id,
             &route.chat_id,
-            "Got your photo! I can't read pictures right now — tell me what you need and I'll update the list.",
+            &family_roster,
+            &sink,
+            || async {
+                Ok(
+                    "Got your photo! I can't read pictures right now — tell me what you need and I'll update the list."
+                        .to_string(),
+                )
+            },
         )
         .await?;
         return Ok(());
@@ -1920,30 +2073,165 @@ async fn handle_photo_shopping_turn(
         .and_then(|s| convo::read_session_summary(workgraph_dir, s));
     let gateway = photo::HttpShoppingGateway::from_env();
 
-    // A per-message scratch dir for the temp image(s); removed after the turn.
-    let scratch = std::env::temp_dir().join(format!(
-        "casa-photo-{}-{}",
-        msg.message_id.as_deref().unwrap_or("na"),
-        msg.sender_id.as_deref().unwrap_or("na"),
-    ));
-    std::fs::create_dir_all(&scratch).ok();
-
-    let outcome = photo::run_photo_shopping_turn(
-        &turn,
-        persona_summary.as_deref(),
-        &photo::PhotoLimits::default(),
-        receiving,
-        &composer,
-        &gateway,
-        &scratch,
+    run_photo_shopping_occurrence(
+        workgraph_dir,
+        &physical_turn_key,
+        &route.bot_id,
+        &route.chat_id,
+        &family_roster,
+        &sink,
+        || async {
+            // The photo `file_id` is only valid for the bot that received it,
+            // so a NEW occurrence downloads via THAT bot's channel. Keep this
+            // lookup and scratch creation inside the mutation closure: an
+            // `applied` delivery retry must not need image inputs or create
+            // fresh temporary state.
+            let receiving = channels
+                .iter()
+                .find(|channel| channel.channel_type() == msg.channel)
+                .with_context(|| format!("no channel matches receiving bot {:?}", msg.channel))?;
+            let scratch = std::env::temp_dir().join(format!(
+                "casa-photo-{}-{}",
+                msg.message_id.as_deref().unwrap_or("na"),
+                msg.sender_id.as_deref().unwrap_or("na"),
+            ));
+            std::fs::create_dir_all(&scratch).ok();
+            let outcome = photo::run_photo_shopping_turn(
+                &turn,
+                persona_summary.as_deref(),
+                &photo::PhotoLimits::default(),
+                receiving,
+                &composer,
+                &gateway,
+                &family_roster,
+                &scratch,
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            Ok(outcome?.reply_text)
+        },
     )
-    .await;
-    let _ = std::fs::remove_dir_all(&scratch);
-
-    let result = outcome?;
-    sink.send(&route.bot_id, &route.chat_id, &result.reply_text)
-        .await?;
+    .await?;
     Ok(())
+}
+
+const PHOTO_SHOPPING_OCCURRENCE_DOMAIN: &str = "photo-shopping";
+
+/// Exact restart payload for one accepted photo-shopping turn.
+///
+/// Only family-visible canonical bytes and their original opaque configured
+/// route are retained. Image handles, captions, chat ids, helper ids, and
+/// household labels remain absent from journal filenames because the shared
+/// occurrence journal hashes the caller-supplied physical key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhotoShoppingOutcome {
+    reply_text: String,
+    bot_id: String,
+    chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhotoShoppingDispatch {
+    outcome: PhotoShoppingOutcome,
+    resumed_delivery: bool,
+    already_delivered: bool,
+}
+
+fn photo_shopping_delivery_id(physical_turn_key: &str) -> String {
+    format!(
+        "photo-shopping-{}",
+        durable_telegram_digest_v1("photo-shopping-delivery", &[physical_turn_key]),
+    )
+}
+
+/// Apply and deliver one image-derived shopping occurrence with restart-safe
+/// ordering.
+///
+/// The mutation closure is invoked only for a newly reserved physical turn.
+/// Its exact guarded reply and original route are persisted before transport.
+/// An `applied` retry therefore sends only those stored bytes; a `delivered`
+/// retry is a no-op. A leftover `reserved` record fails closed because the
+/// process cannot know whether a list mutation reached the gateway.
+async fn run_photo_shopping_occurrence<F, Fut>(
+    workgraph_dir: &Path,
+    physical_turn_key: &str,
+    bot_id: &str,
+    chat_id: &str,
+    family_roster: &worksgood::notify::grounding::FamilyVoiceRoster,
+    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
+    apply: F,
+) -> Result<PhotoShoppingDispatch>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    use worksgood::notify::telegram_conversation as convo;
+    use worksgood::notify::telegram_occurrence::{OccurrenceJournal, OccurrenceState};
+
+    let (journal, state) = OccurrenceJournal::<PhotoShoppingOutcome>::claim(
+        workgraph_dir,
+        PHOTO_SHOPPING_OCCURRENCE_DOMAIN,
+        physical_turn_key,
+    )?;
+
+    let (outcome, resumed_delivery) = match state {
+        OccurrenceState::New => {
+            let draft = apply().await?;
+            let reply_text =
+                worksgood::notify::grounding::enforce_family_voice(&draft, family_roster);
+            if reply_text != draft {
+                eprintln!(
+                    "[{}] family-voice guard: cleaned a photo reply before journaling",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                );
+            }
+            let outcome = PhotoShoppingOutcome {
+                reply_text,
+                bot_id: bot_id.to_string(),
+                chat_id: chat_id.to_string(),
+            };
+            journal.mark_applied(&outcome)?;
+            (outcome, false)
+        }
+        OccurrenceState::Incomplete => {
+            anyhow::bail!(
+                "photo-shopping occurrence is incomplete; refusing to reapply uncertain list changes"
+            );
+        }
+        OccurrenceState::Applied(outcome) => (outcome, true),
+        OccurrenceState::Delivered(outcome) => {
+            return Ok(PhotoShoppingDispatch {
+                outcome,
+                resumed_delivery: false,
+                already_delivered: true,
+            });
+        }
+        OccurrenceState::PassedThrough => {
+            anyhow::bail!(
+                "photo-shopping occurrence was recorded as pass-through; refusing to apply it"
+            );
+        }
+    };
+
+    let delivery_id = photo_shopping_delivery_id(physical_turn_key);
+    convo::send_reply_once(
+        workgraph_dir,
+        &delivery_id,
+        &outcome.bot_id,
+        &outcome.chat_id,
+        &outcome.reply_text,
+        sink,
+    )
+    .await
+    .context("photo-shopping reply delivery failed; the stored outcome remains retryable")?;
+    journal.mark_delivered(&outcome)?;
+
+    Ok(PhotoShoppingDispatch {
+        outcome,
+        resumed_delivery,
+        already_delivered: false,
+    })
 }
 
 /// Classification of an inbound (non-command, non-button) Telegram message.
@@ -2177,7 +2465,10 @@ fn resolve_send_bot(
 /// map is now the norm and the legacy top-level `chat_id` is often empty, so a
 /// caller that reads only `config.chat_id` bails on a perfectly-valid bots-map
 /// config (task `urgent-web-inbound` — the kiosk web-inbound regression).
-fn resolve_group_chat_id(config: &TelegramConfig, chat_id_override: Option<&str>) -> Option<String> {
+fn resolve_group_chat_id(
+    config: &TelegramConfig,
+    chat_id_override: Option<&str>,
+) -> Option<String> {
     if let Some(o) = chat_id_override {
         let o = o.trim();
         if !o.is_empty() {
@@ -2245,6 +2536,7 @@ fn clarify_target(target: &str, config: &TelegramConfig) -> String {
 /// concierge), and flags a `/standup` that the listener would intercept for the
 /// whole roster.
 pub fn run_route(
+    workgraph_dir: &Path,
     message: &str,
     reply_to_bot: Option<&str>,
     chat_type: &str,
@@ -2255,14 +2547,16 @@ pub fn run_route(
 
     // Approximate the listener's mention extraction: any @handle token.
     let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
 
-    let route = route_natural(
+    let route = route_natural_with_owner_map(
         Some(chat_type),
         Some(chat_id),
         message,
         &mention_usernames,
         reply_to_bot,
         &config,
+        &owner_map,
     );
 
     // The listener intercepts `/standup` (for the whole roster) on the routed
@@ -2302,7 +2596,7 @@ pub fn run_route(
         "private" => println!("private chat — 1:1 passthrough (not group-routed)"),
         "drop" => println!("dropped — no chat id, or no voice to route to"),
         "standup" => {
-            println!("/standup — intercepted; posts the whole roster (nora, bruno, mira, otto)")
+            println!("/standup — intercepted; posts the configured household roster")
         }
         _ => println!(
             "routed to {} (by {}): {}",
@@ -2350,7 +2644,10 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        println!("{}", telegram_sender::resolve_inbound_summary(&value, &bindings));
+        println!(
+            "{}",
+            telegram_sender::resolve_inbound_summary(&value, &bindings)
+        );
     }
     Ok(())
 }
@@ -2358,7 +2655,7 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
 /// `wg telegram elect` — show who would respond to a group message in
 /// all-bots-privacy-off mode, without sending anything.
 ///
-/// Runs the exact [`elect_responders_with_owners`] decision the listener uses on a deduped
+/// Runs the exact [`elect_responders_with_owner_map`] decision the listener uses on a deduped
 /// message and prints the outcome: `mention` / `name` / `reply-chain` route to
 /// one voice, `collective` fans out to the whole roster, `otto` coordinates a
 /// team-directed ask, and `silence` means the bots stay out. Mentions are
@@ -2384,7 +2681,8 @@ pub fn run_elect(
     let human_count =
         human_count_override.unwrap_or_else(|| human_agent_id_set(workgraph_dir).len());
 
-    let election = elect_responders_with_owners(
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let election = elect_responders_with_owner_map(
         Some(chat_type),
         Some(chat_id),
         message,
@@ -2395,7 +2693,7 @@ pub fn run_elect(
         false,
         human_count,
         &config,
-        &OwnerMap::load(&project_root(workgraph_dir)),
+        &owner_map,
     );
 
     // (kind, who, addressed_by, body) — `who` is the elected agent for the
@@ -2403,12 +2701,17 @@ pub fn run_elect(
     let (kind, who, addressed_by, body): (&str, Option<String>, Option<String>, String) =
         match &election {
             Election::Private => ("private", None, None, message.to_string()),
-            Election::Silence(reason) => ("silence", None, Some(reason.to_string()), message.to_string()),
+            Election::Silence(reason) => (
+                "silence",
+                None,
+                Some(reason.to_string()),
+                message.to_string(),
+            ),
             Election::All { body, .. } => {
-                let roster = worksgood::notify::telegram_standup::plan_roster(
+                let roster = worksgood::notify::telegram_standup::load_project_roster(
+                    &project_root(workgraph_dir),
                     &config,
-                    worksgood::notify::telegram_standup::DEFAULT_ROSTER,
-                )
+                )?
                 .into_iter()
                 .map(|m| m.bot_id)
                 .collect::<Vec<_>>()
@@ -2454,7 +2757,7 @@ pub fn run_elect(
             who.as_deref().unwrap_or("(none configured)")
         ),
         "standup" => {
-            println!("/standup — intercepted; posts the whole roster (nora, bruno, mira, otto)")
+            println!("/standup — intercepted; posts the configured household roster")
         }
         _ => println!(
             "answered by {} (by {}): {}",
@@ -2469,14 +2772,15 @@ pub fn run_elect(
 /// `wg telegram discuss --dry-run` — show whether a group message would run a
 /// DISCUSSION ROUND, and the planned round, without sending anything.
 ///
-/// Runs the exact [`elect_responders_with_owners`] decision the listener uses, then applies
+/// Runs the exact [`elect_responders_with_owner_map`] decision the listener uses, then applies
 /// the same [`is_discussion_ask`] gate the live `Election::All` handler uses to
-/// split a collective election into a discussion round vs today's four
-/// independent hellos. Prints the category and, for a round, the voices in
-/// contribution order plus the synthesizer (Otto). This is the scripted-test
-/// seam (sibling of `wg telegram elect`): a discussion ask → `discussion-round`;
-/// a plain collective greeting → `collective-greeting`; a named/concierge ask →
-/// `single-voice`; small talk → `silence`. Nothing is sent.
+/// split a collective election into a discussion round vs independent roster
+/// replies. Prints the category and, for a round, the household-authored voices
+/// in contribution order plus the configured coordination-owner synthesizer.
+/// This is the scripted-test seam (sibling of `wg telegram elect`): a discussion
+/// ask → `discussion-round`; a plain collective greeting →
+/// `collective-greeting`; a named/concierge ask → `single-voice`; small talk →
+/// `silence`. Nothing is sent.
 pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()> {
     use worksgood::notify::telegram_discussion as discussion;
     use worksgood::notify::telegram_standup as standup;
@@ -2485,7 +2789,8 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
     let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
     let human_count = human_agent_id_set(workgraph_dir).len();
 
-    let election = elect_responders_with_owners(
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let election = elect_responders_with_owner_map(
         Some("supergroup"),
         Some("-1000000000001"),
         message,
@@ -2495,14 +2800,19 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
         false,
         human_count,
         &config,
-        &OwnerMap::load(&project_root(workgraph_dir)),
+        &owner_map,
     );
 
     let is_discussion = is_discussion_ask(message);
-    let roster_ids: Vec<String> = standup::plan_roster(&config, standup::DEFAULT_ROSTER)
-        .into_iter()
-        .map(|m| m.bot_id)
-        .collect();
+    let roster_ids: Vec<String> =
+        standup::load_project_roster(&project_root(workgraph_dir), &config)?
+            .into_iter()
+            .map(|m| m.bot_id)
+            .collect();
+    let synthesizer_bot = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .and_then(|owner| resolve_mentioned_bot(owner, &config))
+        .map(|bot| bot.bot_id);
 
     // (category, plan) — plan is Some only for a discussion round.
     let (category, plan): (&str, Option<discussion::DiscussionPlan>) = match &election {
@@ -2511,7 +2821,13 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
         Election::One { .. } => ("single-voice", None),
         Election::All { .. } => {
             if is_discussion {
-                ("discussion-round", Some(discussion::plan_round(&roster_ids)))
+                (
+                    "discussion-round",
+                    Some(discussion::plan_round(
+                        &roster_ids,
+                        synthesizer_bot.as_deref(),
+                    )),
+                )
             } else {
                 ("collective-greeting", None)
             }
@@ -2541,9 +2857,9 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
                 },
             );
             match plan.synthesizer {
-                Some(s) => println!(
-                    "then {s} closes with a synthesis (only if ≥2 other voices weigh in)"
-                ),
+                Some(s) => {
+                    println!("then {s} closes with a synthesis (only if ≥2 other voices weigh in)")
+                }
                 None => println!("no synthesizer configured — no closing wrap-up"),
             }
         }
@@ -2578,16 +2894,18 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
 pub fn run_compose_prompt(
     workgraph_dir: &Path,
     message: &str,
-    agent: &str,
+    agent: Option<&str>,
     session: Option<&str>,
     json: bool,
 ) -> Result<()> {
     use worksgood::notify::telegram_conversation;
 
-    let agent_id = agent.trim();
-    if agent_id.is_empty() {
-        anyhow::bail!("--agent must not be empty");
-    }
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let agent_id = agent
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or_else(|| owner_map.owner_for_domain(ownership::Domain::Coordination))
+        .context("--agent is required when household.toml has no configured coordination owner")?;
     // Default the session ref to the persona id: a bound agent name resolves to
     // its session, and an unknown ref simply yields no summary/history (the
     // fresh-session prompt) rather than an error — so a scratch project works.
@@ -2596,8 +2914,12 @@ pub fn run_compose_prompt(
         .filter(|s| !s.is_empty())
         .unwrap_or(agent_id);
 
-    let prompt =
-        telegram_conversation::compose_prompt_preview(workgraph_dir, session_ref, agent_id, message);
+    let prompt = telegram_conversation::compose_prompt_preview(
+        workgraph_dir,
+        session_ref,
+        agent_id,
+        message,
+    );
 
     if json {
         // Which forwarded blocks are present in the ASSEMBLED prompt (not merely
@@ -2628,7 +2950,7 @@ pub fn run_compose_prompt(
 /// Feeds the raw `getUpdates` element through the SAME boundary the live
 /// listener uses: [`decode_update`] (which reads the Telegram entities so a
 /// bare `?` is distinguished from a real `/help`), then [`command_gate`] and
-/// [`elect_responders_with_owners`]. Prints the decision — is it a command, and if not, who
+/// [`elect_responders_with_owner_map`]. Prints the decision — is it a command, and if not, who
 /// the election routes it to. This is the `fix-command-leaks` proof: a bare `?`
 /// or `@mention ?` must decide `conversation` with ZERO commands and never
 /// touch the operator claim/done path.
@@ -2698,7 +3020,8 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
     // Membership-aware silence: mirror the listener by counting onboarded humans
     // so the diagnostic's election matches the live decision.
     let human_count = human_agent_id_set(workgraph_dir).len();
-    let election = elect_responders_with_owners(
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let election = elect_responders_with_owner_map(
         msg.chat_type.as_deref(),
         msg.chat_id.as_deref(),
         &msg.body,
@@ -2707,10 +3030,12 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
         msg.sender_is_bot,
         human_count,
         &config,
-        &OwnerMap::load(&project_root(workgraph_dir)),
+        &owner_map,
     );
     let (elected, addressed_by): (Option<String>, Option<String>) = match &election {
-        Election::One { bot, addressed_by, .. } => (
+        Election::One {
+            bot, addressed_by, ..
+        } => (
             bot.agent_id.clone().or_else(|| Some(bot.bot_id.clone())),
             Some(addressed_by.to_string()),
         ),
@@ -2746,7 +3071,7 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
 ///
 /// Decodes the raw update(s) through the SAME `decode_update` boundary the
 /// listener uses (photo `file_id`, caption, media group), coalesces album
-/// frames into per-turn units, runs the real `elect_responders_with_owners` decision on the
+/// frames into per-turn units, runs the real `elect_responders_with_owner_map` decision on the
 /// first turn's caption (who a captioned photo routes to), and — when a fixture
 /// `--reply` + `--list` are given — parses the model's `SHOPPING_UPDATE:` tail
 /// and prints the exact mutations that WOULD be applied through the gateway
@@ -2764,8 +3089,7 @@ pub fn run_photo_plan(
     // --- 1. Decode update(s) → messages. Accept a single object or an array. ---
     let read_arg = |arg: &str| -> Result<String> {
         if let Some(path) = arg.strip_prefix('@') {
-            std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read fixture {path}"))
+            std::fs::read_to_string(path).with_context(|| format!("failed to read fixture {path}"))
         } else {
             Ok(arg.to_string())
         }
@@ -2792,7 +3116,8 @@ pub fn run_photo_plan(
         Some(turn) => {
             let mention_usernames = parse_at_mention_tokens(&turn.caption);
             let human_count = human_agent_id_set(workgraph_dir).len();
-            let election = elect_responders_with_owners(
+            let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+            let election = elect_responders_with_owner_map(
                 turn.chat_type.as_deref(),
                 turn.chat_id.as_deref(),
                 &turn.caption,
@@ -2801,9 +3126,7 @@ pub fn run_photo_plan(
                 false,
                 human_count,
                 &config,
-                // An UNCAPTIONED photo names nobody, so it falls to whichever
-                // persona this household's `household.toml` gives coordination.
-                &OwnerMap::load(&project_root(workgraph_dir)),
+                &owner_map,
             );
             let who = match &election {
                 Election::One { bot, .. } => {
@@ -2882,7 +3205,14 @@ pub fn run_photo_plan(
             .map(|g| format!(", album group {g}"))
             .unwrap_or_default(),
     );
-    println!("  caption: {}", if turn.caption.is_empty() { "(none)" } else { &turn.caption });
+    println!(
+        "  caption: {}",
+        if turn.caption.is_empty() {
+            "(none)"
+        } else {
+            &turn.caption
+        }
+    );
     println!(
         "  routes to: {}",
         elected.as_deref().unwrap_or("(silence — no one answers)")
@@ -2907,6 +3237,276 @@ pub fn run_photo_plan(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+struct PhotoReplayDownloader {
+    image_path: PathBuf,
+}
+
+#[async_trait]
+impl worksgood::notify::telegram_photo::PhotoDownloader for PhotoReplayDownloader {
+    async fn download(&self, _file_id: &str, dest: &Path) -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating photo replay download dir {}", parent.display())
+            })?;
+        }
+        std::fs::copy(&self.image_path, dest).with_context(|| {
+            format!(
+                "copying photo replay fixture {} to {}",
+                self.image_path.display(),
+                dest.display(),
+            )
+        })?;
+        Ok(())
+    }
+}
+
+struct PhotoReplayComposer {
+    reply: String,
+}
+
+#[async_trait]
+impl worksgood::notify::telegram_photo::VisionComposer for PhotoReplayComposer {
+    async fn compose_vision(&self, prompt: &str, image_paths: &[PathBuf]) -> Result<String> {
+        if prompt.trim().is_empty() || image_paths.is_empty() {
+            anyhow::bail!("photo replay composer did not receive its image prompt");
+        }
+        Ok(self.reply.clone())
+    }
+}
+
+struct PhotoReplayGateway {
+    items: Vec<worksgood::notify::telegram_photo::ShoppingItem>,
+    log_path: PathBuf,
+}
+
+#[async_trait]
+impl worksgood::notify::telegram_photo::ShoppingGateway for PhotoReplayGateway {
+    async fn list(&self) -> Result<Vec<worksgood::notify::telegram_photo::ShoppingItem>> {
+        Ok(self.items.clone())
+    }
+
+    async fn toggle(&self, key: &str, checked: bool) -> Result<()> {
+        append_photo_replay_row(
+            &self.log_path,
+            &serde_json::json!({
+                "op": "toggle",
+                "key": key,
+                "checked": checked,
+            }),
+        )
+    }
+
+    async fn add(&self, text: &str) -> Result<()> {
+        append_photo_replay_row(
+            &self.log_path,
+            &serde_json::json!({
+                "op": "add",
+                "text": text,
+            }),
+        )
+    }
+}
+
+struct PhotoReplaySink {
+    log_path: PathBuf,
+    fail_send: bool,
+}
+
+#[async_trait]
+impl worksgood::notify::telegram_conversation::ReplySink for PhotoReplaySink {
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
+        if self.fail_send {
+            anyhow::bail!("stubbed photo reply transport failure");
+        }
+        append_photo_replay_row(
+            &self.log_path,
+            &serde_json::json!({
+                "bot_id": bot_id,
+                "chat_id": chat_id,
+                "text": text,
+            }),
+        )?;
+        Ok(Some("stubbed-photo-message".to_string()))
+    }
+}
+
+fn append_photo_replay_row(path: &Path, row: &serde_json::Value) -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating photo replay fixture dir {}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening photo replay fixture log {}", path.display()))?;
+    serde_json::to_writer(&mut file, row)
+        .with_context(|| format!("writing photo replay fixture log {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("finishing photo replay fixture log {}", path.display()))
+}
+
+/// Scratch-only binary seam for restart testing the exact occurrence helper
+/// used by [`handle_photo_shopping_turn`].
+///
+/// The raw update, election, complete photo-turn orchestrator, canonical reply
+/// guard, occurrence journal, and delivery ledger are production code. Only
+/// the three I/O seams are replaced: a fixture image is copied instead of
+/// downloaded, the supplied vision reply is returned instead of spawning a
+/// model, and gateway mutations / successful Telegram sends append JSONL rows.
+/// No credential or network is used.
+#[allow(clippy::too_many_arguments)]
+pub fn run_photo_replay(
+    workgraph_dir: &Path,
+    update: &str,
+    reply: &str,
+    list: &str,
+    mock_image: &Path,
+    mock_mutation_log: &Path,
+    mock_send_log: &Path,
+    fail_send: bool,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::telegram as tg;
+    use worksgood::notify::telegram_photo as photo;
+
+    let read_arg = |arg: &str| -> Result<String> {
+        if let Some(path) = arg.strip_prefix('@') {
+            std::fs::read_to_string(path).with_context(|| format!("failed to read fixture {path}"))
+        } else {
+            Ok(arg.to_string())
+        }
+    };
+
+    let update_value: serde_json::Value =
+        serde_json::from_str(&read_arg(update)?).context("update is not valid JSON")?;
+    let elements = match update_value {
+        serde_json::Value::Array(values) => values,
+        value => vec![value],
+    };
+    let messages: Vec<worksgood::notify::IncomingMessage> = elements
+        .iter()
+        .filter_map(|value| tg::decode_update(value, "telegram"))
+        .collect();
+    let photo_message = messages
+        .iter()
+        .find(|message| message.photo_file_id.is_some())
+        .context("update did not contain a photo message")?;
+    let turn = photo::coalesce_album(&messages)
+        .into_iter()
+        .next()
+        .context("update did not produce a photo turn")?;
+
+    let config = load_telegram_config()?;
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let election = elect_responders_with_owner_map(
+        turn.chat_type.as_deref(),
+        turn.chat_id.as_deref(),
+        &turn.caption,
+        &parse_at_mention_tokens(&turn.caption),
+        None,
+        false,
+        human_agent_id_set(workgraph_dir).len(),
+        &config,
+        &owner_map,
+    );
+    let (bot_id, chat_id) = match election {
+        Election::One {
+            bot, reply_chat, ..
+        } => (bot.bot_id, reply_chat),
+        Election::All { .. } => {
+            anyhow::bail!("photo replay fixture expected one configured voice, got the full roster")
+        }
+        Election::Private => anyhow::bail!(
+            "photo replay fixture expected one configured voice, got a private passthrough"
+        ),
+        Election::Silence(reason) => anyhow::bail!(
+            "photo replay fixture expected one configured voice, got {}",
+            reason,
+        ),
+    };
+
+    let list_value: serde_json::Value =
+        serde_json::from_str(&read_arg(list)?).context("list is not valid JSON")?;
+    let items = photo::parse_shopping_json(&list_value);
+
+    let physical_turn_key = telegram_photo_turn_key(photo_message);
+    let family_roster = worksgood::notify::grounding::load_family_voice_roster(
+        &project_root(workgraph_dir),
+        workgraph_dir,
+    );
+    let orchestration_roster = family_roster.clone();
+    let downloader = PhotoReplayDownloader {
+        image_path: mock_image.to_path_buf(),
+    };
+    let composer = PhotoReplayComposer {
+        reply: reply.to_string(),
+    };
+    let gateway = PhotoReplayGateway {
+        items,
+        log_path: mock_mutation_log.to_path_buf(),
+    };
+    let scratch = workgraph_dir
+        .join("photo-replay-scratch")
+        .join(&physical_turn_key);
+    let sink = PhotoReplaySink {
+        log_path: mock_send_log.to_path_buf(),
+        fail_send,
+    };
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    let dispatch = rt.block_on(run_photo_shopping_occurrence(
+        workgraph_dir,
+        &physical_turn_key,
+        &bot_id,
+        &chat_id,
+        &family_roster,
+        &sink,
+        move || async move {
+            std::fs::create_dir_all(&scratch).with_context(|| {
+                format!("creating photo replay scratch dir {}", scratch.display())
+            })?;
+            let result = photo::run_photo_shopping_turn(
+                &turn,
+                None,
+                &photo::PhotoLimits::default(),
+                &downloader,
+                &composer,
+                &gateway,
+                &orchestration_roster,
+                &scratch,
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            Ok(result?.reply_text)
+        },
+    ))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "bot_id": dispatch.outcome.bot_id,
+                "chat_id": dispatch.outcome.chat_id,
+                "reply": dispatch.outcome.reply_text,
+                "resumed_delivery": dispatch.resumed_delivery,
+                "already_delivered": dispatch.already_delivered,
+            }))?
+        );
+    } else {
+        let phase = if dispatch.already_delivered {
+            "already delivered"
+        } else if dispatch.resumed_delivery {
+            "stored delivery resumed"
+        } else {
+            "applied"
+        };
+        println!("photo replay fixture: {phase}");
     }
     Ok(())
 }
@@ -2984,13 +3584,23 @@ pub async fn run_group_standup(
     config: &TelegramConfig,
     target: &str,
 ) -> Result<()> {
+    run_standup_for_scope(workgraph_dir, config, target, ReplyScope::Group).await
+}
+
+async fn run_standup_for_scope(
+    workgraph_dir: &Path,
+    config: &TelegramConfig,
+    target: &str,
+    scope: ReplyScope,
+) -> Result<()> {
     use worksgood::notify::telegram_standup as standup;
 
-    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
     if roster.is_empty() {
-        eprintln!("No named bots configured — /standup has no voices to post.");
+        eprintln!("No household roster entries have matching Telegram bots.");
         return Ok(());
     }
+    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, config);
 
     // Load the graph once; ground every persona's report against it. A missing
     // or unreadable graph is not fatal — the standup still runs with each voice
@@ -3004,8 +3614,10 @@ pub async fn run_group_standup(
         };
         let post = standup::render_report(member, &in_progress, &open);
 
-        let channel = TelegramChannel::from_bot(member.bot_id.clone(), member.bot.clone());
-        match channel.send_text(target, &post.text).await {
+        match family_delivery
+            .send(scope, &member.bot_id, target, &post.text)
+            .await
+        {
             Ok(_) => println!(
                 "[{}] standup: {} posted",
                 chrono::Utc::now().format("%H:%M:%S"),
@@ -3034,6 +3646,11 @@ pub async fn run_group_standup(
 /// bound session** (or the sender isn't a confirmed human) do we fall back to
 /// the task-grounded in-voice line ([`telegram_standup::render_conversational`])
 /// — never silence, never a status dump.
+///
+/// `physical_turn_key` identifies the inbound household turn that elected this
+/// roster. Every voice gets its own request id derived from that shared key:
+/// redelivery of one physical turn remains idempotent, while a later turn in
+/// the same chat cannot collide with an earlier voice's outbox entry.
 pub async fn run_group_collective(
     workgraph_dir: &Path,
     config: &TelegramConfig,
@@ -3041,13 +3658,16 @@ pub async fn run_group_collective(
     feed_path: &Path,
     human_message: &str,
     sender: &str,
+    physical_turn_key: &str,
 ) -> Result<()> {
     use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_standup as standup;
 
-    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
+    let family_delivery =
+        FamilyReplyDelivery::load_at(workgraph_dir, config, feed_path.to_path_buf());
     if roster.is_empty() {
-        eprintln!("No named bots configured — collective reply has no voices to post.");
+        eprintln!("No household roster entries have matching Telegram bots.");
         return Ok(());
     }
 
@@ -3088,15 +3708,13 @@ pub async fn run_group_collective(
         if matches!(plan, convo::ConversationPlan::Converse { .. }) {
             // Grounded per-voice answer to the human's message. The FeedMirror
             // sink relays the reply into the conversation pane's feed too.
-            let sink = FeedMirrorSink::new(
+            let sink = family_delivery.wrap(
                 convo::BotReplySink::new(config.clone()),
-                feed_path.to_path_buf(),
-                config.clone(),
+                ReplyScope::Group,
+                GuardPolicy::AlreadyGuarded,
             );
-            let request_id = format!("tg-collective-{}-{}", target, member.bot_id);
-            let composer = wg_config
-                .clone()
-                .map(convo::OneshotComposer::from_config);
+            let request_id = collective_request_id(target, &member.bot_id, physical_turn_key);
+            let composer = wg_config.clone().map(convo::OneshotComposer::from_config);
             let composer_ref = composer.as_ref().map(|c| c as &dyn convo::ReplyComposer);
             match convo::run_conversation_turn(
                 workgraph_dir,
@@ -3127,23 +3745,30 @@ pub async fn run_group_collective(
             None => (Vec::new(), Vec::new()),
         };
         let post = standup::render_conversational(member, &in_progress, &open);
+        let request_id = collective_request_id(target, &member.bot_id, physical_turn_key);
+        let sink = family_delivery.wrap(
+            convo::BotReplySink::new(config.clone()),
+            ReplyScope::Group,
+            GuardPolicy::Enforce,
+        );
 
-        let channel = TelegramChannel::from_bot(member.bot_id.clone(), member.bot.clone());
-        match channel.send_text(target, &post.text).await {
+        match convo::send_reply_once(
+            workgraph_dir,
+            &request_id,
+            &member.bot_id,
+            target,
+            &post.text,
+            &sink,
+        )
+        .await
+        {
             Ok(sent) => {
                 println!(
                     "[{}] collective: {} replied (sent message_id {})",
                     chrono::Utc::now().format("%H:%M:%S"),
                     post.bot_id,
-                    sent.0,
+                    sent.as_deref().unwrap_or("unknown"),
                 );
-                // Mirror this voice's reply into the conversation pane's feed as
-                // an `agent` line (the persona's answer relayed into the group).
-                let entry =
-                    casa_feed::agent_entry(member.agent_id(), &post.text, casa_feed::now_ms());
-                if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
-                    eprintln!("collective: failed to mirror {} reply to feed: {e}", post.bot_id);
-                }
             }
             Err(e) => eprintln!("collective: {} failed to reply: {e}", post.bot_id),
         }
@@ -3154,13 +3779,14 @@ pub async fn run_group_collective(
 /// Orchestrate a **discussion round** (collective election + an opinion /
 /// discussion ask). Instead of four independent replies the family talks it
 /// through: each bound-session persona contributes one short in-voice take, in
-/// roster order and *reacting* to the takes so far, then Otto closes with a
-/// synthesis when at least two other voices weighed in.
+/// roster order and *reacting* to the takes so far, then the configured
+/// coordination owner closes with a synthesis when at least two other voices
+/// weighed in.
 ///
 /// This is the deliberative sibling of [`run_group_collective`]: same sole
 /// orchestrator (the single listener), same per-voice bot, same
 /// persistent-session composer ([`convo::OneshotComposer`]) and casa-feed mirror
-/// ([`FeedMirrorSink`]). It differs in that the takes are *sequenced with
+/// ([`FamilyReplyDelivery`]). It differs in that the takes are *sequenced with
 /// context* and a voice whose session errors or does not answer in time is
 /// skipped SILENTLY — no glitch line, no jargon in the family group. The
 /// round-runner itself lives in [`telegram_discussion`] and is unit-tested there;
@@ -3174,14 +3800,18 @@ pub async fn run_group_discussion(
     feed_path: &Path,
     human_message: &str,
     sender: &str,
+    physical_turn_key: &str,
 ) -> Result<()> {
+    use worksgood::notify::grounding;
     use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_discussion as discussion;
     use worksgood::notify::telegram_standup as standup;
 
-    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
+    let family_delivery =
+        FamilyReplyDelivery::load_at(workgraph_dir, config, feed_path.to_path_buf());
     if roster.is_empty() {
-        eprintln!("No named bots configured — discussion round has no voices.");
+        eprintln!("No household roster entries have matching Telegram bots.");
         return Ok(());
     }
 
@@ -3206,6 +3836,7 @@ pub async fn run_group_discussion(
         {
             voices.push(discussion::DiscussionVoice {
                 bot_id: member.bot_id.clone(),
+                display_name: member.display_name.clone(),
                 agent_id,
                 session_ref,
             });
@@ -3222,17 +3853,23 @@ pub async fn run_group_discussion(
             feed_path,
             human_message,
             sender,
+            physical_turn_key,
         )
         .await;
     }
 
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let synthesizer_bot = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .and_then(|owner| resolve_mentioned_bot(owner, config))
+        .map(|bot| bot.bot_id);
     let timing = discussion::DiscussionTiming::from_env();
     println!(
         "[{}] discussion round -> {} ({} voice(s), synthesizer {})",
         chrono::Utc::now().format("%H:%M:%S"),
         target,
         voices.len(),
-        CONCIERGE_BOT,
+        synthesizer_bot.as_deref().unwrap_or("none"),
     );
 
     // Same composer + feed-mirroring sink as the collective path: each take is
@@ -3251,24 +3888,29 @@ pub async fn run_group_discussion(
                 feed_path,
                 human_message,
                 sender,
+                physical_turn_key,
             )
             .await;
         }
     };
-    let sink = FeedMirrorSink::new(
+    let sink = family_delivery.wrap(
         convo::BotReplySink::new(config.clone()),
-        feed_path.to_path_buf(),
-        config.clone(),
+        ReplyScope::Group,
+        GuardPolicy::AlreadyGuarded,
     );
+    let family_roster =
+        grounding::load_family_voice_roster(&project_root(workgraph_dir), workgraph_dir);
 
     let outcome = discussion::run_discussion_round(
         workgraph_dir,
         human_message,
         &voices,
-        CONCIERGE_BOT,
+        synthesizer_bot.as_deref().unwrap_or(""),
         composer_ref,
+        &family_roster,
         &sink,
         target,
+        physical_turn_key,
         timing,
     )
     .await?;
@@ -3284,50 +3926,107 @@ pub async fn run_group_discussion(
 }
 
 // ---------------------------------------------------------------------------
-// Casa conversation-pane feed mirror (group-elected agent replies)
+// Engine family-reply delivery seam (Telegram + scoped conversation feed)
 // ---------------------------------------------------------------------------
 
-/// A [`ReplySink`](worksgood::notify::telegram_conversation::ReplySink) decorator
-/// that mirrors every reply it relays into the group to the conversation pane's
-/// feed as an `agent` line, then delegates the real Telegram send to the wrapped
-/// [`BotReplySink`].
-///
-/// Only ever wraps a **group-elected** turn (a 1:1 DM uses the bare sink) so a
-/// private reply never leaks into the shared group feed. The replying `bot_id`
-/// is mapped back to its persona id via [`agent_for_bot`]; the feed line carries
-/// only the six display-safe fields — no token or chat id. A feed-write failure
-/// is logged and swallowed so a full disk can never break the Telegram reply.
-struct FeedMirrorSink {
-    inner: worksgood::notify::telegram_conversation::BotReplySink,
-    feed_path: PathBuf,
-    config: TelegramConfig,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyScope {
+    Group,
+    Private,
 }
 
-impl FeedMirrorSink {
-    fn new(
-        inner: worksgood::notify::telegram_conversation::BotReplySink,
-        feed_path: PathBuf,
-        config: TelegramConfig,
-    ) -> Self {
-        Self {
-            inner,
-            feed_path,
-            config,
+impl ReplyScope {
+    fn from_chat_type(chat_type: Option<&str>) -> Self {
+        if matches!(chat_type, Some("group") | Some("supergroup")) {
+            Self::Group
+        } else {
+            Self::Private
         }
     }
 }
 
-impl FeedMirrorSink {
-    /// Mirror `text` into the casa feed as this bot's persona reply — but never
-    /// the transient latency ack (it's edited away into the real answer, so the
-    /// feed should carry only the answer/glitch line).
-    fn mirror(&self, bot_id: &str, text: &str) {
+/// Shared context for the final engine-owned delivery seam.
+///
+/// Every family-visible reply produced by this command module is sent through
+/// this context. It resolves the configured presentation, applies the
+/// engine-side family-voice guard to direct replies, and mirrors only confirmed
+/// GROUP deliveries to the casa feed. Private replies never touch that file.
+#[derive(Clone)]
+struct FamilyReplyDelivery {
+    feed_path: PathBuf,
+    config: TelegramConfig,
+    personas: casa_feed::PersonaCatalog,
+    family_roster: worksgood::notify::grounding::FamilyVoiceRoster,
+}
+
+impl FamilyReplyDelivery {
+    fn load(workgraph_dir: &Path, config: &TelegramConfig) -> Self {
+        let root = project_root(workgraph_dir);
+        Self::load_at(workgraph_dir, config, casa_feed::feed_path_for(&root))
+    }
+
+    fn load_at(workgraph_dir: &Path, config: &TelegramConfig, feed_path: PathBuf) -> Self {
+        let root = project_root(workgraph_dir);
+        Self {
+            feed_path,
+            config: config.clone(),
+            personas: load_feed_persona_catalog(&root),
+            family_roster: worksgood::notify::grounding::load_family_voice_roster(
+                &root,
+                workgraph_dir,
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_parts(
+        feed_path: PathBuf,
+        config: TelegramConfig,
+        personas: casa_feed::PersonaCatalog,
+        family_roster: worksgood::notify::grounding::FamilyVoiceRoster,
+    ) -> Self {
+        Self {
+            feed_path,
+            config,
+            personas,
+            family_roster,
+        }
+    }
+
+    fn wrap<S>(&self, inner: S, scope: ReplyScope, guard: GuardPolicy) -> ScopedFamilyReplySink<S> {
+        ScopedFamilyReplySink {
+            inner,
+            delivery: self.clone(),
+            scope,
+            guard,
+        }
+    }
+
+    async fn send(
+        &self,
+        scope: ReplyScope,
+        bot_id: &str,
+        chat_id: &str,
+        text: &str,
+    ) -> Result<Option<String>> {
         use worksgood::notify::telegram_conversation as convo;
-        if text == convo::ack_line() {
+        let sink = self.wrap(
+            convo::BotReplySink::new(self.config.clone()),
+            scope,
+            GuardPolicy::Enforce,
+        );
+        convo::ReplySink::send(&sink, bot_id, chat_id, text).await
+    }
+
+    /// Mirror the exact guarded bytes that Telegram accepted, excluding the
+    /// transient latency acknowledgement that a later edit replaces.
+    fn mirror(&self, scope: ReplyScope, bot_id: &str, text: &str) {
+        use worksgood::notify::telegram_conversation as convo;
+        if scope != ReplyScope::Group || text == convo::ack_line() {
             return;
         }
         let agent_id = convo::agent_for_bot(&self.config, bot_id);
-        let entry = casa_feed::agent_entry(&agent_id, text, casa_feed::now_ms());
+        let entry = casa_feed::agent_entry(&self.personas, &agent_id, text, casa_feed::now_ms());
         if let Err(e) = casa_feed::append_entry(&self.feed_path, &entry) {
             eprintln!(
                 "[{}] casa feed: failed to mirror agent reply: {e}",
@@ -3337,21 +4036,92 @@ impl FeedMirrorSink {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardPolicy {
+    /// Apply the grounding module's family-visible copy gate here.
+    Enforce,
+    /// The conversation/discussion engine already applied the richer guard,
+    /// including any narrowly authorized handoff suffix.
+    AlreadyGuarded,
+}
+
+struct ScopedFamilyReplySink<S> {
+    inner: S,
+    delivery: FamilyReplyDelivery,
+    scope: ReplyScope,
+    guard: GuardPolicy,
+}
+
+struct BorrowedReplySink<'a>(&'a dyn worksgood::notify::telegram_conversation::ReplySink);
+
 #[async_trait]
-impl worksgood::notify::telegram_conversation::ReplySink for FeedMirrorSink {
+impl worksgood::notify::telegram_conversation::ReplySink for BorrowedReplySink<'_> {
     async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
-        // Send for real first; only mirror what actually went out to the group.
-        let mid = self.inner.send(bot_id, chat_id, text).await?;
-        self.mirror(bot_id, text);
+        self.0.send(bot_id, chat_id, text).await
+    }
+
+    async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        self.0.edit(bot_id, chat_id, message_id, text).await
+    }
+}
+
+impl<S> ScopedFamilyReplySink<S> {
+    fn guarded(&self, text: &str) -> String {
+        match self.guard {
+            GuardPolicy::Enforce => {
+                let guarded = worksgood::notify::grounding::enforce_family_voice(
+                    text,
+                    &self.delivery.family_roster,
+                );
+                if guarded != text {
+                    eprintln!(
+                        "[{}] family-voice guard: cleaned a direct reply before delivery",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                    );
+                }
+                guarded
+            }
+            GuardPolicy::AlreadyGuarded => text.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl<S> worksgood::notify::telegram_conversation::ReplySink for ScopedFamilyReplySink<S>
+where
+    S: worksgood::notify::telegram_conversation::ReplySink,
+{
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
+        let guarded = self.guarded(text);
+        let mid = self.inner.send(bot_id, chat_id, &guarded).await?;
+        self.delivery.mirror(self.scope, bot_id, &guarded);
         Ok(mid)
     }
 
     async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
-        // The ack is being turned into the final answer (or glitch line) —
-        // mirror that final text into the feed.
-        self.inner.edit(bot_id, chat_id, message_id, text).await?;
-        self.mirror(bot_id, text);
+        let guarded = self.guarded(text);
+        self.inner
+            .edit(bot_id, chat_id, message_id, &guarded)
+            .await?;
+        self.delivery.mirror(self.scope, bot_id, &guarded);
         Ok(())
+    }
+}
+
+/// Load the committable household presentation used by the shared feed.
+///
+/// Delivery remains available when the presentation file is absent or invalid,
+/// but the fallback catalog is intentionally empty: feed entries use a neutral
+/// id-derived label and no emoji instead of a compiled or guessed identity.
+fn load_feed_persona_catalog(project_root: &Path) -> casa_feed::PersonaCatalog {
+    match casa_feed::PersonaCatalog::load(project_root) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!(
+                "[telegram] could not load household presentation for the shared feed ({e:#})"
+            );
+            casa_feed::PersonaCatalog::default()
+        }
     }
 }
 
@@ -3389,7 +4159,10 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
     }
     // 2. Web identity is a display name / humanId — match the binding's `name`
     //    or its `human-`-prefixed agent id, then hand back the stored key.
-    let want = sender.trim().trim_start_matches("human-").to_ascii_lowercase();
+    let want = sender
+        .trim()
+        .trim_start_matches("human-")
+        .to_ascii_lowercase();
     if let Some(b) = map.bindings.iter().find(|b| {
         b.name.eq_ignore_ascii_case(sender)
             || b.agent_id
@@ -3412,13 +4185,13 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 ///
 /// This command runs the SAME pipeline the listener runs on a group message,
 /// without a live socket: it elects responder(s) with the exact
-/// [`elect_responders_with_owners`] table (@mention / addressed name / collective / concierge
+/// [`elect_responders_with_owner_map`] table (@mention / addressed name / collective / concierge
 /// / silence), then dispatches through the SAME senders + composer the listener
 /// uses — [`run_group_discussion`] / [`run_group_collective`] for a collective
 /// address, or the single-voice [`plan_conversation`] +
 /// [`run_conversation_turn`] path for a named/concierge ask. Every reply goes
 /// out to the group via the elected persona's OWN bot AND is mirrored into
-/// `.casa/group-feed.jsonl` (via [`FeedMirrorSink`]) so the kiosk pane shows it.
+/// `.casa/group-feed.jsonl` (via [`FamilyReplyDelivery`]) so the kiosk pane shows it.
 ///
 /// The gateway shells out to this after it mirrors the kiosk line into the group.
 ///
@@ -3434,8 +4207,8 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 ///
 /// [`SilenceReason::BotSender`]: worksgood::notify::telegram_group::SilenceReason
 ///
-/// The idempotency key for a web-inbound single-voice turn — UNIQUE per message,
-/// STABLE on a genuine re-fire.
+/// The idempotency key for a web-inbound single-voice turn — UNIQUE per
+/// physical turn, STABLE on a genuine re-fire.
 ///
 /// `run_composed_turn`'s "one reply per turn" guard keys "already answered" on the
 /// `request_id` (an outbox entry under that id ⇒ skip compose+send). A request_id that
@@ -3446,17 +4219,115 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 /// "single voice (nora) answered [replied]" yet the pane got silence, because the guard
 /// treated a brand-new question as a duplicate of an earlier one.
 ///
-/// Folding a stable content hash of the message body into the id fixes both directions:
-/// a genuine re-fire (identical body — a listener re-poll, a gateway retry, a
-/// restart-replay) still collides and dedupes, while a NEW question gets a NEW id and is
-/// actually answered. `DefaultHasher` is fixed-key SipHash (deterministic across runs —
-/// the same convention `casa_feed`/`reminder` use), so the dedupe survives a restart.
-fn web_inbound_request_id(reply_chat: &str, bot_id: &str, body: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    body.trim().hash(&mut h);
-    format!("web-{}-{}-{:016x}", reply_chat, bot_id, h.finish())
+/// The gateway supplies the physical-turn key once per accepted occurrence.
+/// Hashing that opaque key preserves a real dispatcher refire while allowing a
+/// household member to repeat identical words later and receive another answer.
+fn web_inbound_request_id(reply_chat: &str, bot_id: &str, physical_turn_key: &str) -> String {
+    format!(
+        "web-request-{}",
+        durable_telegram_digest_v1(
+            "web-inbound-request",
+            &[reply_chat, bot_id, physical_turn_key],
+        ),
+    )
+}
+
+/// Stable physical-turn key for a Telegram collective election.
+///
+/// Telegram `message_id` is intentionally excluded: each privacy-off bot sees
+/// the same physical group message with a different id. Use the exact
+/// cross-bot-stable fields used by [`DedupeKey`] instead — chat, stable sender,
+/// sent-at second, and the complete body. The durable digest hashes that
+/// canonical material directly; it must not embed `DedupeKey::text_hash`,
+/// whose listener-local `DefaultHasher` algorithm is not a persistence
+/// contract.
+fn telegram_physical_turn_key(message: &worksgood::notify::IncomingMessage) -> String {
+    let sender = message
+        .sender_id
+        .as_deref()
+        .unwrap_or(message.sender.as_str());
+    let sent_at = message.sent_at.unwrap_or(i64::MIN).to_string();
+    format!(
+        "telegram-turn-{}",
+        durable_telegram_digest_v1(
+            "telegram-physical-turn",
+            &[
+                message.chat_id.as_deref().unwrap_or(""),
+                sender,
+                &sent_at,
+                &message.body,
+            ],
+        ),
+    )
+}
+
+/// Stable physical-turn key for one photo-shopping occurrence.
+///
+/// Every frame in a Telegram album carries the same opaque
+/// `media_group_id`, while its caption and timestamp may differ by frame. Key
+/// albums by that group id so a listener restart on a later frame cannot run a
+/// second vision mutation. A lone photo uses the cross-bot-stable Telegram
+/// fields (chat, stable sender, sent-at second, and caption); bot-scoped
+/// `file_id` and transport-local `message_id` are deliberately excluded.
+fn telegram_photo_turn_key(message: &worksgood::notify::IncomingMessage) -> String {
+    let sender = message
+        .sender_id
+        .as_deref()
+        .unwrap_or(message.sender.as_str());
+    let chat_id = message.chat_id.as_deref().unwrap_or("");
+    let digest = match message
+        .media_group_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(group_id) => durable_telegram_digest_v1(
+            "telegram-photo-physical-turn",
+            &[chat_id, sender, "album", group_id],
+        ),
+        None => {
+            let sent_at = message.sent_at.unwrap_or(i64::MIN).to_string();
+            durable_telegram_digest_v1(
+                "telegram-photo-physical-turn",
+                &[chat_id, sender, "single", &sent_at, &message.body],
+            )
+        }
+    };
+    format!("telegram-photo-turn-{digest}")
+}
+
+/// Physical-turn key for a gateway-originated group turn.
+///
+/// A supplied opaque occurrence id distinguishes two later turns with identical
+/// words. Missing ids retain the legacy chat + trimmed-body fallback so older
+/// gateways remain compatible. The returned fingerprint never exposes the
+/// occurrence id or message body.
+fn web_physical_turn_key(reply_chat: &str, body: &str, turn_id: Option<&str>) -> String {
+    let (kind, occurrence) = turn_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| ("id", id))
+        .unwrap_or_else(|| ("body", body.trim()));
+    format!(
+        "web-turn-{}",
+        durable_telegram_digest_v1("web-physical-turn", &[reply_chat, kind, occurrence],),
+    )
+}
+
+/// Request id stored for one persona's reply to a Telegram group turn.
+///
+/// Both collective and elected-single-voice paths use this shape. Voice, chat,
+/// and physical turn all participate: the same physical redelivery is stable, a
+/// later turn is distinct, and two configured voices never suppress each other
+/// even if they share a session implementation.
+fn collective_request_id(reply_chat: &str, bot_id: &str, physical_turn_key: &str) -> String {
+    format!(
+        "tg-collective-{}",
+        durable_telegram_digest_v1(
+            "telegram-collective-request",
+            &[reply_chat, bot_id, physical_turn_key],
+        ),
+    )
 }
 
 /// Pick the `(bot_id, chat)` a fast-lane confirmation should go out as: the
@@ -3468,7 +4339,10 @@ fn fast_lane_reply_target(
     config: &TelegramConfig,
     target: &str,
 ) -> (String, String) {
-    if let Election::One { bot, reply_chat, .. } = election {
+    if let Election::One {
+        bot, reply_chat, ..
+    } = election
+    {
         return (bot.bot_id.clone(), reply_chat.clone());
     }
     let bot_id = config
@@ -3479,26 +4353,196 @@ fn fast_lane_reply_target(
     (bot_id, target.to_string())
 }
 
+const WEB_FAST_LANE_OCCURRENCE_DOMAIN: &str = "web-fast-lane";
+
+/// Exact restart payload for one web fast-lane mutation.
+///
+/// The mutation's report is guarded before this value is persisted, so an
+/// `applied` replay sends these exact bytes and never re-runs classification,
+/// plan editing, graph stamping, election, or target selection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebFastLaneOutcome {
+    op_kind: String,
+    report: String,
+    bot_id: String,
+    chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebFastLaneDispatch {
+    PassedThrough,
+    Handled {
+        outcome: WebFastLaneOutcome,
+        resumed_delivery: bool,
+        already_delivered: bool,
+    },
+}
+
+fn web_fast_lane_delivery_id(physical_turn_key: &str) -> String {
+    format!(
+        "web-fast-lane-{}",
+        durable_telegram_digest_v1("web-fast-lane-delivery", &[physical_turn_key]),
+    )
+}
+
+/// Apply and deliver one web fast-lane occurrence with restart-safe ordering.
+///
+/// Record-before-act is intentional:
+///
+/// 1. reserve the opaque occurrence;
+/// 2. apply the plan edit and graph stamp once;
+/// 3. persist the exact guarded reply + original route;
+/// 4. claim/send through the transport delivery ledger;
+/// 5. mark the occurrence delivered.
+///
+/// A crash in step 2 leaves `reserved` and a replay fails closed because it
+/// cannot know whether the plan edit reached disk. A transport failure in step
+/// 4 leaves `applied`; the replay sends the stored bytes to the stored route
+/// without touching the plan again. The transport ledger itself claims before
+/// send, closing the send-success/journal-mark crash window.
+#[allow(clippy::too_many_arguments)]
+async fn run_web_fast_lane_occurrence(
+    workgraph_dir: &Path,
+    root: &Path,
+    message: &str,
+    today: chrono::NaiveDate,
+    calendar_owner: Option<&str>,
+    physical_turn_key: &str,
+    bot_id: &str,
+    chat_id: &str,
+    auth_sender: &str,
+    persona: &str,
+    family_roster: &worksgood::notify::grounding::FamilyVoiceRoster,
+    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
+) -> Result<WebFastLaneDispatch> {
+    use worksgood::notify::fast_lane::{Classification, FastLaneResult};
+    use worksgood::notify::telegram_conversation as convo;
+    use worksgood::notify::telegram_occurrence::{OccurrenceJournal, OccurrenceState};
+
+    // Do not create occurrence records for the ordinary conversation pipeline,
+    // but always reopen an existing record first. Mutable dispatcher inputs may
+    // drift on retry; the durable accepted occurrence still wins.
+    let classified_fast_lane = matches!(
+        fast_lane::classify(message, today),
+        Classification::FastLane(_)
+    );
+    let opened = if classified_fast_lane {
+        Some(OccurrenceJournal::<WebFastLaneOutcome>::claim(
+            workgraph_dir,
+            WEB_FAST_LANE_OCCURRENCE_DOMAIN,
+            physical_turn_key,
+        )?)
+    } else {
+        OccurrenceJournal::<WebFastLaneOutcome>::reopen(
+            workgraph_dir,
+            WEB_FAST_LANE_OCCURRENCE_DOMAIN,
+            physical_turn_key,
+        )?
+    };
+    let Some((journal, state)) = opened else {
+        return Ok(WebFastLaneDispatch::PassedThrough);
+    };
+
+    let (outcome, resumed_delivery) = match state {
+        OccurrenceState::New => {
+            match fast_lane::run_fast_lane_with_calendar_owner(root, message, today, calendar_owner)
+            {
+                FastLaneResult::Fallback { .. } => {
+                    // This closed-set classifier did not ultimately own the turn
+                    // (for example, no current plan could be edited). Persist that
+                    // decision so a dispatcher refire takes the same normal path.
+                    journal.mark_passed_through()?;
+                    return Ok(WebFastLaneDispatch::PassedThrough);
+                }
+                FastLaneResult::Applied { report, op, .. } => {
+                    let guarded =
+                        worksgood::notify::grounding::enforce_family_voice(&report, family_roster);
+                    if guarded != report {
+                        eprintln!(
+                            "[{}] family-voice guard: cleaned a web fast-lane reply before journaling",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                        );
+                    }
+
+                    // Graph visibility belongs to the mutation stage. It is
+                    // intentionally never repeated from an `applied` replay.
+                    let origin = worksgood::graph::TaskOrigin::new(
+                        worksgood::graph::OriginChannel::Web,
+                        chat_id.to_string(),
+                        auth_sender.to_string(),
+                        persona.to_string(),
+                        Some(bot_id.to_string()),
+                    );
+                    fast_lane::stamp_graph_node(workgraph_dir, &origin, &op, &guarded);
+
+                    let outcome = WebFastLaneOutcome {
+                        op_kind: op.kind_label().to_string(),
+                        report: guarded,
+                        bot_id: bot_id.to_string(),
+                        chat_id: chat_id.to_string(),
+                    };
+                    // Persist canonical bytes and routing before the first send.
+                    journal.mark_applied(&outcome)?;
+                    (outcome, false)
+                }
+            }
+        }
+        OccurrenceState::Incomplete => {
+            anyhow::bail!(
+                "web fast-lane occurrence is incomplete; refusing to reapply an uncertain plan edit"
+            );
+        }
+        OccurrenceState::Applied(outcome) => (outcome, true),
+        OccurrenceState::Delivered(outcome) => {
+            return Ok(WebFastLaneDispatch::Handled {
+                outcome,
+                resumed_delivery: false,
+                already_delivered: true,
+            });
+        }
+        OccurrenceState::PassedThrough => return Ok(WebFastLaneDispatch::PassedThrough),
+    };
+
+    let delivery_id = web_fast_lane_delivery_id(physical_turn_key);
+    convo::send_reply_once(
+        workgraph_dir,
+        &delivery_id,
+        &outcome.bot_id,
+        &outcome.chat_id,
+        &outcome.report,
+        sink,
+    )
+    .await
+    .context("web fast-lane reply delivery failed; the stored outcome remains retryable")?;
+    journal.mark_delivered(&outcome)?;
+
+    Ok(WebFastLaneDispatch::Handled {
+        outcome,
+        resumed_delivery,
+        already_delivered: false,
+    })
+}
+
 /// Honor a pinned domain owner for a heavy web-inbound turn (task
 /// `owner-pin-engine`).
 ///
 /// THE LAST ROUTING SEAM. When the gateway resolves a domain owner for an
-/// open-ended heavy ask ("tell me the calories" → nutrition → Nora), it drops
+/// open-ended heavy ask, it drops
 /// that persona's crisp "on it" ack AND forwards the pin (`--owner` /
 /// `WG_OWNER_PIN`). Before this, production's shell-out IGNORED the hint — the
 /// fork's election re-resolved ownership and often re-elected the concierge
-/// (Otto), so the async reply came back in a DIFFERENT voice than the one that
-/// acked, talking about the acking persona in the third person. The pin must be
-/// BINDING for voice selection: the composing/delivering bot IS the pinned
-/// persona, not a re-election winner.
+/// so the async reply came back in a DIFFERENT voice than the one that acked.
+/// The pin must be BINDING for voice selection: the composing/delivering bot IS
+/// the pinned persona, not a re-election winner.
 ///
 /// Given the current election, return it with its single voice REBOUND to the
-/// pinned persona's bot. A pin that is empty, is the concierge default
-/// (`otto` — "no owner claimed it, elect as today"), or resolves to no
-/// configured bot leaves the election untouched. The body is preserved from a
-/// One/All election, else the raw `message` — a pinned turn the engine would
-/// have stayed silent on is still forced to answer in the pinned voice, because
-/// the gateway already decided it is a domain-owned heavy ask.
+/// pinned persona's bot. Only a missing, empty, or unconfigured pin leaves the
+/// election untouched; no persona id doubles as a sentinel. The body is
+/// preserved from a One/All election, else the raw `message` — a pinned turn
+/// the engine would have stayed silent on is still forced to answer in the
+/// pinned voice, because the gateway already decided it is a domain-owned
+/// heavy ask.
 fn apply_owner_pin(
     election: Election,
     pin: Option<&str>,
@@ -3507,8 +4551,8 @@ fn apply_owner_pin(
     message: &str,
 ) -> Election {
     let pin = match pin.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) if !p.eq_ignore_ascii_case("otto") => p,
-        _ => return election,
+        Some(p) => p,
+        None => return election,
     };
     let bot = match resolve_mentioned_bot(pin, config) {
         Some(b) => b,
@@ -3533,6 +4577,7 @@ pub fn run_web_inbound(
     message: &str,
     chat_id_override: Option<&str>,
     owner_pin: Option<&str>,
+    turn_id: Option<&str>,
     dry_run: bool,
     json: bool,
 ) -> Result<()> {
@@ -3567,8 +4612,15 @@ pub fn run_web_inbound(
     // the listener runs, via the shared `elect_group_inbound` seam (supergroup,
     // no reply-chain, never bot-sent). The path-parity test locks this to the
     // listener's decision.
-    let mut election =
-        elect_group_inbound(&target, message, &mention_usernames, human_count, &config);
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let mut election = elect_group_inbound_with_owner_map(
+        &target,
+        message,
+        &mention_usernames,
+        human_count,
+        &config,
+        &owner_map,
+    );
 
     // ── CLARIFICATION CONTINUATION ────────────────────────────────────────
     // A bare "yes"/"ok"/"si" from the same human within the clarify window is not
@@ -3647,6 +4699,16 @@ pub fn run_web_inbound(
     );
 
     let feed_path = casa_feed::feed_path_for(&project_root(workgraph_dir));
+    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
+
+    // One physical-turn key is shared by every elected voice and both delivery
+    // shapes. A gateway occurrence id wins; older callers fall back to the
+    // election body fingerprint.
+    let turn_body = match &election {
+        Election::All { body, .. } | Election::One { body, .. } => body.as_str(),
+        _ => message.trim(),
+    };
+    let physical_turn_key = web_physical_turn_key(&target, turn_body, turn_id);
 
     let category = match &election {
         Election::Silence(_) => "silence",
@@ -3668,7 +4730,7 @@ pub fn run_web_inbound(
     if dry_run {
         let who: Option<String> = match &election {
             Election::All { .. } => Some(
-                standup::plan_roster(&config, standup::DEFAULT_ROSTER)
+                standup::load_project_roster(&project_root(workgraph_dir), &config)?
                     .into_iter()
                     .map(|m| m.bot_id)
                     .collect::<Vec<_>>()
@@ -3691,6 +4753,7 @@ pub fn run_web_inbound(
                 // credential-free so the DM-guard is provable through the real
                 // binary without a live compose (which the dry-run seam skips).
                 "clarify_target": clarify_chat,
+                "turn_fingerprint": physical_turn_key,
                 "who": who,
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
@@ -3714,54 +4777,73 @@ pub fn run_web_inbound(
     // exactly as today. Only a confirmed human may trigger a direct write.
     if convo::sender_is_confirmed(workgraph_dir, &auth_sender) {
         let today = chrono::Local::now().date_naive();
-        if let fast_lane::FastLaneResult::Applied { report, op, .. } =
-            fast_lane::run_fast_lane(&project_root(workgraph_dir), message, today)
-        {
-            let (bot_id, chat) = fast_lane_reply_target(&election, &config, &target);
-            let persona = convo::agent_for_bot(&config, &bot_id);
-            println!(
-                "[{}] fast-lane {} applied for {} -> {} ({})",
-                chrono::Utc::now().format("%H:%M:%S"),
-                op.kind_label(),
-                sender,
-                bot_id,
-                report,
-            );
-            let sink = FeedMirrorSink::new(
-                convo::BotReplySink::new(config.clone()),
-                feed_path.clone(),
-                config.clone(),
-            );
-            let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-            rt.block_on(async {
-                use convo::ReplySink as _;
-                let _ = sink.send(&bot_id, &chat, &report).await;
-            });
-            // Origin-stamp + brief graph visibility (a queued→done light) so the
-            // fast-lane edit still shows in the constellation/timeline.
-            let origin = worksgood::graph::TaskOrigin::new(
-                worksgood::graph::OriginChannel::Web,
-                chat.clone(),
-                auth_sender.clone(),
-                persona,
-                Some(bot_id.clone()),
-            );
-            fast_lane::stamp_graph_node(workgraph_dir, &origin, &op, &report);
+        let (bot_id, chat) = fast_lane_reply_target(&election, &config, &target);
+        let persona = convo::agent_for_bot(&config, &bot_id);
+        // The occurrence helper guards the reply before journaling it. Delivery
+        // must preserve those exact canonical bytes on an `applied` retry.
+        let sink = family_delivery.wrap(
+            convo::BotReplySink::new(config.clone()),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+        match rt.block_on(run_web_fast_lane_occurrence(
+            workgraph_dir,
+            &project_root(workgraph_dir),
+            message,
+            today,
+            owner_map.owner_for_domain(ownership::Domain::Calendar),
+            &physical_turn_key,
+            &bot_id,
+            &chat,
+            &auth_sender,
+            &persona,
+            &family_delivery.family_roster,
+            &sink,
+        ))? {
+            WebFastLaneDispatch::PassedThrough => {}
+            WebFastLaneDispatch::Handled {
+                outcome,
+                resumed_delivery,
+                already_delivered,
+            } => {
+                let phase = if already_delivered {
+                    "already delivered"
+                } else if resumed_delivery {
+                    "stored delivery resumed"
+                } else {
+                    "applied"
+                };
+                println!(
+                    "[{}] fast-lane {} {} for {} -> {} ({})",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    outcome.op_kind,
+                    phase,
+                    sender,
+                    outcome.bot_id,
+                    outcome.report,
+                );
 
-            if json {
-                let out = serde_json::json!({
-                    "category": "fast-lane",
-                    "fast_lane_op": op.kind_label(),
-                    "sender": sender,
-                    "auth_sender": auth_sender,
-                    "target": chat,
-                    "outcome": report,
-                });
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            } else {
-                println!("web-inbound [fast-lane {}] from {sender}: {report}", op.kind_label());
+                if json {
+                    let out = serde_json::json!({
+                        "category": "fast-lane",
+                        "fast_lane_op": outcome.op_kind,
+                        "sender": sender,
+                        "auth_sender": auth_sender,
+                        "target": outcome.chat_id,
+                        "outcome": outcome.report,
+                        "replayed": resumed_delivery || already_delivered,
+                        "already_delivered": already_delivered,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    println!(
+                        "web-inbound [fast-lane {}] from {sender}: {}",
+                        outcome.op_kind, outcome.report,
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
         }
     }
 
@@ -3787,6 +4869,7 @@ pub fn run_web_inbound(
                         &feed_path,
                         body,
                         &auth_sender,
+                        &physical_turn_key,
                     )
                     .await?;
                     Ok("discussion round posted".to_string())
@@ -3798,6 +4881,7 @@ pub fn run_web_inbound(
                         &feed_path,
                         body,
                         &auth_sender,
+                        &physical_turn_key,
                     )
                     .await?;
                     Ok("collective reply posted".to_string())
@@ -3821,12 +4905,13 @@ pub fn run_web_inbound(
                     &auth_sender,
                     convo::Entry::GroupElected,
                 );
-                let sink = FeedMirrorSink::new(
+                let sink = family_delivery.wrap(
                     convo::BotReplySink::new(config.clone()),
-                    feed_path.clone(),
-                    config.clone(),
+                    ReplyScope::Group,
+                    GuardPolicy::AlreadyGuarded,
                 );
-                let request_id = web_inbound_request_id(reply_chat, &bot.bot_id, body);
+                let request_id =
+                    web_inbound_request_id(reply_chat, &bot.bot_id, &physical_turn_key);
                 let timing = convo::AckTiming::from_env();
                 let wg_config = worksgood::config::Config::load_merged(workgraph_dir).ok();
                 let composer = wg_config.map(convo::OneshotComposer::from_config);
@@ -3848,10 +4933,7 @@ pub fn run_web_inbound(
                 // itself a continuation so a confirmed exchange can't loop. Best
                 // effort — a ledger write failure never blocks the reply.
                 if clarify_continued_body.is_none() {
-                    let voice = bot
-                        .agent_id
-                        .clone()
-                        .unwrap_or_else(|| bot.bot_id.clone());
+                    let voice = bot.agent_id.clone().unwrap_or_else(|| bot.bot_id.clone());
                     if let Err(e) = ownership::ClarifyLedger::open(
                         &clarify_root,
                         &clarify_chat,
@@ -3902,17 +4984,24 @@ pub fn run_feed_write(
     text: &str,
     src_id: Option<&str>,
 ) -> Result<()> {
+    let personas = load_feed_persona_catalog(root);
     let entry = match kind {
         "group" => {
             let sender = sender.context("--kind group requires --sender")?;
             // Thread the caller-supplied opaque source id (docs/20 §2) so a smoke
             // test can drive the real writer with the SAME id twice and prove the
             // reader's srcId dedupe collapses the re-delivery to one pane line.
-            casa_feed::group_entry(sender, text, casa_feed::now_ms(), src_id.map(str::to_string))
+            casa_feed::group_entry(
+                &personas,
+                sender,
+                text,
+                casa_feed::now_ms(),
+                src_id.map(str::to_string),
+            )
         }
         "agent" => {
             let agent_id = agent_id.context("--kind agent requires --agent-id")?;
-            casa_feed::agent_entry(agent_id, text, casa_feed::now_ms())
+            casa_feed::agent_entry(&personas, agent_id, text, casa_feed::now_ms())
         }
         other => anyhow::bail!("--kind must be 'group' or 'agent', got '{other}'"),
     };
@@ -3959,8 +5048,8 @@ fn human_agent_id_set(workgraph_dir: &Path) -> HashSet<String> {
 /// Orchestrate a single family command (`/dinner`, `/shopping`, `/week`,
 /// `/reminders`, `/help`) or the whole-roster `/standup`.
 ///
-/// * **Group** — a single-reply command is composed once and sent AS the
-///   command's owner bot (Bruno for `/dinner`), regardless of which bot's queue
+/// * **Group** — a single-reply command is composed once and sent as the
+///   command domain's project-configured owner, regardless of which bot's queue
 ///   delivered the surviving (deduped) copy. `/standup` fans out to the whole
 ///   roster via [`run_group_standup`].
 /// * **1:1** — the bot the user messaged (identified by `receiving_channel`,
@@ -3980,10 +5069,15 @@ pub async fn run_family_command(
     // `/standup` posts one message per voice — reuse the standup orchestrator so
     // the group gets the four-voice check-in in roster order, no double-posts.
     if cmd.kind == family_commands::CommandKind::Roster {
-        return run_group_standup(workgraph_dir, config, target).await;
+        let scope = if is_group {
+            ReplyScope::Group
+        } else {
+            ReplyScope::Private
+        };
+        return run_standup_for_scope(workgraph_dir, config, target, scope).await;
     }
 
-    let text = compose_family_reply(workgraph_dir, config, cmd);
+    let text = compose_family_reply(workgraph_dir, config, cmd)?;
 
     // Family-voice gate: a command reply bound for a family chat must never
     // carry coordinator content (markdown backticks or the WG claim/done
@@ -4004,34 +5098,64 @@ pub async fn run_family_command(
         return Ok(());
     }
 
-    // Which bot sends: in a group, the command's owner; in a 1:1, the bot the
-    // user actually messaged (mapped from its channel_type). Fall back to the
-    // owner, then to any configured bot, so a reply always goes out.
+    // Which bot sends: in a group, the project-local domain owner; in a 1:1,
+    // the bot the user actually messaged. Ambiguous/missing mappings fail
+    // loudly rather than attributing the reply to an arbitrary configured bot.
     let bots = config.all_bots();
-    let want_id = if is_group {
-        cmd.owner.to_string()
+    let resolved = if is_group {
+        let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+        let owner = cmd.owner(&owner_map).with_context(|| {
+            format!(
+                "household.toml has no owner for the {} command domain",
+                cmd.domain.slug()
+            )
+        })?;
+        resolve_mentioned_bot(owner, config).with_context(|| {
+            format!(
+                "configured {} owner '{}' has no Telegram bot",
+                cmd.domain.slug(),
+                owner
+            )
+        })?
     } else {
-        receiving_channel
+        let receiving = receiving_channel
             .strip_prefix("telegram:")
-            .unwrap_or(receiving_channel)
-            .to_string()
-    };
-    let chosen = bots
-        .iter()
-        .find(|(id, _)| id == &want_id)
-        .or_else(|| bots.iter().find(|(id, _)| id == cmd.owner))
-        .or_else(|| bots.first());
-    let (bot_id, bot) = match chosen {
-        Some((id, bot)) => (id.clone(), bot.clone()),
-        None => {
-            eprintln!("No Telegram bots configured — cannot answer {}.", cmd.keyword);
-            return Ok(());
+            .unwrap_or(receiving_channel);
+        if receiving.is_empty() || receiving == "telegram" || receiving == "default" {
+            if bots.len() != 1 {
+                anyhow::bail!(
+                    "direct {} reply has no unambiguous receiving Telegram bot",
+                    cmd.keyword
+                );
+            }
+            resolve_mentioned_bot(&bots[0].0, config)
+                .context("the sole configured Telegram bot could not be resolved")?
+        } else {
+            resolve_mentioned_bot(receiving, config).with_context(|| {
+                format!(
+                    "direct {} reply names unknown receiving bot '{}'",
+                    cmd.keyword, receiving
+                )
+            })?
         }
     };
+    let chosen = bots.iter().find(|(id, _)| id == &resolved.bot_id);
+    let bot_id = match chosen {
+        Some((id, _)) => id.clone(),
+        None => anyhow::bail!(
+            "resolved Telegram bot '{}' is not configured",
+            resolved.bot_id
+        ),
+    };
 
-    let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
-    channel
-        .send_text(target, &text)
+    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, config);
+    let scope = if is_group {
+        ReplyScope::Group
+    } else {
+        ReplyScope::Private
+    };
+    family_delivery
+        .send(scope, &bot_id, target, &text)
         .await
         .with_context(|| format!("{} failed to send {}", bot_id, cmd.keyword))?;
     println!(
@@ -4051,7 +5175,7 @@ fn compose_family_reply(
     workgraph_dir: &Path,
     config: &TelegramConfig,
     cmd: &family_commands::FamilyCommand,
-) -> String {
+) -> Result<String> {
     compose_family_reply_on(
         workgraph_dir,
         config,
@@ -4069,19 +5193,25 @@ fn compose_family_reply_on(
     cmd: &family_commands::FamilyCommand,
     today: chrono::NaiveDate,
     now: chrono::DateTime<chrono::Utc>,
-) -> String {
-    let plans = family_plan::load_plans(&project_root(workgraph_dir));
+) -> Result<String> {
+    let root = project_root(workgraph_dir);
+    let plans = family_plan::load_plans(&root);
     let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
     let humans = human_agent_id_set(workgraph_dir);
+    let roster = if cmd.kind == family_commands::CommandKind::Roster {
+        worksgood::notify::telegram_standup::load_project_roster(&root, config)?
+    } else {
+        Vec::new()
+    };
     let ctx = family_commands::CommandContext {
         graph: graph.as_ref(),
-        config,
+        roster: &roster,
         plans: &plans,
         today,
         now,
         human_agents: &humans,
     };
-    family_commands::compose(cmd, &ctx)
+    Ok(family_commands::compose(cmd, &ctx))
 }
 
 /// `wg telegram register-commands` — register the shared family command set with
@@ -4196,14 +5326,17 @@ pub fn run_command(
         .map(|dt| dt.and_utc())
         .unwrap_or_else(chrono::Utc::now);
 
-    let text = compose_family_reply_on(workgraph_dir, &config, cmd, today, now);
+    let text = compose_family_reply_on(workgraph_dir, &config, cmd, today, now)?;
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let owner = cmd.owner(&owner_map);
 
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "command": cmd.keyword,
-                "owner": cmd.owner,
+                "domain": cmd.domain.slug(),
+                "owner": owner,
                 "kind": format!("{:?}", cmd.kind),
                 "data_source": cmd.data_source,
                 "text": text,
@@ -4233,11 +5366,14 @@ pub fn run_remind(
     json: bool,
 ) -> Result<()> {
     use worksgood::agency::TelegramBindingMap;
-    use worksgood::notify::reminder::{
-        self, AdHocStore, FiredLog, FirePolicy, Reminder,
-    };
+    use worksgood::notify::reminder::{self, AdHocStore, FirePolicy, FiredLog, Reminder};
 
     let root = project_root(workgraph_dir);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let coordination_owner = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .unwrap_or_default()
+        .to_string();
     let now = match now_override {
         Some(s) => parse_naive_now(s)
             .with_context(|| format!("invalid --now '{s}', expected YYYY-MM-DDTHH:MM"))?,
@@ -4261,7 +5397,10 @@ pub fn run_remind(
             None => {
                 let msg = "That didn't look like a reminder — try \"remind me Thursday to …\".";
                 if json {
-                    println!("{}", serde_json::json!({ "registered": false, "reason": msg }));
+                    println!(
+                        "{}",
+                        serde_json::json!({ "registered": false, "reason": msg })
+                    );
                 } else {
                     println!("{msg}");
                 }
@@ -4276,15 +5415,15 @@ pub fn run_remind(
         let bot = bindings
             .find_by_name_ci(&who)
             .and_then(|b| b.bot_id.clone())
-            .unwrap_or_else(|| "otto".to_string());
+            .unwrap_or_else(|| coordination_owner.clone());
         let rem = reminder::intent_to_reminder(&intent, &who, &bot);
 
         let path = AdHocStore::path(&root);
         let mut store = AdHocStore::load(&path);
         let added = store.add(rem.clone());
-        store.save(&path).with_context(|| {
-            format!("failed to persist ad-hoc reminder to {}", path.display())
-        })?;
+        store
+            .save(&path)
+            .with_context(|| format!("failed to persist ad-hoc reminder to {}", path.display()))?;
         if json {
             println!(
                 "{}",
@@ -4306,7 +5445,7 @@ pub fn run_remind(
     let plans = family_plan::load_plans(&root);
     let current = family_plan::current_plan(&plans, now.date());
     let mut reminders: Vec<Reminder> = current
-        .map(|p| reminder::reminders_from_plan(p, &members))
+        .map(|p| reminder::reminders_from_plan(p, &members, &owner_map))
         .unwrap_or_default();
     let store = AdHocStore::load(&AdHocStore::path(&root));
     reminders.extend(store.reminders.iter().cloned());
@@ -4398,7 +5537,12 @@ pub fn run_remind(
                 } else {
                     f.reminder.recipient.clone()
                 };
-                println!("WOULD SEND to {} via {}: {}", who, f.reminder.bot, f.message());
+                println!(
+                    "WOULD SEND to {} via {}: {}",
+                    who,
+                    f.reminder.bot,
+                    f.message()
+                );
             }
             for r in &result.dropped {
                 println!("WOULD DROP (too late): ⏰ {}", r.text);
@@ -4407,7 +5551,17 @@ pub fn run_remind(
         // Show errands that WOULD nudge too (renders from live shopping state).
         if !json {
             let config = load_telegram_config().unwrap_or_default();
-            if let Err(e) = fire_errands(&root, now, current, &members, &bindings, &config, true) {
+            if let Err(e) = fire_errands(
+                workgraph_dir,
+                &root,
+                now,
+                current,
+                &members,
+                &owner_map,
+                &bindings,
+                &config,
+                true,
+            ) {
                 eprintln!("errand dry-run skipped: {e:#}");
             }
         }
@@ -4426,12 +5580,13 @@ pub fn run_remind(
         );
     }
     let config = load_telegram_config().unwrap_or_default();
+    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
     let mut sent = 0usize;
     if !result.fired.is_empty() {
         let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
         rt.block_on(async {
             for f in &result.fired {
-                let (target, bot_id, bot) =
+                let (target, bot_id, _bot) =
                     match resolve_reminder_target(&config, &bindings, &f.reminder) {
                         Some(t) => t,
                         None => {
@@ -4443,8 +5598,10 @@ pub fn run_remind(
                             continue;
                         }
                     };
-                let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
-                match channel.send_text(&target, &f.message()).await {
+                match family_delivery
+                    .send(ReplyScope::Private, &bot_id, &target, &f.message())
+                    .await
+                {
                     Ok(_) => {
                         sent += 1;
                         println!(
@@ -4467,8 +5624,18 @@ pub fn run_remind(
     }
 
     // Errands ride the same tick: rendered from live shopping state, paced through
-    // the daily-digest layer, and DM'd standalone via the owning bot (e.g. Otto).
-    let errand_sent = fire_errands(&root, now, current, &members, &bindings, &config, false)?;
+    // the daily-digest layer, and DM'd standalone via the configured owning bot.
+    let errand_sent = fire_errands(
+        workgraph_dir,
+        &root,
+        now,
+        current,
+        &members,
+        &owner_map,
+        &bindings,
+        &config,
+        false,
+    )?;
 
     if result.fired.is_empty() && errand_sent == 0 && !json {
         println!("Nothing due at {}.", now.format("%Y-%m-%d %H:%M"));
@@ -4482,9 +5649,12 @@ pub fn run_remind(
     Ok(())
 }
 
-/// Resolve which bot fronts a reminder's recipient and the chat to DM: prefer the
-/// recipient's own bound bot + chat, else a bot whose `agent_id` matches the
-/// reminder's owning voice, else any configured bot to the recipient's chat.
+/// Resolve which bot fronts a reminder's recipient and the chat to DM.
+///
+/// A non-empty plan Source is already a roster-resolved stable persona id, so
+/// its matching bot must win. If that bot is not configured, fail closed rather
+/// than speaking in an unrelated voice. Only a reminder with no Source may use
+/// the recipient's explicitly bound bot.
 fn resolve_reminder_target(
     config: &TelegramConfig,
     bindings: &worksgood::agency::TelegramBindingMap,
@@ -4501,12 +5671,7 @@ fn resolve_reminder_target(
 /// reply already carries a `TASK_CREATE:` tail, and whether there is a MISMATCH
 /// a live turn would repair (a one-off action promised with no artifact). No
 /// side effects — nothing is sent, no task is created.
-pub fn run_parity(
-    reply_text: &str,
-    human: Option<&str>,
-    _dry_run: bool,
-    json: bool,
-) -> Result<()> {
+pub fn run_parity(reply_text: &str, human: Option<&str>, _dry_run: bool, json: bool) -> Result<()> {
     use worksgood::notify::lifecycle;
     use worksgood::notify::parity::{self, PromiseKind};
 
@@ -4588,7 +5753,7 @@ pub fn run_owner(
     let domain = ownership::classify_domain(ask);
     let map = match root {
         Some(r) => OwnerMap::load(r),
-        None => OwnerMap::casa_default(),
+        None => OwnerMap::default(),
     };
     let owner = map.owner_for_ask(ask).map(str::to_string);
     let decision = persona.map(|p| map.decide_owner(p, ask));
@@ -4624,7 +5789,9 @@ pub fn run_owner(
             println!("verdict: {p} OWNS this ask → it creates the task");
         }
         (Some(p), Some(OwnerDecision::Defer { owner })) => {
-            println!("verdict: {p} is OFF-DOMAIN → defers to {owner} (re-routed, never its own copy)");
+            println!(
+                "verdict: {p} is OFF-DOMAIN → defers to {owner} (re-routed, never its own copy)"
+            );
         }
         _ => {}
     }
@@ -4675,12 +5842,11 @@ impl worksgood::notify::telegram_conversation::ReplySink for RecordingSink {
 /// a later tick retries rather than the human silently never hearing back.
 async fn deliver_lifecycle_fire(
     sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
-    config: &TelegramConfig,
-    feed_path: &Path,
+    delivery: &FamilyReplyDelivery,
     fire: &worksgood::notify::lifecycle::LifecycleFire,
 ) -> Result<()> {
     use worksgood::graph::OriginChannel;
-    use worksgood::notify::telegram_conversation as convo;
+    use worksgood::notify::telegram_conversation::ReplySink as _;
 
     // Send AS the origin persona's bot (bot_id when known, else the persona id):
     // the reply leaves via the same voice the human addressed, never a wrong face.
@@ -4689,6 +5855,12 @@ async fn deliver_lifecycle_fire(
         .bot_id
         .clone()
         .unwrap_or_else(|| fire.origin.persona.clone());
+    let scope = if matches!(fire.origin.channel, OriginChannel::TelegramGroup) {
+        ReplyScope::Group
+    } else {
+        ReplyScope::Private
+    };
+    let sink = delivery.wrap(BorrowedReplySink(sink), scope, GuardPolicy::Enforce);
 
     // DELIVERY VERIFICATION with a single retry. `send` bails on a non-`ok`
     // Telegram response, so `Ok` here means the API accepted the message.
@@ -4716,63 +5888,34 @@ async fn deliver_lifecycle_fire(
         fire.text,
     );
 
-    // LEDGER MIRROR — a group report-back is part of the family group
-    // conversation, so it lands in the canonical feed the pane reads, via the
-    // exact same `casa_feed` writer the conversation replies use.
-    if matches!(fire.origin.channel, OriginChannel::TelegramGroup) {
-        let agent_id = convo::agent_for_bot(config, &bot_id);
-        let entry = casa_feed::agent_entry(&agent_id, &fire.text, casa_feed::now_ms());
-        if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
-            eprintln!(
-                "[{}] casa feed: failed to mirror lifecycle {} for {}: {e}",
-                chrono::Utc::now().format("%H:%M:%S"),
-                fire.event.slug(),
-                fire.task_id,
-            );
-        }
-    }
     Ok(())
 }
 
 /// The owner's DM chat for a dead-end escalation, and the bot that speaks it.
 ///
-/// Prefers the concierge persona ([`OPERATOR_ALERT_BOT`] — Otto), whose 1:1 chat
-/// id IS the household owner's DM; falls back to the legacy top-level operator
-/// `chat_id`, then to any configured bot, so a household that named its
-/// coordinator something else still gets the alert. `None` when nothing is
-/// configured — the caller then relies on the loud stderr line.
+/// Uses only the explicit positive legacy top-level operator chat.
 ///
-/// [`OPERATOR_ALERT_BOT`]: worksgood::notify::lifecycle::OPERATOR_ALERT_BOT
-fn operator_alert_route(config: &TelegramConfig) -> Option<(String, String)> {
-    use worksgood::notify::lifecycle::OPERATOR_ALERT_BOT;
-    let usable = |id: &String, bot: &worksgood::notify::telegram::TelegramBotConfig| {
-        (!bot.bot_token.trim().is_empty() && !bot.chat_id.trim().is_empty())
-            .then(|| (id.clone(), bot.chat_id.clone()))
-    };
-    // Otto by bot key or by the agent id he fronts.
-    if let Some(hit) = config
-        .bots
-        .iter()
-        .find(|(id, bot)| {
-            id.eq_ignore_ascii_case(OPERATOR_ALERT_BOT)
-                || bot
-                    .agent_id
-                    .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(OPERATOR_ALERT_BOT))
-        })
-        .and_then(|(id, bot)| usable(id, bot))
+/// A helper bot's `chat_id` identifies a conversation, not who owns that
+/// conversation. Even when the helper is assigned the coordination domain, a
+/// positive id proves only that the target is a DM; it does not prove that the
+/// DM belongs to the household operator. Owner-facing alerts contain task
+/// details, so every per-helper target fails closed to the loud stderr record.
+/// Group/negative/empty legacy targets fail closed too. `None` means there is no
+/// proven private operator target; no persona or recipient is guessed.
+fn operator_alert_route(
+    config: &TelegramConfig,
+    _coordination_owner: Option<&str>,
+) -> Option<(String, String)> {
+    // Legacy single-bot operator chat, only when it is explicitly a private id.
+    if !config.bot_token.trim().is_empty()
+        && worksgood::notify::telegram::is_dm_chat_id(&config.chat_id)
     {
-        return Some(hit);
-    }
-    // Legacy single-bot operator chat.
-    if !config.bot_token.trim().is_empty() && !config.chat_id.trim().is_empty() {
         return Some((String::new(), config.chat_id.clone()));
     }
-    // Any bot at all beats silence for a dead-end ask.
-    config
-        .bots
-        .iter()
-        .find_map(|(id, bot)| usable(id, bot))
+    // A positive id proves only that a chat is private, not that its member is
+    // the coordination owner. Without an owner-bound or legacy operator target,
+    // deliberately fall through to the log-only path.
+    None
 }
 
 /// Deliver ONE dead-end operator alert — a family-origin task that failed with
@@ -4780,11 +5923,13 @@ fn operator_alert_route(config: &TelegramConfig) -> Option<(String, String)> {
 /// line; this is the flag being raised, so the ask is never a dead end.
 ///
 /// Loud on stderr FIRST (that record survives a missing/broken bot config),
-/// then best-effort DM'd to the owner as Otto. Errors are reported, never
-/// propagated: a failed escalation must not abort the remaining report-backs.
+/// then best-effort DM'd through the explicit legacy operator target. Errors are
+/// reported, never propagated: a failed escalation must not abort the remaining
+/// report-backs.
 async fn deliver_operator_alert(
     sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
     config: &TelegramConfig,
+    coordination_owner: Option<&str>,
     alert: &worksgood::notify::lifecycle::OperatorAlert,
 ) -> bool {
     eprintln!(
@@ -4798,7 +5943,7 @@ async fn deliver_operator_alert(
         },
         alert.text,
     );
-    let Some((bot_id, chat_id)) = operator_alert_route(config) else {
+    let Some((bot_id, chat_id)) = operator_alert_route(config, coordination_owner) else {
         eprintln!(
             "[{}] operator alert for {} not DM'd: no telegram bot/chat configured (logged only)",
             chrono::Utc::now().format("%H:%M:%S"),
@@ -4813,7 +5958,11 @@ async fn deliver_operator_alert(
                 chrono::Utc::now().format("%H:%M:%S"),
                 alert.task_id,
                 chat_id,
-                if bot_id.is_empty() { "legacy bot" } else { &bot_id },
+                if bot_id.is_empty() {
+                    "legacy bot"
+                } else {
+                    &bot_id
+                },
             );
             true
         }
@@ -4829,6 +5978,312 @@ async fn deliver_operator_alert(
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LifecycleDeliverySummary {
+    sent: usize,
+    undelivered: usize,
+    alerted: usize,
+    rearmed: usize,
+}
+
+/// One exact lifecycle suppressor that must be removed before a notification can
+/// be retried. Operator alerts have no pacing entry; family report-backs carry
+/// the one recipient whose `DigestStore.seen` entry must be reconciled.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+struct LifecycleRearmEntry {
+    notification_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipient: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct LifecycleRearmJournal {
+    #[serde(default)]
+    entries: Vec<LifecycleRearmEntry>,
+}
+
+fn lifecycle_rearm_path(log_path: &Path) -> PathBuf {
+    log_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("lifecycle-rearm.json")
+}
+
+fn load_lifecycle_rearm_journal(path: &Path) -> Result<LifecycleRearmJournal> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LifecycleRearmJournal::default());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let mut journal: LifecycleRearmJournal = serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    for entry in &journal.entries {
+        let id = entry.notification_id.trim();
+        if id.is_empty()
+            || (!id.starts_with("lifecycle:") && !id.starts_with("lifecycle-alert:"))
+            || entry
+                .recipient
+                .as_deref()
+                .is_some_and(|recipient| recipient.trim().is_empty())
+            || (entry.recipient.is_some() && !id.starts_with("lifecycle:"))
+        {
+            anyhow::bail!(
+                "refusing invalid lifecycle reconciliation entry in {}",
+                path.display()
+            );
+        }
+    }
+    journal.entries.sort();
+    journal.entries.dedup();
+    Ok(journal)
+}
+
+/// Wake the listener's lifecycle runner when an interrupted update needs
+/// reconciliation, even if the stale FiredLog otherwise hides every transition.
+/// An unreadable journal also wakes the runner so the error is surfaced loudly
+/// instead of turning into permanent silence at the cheap pre-run gate.
+fn lifecycle_reconciliation_needs_tick(log_path: &Path) -> bool {
+    let path = lifecycle_rearm_path(log_path);
+    match load_lifecycle_rearm_journal(&path) {
+        Ok(journal) => !journal.entries.is_empty(),
+        Err(_) => path.exists(),
+    }
+}
+
+fn save_lifecycle_rearm_journal(path: &Path, journal: &LifecycleRearmJournal) -> Result<()> {
+    let body = serde_json::to_vec_pretty(journal)
+        .context("failed to serialize lifecycle reconciliation record")?;
+    worksgood::atomic_file::write_atomic(path, body)
+        .with_context(|| format!("failed to persist {}", path.display()))
+}
+
+/// Stage a new exact reconciliation set before either suppressor store changes.
+///
+/// A non-empty prior journal means startup reconciliation was skipped or failed;
+/// overwriting it could lose an older undelivered id, so fail loudly instead.
+fn stage_lifecycle_rearms(path: &Path, mut entries: Vec<LifecycleRearmEntry>) -> Result<()> {
+    entries.sort();
+    entries.dedup();
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if !load_lifecycle_rearm_journal(path)?.entries.is_empty() {
+        anyhow::bail!(
+            "pending lifecycle reconciliation in {}; retry after it succeeds",
+            path.display()
+        );
+    }
+    save_lifecycle_rearm_journal(path, &LifecycleRearmJournal { entries })
+}
+
+fn clear_lifecycle_rearms(path: &Path) -> Result<()> {
+    // Atomically replace with an empty journal instead of unlinking. A crash can
+    // therefore expose either the complete old set or the complete empty set,
+    // never a torn/partly-cleared record.
+    save_lifecycle_rearm_journal(path, &LifecycleRearmJournal::default())
+}
+
+fn apply_lifecycle_rearms(
+    entries: &[LifecycleRearmEntry],
+    log: &mut worksgood::notify::reminder::FiredLog,
+    store: &mut worksgood::notify::daily_digest::DigestStore,
+) {
+    for entry in entries {
+        log.rearm(&entry.notification_id);
+        if let Some(recipient) = &entry.recipient {
+            store.rearm_lifecycle(recipient, &entry.notification_id);
+        }
+    }
+}
+
+/// Finish an interrupted two-file update before computing the next tick.
+///
+/// The journal contains only exact undelivered notification ids and their one
+/// pacing recipient. Reapplying removals is idempotent. The record remains until
+/// BOTH state files save, so a failure after either save is recoverable on the
+/// following process start without broad replay.
+fn reconcile_lifecycle_rearms(
+    log_path: &Path,
+    store_path: &Path,
+    log: &mut worksgood::notify::reminder::FiredLog,
+    store: &mut worksgood::notify::daily_digest::DigestStore,
+) -> Result<usize> {
+    let journal_path = lifecycle_rearm_path(log_path);
+    let journal = load_lifecycle_rearm_journal(&journal_path)?;
+    if journal.entries.is_empty() {
+        return Ok(0);
+    }
+    apply_lifecycle_rearms(&journal.entries, log, store);
+    log.save(log_path).with_context(|| {
+        format!(
+            "failed to reconcile lifecycle state in {}",
+            log_path.display()
+        )
+    })?;
+    store.save(store_path).with_context(|| {
+        format!(
+            "failed to reconcile lifecycle pacing state in {}",
+            store_path.display()
+        )
+    })?;
+    clear_lifecycle_rearms(&journal_path)?;
+    Ok(journal.entries.len())
+}
+
+fn lifecycle_result_rearms(
+    result: &worksgood::notify::lifecycle::LifecycleTickResult,
+) -> Vec<LifecycleRearmEntry> {
+    let family = result
+        .fired
+        .iter()
+        .chain(result.capped.iter())
+        .map(|fire| LifecycleRearmEntry {
+            notification_id: worksgood::notify::lifecycle::notification_id(
+                &fire.task_id,
+                fire.event,
+            ),
+            recipient: Some(fire.origin.requester.clone()),
+        });
+    let alerts = result
+        .operator_alerts
+        .iter()
+        .map(|alert| LifecycleRearmEntry {
+            notification_id: alert.notification_id.clone(),
+            recipient: None,
+        });
+    family.chain(alerts).collect()
+}
+
+/// Persist the record-before-transport state as a recoverable two-file update.
+///
+/// Nothing has been sent yet, so every result id is safe to re-arm if either
+/// state save fails. The exact journal is cleared before transport only after
+/// both saves succeed.
+fn persist_lifecycle_state_before_transport(
+    result: &worksgood::notify::lifecycle::LifecycleTickResult,
+    log: &worksgood::notify::reminder::FiredLog,
+    log_path: &Path,
+    store: &worksgood::notify::daily_digest::DigestStore,
+    store_path: &Path,
+) -> Result<()> {
+    let journal_path = lifecycle_rearm_path(log_path);
+    let entries = lifecycle_result_rearms(result);
+    stage_lifecycle_rearms(&journal_path, entries.clone())?;
+    log.save(log_path).with_context(|| {
+        format!(
+            "failed to persist lifecycle state to {}",
+            log_path.display()
+        )
+    })?;
+    store
+        .save(store_path)
+        .with_context(|| format!("failed to persist pacing state to {}", store_path.display()))?;
+    if !entries.is_empty() {
+        clear_lifecycle_rearms(&journal_path)?;
+    }
+    Ok(())
+}
+
+/// Deliver one tick's report-backs and alerts, then durably re-arm every
+/// notification whose transport was not confirmed.
+///
+/// `lifecycle_tick` records ids before transport so a process crash cannot
+/// duplicate a message that Telegram accepted. Once the process is still alive
+/// and both attempts have failed, keeping that id would instead turn a transient
+/// failure into permanent silence. Remove only the failed id from the fired log
+/// and lifecycle pacing set, then persist both before returning so the next tick
+/// can try again.
+fn deliver_lifecycle_tick_result(
+    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
+    family_delivery: &FamilyReplyDelivery,
+    config: &TelegramConfig,
+    coordination_owner: Option<&str>,
+    result: &worksgood::notify::lifecycle::LifecycleTickResult,
+    log: &mut worksgood::notify::reminder::FiredLog,
+    log_path: &Path,
+    store: &mut worksgood::notify::daily_digest::DigestStore,
+    store_path: &Path,
+) -> Result<LifecycleDeliverySummary> {
+    let mut summary = LifecycleDeliverySummary::default();
+    let mut failed_rearms = Vec::new();
+    if result.fired.is_empty() && result.operator_alerts.is_empty() {
+        return Ok(summary);
+    }
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    rt.block_on(async {
+        // DEAD-END ESCALATION FIRST. A family-origin task that failed with no
+        // retry behind it just told the family "I've flagged it so it isn't
+        // forgotten" — raising the flag is what makes that line true, so it
+        // goes out even if a report-back delivery below fails.
+        for alert in &result.operator_alerts {
+            if deliver_operator_alert(sink, config, coordination_owner, alert).await {
+                summary.alerted += 1;
+            } else {
+                failed_rearms.push(LifecycleRearmEntry {
+                    notification_id: alert.notification_id.clone(),
+                    recipient: None,
+                });
+            }
+        }
+        for fire in &result.fired {
+            match deliver_lifecycle_fire(sink, family_delivery, fire).await {
+                Ok(()) => summary.sent += 1,
+                Err(e) => {
+                    // Both attempts failed — surface it LOUDLY (matching the
+                    // web-inbound "make failure visible" rule) so a dropped
+                    // report-back can never masquerade as delivered in the log.
+                    summary.undelivered += 1;
+                    let notification_id =
+                        worksgood::notify::lifecycle::notification_id(&fire.task_id, fire.event);
+                    failed_rearms.push(LifecycleRearmEntry {
+                        notification_id,
+                        recipient: Some(fire.origin.requester.clone()),
+                    });
+                    eprintln!(
+                        "[{}] UNDELIVERED lifecycle {} for {} after 2 attempts; re-armed for the next tick: {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        fire.event.slug(),
+                        fire.task_id,
+                        worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                    );
+                }
+            }
+        }
+    });
+
+    if !failed_rearms.is_empty() {
+        let journal_path = lifecycle_rearm_path(log_path);
+        stage_lifecycle_rearms(&journal_path, failed_rearms.clone())?;
+        for entry in &failed_rearms {
+            if log.rearm(&entry.notification_id) {
+                summary.rearmed += 1;
+            }
+            if let Some(recipient) = &entry.recipient {
+                store.rearm_lifecycle(recipient, &entry.notification_id);
+            }
+        }
+        log.save(log_path).with_context(|| {
+            format!(
+                "failed to persist re-armed lifecycle state to {}",
+                log_path.display()
+            )
+        })?;
+        store.save(store_path).with_context(|| {
+            format!(
+                "failed to persist re-armed lifecycle pacing state to {}",
+                store_path.display()
+            )
+        })?;
+        clear_lifecycle_rearms(&journal_path)?;
+    }
+    Ok(summary)
+}
+
 /// Report conversational tasks' progress back to the chats they came from — the
 /// `wg telegram lifecycle` seam (see [`crate::cli::TelegramCommands::Lifecycle`]).
 ///
@@ -4838,7 +6293,9 @@ async fn deliver_operator_alert(
 /// daily-digest choke point (time-critical but capped) and delivered to the
 /// origin chat via the origin persona's bot. `--dry-run` prints what would be
 /// sent where and touches no state; the real path persists the FiredLog +
-/// pacing store FIRST (restart-safe), then sends.
+/// pacing store FIRST (restart-safe), then sends. A delivery that exhausts its
+/// retries is removed from both exactly-once stores and persisted again so the
+/// next tick retries it.
 pub fn run_lifecycle(
     workgraph_dir: &Path,
     task_id: Option<&str>,
@@ -4886,14 +6343,28 @@ pub fn run_lifecycle(
     let store_path = DigestStore::path(&root);
     let mut log = FiredLog::load(&log_path);
     let mut store = DigestStore::load(&store_path);
+    if !dry_run {
+        let reconciled = reconcile_lifecycle_rearms(&log_path, &store_path, &mut log, &mut store)?;
+        if reconciled > 0 {
+            eprintln!(
+                "[{}] reconciled {} undelivered lifecycle notification(s) before tick",
+                chrono::Utc::now().format("%H:%M:%S"),
+                reconciled,
+            );
+        }
+    }
     let policy = DigestPolicy::default();
+    let config = load_telegram_config().unwrap_or_default();
+    let owner_map = ownership::OwnerMap::load(&root);
+    let coordination_owner = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .map(str::to_string);
 
     if dry_run {
         // Compute against throwaway copies so a dry run records nothing.
         let mut dry_log = log.clone();
         let mut dry_store = store.clone();
-        let result =
-            lifecycle::lifecycle_tick(&inputs, &mut dry_log, &mut dry_store, now, &policy);
+        let result = lifecycle::lifecycle_tick(&inputs, &mut dry_log, &mut dry_store, now, &policy);
         if json {
             let rows: Vec<_> = result
                 .fired
@@ -4916,10 +6387,14 @@ pub fn run_lifecycle(
                 .operator_alerts
                 .iter()
                 .map(|a| {
+                    let route =
+                        operator_alert_route(&config, coordination_owner.as_deref());
                     serde_json::json!({
                         "task": a.task_id,
                         "operator_alert": true,
                         "requester": a.requester,
+                        "bot": route.as_ref().map(|(bot, _)| if bot.is_empty() { "legacy bot" } else { bot.as_str() }),
+                        "chat": route.as_ref().map(|(_, chat)| chat.as_str()),
                         "text": a.text,
                     })
                 })
@@ -4931,16 +6406,26 @@ pub fn run_lifecycle(
             && result.capped.is_empty()
             && result.operator_alerts.is_empty()
         {
-            println!("Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).", now.format("%Y-%m-%d %H:%M"));
+            println!(
+                "Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).",
+                now.format("%Y-%m-%d %H:%M")
+            );
         } else {
             for f in &result.fired {
                 println!("{}", lifecycle::dry_run_line(f));
             }
             for f in &result.capped {
-                println!("[dry-run] (capped → folds into digest) {}", lifecycle::dry_run_line(f));
+                println!(
+                    "[dry-run] (capped → folds into digest) {}",
+                    lifecycle::dry_run_line(f)
+                );
             }
             for a in &result.operator_alerts {
-                println!("{}", lifecycle::dry_run_alert_line(a));
+                let route = operator_alert_route(&config, coordination_owner.as_deref());
+                println!(
+                    "{}",
+                    lifecycle::dry_run_alert_line(a, route.as_ref().map(|(bot, _)| bot.as_str()),)
+                );
             }
         }
         return Ok(());
@@ -4948,14 +6433,10 @@ pub fn run_lifecycle(
 
     // Real firing: persist exactly-once + pacing state FIRST, then deliver.
     let result = lifecycle::lifecycle_tick(&inputs, &mut log, &mut store, now, &policy);
-    log.save(&log_path)
-        .with_context(|| format!("failed to persist lifecycle state to {}", log_path.display()))?;
-    store
-        .save(&store_path)
-        .with_context(|| format!("failed to persist pacing state to {}", store_path.display()))?;
+    persist_lifecycle_state_before_transport(&result, &log, &log_path, &store, &store_path)?;
 
     let config = load_telegram_config().unwrap_or_default();
-    let feed_path = casa_feed::feed_path_for(&root);
+    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
     // The ONE-PATH writer: lifecycle report-backs leave through the same
     // `ReplySink` the conversation replies use, so a group report-back both
     // reaches Telegram AND lands in the canonical `.casa/group-feed.jsonl` the
@@ -4967,59 +6448,38 @@ pub fn run_lifecycle(
     } else {
         Box::new(BotReplySink::new(config.clone()))
     };
-    let mut sent = 0usize;
-    let mut undelivered = 0usize;
-    let mut alerted = 0usize;
-    if !result.fired.is_empty() || !result.operator_alerts.is_empty() {
-        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-        rt.block_on(async {
-            // DEAD-END ESCALATION FIRST. A family-origin task that failed with no
-            // retry behind it just told the family "I've flagged it so it isn't
-            // forgotten" — raising the flag is what makes that line true, so it
-            // goes out even if a report-back delivery below fails.
-            for a in &result.operator_alerts {
-                if deliver_operator_alert(sink.as_ref(), &config, a).await {
-                    alerted += 1;
-                }
-            }
-            for f in &result.fired {
-                match deliver_lifecycle_fire(sink.as_ref(), &config, &feed_path, f).await {
-                    Ok(()) => sent += 1,
-                    Err(e) => {
-                        // Both attempts failed — surface it LOUDLY (matching the
-                        // web-inbound "make failure visible" rule) so a dropped
-                        // report-back can never masquerade as delivered in the log.
-                        undelivered += 1;
-                        eprintln!(
-                            "[{}] UNDELIVERED lifecycle {} for {} after 2 attempts: {}",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                            f.event.slug(),
-                            f.task_id,
-                            worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
-                        );
-                    }
-                }
-            }
-        });
-    }
+    let delivery_summary = deliver_lifecycle_tick_result(
+        sink.as_ref(),
+        &family_delivery,
+        &config,
+        coordination_owner.as_deref(),
+        &result,
+        &mut log,
+        &log_path,
+        &mut store,
+        &store_path,
+    )?;
 
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "fired": result.fired.len(),
-                "sent": sent,
-                "undelivered": undelivered,
+                "sent": delivery_summary.sent,
+                "undelivered": delivery_summary.undelivered,
                 "capped": result.capped.len(),
                 "operator_alerts": result.operator_alerts.len(),
-                "operator_alerts_sent": alerted,
+                "operator_alerts_sent": delivery_summary.alerted,
             })
         );
     } else if result.fired.is_empty()
         && result.capped.is_empty()
         && result.operator_alerts.is_empty()
     {
-        println!("Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).", now.format("%Y-%m-%d %H:%M"));
+        println!(
+            "Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).",
+            now.format("%Y-%m-%d %H:%M")
+        );
     }
     Ok(())
 }
@@ -5037,15 +6497,14 @@ pub fn run_lifecycle(
 /// For each known member whose digest is due at `now` — past the digest hour,
 /// out of quiet hours, pending non-empty, not already sent today (see
 /// [`DigestStore::digest_due`]) — compose the calm `Today: …` line, deliver it
-/// through the SAME one-path writer the lifecycle report-backs use
-/// ([`deliver_digest_fire`]: send + verify + retry once, then mirror to the
-/// canonical `.casa/group-feed.jsonl` ledger the pane reads), and — ONLY on a
+/// through the SAME scoped writer the lifecycle report-backs use
+/// ([`deliver_digest_fire`]: guard, send, verify, and retry once), and — ONLY on a
 /// confirmed delivery — mark the digest sent + clear the queue. A failed send
 /// leaves the queue intact so the next tick retries; at most one per person/day.
 ///
 /// `--dry-run` prints what would go to whom and touches no state. `--mock-send`
-/// runs the REAL tick + REAL ledger mirror against a network-free recorder so a
-/// smoke/test proves the full path (engine → Telegram → ledger) without a bot.
+/// runs the real tick against a network-free recorder so a smoke/test proves the
+/// guarded private-delivery path without a bot.
 pub fn run_digest(
     workgraph_dir: &Path,
     dry_run: bool,
@@ -5075,6 +6534,7 @@ pub fn run_digest(
         .collect();
 
     let config = load_telegram_config().unwrap_or_default();
+    let coordination_owner = coordination_owner_hint(&root);
     let policy = DigestPolicy::default();
     let store_path = DigestStore::path(&root);
     let mut store = DigestStore::load(&store_path);
@@ -5112,9 +6572,9 @@ pub fn run_digest(
         return Ok(());
     }
 
-    let feed_path = casa_feed::feed_path_for(&root);
-    // `--mock-send` swaps in a network-free recorder so the cross-surface smoke
-    // exercises the real tick + real feed mirror without a live bot.
+    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
+    // `--mock-send` swaps in a network-free recorder so the private delivery
+    // path is exercised without a live bot.
     let sink: Box<dyn ReplySink> = if mock_send {
         Box::new(RecordingSink::default())
     } else {
@@ -5127,11 +6587,11 @@ pub fn run_digest(
         let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
         rt.block_on(async {
             for (member, text) in &due {
-                // Resolve the recipient's DM target; the digest is the household
-                // concierge's calm summary, so it fronts as the recipient's own
-                // bot when bound, else Otto (see `resolve_dm_target`).
+                // Resolve the recipient's DM target through the project-authored
+                // coordination owner. Without one, only the recipient's explicit
+                // bot binding may send; roster/map order is never a fallback.
                 let (target, bot_id, _bot) =
-                    match resolve_dm_target(&config, &bindings, member, "otto") {
+                    match resolve_dm_target(&config, &bindings, member, &coordination_owner) {
                         Some(t) => t,
                         None => {
                             eprintln!(
@@ -5142,15 +6602,8 @@ pub fn run_digest(
                             continue;
                         }
                     };
-                match deliver_digest_fire(
-                    sink.as_ref(),
-                    &config,
-                    &feed_path,
-                    &bot_id,
-                    &target,
-                    text,
-                )
-                .await
+                match deliver_digest_fire(sink.as_ref(), &family_delivery, &bot_id, &target, text)
+                    .await
                 {
                     Ok(()) => {
                         // Confirmed delivery: NOW mark today's digest sent and
@@ -5200,29 +6653,30 @@ pub fn run_digest(
     Ok(())
 }
 
-/// Deliver ONE morning digest through the same one-path writer the lifecycle
-/// report-backs use (see [`deliver_lifecycle_fire`]): send + verify with a single
-/// retry, then mirror the delivered text into the canonical `.casa/group-feed.jsonl`
-/// ledger the constellation pane reads, via the SAME [`casa_feed`] writer.
+/// Deliver one private morning digest through the same scoped writer lifecycle
+/// report-backs use (see [`deliver_lifecycle_fire`]): guard, send, verify, and
+/// retry once.
 ///
-/// The digest is the household's calm morning summary of family-group activity
-/// (bundled report-backs, reminders, errands), so — unlike a private 1:1 reply —
-/// it belongs in the shared pane ledger: "arrives in Telegram AND the ledger"
-/// (task `re-arm-the`, sequenced with `lifecycle-messages-obey`). A feed-write
-/// failure is logged and swallowed so a full disk can't lose the Telegram send.
+/// The digest is delivered to one member's bound 1:1 chat. The shared
+/// conversation feed is the family group's history, so this private text must
+/// never be copied there.
 /// Returns `Ok(())` on confirmed delivery, `Err` when BOTH send attempts failed
 /// (the caller then leaves the pending queue intact for the next tick).
 async fn deliver_digest_fire(
     sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
-    config: &TelegramConfig,
-    feed_path: &Path,
+    delivery: &FamilyReplyDelivery,
     bot_id: &str,
     chat_id: &str,
     text: &str,
 ) -> Result<()> {
-    use worksgood::notify::telegram_conversation as convo;
+    use worksgood::notify::telegram_conversation::ReplySink as _;
 
     // DELIVERY VERIFICATION with a single retry (matches the lifecycle path).
+    let sink = delivery.wrap(
+        BorrowedReplySink(sink),
+        ReplyScope::Private,
+        GuardPolicy::Enforce,
+    );
     let mut result = sink.send(bot_id, chat_id, text).await;
     if let Err(first) = &result {
         eprintln!(
@@ -5235,16 +6689,6 @@ async fn deliver_digest_fire(
     }
     let _message_id = result?.unwrap_or_default();
 
-    // LEDGER MIRROR — the morning digest lands in the canonical feed the pane
-    // reads, via the exact same `casa_feed` writer the conversation replies use.
-    let agent_id = convo::agent_for_bot(config, bot_id);
-    let entry = casa_feed::agent_entry(&agent_id, text, casa_feed::now_ms());
-    if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
-        eprintln!(
-            "[{}] casa feed: failed to mirror digest to ledger: {e}",
-            chrono::Utc::now().format("%H:%M:%S"),
-        );
-    }
     Ok(())
 }
 
@@ -5267,9 +6711,10 @@ fn lifecycle_workers(task: &worksgood::graph::Task) -> Vec<String> {
 }
 
 /// Resolve the DM target (chat + bot) for a proactive nudge to `recipient`, sent
-/// in the voice `bot`: prefer the recipient's own bound bot + chat, else a bot
-/// whose `agent_id` matches the owning voice, else any configured bot. Shared by
-/// the reminder tick and the errand tick so both DMs leave via the same rule.
+/// in the stable voice `bot`. A resolved Source voice wins; if it has no
+/// configured bot, delivery fails closed. With an empty Source only, the
+/// recipient's explicit bot binding may send. Shared by the reminder and errand
+/// ticks so neither path depends on roster or map iteration order.
 fn resolve_dm_target(
     config: &TelegramConfig,
     bindings: &worksgood::agency::TelegramBindingMap,
@@ -5279,21 +6724,34 @@ fn resolve_dm_target(
     let binding = bindings.find_by_name_ci(recipient)?;
     let target = binding.telegram_user.clone();
     let bots = config.all_bots();
-    // 1) the recipient's configured bot.
-    if let Some(bid) = &binding.bot_id {
-        if let Some((id, b)) = bots.iter().find(|(id, _)| id == bid) {
-            return Some((target, id.clone(), b.clone()));
-        }
+    if !bot.trim().is_empty() {
+        return bots
+            .iter()
+            .find(|(id, b)| {
+                id.eq_ignore_ascii_case(bot) || {
+                    b.agent_id
+                        .as_deref()
+                        .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case(bot))
+                }
+            })
+            .map(|(id, b)| (target, id.clone(), b.clone()));
     }
-    // 2) a bot fronting the nudge's owning voice.
-    if let Some((id, b)) = bots
-        .iter()
-        .find(|(id, b)| id == &bot || b.agent_id.as_deref() == Some(bot))
-    {
-        return Some((target, id.clone(), b.clone()));
-    }
-    // 3) any bot.
-    bots.first().map(|(id, b)| (target, id.clone(), b.clone()))
+    binding.bot_id.as_ref().and_then(|bound_id| {
+        bots.iter()
+            .find(|(id, _)| id == bound_id)
+            .map(|(id, b)| (target, id.clone(), b.clone()))
+    })
+}
+
+/// The project-authored voice for proactive coordination messages.
+///
+/// An empty result is intentional: callers then persist no guessed persona and
+/// [`resolve_dm_target`] may use only the recipient's explicit bot binding.
+fn coordination_owner_hint(root: &Path) -> String {
+    ownership::OwnerMap::load(root)
+        .owner_for_domain(ownership::Domain::Coordination)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Fire due errand nudges as part of the `wg telegram remind` tick.
@@ -5309,23 +6767,25 @@ fn resolve_dm_target(
 /// (`Ok(0)`), so the one nudge is never burned on a stale or empty render.
 #[allow(clippy::too_many_arguments)]
 fn fire_errands(
+    workgraph_dir: &Path,
     root: &Path,
     now: chrono::NaiveDateTime,
     current: Option<&worksgood::notify::family_plan::PlanDoc>,
     members: &[String],
+    owner_map: &ownership::OwnerMap,
     bindings: &worksgood::agency::TelegramBindingMap,
     config: &TelegramConfig,
     dry_run: bool,
 ) -> Result<usize> {
     use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, Offer};
     use worksgood::notify::errand::{self, ShoppingModel};
-    use worksgood::notify::reminder::{FiredLog, FirePolicy};
+    use worksgood::notify::reminder::{FirePolicy, FiredLog};
 
     let plan = match current {
         Some(p) => p,
         None => return Ok(0),
     };
-    let errands = errand::errands_from_plan(plan, members, errand::resolve_lead());
+    let errands = errand::errands_from_plan(plan, members, owner_map, errand::resolve_lead());
     if errands.is_empty() {
         return Ok(0);
     }
@@ -5361,7 +6821,14 @@ fn fire_errands(
 
     if dry_run {
         for f in &firings {
-            let body = errand::route_errand_nudge(f, &shopping, &mut DigestStore::default(), now, &DigestPolicy::new()).0;
+            let body = errand::route_errand_nudge(
+                f,
+                &shopping,
+                &mut DigestStore::default(),
+                now,
+                &DigestPolicy::new(),
+            )
+            .0;
             let who = if f.errand.recipient.is_empty() {
                 "(group)".to_string()
             } else {
@@ -5387,25 +6854,32 @@ fn fire_errands(
     let policy = DigestPolicy::new();
 
     let mut sent = 0usize;
+    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, config);
     rt.block_on(async {
         for f in &firings {
             let (_, offer) = errand::route_errand_nudge(f, &shopping, &mut digest, now, &policy);
             match offer {
                 Offer::SendNow(text) => {
-                    let (target, bot_id, bot) =
-                        match resolve_dm_target(config, bindings, &f.errand.recipient, &f.errand.bot) {
-                            Some(t) => t,
-                            None => {
-                                eprintln!(
-                                    "[{}] no bound bot/chat for errand recipient '{}' — skipping DM",
-                                    chrono::Utc::now().format("%H:%M:%S"),
-                                    f.errand.recipient,
-                                );
-                                continue;
-                            }
-                        };
-                    let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
-                    match channel.send_text(&target, &text).await {
+                    let (target, bot_id, _bot) = match resolve_dm_target(
+                        config,
+                        bindings,
+                        &f.errand.recipient,
+                        &f.errand.bot,
+                    ) {
+                        Some(t) => t,
+                        None => {
+                            eprintln!(
+                                "[{}] no bound bot/chat for errand recipient '{}' — skipping DM",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                f.errand.recipient,
+                            );
+                            continue;
+                        }
+                    };
+                    match family_delivery
+                        .send(ReplyScope::Private, &bot_id, &target, &text)
+                        .await
+                    {
                         Ok(_) => {
                             sent += 1;
                             println!(
@@ -5464,6 +6938,12 @@ fn parse_naive_now(s: &str) -> Option<chrono::NaiveDateTime> {
 /// agent (making the plan `converse`), the human's message is written to that
 /// session's inbox, a fixture responder writes `<text>` to the outbox, and the
 /// relayed reply is captured.
+///
+/// With the hidden `--composed-reply <text>` test seam, the supplied draft is
+/// injected as a [`ReplyComposer`] result and therefore traverses the real
+/// finalize → outbox → delivery path. This is the credential-free scratch proof
+/// for post-composition guards; unlike `--session-reply`, it does not bypass the
+/// finalizer.
 ///
 /// With `--compose` it exercises the REAL fix end-to-end: the converse turn is
 /// driven by the production [`OneshotComposer`] (a live one-shot `claude`
@@ -5620,6 +7100,7 @@ pub fn run_conversation_dryrun(
     message: &str,
     group: bool,
     session_reply: Option<&str>,
+    composed_reply: Option<&str>,
     compose: bool,
     compose_error: bool,
     json: bool,
@@ -5627,7 +7108,13 @@ pub fn run_conversation_dryrun(
     use std::sync::{Arc, Mutex};
     use worksgood::notify::telegram_conversation as convo;
 
-    let config = load_telegram_config().unwrap_or_default();
+    let config = if composed_reply.is_some() {
+        load_telegram_config().context(
+            "--composed-reply requires a project-local .wg/notify.toml so the real finalizer is reachable",
+        )?
+    } else {
+        load_telegram_config().unwrap_or_default()
+    };
     let entry = if group {
         convo::Entry::GroupElected
     } else {
@@ -5637,8 +7124,12 @@ pub fn run_conversation_dryrun(
     // Bind an ephemeral session to the addressed agent so the plan resolves to
     // `converse` and the turn has somewhere to land — needed for the fixture
     // round-trip AND both compose modes.
-    if session_reply.is_some() || compose || compose_error {
-        if let Some(agent_id) = convo::agent_for_channel(&config, channel) {
+    if session_reply.is_some() || composed_reply.is_some() || compose || compose_error {
+        let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+        let coordination_owner = owner_map.owner_for_domain(ownership::Domain::Coordination);
+        if let Some(agent_id) =
+            convo::agent_for_channel_with_default(&config, channel, coordination_owner)
+        {
             let uuid = worksgood::chat_sessions::create_session(
                 workgraph_dir,
                 worksgood::chat_sessions::SessionKind::Interactive,
@@ -5690,17 +7181,28 @@ pub fn run_conversation_dryrun(
     }
     let sink = DryRunSink::default();
 
+    // Credential-free composed-turn fixture used only by smoke tests. Unlike
+    // `--session-reply`, this enters through ReplyComposer and therefore drives
+    // every production finalizer before the recording sink sees the reply.
+    struct FixtureComposer(String);
+    #[async_trait::async_trait]
+    impl convo::ReplyComposer for FixtureComposer {
+        async fn compose(
+            &self,
+            _wg: &Path,
+            _session_ref: &str,
+            _agent_id: &str,
+            _message: &str,
+        ) -> Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
     // Injected failing composer for `--compose-error`.
     struct FailingComposer;
     #[async_trait::async_trait]
     impl convo::ReplyComposer for FailingComposer {
-        async fn compose(
-            &self,
-            _wg: &Path,
-            _s: &str,
-            _a: &str,
-            _m: &str,
-        ) -> Result<String> {
+        async fn compose(&self, _wg: &Path, _s: &str, _a: &str, _m: &str) -> Result<String> {
             anyhow::bail!("induced compose failure (--compose-error)")
         }
     }
@@ -5714,12 +7216,18 @@ pub fn run_conversation_dryrun(
     } else {
         None
     };
+    let fixture_composer = composed_reply.map(|reply| FixtureComposer(reply.to_string()));
     let failing_composer = FailingComposer;
-    let composer_ref: Option<&dyn convo::ReplyComposer> = if compose_error {
-        Some(&failing_composer)
-    } else {
-        real_composer.as_ref().map(|c| c as &dyn convo::ReplyComposer)
-    };
+    let composer_ref: Option<&dyn convo::ReplyComposer> =
+        if let Some(fixture) = fixture_composer.as_ref() {
+            Some(fixture)
+        } else if compose_error {
+            Some(&failing_composer)
+        } else {
+            real_composer
+                .as_ref()
+                .map(|c| c as &dyn convo::ReplyComposer)
+        };
 
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
     let outcome = rt.block_on(async {
@@ -5734,8 +7242,8 @@ pub fn run_conversation_dryrun(
                 let reply = reply.to_string();
                 tokio::spawn(async move {
                     for _ in 0..200 {
-                        let inbox = worksgood::chat::read_inbox_ref(&dir, &session_ref)
-                            .unwrap_or_default();
+                        let inbox =
+                            worksgood::chat::read_inbox_ref(&dir, &session_ref).unwrap_or_default();
                         if let Some(m) = inbox.iter().find(|m| m.role == "user") {
                             let _ = worksgood::chat::append_outbox_ref(
                                 &dir,
@@ -5788,9 +7296,7 @@ pub fn run_conversation_dryrun(
     if json {
         let sends_json: Vec<_> = sends
             .iter()
-            .map(|(bot, chat, text)| {
-                serde_json::json!({ "bot": bot, "chat": chat, "text": text })
-            })
+            .map(|(bot, chat, text)| serde_json::json!({ "bot": bot, "chat": chat, "text": text }))
             .collect();
         println!(
             "{}",
@@ -5826,13 +7332,13 @@ pub fn run_standup(workgraph_dir: &Path, chat_id: Option<&str>, dry_run: bool) -
     use worksgood::notify::telegram_standup as standup;
 
     let config = load_telegram_config()?;
-    let roster = standup::plan_roster(&config, standup::DEFAULT_ROSTER);
+    let roster = standup::load_project_roster(&project_root(workgraph_dir), &config)?;
     if roster.is_empty() {
-        anyhow::bail!("No named bots configured under [telegram.bots.*] — nothing to post.");
+        anyhow::bail!("No household roster entries have matching Telegram bots.");
     }
 
-    // Target: explicit --chat-id, else the first named bot's configured chat id
-    // (in Casa Pinello every bot shares the group chat id).
+    // Target: explicit --chat-id, else the first roster bot's configured chat
+    // id (a household's roster bots normally share the group chat id).
     let target = chat_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| roster[0].bot.chat_id.clone());
@@ -6299,8 +7805,7 @@ async fn poll_once(
                 .map(|id| id.to_string());
 
             if chat_id.as_deref() == Some(target_chat_id) {
-                let identity =
-                    worksgood::notify::telegram_sender::identity_from_message(message);
+                let identity = worksgood::notify::telegram_sender::identity_from_message(message);
                 let sender = identity.display();
 
                 let body = message
@@ -6418,7 +7923,13 @@ fn bot_offset_state_path(bot_id: &str) -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().context("could not determine home directory")?;
     let safe: String = bot_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Ok(home
         .join(".config")
@@ -6507,7 +8018,10 @@ mod tests {
         let g = command_gate(&gate_msg("supergroup", false));
         assert!(!g.family && !g.operator, "no slash entity → no command");
         let g = command_gate(&gate_msg("private", false));
-        assert!(!g.family && !g.operator, "no slash entity → no command in DM either");
+        assert!(
+            !g.family && !g.operator,
+            "no slash entity → no command in DM either"
+        );
     }
 
     #[test]
@@ -6515,8 +8029,14 @@ mod tests {
         // Even a genuine slash command in a family GROUP must NOT open the
         // operator claim/done path — that content is coordinator-only.
         let g = command_gate(&gate_msg("supergroup", true));
-        assert!(g.family, "a real /command still runs the family set in a group");
-        assert!(!g.operator, "the operator WG reference must never surface in a group");
+        assert!(
+            g.family,
+            "a real /command still runs the family set in a group"
+        );
+        assert!(
+            !g.operator,
+            "the operator WG reference must never surface in a group"
+        );
     }
 
     #[test]
@@ -6524,7 +8044,10 @@ mod tests {
         // A 1:1 operator DM with a real slash command is the only place the
         // operator reference may run.
         let g = command_gate(&gate_msg("private", true));
-        assert!(g.operator, "operator reference is allowed in a 1:1 slash command");
+        assert!(
+            g.operator,
+            "operator reference is allowed in a 1:1 slash command"
+        );
     }
 
     #[test]
@@ -6575,14 +8098,19 @@ mod tests {
     fn auth_confirm_url_defaults_to_loopback() {
         // Default (no override) is the loopback gateway. We do not mutate the
         // process env here (tests run concurrently); just assert the constant.
-        assert_eq!(AUTH_CONFIRM_URL_DEFAULT, "http://127.0.0.1:7788/auth/confirm");
+        assert_eq!(
+            AUTH_CONFIRM_URL_DEFAULT,
+            "http://127.0.0.1:7788/auth/confirm"
+        );
     }
 
     /// Spin a one-shot loopback HTTP stub standing in for the gateway
     /// `POST /auth/confirm`. It captures the request body (so the test can assert
     /// exactly `{nonce, telegram_id}` crossed the wire) and answers with
     /// `response_json`. Drives the REAL `confirm_web_login` POST path end to end.
-    fn spawn_confirm_stub(response_json: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    fn spawn_confirm_stub(
+        response_json: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6638,7 +8166,9 @@ mod tests {
     /// over the channel, so a test can assert on the request HEADERS — used to
     /// prove the listener attaches (or omits) the `x-casa-auth-secret` header
     /// (task urgent-auth-phantom).
-    fn spawn_confirm_stub_raw(response_json: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    fn spawn_confirm_stub_raw(
+        response_json: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6731,7 +8261,10 @@ mod tests {
             std::env::remove_var("CASA_AUTH_CONFIRM_SECRET");
             // Point the file lookup at a path that cannot exist so the default
             // `.casa/auth-confirm.secret` (which may exist in a live CWD) is skipped.
-            std::env::set_var("CASA_AUTH_CONFIRM_SECRET_FILE", "/nonexistent/casa/auth-confirm.secret");
+            std::env::set_var(
+                "CASA_AUTH_CONFIRM_SECRET_FILE",
+                "/nonexistent/casa/auth-confirm.secret",
+            );
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = reqwest::Client::new();
@@ -6767,10 +8300,10 @@ mod tests {
         assert!(reply.starts_with("You're signed in"), "reply: {reply}");
     }
 
-    /// An unknown telegram id → the friendly "ask Otto" reply, no session.
+    /// An unknown telegram id → role-based recovery guidance, no session.
     #[test]
     #[serial_test::serial]
-    fn confirm_web_login_unknown_user_gets_ask_otto_reply() {
+    fn confirm_web_login_unknown_user_gets_role_based_reply() {
         let (url, _rx) = spawn_confirm_stub(r#"{"ok":false,"reason":"unknown-user"}"#);
         unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -6778,7 +8311,10 @@ mod tests {
         let reply = rt.block_on(confirm_web_login(&client, "nonce", "999"));
         unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
 
-        assert!(reply.contains("ask Otto"), "reply: {reply}");
+        assert_eq!(
+            reply,
+            "I don't recognise you yet — ask someone already in the household to add you."
+        );
         assert!(!reply.starts_with("You're signed in"));
     }
 
@@ -6825,7 +8361,13 @@ mod tests {
     /// across the device families the gateway maps a User-Agent to.
     #[test]
     fn signed_in_reply_names_the_real_device_not_kitchen_tablet() {
-        for label in ["your iPhone", "your iPad", "a Mac", "a Windows PC", "an Android phone"] {
+        for label in [
+            "your iPhone",
+            "your iPad",
+            "a Mac",
+            "a Windows PC",
+            "an Android phone",
+        ] {
             let reply = WebLoginOutcome::SignedIn {
                 device: label.to_string(),
                 tablet: false,
@@ -6858,7 +8400,10 @@ mod tests {
             tablet: true,
         }
         .reply();
-        assert!(marker_beats_label.contains("kitchen tablet"), "reply: {marker_beats_label}");
+        assert!(
+            marker_beats_label.contains("kitchen tablet"),
+            "reply: {marker_beats_label}"
+        );
     }
 
     /// An older gateway that carries no device descriptor → a neutral fallback
@@ -6895,7 +8440,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn confirm_web_login_marked_tablet_says_kitchen_tablet() {
-        let (url, _rx) = spawn_confirm_stub(r#"{"ok":true,"device":"the kitchen tablet","tablet":true}"#);
+        let (url, _rx) =
+            spawn_confirm_stub(r#"{"ok":true,"device":"the kitchen tablet","tablet":true}"#);
         unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = reqwest::Client::new();
@@ -7261,28 +8807,191 @@ mod tests {
     /// owner's crisp ack and forwards the same persona id, so the async reply
     /// must come back in the SAME voice — not a re-election winner. The engine's
     /// election is BINDING-overridden to the pinned persona's bot. THE LAST
-    /// ROUTING SEAM: before this, production's shell-out re-elected the concierge
-    /// (Otto) and the delivery voice ≠ the ack voice.
+    /// ROUTING SEAM: before this, production's shell-out re-elected the
+    /// concierge and the delivery voice differed from the ack voice.
     #[test]
     fn owner_pin_binds_delivery_voice_to_pinned_persona() {
-        use worksgood::notify::telegram_group::{AddressedBy, ResolvedBot};
+        use worksgood::notify::telegram_group::AddressedBy;
 
         let mut bots = HashMap::new();
+        for (id, token) in [
+            ("harbor", "111:AAA"),
+            ("cedar", "222:BBB"),
+            // This id used to be a compiled no-owner sentinel. It is now just
+            // another configured id and must be bindable like any other.
+            ("otto", "333:CCC"),
+        ] {
+            bots.insert(
+                id.to_string(),
+                TelegramBotConfig {
+                    bot_token: token.to_string(),
+                    chat_id: "-100777".to_string(),
+                    agent_id: Some(id.to_string()),
+                    username: None,
+                },
+            );
+        }
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        let elected = Election::One {
+            bot: resolve_mentioned_bot("harbor", &config).unwrap(),
+            reply_chat: "-100777".to_string(),
+            body: "how many calories are in tonight's pasta?".to_string(),
+            addressed_by: AddressedBy::ReplyChain,
+        };
+
+        let pinned = apply_owner_pin(
+            elected.clone(),
+            Some("cedar"),
+            &config,
+            "-100777",
+            "how many calories are in tonight's pasta?",
+        );
+        match &pinned {
+            Election::One {
+                bot,
+                body,
+                reply_chat,
+                ..
+            } => {
+                assert_eq!(bot.bot_id, "cedar");
+                assert_eq!(bot.agent_id.as_deref(), Some("cedar"));
+                assert_eq!(reply_chat, "-100777");
+                assert_eq!(body, "how many calories are in tonight's pasta?");
+            }
+            other => panic!("pin must yield Election::One, got {other:?}"),
+        }
+
+        // Only an absent, empty, or unknown pin is a no-op.
+        for pin in [None, Some(""), Some("  "), Some("nobody")] {
+            let unchanged = apply_owner_pin(elected.clone(), pin, &config, "-100777", "m");
+            match &unchanged {
+                Election::One { bot, .. } => assert_eq!(
+                    bot.bot_id, "harbor",
+                    "pin={pin:?} must leave the election untouched, got {unchanged:?}"
+                ),
+                other => panic!("expected the original One election, got {other:?}"),
+            }
+        }
+
+        // No configured persona id is a sentinel, including an id that matched
+        // an older shipped household fixture.
+        let formerly_special =
+            apply_owner_pin(elected.clone(), Some("otto"), &config, "-100777", "m");
+        match formerly_special {
+            Election::One { bot, .. } => assert_eq!(bot.bot_id, "otto"),
+            other => panic!("every configured pin must bind, got {other:?}"),
+        }
+
+        // A pinned turn the engine would have stayed silent on is still forced
+        // to answer in the pinned voice with the raw message as the body.
+        let silent = Election::Silence(worksgood::notify::telegram_group::SilenceReason::SmallTalk);
+        let forced = apply_owner_pin(
+            silent,
+            Some("cedar"),
+            &config,
+            "-100777",
+            "tell me the calories",
+        );
+        match &forced {
+            Election::One { bot, body, .. } => {
+                assert_eq!(bot.bot_id, "cedar");
+                assert_eq!(
+                    body, "tell me the calories",
+                    "raw message becomes the body on a forced pin"
+                );
+            }
+            other => panic!("pin over silence must force a One election, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proactive_messages_use_the_configured_coordination_owner() {
+        use worksgood::notify::reminder::AdHocStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "garden-relay"
+name = "Garden Relay"
+domains = ["coordination"]
+
+[[agent]]
+id = "pantry-relay"
+name = "Pantry Relay"
+domains = ["cooking"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
+
+        let now =
+            chrono::NaiveDateTime::parse_from_str("2026-07-12T10:00", "%Y-%m-%dT%H:%M").unwrap();
+        assert!(
+            try_register_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "remind me tomorrow at 7pm to lock the patio",
+                now,
+            )
+            .is_some()
+        );
+        run_remind(
+            &wg,
+            false,
+            false,
+            Some("remind me Tuesday at 8am to set out the bins"),
+            Some("Household Member"),
+            Some("2026-07-12T10:00"),
+            false,
+        )
+        .unwrap();
+
+        let store = AdHocStore::load(&AdHocStore::path(root));
+        assert_eq!(store.reminders.len(), 2);
+        assert!(
+            store
+                .reminders
+                .iter()
+                .all(|reminder| reminder.bot == "garden-relay"),
+            "both registration seams must persist only the configured coordination owner: {:?}",
+            store.reminders,
+        );
+
+        let bindings = TelegramBindingMap::load(&wg.join("agency")).unwrap();
+        assert!(
+            bindings
+                .bindings
+                .iter()
+                .all(|binding| binding.bot_id.is_none()),
+            "the fixture must exercise the missing-bot binding path",
+        );
+        let mut bots = HashMap::new();
         bots.insert(
-            "otto".to_string(),
+            "first-fallback".to_string(),
             TelegramBotConfig {
-                bot_token: "111:AAA".to_string(),
-                chat_id: "-100777".to_string(),
-                agent_id: Some("otto".to_string()),
+                bot_token: "100:AAA".to_string(),
+                chat_id: "-1001".to_string(),
+                agent_id: Some("pantry-relay".to_string()),
                 username: None,
             },
         );
         bots.insert(
-            "nora".to_string(),
+            "coordination-channel".to_string(),
             TelegramBotConfig {
-                bot_token: "222:BBB".to_string(),
-                chat_id: "-100777".to_string(),
-                agent_id: Some("nora".to_string()),
+                bot_token: "200:BBB".to_string(),
+                chat_id: "-1002".to_string(),
+                agent_id: Some("garden-relay".to_string()),
                 username: None,
             },
         );
@@ -7291,67 +9000,310 @@ mod tests {
             chat_id: String::new(),
             bots,
         };
-
-        // The engine re-elected Otto (the concierge) for a heavy nutrition ask.
-        let otto_bot = resolve_mentioned_bot("otto", &config).unwrap();
-        let elected_otto = Election::One {
-            bot: otto_bot,
-            reply_chat: "-100777".to_string(),
-            body: "how many calories in the pasta pomodoro?".to_string(),
-            addressed_by: AddressedBy::ReplyChain,
-        };
-
-        // Pin = nora → the delivering voice is rebound to Nora, body preserved.
-        let pinned = apply_owner_pin(
-            elected_otto.clone(),
-            Some("nora"),
-            &config,
-            "-100777",
-            "how many calories in the pasta pomodoro?",
+        let hint = coordination_owner_hint(root);
+        let (_, bot_id, _) =
+            resolve_dm_target(&config, &bindings, "Household Member", &hint).unwrap();
+        assert_eq!(
+            bot_id, "coordination-channel",
+            "a digest for an unbound member must use the configured coordination voice",
         );
-        match &pinned {
-            Election::One { bot, body, reply_chat, .. } => {
-                assert_eq!(bot.bot_id, "nora", "pin must rebind the delivery voice to Nora:\n{pinned:?}");
-                assert_eq!(bot.agent_id.as_deref(), Some("nora"));
-                assert_eq!(reply_chat, "-100777");
-                assert_eq!(body, "how many calories in the pasta pomodoro?", "body preserved from the election");
-            }
-            other => panic!("pin must yield Election::One, got {other:?}"),
-        }
+    }
 
-        // No pin → election stands (Otto). Empty / concierge-default / unknown all no-op.
-        for pin in [None, Some(""), Some("  "), Some("otto"), Some("OTTO"), Some("nobody")] {
-            let unchanged = apply_owner_pin(elected_otto.clone(), pin, &config, "-100777", "m");
-            match &unchanged {
-                Election::One { bot, .. } => assert_eq!(
-                    bot.bot_id, "otto",
-                    "pin={pin:?} must leave the election untouched (Otto), got {unchanged:?}"
+    #[test]
+    fn proactive_owner_hint_is_empty_without_a_valid_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(coordination_owner_hint(dir.path()), "");
+
+        std::fs::write(dir.path().join("household.toml"), "agent = [").unwrap();
+        assert_eq!(
+            coordination_owner_hint(dir.path()),
+            "",
+            "malformed configuration must not manufacture a persona id",
+        );
+    }
+
+    #[test]
+    fn ambiguous_plan_source_never_selects_first_bot() {
+        use worksgood::notify::family_plan::CalendarEvent;
+        use worksgood::notify::reminder::Reminder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "coordination-anchor-a"
+name = "Shared Lantern"
+domains = ["coordination"]
+
+[[agent]]
+id = "coordination-anchor-b"
+name = "Shared Lantern"
+domains = ["calendar"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
+        let bindings = TelegramBindingMap::load(&wg.join("agency")).unwrap();
+        let owners = ownership::OwnerMap::load(root);
+        let event = CalendarEvent {
+            weekday: "Tue".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 7, 28),
+            time: "08:00".into(),
+            event: "\u{23f0} Reminder: Household Member set out the bins".into(),
+            source: "Shared Lantern".into(),
+        };
+        assert!(
+            Reminder::from_calendar_event(
+                "2026-W31",
+                &event,
+                &["Household Member".to_string()],
+                &owners,
+            )
+            .is_none(),
+            "duplicate display labels must not become a guessed stable owner",
+        );
+
+        for reverse in [false, true] {
+            let entries = [
+                (
+                    "first-wire",
+                    TelegramBotConfig {
+                        bot_token: "100:AAA".to_string(),
+                        chat_id: "-1001".to_string(),
+                        agent_id: Some("coordination-anchor-a".to_string()),
+                        username: None,
+                    },
                 ),
-                other => panic!("expected Otto One for pin={pin:?}, got {other:?}"),
+                (
+                    "second-wire",
+                    TelegramBotConfig {
+                        bot_token: "200:BBB".to_string(),
+                        chat_id: "-1002".to_string(),
+                        agent_id: Some("coordination-anchor-b".to_string()),
+                        username: None,
+                    },
+                ),
+            ];
+            let mut bots = HashMap::new();
+            let order: &[usize] = if reverse { &[1, 0] } else { &[0, 1] };
+            for index in order {
+                let (id, bot) = &entries[*index];
+                bots.insert((*id).to_string(), bot.clone());
+            }
+            let config = TelegramConfig {
+                bot_token: String::new(),
+                chat_id: String::new(),
+                bots,
+            };
+            assert!(
+                resolve_dm_target(&config, &bindings, "Household Member", "unresolved-source",)
+                    .is_none(),
+                "an unresolved non-empty Source must never fall through to map order",
+            );
+        }
+    }
+
+    #[test]
+    fn operator_alert_route_refuses_unproven_coordination_dm() {
+        use worksgood::notify::lifecycle::OperatorAlert;
+
+        fn config_with_order(reverse: bool) -> TelegramConfig {
+            let entries = [
+                (
+                    "fallback-wire",
+                    TelegramBotConfig {
+                        bot_token: "100:AAA".to_string(),
+                        chat_id: "7001".to_string(),
+                        agent_id: Some("pantry-orbit".to_string()),
+                        username: None,
+                    },
+                ),
+                (
+                    "coordination-wire",
+                    TelegramBotConfig {
+                        bot_token: "200:BBB".to_string(),
+                        chat_id: "7002".to_string(),
+                        agent_id: Some("night-orbit".to_string()),
+                        username: None,
+                    },
+                ),
+            ];
+            let mut bots = HashMap::new();
+            let order: &[usize] = if reverse { &[1, 0] } else { &[0, 1] };
+            for index in order {
+                let (id, bot) = &entries[*index];
+                bots.insert((*id).to_string(), bot.clone());
+            }
+            TelegramConfig {
+                bot_token: String::new(),
+                chat_id: String::new(),
+                bots,
             }
         }
 
-        // A pinned turn the engine would have stayed SILENT on is still forced to
-        // answer in the pinned voice with the raw message as the body (the
-        // gateway already decided it is a domain-owned heavy ask).
-        let silent = Election::Silence(
-            worksgood::notify::telegram_group::SilenceReason::SmallTalk,
-        );
-        let forced = apply_owner_pin(silent, Some("nora"), &config, "-100777", "tell me the calories");
-        match &forced {
-            Election::One { bot, body, .. } => {
-                assert_eq!(bot.bot_id, "nora");
-                assert_eq!(body, "tell me the calories", "raw message becomes the body on a forced pin");
-            }
-            other => panic!("pin over silence must force Nora One, got {other:?}"),
-        }
-        // Silence self-check so ResolvedBot import is exercised even if the arms
-        // above change.
-        let _ = ResolvedBot {
-            bot_id: "x".into(),
-            channel_type: "telegram:x".into(),
-            agent_id: None,
+        let alert = OperatorAlert {
+            task_id: "stalled-porch-light".to_string(),
+            requester: "Household Member".to_string(),
+            text: "The porch-light request needs a look.".to_string(),
+            notification_id: "alert-stalled-porch-light".to_string(),
         };
+        for reverse in [false, true] {
+            let config = config_with_order(reverse);
+            assert_eq!(
+                operator_alert_route(&config, Some("night-orbit")),
+                None,
+                "coordination ownership does not prove who owns a helper bot's private chat",
+            );
+            let line = worksgood::notify::lifecycle::dry_run_alert_line(&alert, None);
+            assert!(
+                line.contains("logged only"),
+                "dry-run must expose the fail-closed route: {line}",
+            );
+        }
+    }
+
+    #[test]
+    fn operator_alert_route_falls_back_honestly_without_a_valid_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = TelegramConfig {
+            bot_token: "300:CCC".to_string(),
+            chat_id: "7003".to_string(),
+            bots: HashMap::new(),
+        };
+        for invalid_household in [None, Some("agent = [")] {
+            if let Some(body) = invalid_household {
+                std::fs::write(dir.path().join("household.toml"), body).unwrap();
+            }
+            let owner_map = ownership::OwnerMap::load(dir.path());
+            let owner = owner_map.owner_for_domain(ownership::Domain::Coordination);
+            assert_eq!(owner, None);
+            assert_eq!(
+                operator_alert_route(&legacy, owner),
+                Some((String::new(), "7003".to_string())),
+                "missing or malformed ownership must retain the explicit legacy route",
+            );
+        }
+
+        let mut bots = HashMap::new();
+        bots.insert(
+            "only-configured-wire".to_string(),
+            TelegramBotConfig {
+                bot_token: "400:DDD".to_string(),
+                chat_id: "7004".to_string(),
+                agent_id: Some("unowned-orbit".to_string()),
+                username: None,
+            },
+        );
+        let one_bot = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+        assert_eq!(
+            operator_alert_route(&one_bot, None),
+            None,
+            "an arbitrary private member chat is not an owner-alert fallback",
+        );
+
+        assert_eq!(operator_alert_route(&TelegramConfig::default(), None), None);
+        let alert = worksgood::notify::lifecycle::OperatorAlert {
+            task_id: "stalled-entry-key".to_string(),
+            requester: "Household Member".to_string(),
+            text: "The entry-key request needs a look.".to_string(),
+            notification_id: "alert-stalled-entry-key".to_string(),
+        };
+        let line = worksgood::notify::lifecycle::dry_run_alert_line(&alert, None);
+        assert!(
+            line.contains("no configured bot") && line.contains("logged only"),
+            "an unavailable route must be visible in dry-run output: {line}",
+        );
+    }
+
+    #[test]
+    fn operator_alert_route_refuses_group_chat_ids() {
+        use worksgood::notify::lifecycle::OperatorAlert;
+
+        let mut bots = HashMap::new();
+        bots.insert(
+            "coordination-wire".to_string(),
+            TelegramBotConfig {
+                bot_token: "200:BBB".to_string(),
+                chat_id: "-1007002".to_string(),
+                agent_id: Some("configured-owner".to_string()),
+                username: None,
+            },
+        );
+        bots.insert(
+            "fallback-wire".to_string(),
+            TelegramBotConfig {
+                bot_token: "100:AAA".to_string(),
+                chat_id: "-1007001".to_string(),
+                agent_id: Some("other-member".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: "300:CCC".to_string(),
+            chat_id: "-1007003".to_string(),
+            bots,
+        };
+
+        assert_eq!(
+            operator_alert_route(&config, Some("configured-owner")),
+            None,
+            "normal negative family-group ids must never masquerade as an owner DM",
+        );
+
+        let alert = OperatorAlert {
+            task_id: "stalled-porch-light".to_string(),
+            requester: "Household Member".to_string(),
+            text: "The porch-light request needs a look.".to_string(),
+            notification_id: "alert-stalled-porch-light".to_string(),
+        };
+        let sink = RecordingSink::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(
+            !rt.block_on(deliver_operator_alert(
+                &sink,
+                &config,
+                Some("configured-owner"),
+                &alert,
+            )),
+            "group-only configuration must retain the alert as a loud log record",
+        );
+        assert!(
+            sink.sends.lock().unwrap().is_empty(),
+            "owner-facing task details must never be sent into a family group",
+        );
+
+        let unrelated_private = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots: HashMap::from([(
+                "unrelated-wire".to_string(),
+                TelegramBotConfig {
+                    bot_token: "400:DDD".to_string(),
+                    chat_id: "7004".to_string(),
+                    agent_id: Some("other-member".to_string()),
+                    username: None,
+                },
+            )]),
+        };
+        assert_eq!(
+            operator_alert_route(&unrelated_private, Some("configured-owner")),
+            None,
+            "a positive private id is not proof that the chat belongs to the owner",
+        );
+
+        let line = worksgood::notify::lifecycle::dry_run_alert_line(&alert, None);
+        assert!(
+            line.contains("logged only"),
+            "the dry-run must report the fail-closed route honestly: {line}",
+        );
     }
 
     #[test]
@@ -7377,36 +9329,840 @@ mod tests {
     }
 
     #[test]
-    fn web_inbound_request_id_is_unique_per_message_stable_on_refire() {
-        // THE 17:03 LIE (task live-compose-reliability): the id was CONSTANT per
-        // (chat, bot), so the idempotency guard treated the SECOND named ask to Nora
-        // as a duplicate of the first and returned `[replied]` while sending nothing.
-        let a = web_inbound_request_id("-100777", "nora", "what's for dinner Monday?");
-        let b = web_inbound_request_id("-100777", "nora", "and what about Tuesday?");
-        assert_ne!(
-            a, b,
-            "two DIFFERENT questions to the same voice must get DIFFERENT ids (else the 2nd is silently deduped)"
-        );
+    fn collective_request_id_is_unique_per_turn_stable_on_refire() {
+        let mut first = gate_msg("supergroup", false);
+        first.channel = "telegram:voice-7".to_string();
+        first.sender = "member-4".to_string();
+        first.sender_id = Some("member-id-4".to_string());
+        first.sent_at = Some(1_720_000_000);
+        first.body = "hello household".to_string();
+        first.message_id = Some("41".to_string());
+        first.chat_id = Some("-100700".to_string());
 
-        // A genuine re-fire — the SAME body (a listener re-poll / gateway retry /
-        // restart-replay) — must still collide so the double-post guard holds.
-        let a_again = web_inbound_request_id("-100777", "nora", "what's for dinner Monday?");
-        assert_eq!(a, a_again, "an identical re-fire must dedupe to the SAME id");
-
-        // Whitespace-only differences are a re-fire, not a new turn (body is trimmed).
+        let first_turn = telegram_physical_turn_key(&first);
+        // The same physical group message arrives through another bot with a
+        // different channel and message_id. Those transport-local fields must
+        // not split the shared turn key.
+        let mut cross_bot_refire = first.clone();
+        cross_bot_refire.channel = "telegram:voice-9".to_string();
+        cross_bot_refire.message_id = Some("907".to_string());
+        let first_refire = telegram_physical_turn_key(&cross_bot_refire);
         assert_eq!(
-            web_inbound_request_id("-100777", "nora", "  what's for dinner Monday?  "),
-            a,
-            "leading/trailing whitespace must not defeat the re-fire dedupe",
+            first_turn, first_refire,
+            "cross-bot Telegram deliveries must retain one physical-turn key",
         );
 
-        // Distinct chat or bot ⇒ distinct id (a shared body across voices/chats is
-        // still separate turns).
-        assert_ne!(a, web_inbound_request_id("-100888", "nora", "what's for dinner Monday?"));
-        assert_ne!(a, web_inbound_request_id("-100777", "bruno", "what's for dinner Monday?"));
+        let mut later = first.clone();
+        later.message_id = Some("42".to_string());
+        later.sent_at = Some(1_720_000_001);
+        let later_turn = telegram_physical_turn_key(&later);
+        assert_ne!(
+            first_turn, later_turn,
+            "a later same-body Telegram turn must not reuse the earlier key",
+        );
 
-        // The id keeps its stable, greppable prefix for log correlation.
-        assert!(a.starts_with("web--100777-nora-"), "unexpected id shape: {a}");
+        let first_id = collective_request_id("-100700", "voice-7", &first_turn);
+        let refire_id = collective_request_id("-100700", "voice-7", &first_refire);
+        let later_id = collective_request_id("-100700", "voice-7", &later_turn);
+        assert_eq!(
+            first_id, refire_id,
+            "the outbox guard must dedupe a true refire",
+        );
+        assert_ne!(
+            first_id, later_id,
+            "the outbox guard must admit the later household turn",
+        );
+        assert_ne!(
+            first_id,
+            collective_request_id("-100700", "voice-8", &first_turn),
+            "each configured roster voice needs its own request id",
+        );
+
+        // A transport that omits message_id uses the same key because message_id
+        // never participates in the physical fingerprint.
+        let mut fallback = first.clone();
+        fallback.message_id = None;
+        let fallback_key = telegram_physical_turn_key(&fallback);
+        assert_eq!(
+            first_turn, fallback_key,
+            "message_id presence must not affect the cross-bot key",
+        );
+
+        // Web collective callers share the explicit occurrence id across voices.
+        let web_first = web_physical_turn_key("-100700", "hello household", Some("turn-fixture-a"));
+        assert_eq!(
+            web_first,
+            web_physical_turn_key(
+                "-100700",
+                "body changes do not matter on a true refire",
+                Some("turn-fixture-a"),
+            ),
+            "web refires retain the explicit occurrence fingerprint",
+        );
+        assert_ne!(
+            web_first,
+            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-b"),),
+            "a later web occurrence gets a fresh collective key even with identical words",
+        );
+    }
+
+    #[test]
+    fn durable_turn_ids_have_stable_vectors() {
+        let mut message = gate_msg("supergroup", false);
+        message.channel = "telegram:voice-7".to_string();
+        message.sender = "member-display".to_string();
+        message.sender_id = Some("member-id-4".to_string());
+        message.sent_at = Some(1_720_000_000);
+        message.body = "hello household".to_string();
+        message.message_id = Some("transport-local-41".to_string());
+        message.chat_id = Some("-100700".to_string());
+
+        let telegram_turn = telegram_physical_turn_key(&message);
+        assert_eq!(
+            telegram_turn,
+            "telegram-turn-b3-v1-5c81580a6d5538a35b1233961550e48f16c2f8633615ecb2501491deb9673a83",
+        );
+
+        let web_turn = web_physical_turn_key("-100700", "hello household", Some("opaque-turn-a7"));
+        assert_eq!(
+            web_turn,
+            "web-turn-b3-v1-62753b68ec0fbd6e844d7728ecd3ce10560f707a7ef63f394b400dc60eeaa930",
+        );
+        assert_eq!(
+            web_physical_turn_key("-100700", "hello household", None),
+            "web-turn-b3-v1-6debece65596fe4ed96650f648c8ee482b351c65978c3dfd5bb9652ad7168fab",
+        );
+        assert_eq!(
+            collective_request_id("-100700", "voice-7", &telegram_turn),
+            "tg-collective-b3-v1-49ba9313a9bf36256388d82b83660fe204196d1aa270cfb2e3add5544b818750",
+        );
+        assert_eq!(
+            web_inbound_request_id("-100700", "voice-7", &web_turn),
+            "web-request-b3-v1-96ebd0939919bcb2a67b9baf8c50cb15fcc489edb598f3d5d1085e8e210f5115",
+        );
+    }
+
+    /// Permanent behavior gate for the photo mutation boundary. A fresh
+    /// invocation after transport failure may deliver the stored canonical
+    /// reply, but it must never rerun image-derived list changes.
+    #[tokio::test]
+    async fn photo_shopping_same_physical_turn_mutates_and_sends_once() {
+        #[derive(Default)]
+        struct ReplaySink {
+            fail_next: std::sync::atomic::AtomicBool,
+            attempts: std::sync::Mutex<Vec<(String, String, String)>>,
+            delivered: std::sync::Mutex<Vec<(String, String, String)>>,
+        }
+
+        #[async_trait]
+        impl worksgood::notify::telegram_conversation::ReplySink for ReplaySink {
+            async fn send(
+                &self,
+                bot_id: &str,
+                chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                let row = (bot_id.to_string(), chat_id.to_string(), text.to_string());
+                self.attempts.lock().unwrap().push(row.clone());
+                if self
+                    .fail_next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    anyhow::bail!("fixture transport failure");
+                }
+                let mut delivered = self.delivered.lock().unwrap();
+                delivered.push(row);
+                Ok(Some(format!("fixture-{}", delivered.len())))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workgraph_dir = dir.path().join(".wg");
+        std::fs::create_dir_all(&workgraph_dir).unwrap();
+        let roster = worksgood::notify::grounding::FamilyVoiceRoster::from_names(
+            ["Copper Comet"],
+            ["Household Member"],
+        );
+        let sink = ReplaySink::default();
+        sink.fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mutations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut first = gate_msg("supergroup", false);
+        first.channel = "telegram:wire-axis-7".to_string();
+        first.sender = "member-display".to_string();
+        first.sender_id = Some("member-anchor-41".to_string());
+        first.sent_at = Some(1_721_900_000);
+        first.body = "Copper Comet, what do we still need?".to_string();
+        first.message_id = Some("transport-local-58".to_string());
+        first.chat_id = Some("-100700".to_string());
+        first.photo_file_id = Some("bot-scoped-photo-a".to_string());
+        let first_key = telegram_photo_turn_key(&first);
+
+        // Bot-scoped transport fields may drift on a true refire; the physical
+        // key must stay stable.
+        let mut cross_bot_refire = first.clone();
+        cross_bot_refire.channel = "telegram:wire-axis-9".to_string();
+        cross_bot_refire.message_id = Some("transport-local-907".to_string());
+        cross_bot_refire.photo_file_id = Some("other-bot-photo-handle".to_string());
+        assert_eq!(
+            first_key,
+            telegram_photo_turn_key(&cross_bot_refire),
+            "bot-scoped photo handles must not split one physical turn",
+        );
+
+        // Every frame of one album is one mutation occurrence even when only a
+        // later frame is seen after restart.
+        let mut album_first = first.clone();
+        album_first.media_group_id = Some("album-occurrence-31".to_string());
+        let mut album_later_frame = album_first.clone();
+        album_later_frame.body.clear();
+        album_later_frame.sent_at = Some(1_721_900_001);
+        album_later_frame.photo_file_id = Some("album-frame-two".to_string());
+        assert_eq!(
+            telegram_photo_turn_key(&album_first),
+            telegram_photo_turn_key(&album_later_frame),
+        );
+
+        let first_mutations = mutations.clone();
+        let first_attempt = run_photo_shopping_occurrence(
+            &workgraph_dir,
+            &first_key,
+            "voice-anchor-731",
+            "-100700",
+            &roster,
+            &sink,
+            move || async move {
+                first_mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("I found chickpeas and added oat milk to the list.".to_string())
+            },
+        )
+        .await;
+        assert!(first_attempt.is_err());
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 1,);
+
+        // A fresh invocation carries drifted route and draft inputs. The
+        // persisted original route and exact reply win, and apply is untouched.
+        let retry_mutations = mutations.clone();
+        let retry = run_photo_shopping_occurrence(
+            &workgraph_dir,
+            &first_key,
+            "decoy-voice-992",
+            "-100999",
+            &roster,
+            &sink,
+            move || async move {
+                retry_mutations.fetch_add(100, std::sync::atomic::Ordering::SeqCst);
+                Ok("This newly composed reply must never be used.".to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(retry.resumed_delivery);
+        assert!(!retry.already_delivered);
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 1,);
+        let delivered = sink.delivered.lock().unwrap().clone();
+        assert_eq!(
+            delivered,
+            vec![(
+                "voice-anchor-731".to_string(),
+                "-100700".to_string(),
+                "I found chickpeas and added oat milk to the list.".to_string(),
+            )],
+        );
+
+        let completed_mutations = mutations.clone();
+        let completed = run_photo_shopping_occurrence(
+            &workgraph_dir,
+            &first_key,
+            "voice-anchor-731",
+            "-100700",
+            &roster,
+            &sink,
+            move || async move {
+                completed_mutations.fetch_add(100, std::sync::atomic::Ordering::SeqCst);
+                Ok("This completed replay must stay silent.".to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(completed.already_delivered);
+        assert_eq!(sink.attempts.lock().unwrap().len(), 2);
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 1,);
+
+        // Identical words one second later are a distinct photo occurrence.
+        let mut later = first.clone();
+        later.sent_at = Some(1_721_900_001);
+        later.message_id = Some("transport-local-59".to_string());
+        later.photo_file_id = Some("bot-scoped-photo-b".to_string());
+        let later_key = telegram_photo_turn_key(&later);
+        assert_ne!(first_key, later_key);
+        let later_mutations = mutations.clone();
+        run_photo_shopping_occurrence(
+            &workgraph_dir,
+            &later_key,
+            "voice-anchor-731",
+            "-100700",
+            &roster,
+            &sink,
+            move || async move {
+                later_mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("I found chickpeas and added oat milk to the list.".to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 2,);
+        assert_eq!(sink.delivered.lock().unwrap().len(), 2);
+    }
+
+    /// Permanent behavior gate at the mutation boundary. A fresh invocation
+    /// retries only the stored delivery after transport failure, a completed
+    /// same-turn refire is silent, and a distinct occurrence id admits the same
+    /// household words later.
+    #[tokio::test]
+    async fn web_fast_lane_same_turn_mutates_and_sends_once_after_restart() {
+        #[derive(Default)]
+        struct ReplaySink {
+            fail_next: std::sync::atomic::AtomicBool,
+            attempts: std::sync::Mutex<Vec<(String, String, String)>>,
+            delivered: std::sync::Mutex<Vec<(String, String, String)>>,
+        }
+
+        #[async_trait]
+        impl worksgood::notify::telegram_conversation::ReplySink for ReplaySink {
+            async fn send(
+                &self,
+                bot_id: &str,
+                chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                let row = (bot_id.to_string(), chat_id.to_string(), text.to_string());
+                self.attempts.lock().unwrap().push(row.clone());
+                if self
+                    .fail_next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    anyhow::bail!("fixture transport failure");
+                }
+                let mut delivered = self.delivered.lock().unwrap();
+                delivered.push(row);
+                Ok(Some(format!("fixture-{}", delivered.len())))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let workgraph_dir = root.join(".wg");
+        let plans_dir = root.join("plans");
+        std::fs::create_dir_all(&workgraph_dir).unwrap();
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan_path = plans_dir.join("2026-W30-family-plan.md");
+        std::fs::write(
+            &plan_path,
+            r#"# Household weekly plan · 2026-W30
+
+**Week of Monday 2026-07-20 → Sunday 2026-07-26**
+
+## 1. Dinners (Cedar Signal → Copper Ladle)
+
+| Day | Slot type | Dinner | Prep | Note |
+|-----|-----------|--------|------|------|
+| Wed 07-22 | Vegetarian | Miso aubergine noodles | ~30 min | pantry |
+
+## 2. Calendar (Open Door)
+
+| Day | Time | Event | Source |
+|-----|------|-------|--------|
+| Wed 07-22 | 18:30 | Cook: miso aubergine noodles | Copper Ladle |
+
+## 3. Shopping list (Open Door)
+
+### Produce
+- Aubergines ×2
+"#,
+        )
+        .unwrap();
+
+        let roster = worksgood::notify::grounding::FamilyVoiceRoster::from_names(
+            ["Open Door"],
+            ["River Guest"],
+        );
+        let sink = ReplaySink::default();
+        sink.fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 22).unwrap();
+        let words = "add oat milk to the shopping list";
+        let first_key = web_physical_turn_key("-100700", words, Some("turn-a"));
+
+        // First invocation applies once and retains canonical bytes when the
+        // transport fails.
+        let first = run_web_fast_lane_occurrence(
+            &workgraph_dir,
+            root,
+            words,
+            today,
+            None,
+            &first_key,
+            "helper-9",
+            "-100700",
+            "member-41",
+            "helper-9",
+            &roster,
+            &sink,
+        )
+        .await;
+        assert!(first.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&plan_path)
+                .unwrap()
+                .matches("- oat milk")
+                .count(),
+            1,
+        );
+
+        // A fresh-process refire may carry drifted mutable inputs. The persisted
+        // outcome still wins even when the body no longer classifies as a fast
+        // edit: original route and exact oat-milk reply.
+        let retry = run_web_fast_lane_occurrence(
+            &workgraph_dir,
+            root,
+            "please help me with this",
+            today,
+            None,
+            &first_key,
+            "decoy-bot",
+            "-100999",
+            "different-member",
+            "decoy-persona",
+            &roster,
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            retry,
+            WebFastLaneDispatch::Handled {
+                resumed_delivery: true,
+                already_delivered: false,
+                ..
+            }
+        ));
+        let plan = std::fs::read_to_string(&plan_path).unwrap();
+        assert_eq!(plan.matches("- oat milk").count(), 1);
+        let delivered = sink.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(&delivered[0].0, "helper-9");
+        assert_eq!(&delivered[0].1, "-100700");
+        assert!(delivered[0].2.contains("oat milk"));
+
+        // Once delivered, the same occurrence is a full no-op.
+        let completed = run_web_fast_lane_occurrence(
+            &workgraph_dir,
+            root,
+            words,
+            today,
+            None,
+            &first_key,
+            "helper-9",
+            "-100700",
+            "member-41",
+            "helper-9",
+            &roster,
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            completed,
+            WebFastLaneDispatch::Handled {
+                already_delivered: true,
+                ..
+            }
+        ));
+        assert_eq!(sink.attempts.lock().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&plan_path)
+                .unwrap()
+                .matches("- oat milk")
+                .count(),
+            1,
+        );
+
+        // Identical words with a later occurrence id remain a new household
+        // turn and therefore apply + deliver once of their own.
+        let later_key = web_physical_turn_key("-100700", words, Some("turn-b"));
+        run_web_fast_lane_occurrence(
+            &workgraph_dir,
+            root,
+            words,
+            today,
+            None,
+            &later_key,
+            "helper-9",
+            "-100700",
+            "member-41",
+            "helper-9",
+            &roster,
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sink.attempts.lock().unwrap().len(), 3);
+        assert_eq!(sink.delivered.lock().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&plan_path)
+                .unwrap()
+                .matches("- oat milk")
+                .count(),
+            2,
+        );
+        let graph = worksgood::parser::load_graph(workgraph_dir.join("graph.jsonl")).unwrap();
+        assert_eq!(
+            graph
+                .tasks()
+                .filter(|task| task.tags.iter().any(|tag| tag == "fast-lane"))
+                .count(),
+            2,
+        );
+    }
+
+    /// Behavior gate for every conversational group-delivery shape. One
+    /// physical Telegram turn is replayed through a fresh invocation, then the
+    /// same words arrive one second later as a distinct turn. The replay sends
+    /// nothing; the later occurrence sends normally.
+    #[tokio::test]
+    async fn physical_turn_refire_deduplicates_all_group_reply_modes() {
+        use std::time::Duration;
+        use worksgood::chat;
+        use worksgood::chat_sessions::{SessionKind, create_session};
+        use worksgood::graph::OriginChannel;
+        use worksgood::notify::grounding::FamilyVoiceRoster;
+        use worksgood::notify::telegram_conversation as convo;
+        use worksgood::notify::telegram_discussion as discussion;
+
+        #[derive(Default)]
+        struct CountingSink {
+            sends: std::sync::Mutex<Vec<(String, String, String)>>,
+        }
+        #[async_trait]
+        impl convo::ReplySink for CountingSink {
+            async fn send(
+                &self,
+                bot_id: &str,
+                chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                let mut sends = self.sends.lock().unwrap();
+                sends.push((bot_id.to_string(), chat_id.to_string(), text.to_string()));
+                Ok(Some(format!("stub-{}", sends.len())))
+            }
+        }
+
+        struct FixedComposer;
+        #[async_trait]
+        impl convo::ReplyComposer for FixedComposer {
+            async fn compose(
+                &self,
+                _workgraph_dir: &Path,
+                _session_ref: &str,
+                _agent_id: &str,
+                _human_message: &str,
+            ) -> Result<String> {
+                Ok("That sounds good to me.".to_string())
+            }
+        }
+
+        async fn append_legacy_reply(
+            workgraph_dir: PathBuf,
+            session_ref: String,
+            request_id: String,
+        ) {
+            for _ in 0..200 {
+                let inbox = chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap_or_default();
+                if inbox.iter().any(|message| message.request_id == request_id) {
+                    chat::append_outbox_ref(
+                        &workgraph_dir,
+                        &session_ref,
+                        "The legacy session answered.",
+                        &request_id,
+                    )
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("legacy fixture never observed request {request_id}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workgraph_dir = dir.path().join(".wg");
+        std::fs::create_dir_all(&workgraph_dir).unwrap();
+        let chat_id = "-100700";
+        let words = "what does everyone think?";
+
+        let mut first = gate_msg("supergroup", false);
+        first.channel = "telegram:wire-1".to_string();
+        first.sender = "member-4".to_string();
+        first.sender_id = Some("member-id-4".to_string());
+        first.sent_at = Some(1_720_000_000);
+        first.body = words.to_string();
+        first.message_id = Some("41".to_string());
+        first.chat_id = Some(chat_id.to_string());
+        let mut replay = first.clone();
+        replay.channel = "telegram:wire-2".to_string();
+        replay.message_id = Some("907".to_string());
+        let mut later = first.clone();
+        later.sent_at = Some(1_720_000_001);
+        later.message_id = Some("42".to_string());
+
+        let first_key = telegram_physical_turn_key(&first);
+        let replay_key = telegram_physical_turn_key(&replay);
+        let later_key = telegram_physical_turn_key(&later);
+        assert_eq!(first_key, replay_key);
+        assert_ne!(first_key, later_key);
+        let keys = [&first_key, &replay_key, &later_key];
+
+        let sink = CountingSink::default();
+        let timing = convo::AckTiming {
+            ack_after: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(3),
+            poll: Duration::from_millis(5),
+        };
+
+        // Collective fallback: this is the direct no-session send seam used by
+        // `run_group_collective`.
+        for key in keys {
+            let request_id = collective_request_id(chat_id, "wire-fallback", key);
+            convo::send_reply_once(
+                &workgraph_dir,
+                &request_id,
+                "wire-fallback",
+                chat_id,
+                "I am here.",
+                &sink,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Group sessionless path.
+        let sessionless = convo::ConversationPlan::Sessionless {
+            agent_id: "persona-sessionless".to_string(),
+            route: convo::ReplyRoute {
+                bot_id: "wire-sessionless".to_string(),
+                chat_id: chat_id.to_string(),
+            },
+            entry: convo::Entry::GroupElected,
+        };
+        for key in keys {
+            let request_id = collective_request_id(chat_id, "wire-sessionless", key);
+            convo::run_conversation_turn(
+                &workgraph_dir,
+                &sessionless,
+                words,
+                &request_id,
+                timing,
+                None,
+                &sink,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Legacy session polling path (no injected composer).
+        let legacy_session =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let legacy = convo::ConversationPlan::Converse {
+            session_ref: legacy_session.clone(),
+            agent_id: "persona-legacy".to_string(),
+            route: convo::ReplyRoute {
+                bot_id: "wire-legacy".to_string(),
+                chat_id: chat_id.to_string(),
+            },
+            entry: convo::Entry::GroupElected,
+            requester: "member-4".to_string(),
+            channel: OriginChannel::TelegramGroup,
+        };
+        let first_legacy_id = collective_request_id(chat_id, "wire-legacy", &first_key);
+        let first_responder = tokio::spawn(append_legacy_reply(
+            workgraph_dir.clone(),
+            legacy_session.clone(),
+            first_legacy_id.clone(),
+        ));
+        convo::run_conversation_turn(
+            &workgraph_dir,
+            &legacy,
+            words,
+            &first_legacy_id,
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        first_responder.await.unwrap();
+        convo::run_conversation_turn(
+            &workgraph_dir,
+            &legacy,
+            words,
+            &collective_request_id(chat_id, "wire-legacy", &replay_key),
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        let later_legacy_id = collective_request_id(chat_id, "wire-legacy", &later_key);
+        let later_responder = tokio::spawn(append_legacy_reply(
+            workgraph_dir.clone(),
+            legacy_session,
+            later_legacy_id.clone(),
+        ));
+        convo::run_conversation_turn(
+            &workgraph_dir,
+            &legacy,
+            words,
+            &later_legacy_id,
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        later_responder.await.unwrap();
+
+        // Real elected single-voice compose/finalize path.
+        let single_session =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let single = convo::ConversationPlan::Converse {
+            session_ref: single_session,
+            agent_id: "persona-single".to_string(),
+            route: convo::ReplyRoute {
+                bot_id: "wire-single".to_string(),
+                chat_id: chat_id.to_string(),
+            },
+            entry: convo::Entry::GroupElected,
+            requester: "member-4".to_string(),
+            channel: OriginChannel::TelegramGroup,
+        };
+        let composer = FixedComposer;
+        for key in keys {
+            let request_id = collective_request_id(chat_id, "wire-single", key);
+            convo::run_conversation_turn(
+                &workgraph_dir,
+                &single,
+                words,
+                &request_id,
+                timing,
+                Some(&composer),
+                &sink,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Discussion takes plus synthesis each receive a logical sub-key.
+        let voices = ["wire-discuss-1", "wire-discuss-2", "wire-discuss-3"]
+            .into_iter()
+            .map(|bot_id| discussion::DiscussionVoice {
+                bot_id: bot_id.to_string(),
+                display_name: format!("Voice {bot_id}"),
+                agent_id: format!("persona-{bot_id}"),
+                session_ref: format!("session-{bot_id}"),
+            })
+            .collect::<Vec<_>>();
+        let family_roster = FamilyVoiceRoster::from_names(
+            voices.iter().map(|voice| voice.display_name.as_str()),
+            ["Household Member"],
+        );
+        let discuss_timing = discussion::DiscussionTiming {
+            per_voice: Duration::from_secs(2),
+            overall: Duration::from_secs(10),
+        };
+        for key in keys {
+            discussion::run_discussion_round(
+                &workgraph_dir,
+                words,
+                &voices,
+                "wire-discuss-3",
+                &composer,
+                &family_roster,
+                &sink,
+                chat_id,
+                key,
+                discuss_timing,
+            )
+            .await
+            .unwrap();
+        }
+
+        let sends = sink.sends.lock().unwrap();
+        let count = |bot_id: &str| {
+            sends
+                .iter()
+                .filter(|(actual, _, _)| actual == bot_id)
+                .count()
+        };
+        for bot_id in [
+            "wire-fallback",
+            "wire-sessionless",
+            "wire-legacy",
+            "wire-single",
+        ] {
+            assert_eq!(
+                count(bot_id),
+                2,
+                "{bot_id}: first and later occurrences send; refire does not",
+            );
+        }
+        assert_eq!(count("wire-discuss-1"), 2);
+        assert_eq!(count("wire-discuss-2"), 2);
+        assert_eq!(
+            count("wire-discuss-3"),
+            4,
+            "the configured synthesizer sends one take and one synthesis per distinct occurrence",
+        );
+    }
+
+    #[test]
+    fn web_inbound_request_id_distinguishes_identical_later_turns() {
+        let chat = "-100777";
+        let voice = "voice-3";
+        let words = "please help with the weekend";
+        let first_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"));
+        let refire_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"));
+        let later_key = web_physical_turn_key(chat, words, Some("opaque-turn-b9"));
+
+        let first = web_inbound_request_id(chat, voice, &first_key);
+        let refire = web_inbound_request_id(chat, voice, &refire_key);
+        let later = web_inbound_request_id(chat, voice, &later_key);
+        assert_eq!(
+            first, refire,
+            "the same explicit turn id must remain stable on dispatcher refire",
+        );
+        assert_ne!(
+            first, later,
+            "different occurrence ids must admit later identical words",
+        );
+
+        // Missing WG_TURN_ID retains the legacy trimmed-body fallback for an
+        // older gateway, including its original refire behavior.
+        let fallback = web_physical_turn_key(chat, words, None);
+        assert_eq!(
+            fallback,
+            web_physical_turn_key(chat, "  please help with the weekend  ", None),
+        );
+        assert_ne!(
+            fallback,
+            web_physical_turn_key(chat, "a different legacy message", None),
+        );
+        assert_ne!(first, web_inbound_request_id("-100888", voice, &first_key),);
+        assert_ne!(first, web_inbound_request_id(chat, "voice-8", &first_key),);
+        assert!(
+            first.starts_with("web-request-b3-v1-"),
+            "unexpected id shape: {first}",
+        );
     }
 
     #[test]
@@ -7509,7 +10265,10 @@ mod tests {
         let (bot_id, bot, chat) = resolve_send_bot(&config, None, None).unwrap();
         assert_eq!(bot_id, "nora");
         assert_eq!(bot.bot_token, "111:AAA", "must not slice an empty token");
-        assert!(!bot.bot_token.is_empty(), "empty token would yield a 404 URL");
+        assert!(
+            !bot.bot_token.is_empty(),
+            "empty token would yield a 404 URL"
+        );
         assert_eq!(chat, "1001", "defaults to the resolved bot's own chat");
     }
 
@@ -7584,7 +10343,9 @@ mod tests {
             chat_id: String::new(),
             bots: HashMap::new(),
         };
-        let err = resolve_send_bot(&config, None, None).unwrap_err().to_string();
+        let err = resolve_send_bot(&config, None, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("No Telegram bots configured"), "got: {err}");
     }
 
@@ -7690,7 +10451,10 @@ mod tests {
             "a persona-named send with no matching bot must hard-fail, not fall back to bruno"
         );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("otto"), "error must name the missing persona: {err}");
+        assert!(
+            err.contains("otto"),
+            "error must name the missing persona: {err}"
+        );
         assert!(
             !err.contains("BRUNO"),
             "error must never leak/return bruno's token as a fallback: {err}"
@@ -7947,7 +10711,13 @@ mod tests {
         // benign NotParkedReply — NOT a security Rejected — carrying the persona
         // DISPLAY NAME ("Otto"), never the raw agent id/hash. That name is what
         // the listener logs, so tailing the log never reads as a refusal.
-        match route_inbound_reply(dir, "telegram:otto", "luca-1", Some("luca-1"), "otto, are you there?") {
+        match route_inbound_reply(
+            dir,
+            "telegram:otto",
+            "luca-1",
+            Some("luca-1"),
+            "otto, are you there?",
+        ) {
             InboundReplyOutcome::NotParkedReply { persona } => {
                 assert_eq!(persona, "Otto", "logs the persona display name, not a hash");
                 let line = fallthrough_log_line(&persona);
@@ -7974,6 +10744,152 @@ mod tests {
         );
     }
 
+    // --- final family-reply delivery seam -----------------------------------
+
+    #[derive(Default)]
+    struct ExactReplySink {
+        sends: std::sync::Mutex<Vec<(String, String, String)>>,
+        edits: std::sync::Mutex<Vec<(String, String, String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl worksgood::notify::telegram_conversation::ReplySink for ExactReplySink {
+        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
+            self.sends.lock().unwrap().push((
+                bot_id.to_string(),
+                chat_id.to_string(),
+                text.to_string(),
+            ));
+            Ok(Some("message-1".to_string()))
+        }
+
+        async fn edit(
+            &self,
+            bot_id: &str,
+            chat_id: &str,
+            message_id: &str,
+            text: &str,
+        ) -> Result<()> {
+            self.edits.lock().unwrap().push((
+                bot_id.to_string(),
+                chat_id.to_string(),
+                message_id.to_string(),
+                text.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn opaque_delivery(feed: &Path) -> FamilyReplyDelivery {
+        use worksgood::notify::telegram_standup::HouseholdPersona;
+
+        let mut config = TelegramConfig::default();
+        config.bots.insert(
+            "harbor".to_string(),
+            TelegramBotConfig {
+                bot_token: "stub-token".to_string(),
+                chat_id: "group-chat".to_string(),
+                agent_id: Some("harbor".to_string()),
+                username: Some("harbor_stub".to_string()),
+            },
+        );
+        FamilyReplyDelivery::from_parts(
+            feed.to_path_buf(),
+            config,
+            casa_feed::PersonaCatalog::from_personas(vec![HouseholdPersona {
+                id: "harbor".to_string(),
+                display_name: "Harbor Voice".to_string(),
+                emoji: "🌊".to_string(),
+            }]),
+            worksgood::notify::grounding::FamilyVoiceRoster::from_names(
+                ["harbor", "Harbor Voice"],
+                ["Household Member"],
+            ),
+        )
+    }
+
+    #[test]
+    fn group_delivery_guards_and_mirrors_exact_sent_bytes_while_private_stays_private() {
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let delivery = opaque_delivery(&feed);
+        let group_transport = ExactReplySink::default();
+        let group = delivery.wrap(group_transport, ReplyScope::Group, GuardPolicy::Enforce);
+        let raw = "**Harbor Voice** 💬 **Dinner is ready.** \
+                   That lives over in the pipeline. **Service:** dispatcher healthy — 2 agents.";
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(group.send("harbor", "group-chat", raw))
+            .unwrap();
+
+        let sent = group.inner.sends.lock().unwrap();
+        assert_eq!(sent.len(), 1, "one confirmed group send");
+        assert_eq!(
+            sent[0].2, "Dinner is ready.",
+            "the engine guard owns final bytes"
+        );
+        let lines = feed_lines(&feed);
+        assert_eq!(
+            lines.len(),
+            1,
+            "one confirmed group send produces one feed line"
+        );
+        let entry: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            entry["text"].as_str().unwrap(),
+            sent[0].2,
+            "Telegram and the feed receive byte-identical guarded text"
+        );
+        assert_eq!(entry["sender"], "Harbor Voice");
+        assert_eq!(entry["emoji"], "🌊");
+        drop(sent);
+
+        let private_transport = ExactReplySink::default();
+        let private = delivery.wrap(private_transport, ReplyScope::Private, GuardPolicy::Enforce);
+        rt.block_on(private.send("harbor", "private-chat", "A private answer."))
+            .unwrap();
+        assert_eq!(private.inner.sends.lock().unwrap().len(), 1);
+        assert_eq!(
+            feed_lines(&feed).len(),
+            1,
+            "a private delivery appends no shared-feed line"
+        );
+    }
+
+    #[test]
+    fn composed_ack_edit_mirrors_only_the_final_answer_once() {
+        use worksgood::notify::telegram_conversation as convo;
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let delivery = opaque_delivery(&feed);
+        let sink = delivery.wrap(
+            ExactReplySink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(sink.send("harbor", "group-chat", &convo::ack_line()))
+            .unwrap();
+        assert!(
+            !feed.exists() || feed_lines(&feed).is_empty(),
+            "the transient acknowledgement is never a feed line"
+        );
+        rt.block_on(sink.edit("harbor", "group-chat", "message-1", "Dinner is ready."))
+            .unwrap();
+
+        assert_eq!(sink.inner.sends.lock().unwrap().len(), 1);
+        assert_eq!(sink.inner.edits.lock().unwrap().len(), 1);
+        let lines = feed_lines(&feed);
+        assert_eq!(lines.len(), 1, "the final edit mirrors exactly once");
+        let entry: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(entry["text"], "Dinner is ready.");
+    }
+
     // --- lifecycle cross-surface delivery (lifecycle-messages-obey) --------
     //
     // The one-path writer: a lifecycle report-back must reach BOTH surfaces the
@@ -7991,7 +10907,13 @@ mod tests {
         LifecycleFire {
             task_id: "tweak-the-week".to_string(),
             event,
-            origin: TaskOrigin::new(channel, "-100999", "Luca", "nora", Some("nora".to_string())),
+            origin: TaskOrigin::new(
+                channel,
+                "opaque-chat",
+                "Household Member",
+                "harbor",
+                Some("harbor".to_string()),
+            ),
             text: text.to_string(),
         }
     }
@@ -8036,29 +10958,33 @@ mod tests {
     fn lifecycle_group_report_back_lands_in_feed_and_telegram_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
-        let config = TelegramConfig::default();
+        let delivery = opaque_delivery(&feed);
         let sink = RecordingSink::default();
         let fire = lc_fire(
             OriginChannel::TelegramGroup,
             LifecycleEvent::Started,
-            "Nora is on it 🍳",
+            "Dinner is underway.",
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
+        rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
             .unwrap();
 
         // Telegram: exactly one send.
-        assert_eq!(sink.sends.lock().unwrap().len(), 1, "exactly one telegram send");
+        assert_eq!(
+            sink.sends.lock().unwrap().len(),
+            1,
+            "exactly one telegram send"
+        );
         // Pane feed: exactly one `agent` line carrying the report-back.
         let lines = feed_lines(&feed);
         assert_eq!(lines.len(), 1, "exactly one feed line, got {lines:?}");
         let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(v["kind"], "agent", "{v}");
-        assert_eq!(v["agentId"], "nora", "{v}");
+        assert_eq!(v["agentId"], "harbor", "{v}");
         assert!(
-            v["text"].as_str().unwrap().contains("is on it"),
-            "the ledger carries the 'is on it' report-back: {v}"
+            v["text"].as_str().unwrap().contains("underway"),
+            "the ledger carries the guarded report-back: {v}"
         );
     }
 
@@ -8068,7 +10994,7 @@ mod tests {
         // written into the shared group-feed the pane renders (docs/15 privacy).
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
-        let config = TelegramConfig::default();
+        let delivery = opaque_delivery(&feed);
         let sink = RecordingSink::default();
         let fire = lc_fire(
             OriginChannel::TelegramDirect,
@@ -8077,10 +11003,14 @@ mod tests {
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
+        rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
             .unwrap();
 
-        assert_eq!(sink.sends.lock().unwrap().len(), 1, "the 1:1 DM is still sent");
+        assert_eq!(
+            sink.sends.lock().unwrap().len(),
+            1,
+            "the 1:1 DM is still sent"
+        );
         assert!(
             !feed.exists() || feed_lines(&feed).is_empty(),
             "a 1:1 DM report-back must not touch the shared group feed"
@@ -8091,16 +11021,16 @@ mod tests {
     fn lifecycle_send_retries_once_then_succeeds_and_still_mirrors() {
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
-        let config = TelegramConfig::default();
+        let delivery = opaque_delivery(&feed);
         let sink = FlakySink::new(1); // first attempt fails, retry succeeds
         let fire = lc_fire(
             OriginChannel::TelegramGroup,
             LifecycleEvent::Started,
-            "Nora is on it 🍳",
+            "Dinner is underway.",
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
+        rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
             .unwrap();
 
         assert_eq!(
@@ -8121,18 +11051,21 @@ mod tests {
         // undelivered line must NOT appear in the pane (no phantom "Done!").
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
-        let config = TelegramConfig::default();
+        let delivery = opaque_delivery(&feed);
         let sink = FlakySink::new(2);
         let fire = lc_fire(
             OriginChannel::TelegramGroup,
             LifecycleEvent::Started,
-            "Nora is on it 🍳",
+            "Dinner is underway.",
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let res = rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire));
+        let res = rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire));
 
-        assert!(res.is_err(), "two failures surface an error for the caller to re-arm");
+        assert!(
+            res.is_err(),
+            "two failures surface an error for the caller to re-arm"
+        );
         assert_eq!(
             sink.attempts.lock().unwrap().len(),
             2,
@@ -8144,42 +11077,327 @@ mod tests {
         );
     }
 
-    // ── Daily-digest flush delivery (task re-arm-the) ──────────────────────
-    //
-    // The morning digest must reach Telegram AND land in the canonical ledger
-    // the pane reads — the same one-path contract lifecycle report-backs obey
-    // (lifecycle-messages-obey). These exercise `deliver_digest_fire` directly,
-    // mirroring the lifecycle delivery tests above.
+    #[test]
+    fn pretransport_partial_state_save_reconciles_before_tick() {
+        use worksgood::notify::daily_digest::{DigestPolicy, DigestStore};
+        use worksgood::notify::lifecycle::{self, FailureShape, LifecycleInput};
+        use worksgood::notify::reminder::FiredLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = FiredLog::path(dir.path());
+        let store_path = DigestStore::path(dir.path());
+        let blocked_store_path = dir.path().join(".casa").join("blocked-pretransport");
+        let now = parse_naive_now("2026-07-24T19:30").unwrap();
+        let input = LifecycleInput {
+            task_id: "entry-lamp-check".to_string(),
+            origin: TaskOrigin::new(
+                OriginChannel::TelegramDirect,
+                "private-origin",
+                "Household Member",
+                "harbor",
+                Some("harbor".to_string()),
+            ),
+            event: LifecycleEvent::Started,
+            workers: vec!["configured-worker".to_string()],
+            summary: None,
+            failure: FailureShape::Dropped,
+            what: "check the entry lamp".to_string(),
+        };
+        let policy = DigestPolicy::default();
+        let lifecycle_id = lifecycle::notification_id(&input.task_id, input.event);
+        let mut log = FiredLog::default();
+        let mut store = DigestStore::default();
+        let first = lifecycle::lifecycle_tick(
+            std::slice::from_ref(&input),
+            &mut log,
+            &mut store,
+            now,
+            &policy,
+        );
+        assert_eq!(first.fired.len(), 1);
+
+        std::fs::create_dir_all(&blocked_store_path).unwrap();
+        let failure = persist_lifecycle_state_before_transport(
+            &first,
+            &log,
+            &log_path,
+            &store,
+            &blocked_store_path,
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("failed to persist pacing state"),
+            "the injected second-file failure must be surfaced: {failure:#}",
+        );
+        assert!(
+            FiredLog::load(&log_path).contains(&lifecycle_id),
+            "the first state file was durably written before the injected failure",
+        );
+        assert_eq!(
+            load_lifecycle_rearm_journal(&lifecycle_rearm_path(&log_path))
+                .unwrap()
+                .entries
+                .len(),
+            1,
+        );
+        assert!(
+            lifecycle_reconciliation_needs_tick(&log_path),
+            "the listener gate must wake even though the stale FiredLog suppresses the turn",
+        );
+        std::fs::remove_dir(&blocked_store_path).unwrap();
+
+        let mut reloaded_log = FiredLog::load(&log_path);
+        let mut reloaded_store = DigestStore::load(&store_path);
+        reconcile_lifecycle_rearms(
+            &log_path,
+            &store_path,
+            &mut reloaded_log,
+            &mut reloaded_store,
+        )
+        .unwrap();
+        assert!(
+            !lifecycle_reconciliation_needs_tick(&log_path),
+            "a fully reconciled empty journal lets idle listener ticks stay quiet",
+        );
+        let retry = lifecycle::lifecycle_tick(
+            &[input],
+            &mut reloaded_log,
+            &mut reloaded_store,
+            now,
+            &policy,
+        );
+        assert_eq!(
+            retry.fired.len(),
+            1,
+            "startup reconciliation must restore the unsent exact id",
+        );
+    }
 
     #[test]
-    fn digest_delivers_to_telegram_and_mirrors_to_ledger() {
+    fn failed_delivery_rearm_survives_partial_state_save() {
+        use worksgood::notify::daily_digest::{DigestPolicy, DigestStore};
+        use worksgood::notify::lifecycle::{self, FailureShape, LifecycleInput};
+        use worksgood::notify::reminder::FiredLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = FiredLog::path(dir.path());
+        let store_path = DigestStore::path(dir.path());
+        let feed = casa_feed::feed_path_for(dir.path());
+        let delivery = opaque_delivery(&feed);
+        let now = parse_naive_now("2026-07-24T19:30").unwrap();
+        let input = LifecycleInput {
+            task_id: "stalled-porch-light".to_string(),
+            origin: TaskOrigin::new(
+                OriginChannel::TelegramDirect,
+                "private-origin",
+                "Household Member",
+                "harbor",
+                Some("harbor".to_string()),
+            ),
+            event: LifecycleEvent::Failed,
+            workers: vec!["configured-worker".to_string()],
+            summary: None,
+            failure: FailureShape::Final,
+            what: "replace the porch light".to_string(),
+        };
+        let policy = DigestPolicy::default();
+        let lifecycle_id = lifecycle::notification_id(&input.task_id, LifecycleEvent::Failed);
+        let alert_id = lifecycle::alert_notification_id(&input.task_id);
+
+        let mut log = FiredLog::default();
+        let mut store = DigestStore::default();
+        let first = lifecycle::lifecycle_tick(
+            std::slice::from_ref(&input),
+            &mut log,
+            &mut store,
+            now,
+            &policy,
+        );
+        assert_eq!(first.fired.len(), 1);
+        assert_eq!(first.operator_alerts.len(), 1);
+        assert!(log.contains(&lifecycle_id));
+        assert!(log.contains(&alert_id));
+        persist_lifecycle_state_before_transport(&first, &log, &log_path, &store, &store_path)
+            .unwrap();
+
+        let mut bots = HashMap::new();
+        bots.insert(
+            "owner-wire".to_string(),
+            TelegramBotConfig {
+                bot_token: "500:EEE".to_string(),
+                chat_id: "7005".to_string(),
+                agent_id: Some("configured-owner".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: "600:FFF".to_string(),
+            chat_id: "7006".to_string(),
+            bots,
+        };
+        // Operator alert fails once, then both family-send attempts fail.
+        let failing_sink = FlakySink::new(3);
+        let blocked_store_path = dir.path().join(".casa").join("blocked-store");
+        std::fs::create_dir(&blocked_store_path).unwrap();
+        let failure = deliver_lifecycle_tick_result(
+            &failing_sink,
+            &delivery,
+            &config,
+            Some("configured-owner"),
+            &first,
+            &mut log,
+            &log_path,
+            &mut store,
+            &blocked_store_path,
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("failed to persist re-armed lifecycle pacing state"),
+            "the injected second-file failure must be surfaced: {failure:#}",
+        );
+        assert_eq!(
+            failing_sink.attempts.lock().unwrap().len(),
+            3,
+            "one owner-alert attempt plus two family-delivery attempts",
+        );
+        let journal_path = lifecycle_rearm_path(&log_path);
+        assert_eq!(
+            load_lifecycle_rearm_journal(&journal_path)
+                .unwrap()
+                .entries
+                .len(),
+            2,
+            "both exact undelivered ids remain in the reconciliation record",
+        );
+        std::fs::remove_dir(&blocked_store_path).unwrap();
+
+        // Reload from disk, as the next scheduler process would. The first state
+        // file saved its re-arm, but the second still contains the pacing
+        // suppressor. Startup must reconcile BOTH before computing the tick.
+        let mut reloaded_log = FiredLog::load(&log_path);
+        let mut reloaded_store = DigestStore::load(&store_path);
+        let mut unreconciled_log = reloaded_log.clone();
+        let mut unreconciled_store = reloaded_store.clone();
+        let suppressed = lifecycle::lifecycle_tick(
+            std::slice::from_ref(&input),
+            &mut unreconciled_log,
+            &mut unreconciled_store,
+            now,
+            &policy,
+        );
+        assert!(
+            suppressed.fired.is_empty(),
+            "the stale pacing file really would suppress the family retry",
+        );
+        assert_eq!(
+            reconcile_lifecycle_rearms(
+                &log_path,
+                &store_path,
+                &mut reloaded_log,
+                &mut reloaded_store,
+            )
+            .unwrap(),
+            2,
+        );
+        assert!(
+            load_lifecycle_rearm_journal(&journal_path)
+                .unwrap()
+                .entries
+                .is_empty(),
+            "the record clears only after both reconciled files save",
+        );
+        assert!(!reloaded_log.contains(&lifecycle_id));
+        assert!(!reloaded_log.contains(&alert_id));
+        let second = lifecycle::lifecycle_tick(
+            std::slice::from_ref(&input),
+            &mut reloaded_log,
+            &mut reloaded_store,
+            now,
+            &policy,
+        );
+        assert_eq!(
+            second.fired.len(),
+            1,
+            "the next tick retries the failed family report-back",
+        );
+        assert_eq!(
+            second.operator_alerts.len(),
+            1,
+            "the next tick retries the failed private owner alert",
+        );
+
+        // A confirmed second-tick delivery becomes durable exactly once again.
+        persist_lifecycle_state_before_transport(
+            &second,
+            &reloaded_log,
+            &log_path,
+            &reloaded_store,
+            &store_path,
+        )
+        .unwrap();
+        let succeeding_sink = RecordingSink::default();
+        let delivered = deliver_lifecycle_tick_result(
+            &succeeding_sink,
+            &delivery,
+            &config,
+            Some("configured-owner"),
+            &second,
+            &mut reloaded_log,
+            &log_path,
+            &mut reloaded_store,
+            &store_path,
+        )
+        .unwrap();
+        assert_eq!(delivered.sent, 1);
+        assert_eq!(delivered.alerted, 1);
+        assert_eq!(delivered.rearmed, 0);
+        assert_eq!(succeeding_sink.sends.lock().unwrap().len(), 2);
+
+        let mut final_log = FiredLog::load(&log_path);
+        let mut final_store = DigestStore::load(&store_path);
+        let third =
+            lifecycle::lifecycle_tick(&[input], &mut final_log, &mut final_store, now, &policy);
+        assert!(third.fired.is_empty());
+        assert!(third.operator_alerts.is_empty());
+    }
+
+    // ── Daily-digest flush delivery (task re-arm-the) ──────────────────────
+    //
+    // A morning digest is a private 1:1 delivery. It uses the same guard/retry
+    // seam as lifecycle report-backs but must never enter the shared group feed.
+
+    #[test]
+    fn digest_delivers_privately_without_touching_the_group_feed() {
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
-        let config = TelegramConfig::default();
+        let delivery = opaque_delivery(&feed);
         let sink = RecordingSink::default();
         let text = "Today: PT check-in at 19:30 · how was last night's salmon?";
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(deliver_digest_fire(
-            &sink, &config, &feed, "otto", "-100777", text,
+            &sink,
+            &delivery,
+            "harbor",
+            "private-chat",
+            text,
         ))
         .unwrap();
 
         // Telegram: exactly one send, to the resolved chat.
         let sends = sink.sends.lock().unwrap();
         assert_eq!(sends.len(), 1, "exactly one digest telegram send");
-        assert_eq!(sends[0].1, "-100777", "sent to the resolved chat");
+        assert_eq!(sends[0].1, "private-chat", "sent to the resolved chat");
         assert_eq!(sends[0].2, text, "the composed digest is what goes out");
         drop(sends);
 
-        // Ledger: exactly one `agent` line carrying the digest text.
-        let lines = feed_lines(&feed);
-        assert_eq!(lines.len(), 1, "exactly one feed line, got {lines:?}");
-        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(v["kind"], "agent", "{v}");
         assert!(
-            v["text"].as_str().unwrap().contains("PT check-in"),
-            "the ledger carries the morning digest: {v}"
+            !feed.exists() || feed_lines(&feed).is_empty(),
+            "a private digest must not appear in the shared group feed"
         );
     }
 
@@ -8190,15 +11408,22 @@ mod tests {
         // in the pane for a message that never reached the human).
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
-        let config = TelegramConfig::default();
+        let delivery = opaque_delivery(&feed);
         let sink = FlakySink::new(2);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let res = rt.block_on(deliver_digest_fire(
-            &sink, &config, &feed, "otto", "-100777", "Today: something",
+            &sink,
+            &delivery,
+            "harbor",
+            "private-chat",
+            "Today: something",
         ));
 
-        assert!(res.is_err(), "two failures surface an error so the queue is kept");
+        assert!(
+            res.is_err(),
+            "two failures surface an error so the queue is kept"
+        );
         assert_eq!(
             sink.attempts.lock().unwrap().len(),
             2,
