@@ -1851,11 +1851,23 @@ fn emit_operator_alert_with_sender<F>(
     let policy = DigestPolicy::new();
     let now = chrono::Local::now().naive_local();
     let nudge = spawn_breaker::operator_alert_nudge("operator", episode, now, text);
+    let mut failed_delivery_rearmed = false;
 
     match store.offer(&nudge, now, &policy) {
         Offer::SendNow(body) => match send(tg_config, &chat_id, &body) {
             Ok(()) => logger.info("operator alert DM sent (time-critical)"),
-            Err(e) => logger.warn(&format!("operator alert: {e}")),
+            Err(e) => {
+                logger.warn(&format!("operator alert: {e}"));
+                if store.rearm_standalone_proactive(&nudge) {
+                    failed_delivery_rearmed = true;
+                    logger.info("operator alert re-armed after unconfirmed delivery");
+                } else {
+                    logger.error(
+                        "operator alert: failed delivery could not be safely re-armed; \
+                         next attempt may be suppressed",
+                    );
+                }
+            }
         },
         Offer::Queued { overflow } => logger.info(&format!(
             "operator alert folded into the next digest (overflow={overflow})"
@@ -1864,7 +1876,15 @@ fn emit_operator_alert_with_sender<F>(
     }
 
     if let Err(e) = store.save(&digest_path) {
-        logger.warn(&format!("operator alert: failed to persist digest store: {}", e));
+        if failed_delivery_rearmed {
+            logger.error(&format!(
+                "operator alert: failed to persist re-armed delivery: {}; \
+                 next attempt may be suppressed",
+                e
+            ));
+        } else {
+            logger.warn(&format!("operator alert: failed to persist digest store: {}", e));
+        }
     }
 }
 
@@ -5218,6 +5238,80 @@ chat_id = "-100900001"
         let warnings = tail_log(&wg_dir, 20, Some("WARN")).join("\n");
         assert!(warnings.contains("Private diagnostic detail."));
         assert!(warnings.contains("no private Telegram chat configured"));
+    }
+
+    #[test]
+    fn failed_operator_alert_retries_after_reload() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        fs::create_dir_all(&wg_dir).unwrap();
+        fs::write(
+            wg_dir.join("notify.toml"),
+            r#"
+[telegram]
+bot_token = "900002:opaque-fixture-token"
+chat_id = "900002"
+"#,
+        )
+        .unwrap();
+        let logger = DaemonLogger::open(&wg_dir).unwrap();
+        let attempts = Cell::new(0_u32);
+
+        emit_operator_alert_with_sender(
+            &wg_dir,
+            &logger,
+            "opaque-retry",
+            "Private retry detail.",
+            |_config, chat_id, _body| {
+                assert_eq!(chat_id, "900002");
+                attempts.set(attempts.get() + 1);
+                Err("fixture transport refused".to_string())
+            },
+        );
+        assert_eq!(attempts.get(), 1);
+        let digest_path = worksgood::notify::daily_digest::DigestStore::path(tmp.path());
+        let after_failure = worksgood::notify::daily_digest::DigestStore::load(&digest_path);
+        assert_eq!(
+            after_failure.state("operator").unwrap().standalone_sent(),
+            0,
+            "the failed attempt's proactive cap slot is refunded on disk"
+        );
+
+        emit_operator_alert_with_sender(
+            &wg_dir,
+            &logger,
+            "opaque-retry",
+            "Private retry detail.",
+            |_config, _chat_id, _body| {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(attempts.get(), 2, "a reloaded next tick retries once");
+        let after_success = worksgood::notify::daily_digest::DigestStore::load(&digest_path);
+        assert_eq!(
+            after_success.state("operator").unwrap().standalone_sent(),
+            1,
+            "the confirmed retry spends one proactive cap slot"
+        );
+
+        emit_operator_alert_with_sender(
+            &wg_dir,
+            &logger,
+            "opaque-retry",
+            "Private retry detail.",
+            |_config, _chat_id, _body| {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            attempts.get(),
+            2,
+            "a second reload sees the confirmed episode as a duplicate"
+        );
+        let final_store = worksgood::notify::daily_digest::DigestStore::load(&digest_path);
+        assert_eq!(final_store.state("operator").unwrap().standalone_sent(), 1);
     }
 
     /// Build a service-paused ProviderHealth on disk (mirrors what triage does

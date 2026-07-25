@@ -422,6 +422,34 @@ impl DigestStore {
         state.seen.len() != before
     }
 
+    /// Forget one standalone proactive pacing decision after its transport was
+    /// not confirmed, allowing the next scheduler tick to offer it again.
+    ///
+    /// This is deliberately narrower than a general rollback: only a
+    /// time-critical [`NudgeKind::Proactive`] item that is still present in the
+    /// `seen` set, absent from the pending digest, and has a cap slot to refund
+    /// can be re-armed. It removes one matching id and refunds one slot. Queued
+    /// digests, lifecycle replies, reminders, and unrelated ids are untouched.
+    pub fn rearm_standalone_proactive(&mut self, nudge: &Nudge) -> bool {
+        if nudge.kind != NudgeKind::Proactive || nudge.urgency != Urgency::TimeCritical {
+            return false;
+        }
+        let Some(state) = self.people.get_mut(&nudge.recipient) else {
+            return false;
+        };
+        if state.pending.iter().any(|item| item.id == nudge.id)
+            || state.standalone_sent == 0
+        {
+            return false;
+        }
+        let Some(seen_index) = state.seen.iter().position(|id| id == &nudge.id) else {
+            return false;
+        };
+        state.seen.remove(seen_index);
+        state.standalone_sent -= 1;
+        true
+    }
+
     /// Offer one nudge to the pacing layer at `now`.
     ///
     /// * Not yet due → [`Offer::Pending`] (nothing recorded).
@@ -823,6 +851,115 @@ mod tests {
         assert!(matches!(store.offer(&n, dt(2026, 7, 13, 9, 0), &policy), Offer::SendNow(_)));
         assert_eq!(store.offer(&n, dt(2026, 7, 13, 9, 1), &policy), Offer::Duplicate);
         assert_eq!(store.state("Luca").unwrap().standalone_sent(), 1, "no double count");
+    }
+
+    #[test]
+    fn rearm_standalone_proactive_refunds_exactly_one_cap_slot() {
+        let mut store = DigestStore::default();
+        let policy = DigestPolicy::new();
+        let now = dt(2026, 7, 13, 9, 0);
+        let failed = Nudge::time_critical(
+            "proactive:opaque-failed",
+            "opaque-recipient",
+            NudgeKind::Proactive,
+            now,
+            "Private detail.",
+        );
+        let confirmed = Nudge::time_critical(
+            "proactive:opaque-confirmed",
+            "opaque-recipient",
+            NudgeKind::Proactive,
+            now,
+            "Another private detail.",
+        );
+
+        assert!(matches!(
+            store.offer(&failed, now, &policy),
+            Offer::SendNow(_)
+        ));
+        assert!(matches!(
+            store.offer(&confirmed, now, &policy),
+            Offer::SendNow(_)
+        ));
+        assert_eq!(
+            store.state("opaque-recipient").unwrap().standalone_sent(),
+            2
+        );
+
+        assert!(store.rearm_standalone_proactive(&failed));
+        assert_eq!(
+            store.state("opaque-recipient").unwrap().standalone_sent(),
+            1,
+            "exactly the failed send's cap slot is refunded"
+        );
+        assert!(
+            !store.rearm_standalone_proactive(&failed),
+            "one failed transport can only refund once"
+        );
+        assert_eq!(
+            store.offer(&confirmed, now, &policy),
+            Offer::Duplicate,
+            "the unrelated confirmed send stays seen"
+        );
+        assert!(matches!(
+            store.offer(&failed, now, &policy),
+            Offer::SendNow(_)
+        ));
+        assert_eq!(
+            store.state("opaque-recipient").unwrap().standalone_sent(),
+            2
+        );
+    }
+
+    #[test]
+    fn rearm_standalone_proactive_never_replays_a_queued_digest() {
+        let policy = DigestPolicy::new().with_override(
+            "opaque-recipient",
+            PersonOverride {
+                standalone_cap: Some(0),
+                ..Default::default()
+            },
+        );
+        let mut store = DigestStore::default();
+        let now = dt(2026, 7, 13, 9, 0);
+        let queued = Nudge::time_critical(
+            "proactive:opaque-queued",
+            "opaque-recipient",
+            NudgeKind::Proactive,
+            now,
+            "Held private detail.",
+        );
+
+        assert_eq!(
+            store.offer(&queued, now, &policy),
+            Offer::Queued { overflow: true }
+        );
+        assert!(!store.rearm_standalone_proactive(&queued));
+        assert_eq!(store.offer(&queued, now, &policy), Offer::Duplicate);
+        let state = store.state("opaque-recipient").unwrap();
+        assert_eq!(state.standalone_sent(), 0);
+        assert_eq!(state.pending().len(), 1);
+        assert_eq!(state.pending()[0].id, queued.id);
+
+        let other_kind = Nudge::time_critical(
+            "reminder:opaque-confirmed",
+            "other-recipient",
+            NudgeKind::Reminder,
+            now,
+            "Confirmed reminder.",
+        );
+        assert!(matches!(
+            store.offer(&other_kind, now, &DigestPolicy::new()),
+            Offer::SendNow(_)
+        ));
+        assert!(
+            !store.rearm_standalone_proactive(&other_kind),
+            "the rollback seam must not widen to other proactive senders"
+        );
+        assert_eq!(
+            store.offer(&other_kind, now, &DigestPolicy::new()),
+            Offer::Duplicate
+        );
     }
 
     #[test]
