@@ -2569,3 +2569,13 @@ owners = [
 ]
 description = "Regression (lifecycle-voice-honesty, Luca 2026-07-24): three rapid pizza messages minted three tasks, dedupe abandoned two as duplicates, and each abandon reached the family as 'Ran into a snag — I'll take another crack at it' — twice, from two personas, promising a retry no machinery performs, when nothing had failed. Drives the real engine tick through the real `wg telegram lifecycle --dry-run` CLI over a scratch graph built from the live task shapes and pins four rules: a duplicate-abandon produces NO family line at all; a retries-exhausted failure uses the honest final copy AND raises an operator alert so the ask is not a dead end; a failure with a real rescue behind it still keeps the retry promise; a genuinely dropped (non-duplicate) abandon is reported honestly without a retry claim."
 timeout_seconds = 60
+
+[[scenario]]
+name = "tracked_paths_case_unique"
+script = "scenarios/tracked_paths_case_unique.sh"
+owners = [
+    "p2-engine-case-colliding-paths",
+    "smoke-gate-is",
+]
+description = "Prevents a fresh clone on a case-insensitive filesystem from starting dirty or silently replacing one tracked file with another. The real Git index is normalized and checked for duplicate portable path names."
+timeout_seconds = 15
