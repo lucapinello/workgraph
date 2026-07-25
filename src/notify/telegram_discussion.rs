@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::grounding::{self, FamilyVoiceRoster};
-use super::telegram_conversation::{ReplyComposer, ReplySink};
+use super::telegram_conversation::{ReplyComposer, ReplySink, send_reply_once};
 
 /// Hard character cap for a single voice's take, applied after compose as a
 /// safety net (the prompt already asks for one or two sentences). Cut on a word
@@ -220,6 +220,14 @@ fn remaining(overall: Duration, started: Instant) -> Duration {
     overall.checked_sub(started.elapsed()).unwrap_or_default()
 }
 
+fn discussion_delivery_id(physical_turn_key: &str, part: &str, bot_id: &str) -> String {
+    if physical_turn_key.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{physical_turn_key}\u{1f}{part}\u{1f}{bot_id}")
+    }
+}
+
 /// Run a discussion round: sequenced in-voice takes then an optional synthesis,
 /// sending via `sink`.
 ///
@@ -229,6 +237,10 @@ fn remaining(overall: Duration, started: Instant) -> Duration {
 /// *other* voices contributed a take. `timing` bounds each voice and the round
 /// as a whole; a voice that errors or does not answer within its budget is
 /// skipped, never blocking the round and never leaking an error to the group.
+/// `physical_turn_key` is the opaque occurrence key shared by every contribution
+/// in this round. Each take and synthesis derives a distinct durable delivery
+/// claim from it, so replaying one physical turn sends nothing twice while a
+/// later turn containing the same words remains eligible.
 pub async fn run_discussion_round(
     workgraph_dir: &Path,
     topic: &str,
@@ -238,6 +250,7 @@ pub async fn run_discussion_round(
     family_roster: &FamilyVoiceRoster,
     sink: &dyn ReplySink,
     chat_id: &str,
+    physical_turn_key: &str,
     timing: DiscussionTiming,
 ) -> Result<DiscussionOutcome> {
     let started = Instant::now();
@@ -264,16 +277,29 @@ pub async fn run_discussion_round(
         )
         .await;
         match text {
-            Some(text) => match sink.send(&voice.bot_id, chat_id, &text).await {
-                Ok(_) => takes.push(Take {
-                    bot_id: voice.bot_id.clone(),
-                    display_name: voice.display_name.clone(),
-                    text,
-                }),
-                // A send failure is a delivery problem, not an error to surface —
-                // record the skip and keep the round moving.
-                Err(_) => skipped.push(voice.bot_id.clone()),
-            },
+            Some(text) => {
+                let delivery_id =
+                    discussion_delivery_id(physical_turn_key, "take", &voice.bot_id);
+                match send_reply_once(
+                    workgraph_dir,
+                    &delivery_id,
+                    &voice.bot_id,
+                    chat_id,
+                    &text,
+                    sink,
+                )
+                .await
+                {
+                    Ok(_) => takes.push(Take {
+                        bot_id: voice.bot_id.clone(),
+                        display_name: voice.display_name.clone(),
+                        text,
+                    }),
+                    // A send failure is a delivery problem, not an error to surface —
+                    // record the skip and keep the round moving.
+                    Err(_) => skipped.push(voice.bot_id.clone()),
+                }
+            }
             None => skipped.push(voice.bot_id.clone()),
         }
     }
@@ -308,7 +334,19 @@ pub async fn run_discussion_round(
                 )
                 .await
                 {
-                    if sink.send(&voice.bot_id, chat_id, &text).await.is_ok() {
+                    let delivery_id =
+                        discussion_delivery_id(physical_turn_key, "synthesis", &voice.bot_id);
+                    if send_reply_once(
+                        workgraph_dir,
+                        &delivery_id,
+                        &voice.bot_id,
+                        chat_id,
+                        &text,
+                        sink,
+                    )
+                    .await
+                    .is_ok()
+                    {
                         synthesis = Some(text);
                     }
                 }
@@ -458,6 +496,7 @@ mod tests {
             &family_roster(),
             &sink,
             "-100",
+            "",
             generous_timing(),
         )
         .await
@@ -522,6 +561,7 @@ mod tests {
             &family_roster(),
             &sink,
             "-100",
+            "",
             generous_timing(),
         )
         .await
@@ -567,6 +607,7 @@ mod tests {
             &family_roster(),
             &sink,
             "-100",
+            "",
             generous_timing(),
         )
         .await
@@ -605,6 +646,7 @@ mod tests {
             &family_roster(),
             &sink,
             "-100",
+            "",
             generous_timing(),
         )
         .await
@@ -648,6 +690,7 @@ mod tests {
             &family_roster(),
             &sink,
             "-100",
+            "",
             generous_timing(),
         )
         .await

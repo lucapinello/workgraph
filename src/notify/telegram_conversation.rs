@@ -41,7 +41,10 @@
 //! - **No tokens or secrets** are ever logged; the bot token lives only on the
 //!   send channel.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -55,6 +58,7 @@ use crate::notify::grounding;
 use crate::notify::lifecycle;
 use crate::notify::ownership;
 use crate::notify::parity;
+use crate::notify::telegram_dedupe::hash_text;
 
 use super::NotificationChannel;
 use super::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
@@ -533,6 +537,318 @@ pub trait ReplySink: Send + Sync {
         let _ = message_id;
         self.send(bot_id, chat_id, text).await.map(|_| ())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Durable physical-turn delivery guard
+// ---------------------------------------------------------------------------
+
+/// Local state for one logical family-visible reply.
+///
+/// The filesystem claim is the cross-process authority. This state only keeps
+/// one invocation from calling its inner transport twice (for example, if an
+/// acknowledgement send returned no editable message id).
+#[derive(Debug, Clone)]
+enum TurnDeliveryState {
+    Fresh,
+    Owned(Option<String>),
+    Duplicate(Option<String>),
+}
+
+/// A restart-stable, record-before-send guard around one logical reply.
+///
+/// Session outboxes already make successful composed turns idempotent, but
+/// sessionless/onboarding replies, the legacy outbox-poll path, discussion
+/// takes, and compose failures do not all leave an outbox reply. Those paths
+/// therefore share this transport-level guard. The caller supplies an opaque
+/// physical-turn-derived id; bot and chat routing are folded into the claim so
+/// two configured voices never suppress one another.
+struct TurnDeliverySink<'a> {
+    inner: &'a dyn ReplySink,
+    claim_path: Option<PathBuf>,
+    retry_path: Option<PathBuf>,
+    state: Mutex<TurnDeliveryState>,
+}
+
+impl<'a> TurnDeliverySink<'a> {
+    fn new(
+        workgraph_dir: &Path,
+        delivery_id: &str,
+        bot_id: &str,
+        chat_id: &str,
+        inner: &'a dyn ReplySink,
+    ) -> Self {
+        let claim_path = if delivery_id.trim().is_empty() {
+            None
+        } else {
+            let material =
+                format!("telegram-delivery-v1\u{1f}{delivery_id}\u{1f}{bot_id}\u{1f}{chat_id}");
+            // Two independently salted 64-bit hashes keep the filename opaque
+            // and make accidental collisions negligible without persisting
+            // household ids or message text.
+            let first = hash_text(&material);
+            let second = hash_text(&format!("reply\u{1f}{material}"));
+            Some(
+                workgraph_dir
+                    .join("telegram-deliveries")
+                    .join(format!("{first:016x}{second:016x}.sent")),
+            )
+        };
+        let retry_path = claim_path.as_ref().map(|path| path.with_extension("retry"));
+        Self {
+            inner,
+            claim_path,
+            retry_path,
+            state: Mutex::new(TurnDeliveryState::Fresh),
+        }
+    }
+
+    /// A completed or in-flight claim means another invocation owns this
+    /// physical reply. This early check keeps legacy polling/composition from
+    /// running again; the atomic `create_new` in [`claim`] remains the race-safe
+    /// authority when two processes reach this check together.
+    fn already_claimed(&self) -> bool {
+        self.claim_path.as_ref().is_some_and(|path| path.exists())
+    }
+
+    /// A prior transport call failed after the reply bytes were persisted to a
+    /// session outbox. The next attempt should reuse those canonical bytes
+    /// rather than compose and append a second same-request draft.
+    fn has_failed_attempt(&self) -> bool {
+        self.retry_path.as_ref().is_some_and(|path| path.exists())
+    }
+
+    fn failed_edit_message_id(&self) -> Option<String> {
+        let path = self.retry_path.as_ref()?;
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .strip_prefix("edit:")
+            .map(str::trim)
+            .filter(|message_id| !message_id.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Atomically claim this logical reply. The claim is created and synced
+    /// before transport, so a listener restart cannot resend an already-started
+    /// physical turn. A confirmed Telegram message id replaces the empty
+    /// pending marker after send, allowing a racing invocation to preserve the
+    /// acknowledgement/edit shape without sending again.
+    fn claim(&self) -> Result<TurnDeliveryState> {
+        let Some(path) = self.claim_path.as_ref() else {
+            return Ok(TurnDeliveryState::Owned(None));
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create Telegram delivery ledger {}",
+                    parent.display()
+                )
+            })?;
+        }
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                if let Err(error) = file
+                    .write_all(b"pending\n")
+                    .and_then(|_| file.sync_all())
+                {
+                    drop(file);
+                    let _ = std::fs::remove_file(path);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to persist Telegram delivery claim {}",
+                            path.display()
+                        )
+                    });
+                }
+                if let Some(retry_path) = self.retry_path.as_ref() {
+                    let _ = std::fs::remove_file(retry_path);
+                }
+                Ok(TurnDeliveryState::Owned(None))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let message_id = std::fs::read_to_string(path)
+                    .ok()
+                    .map(|body| body.trim().to_string())
+                    .filter(|body| !body.is_empty() && body != "pending");
+                Ok(TurnDeliveryState::Duplicate(message_id))
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to claim Telegram delivery {}", path.display())),
+        }
+    }
+
+    fn persist_message_id(&self, message_id: Option<&str>) {
+        let Some(path) = self.claim_path.as_ref() else {
+            return;
+        };
+        let body = message_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("sent");
+        if let Err(error) = crate::atomic_file::write_atomic(path, format!("{body}\n").as_bytes()) {
+            // The record-before-send claim still prevents a duplicate. Losing
+            // only the transport-local id is safe because a replay exits before
+            // composing; keep the confirmed delivery successful.
+            eprintln!(
+                "[{}] Telegram delivery ledger could not store message id: {error}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+    }
+
+    fn rearm(&self, retry_state: &str) {
+        if let Some(path) = self.claim_path.as_ref()
+            && let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "[{}] Telegram delivery ledger could not re-arm failed send: {error}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+        if let Some(retry_path) = self.retry_path.as_ref()
+            && let Err(error) = crate::atomic_file::write_atomic(
+                retry_path,
+                format!("{retry_state}\n").as_bytes(),
+            )
+        {
+            eprintln!(
+                "[{}] Telegram delivery ledger could not mark failed delivery retryable: {error}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+        *self.state.lock().unwrap() = TurnDeliveryState::Fresh;
+    }
+
+    fn rearm_after_send_failure(&self) {
+        self.rearm("send");
+    }
+
+    fn rearm_after_edit_failure(&self, message_id: &str) {
+        self.rearm(&format!("edit:{message_id}"));
+    }
+
+    fn rearm_incomplete_ack(&self) {
+        let state = self.state.lock().unwrap().clone();
+        match state {
+            TurnDeliveryState::Owned(Some(message_id)) => {
+                self.rearm_after_edit_failure(&message_id);
+            }
+            TurnDeliveryState::Owned(None) => self.rearm_after_send_failure(),
+            TurnDeliveryState::Fresh | TurnDeliveryState::Duplicate(_) => {}
+        }
+    }
+
+    fn duplicate_outcome(plan: &ConversationPlan) -> TurnOutcome {
+        match plan {
+            ConversationPlan::Onboard { .. } => TurnOutcome::Onboarded,
+            ConversationPlan::Sessionless { .. } => TurnOutcome::Sessionless,
+            ConversationPlan::Converse { .. } => TurnOutcome::Replied { acked: false },
+        }
+    }
+}
+
+#[async_trait]
+impl ReplySink for TurnDeliverySink<'_> {
+    async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
+        let state = {
+            let mut state = self.state.lock().unwrap();
+            match &*state {
+                TurnDeliveryState::Fresh => {
+                    let claimed = self.claim()?;
+                    *state = claimed.clone();
+                    claimed
+                }
+                existing => existing.clone(),
+            }
+        };
+
+        match state {
+            TurnDeliveryState::Duplicate(Some(message_id))
+            | TurnDeliveryState::Owned(Some(message_id)) => Ok(Some(message_id)),
+            TurnDeliveryState::Duplicate(None) => Ok(None),
+            TurnDeliveryState::Owned(None) => match self.inner.send(bot_id, chat_id, text).await {
+                Ok(message_id) => {
+                    self.persist_message_id(message_id.as_deref());
+                    *self.state.lock().unwrap() = TurnDeliveryState::Owned(message_id.clone());
+                    Ok(message_id)
+                }
+                Err(error) => {
+                    self.rearm_after_send_failure();
+                    Err(error)
+                }
+            },
+            TurnDeliveryState::Fresh => unreachable!("fresh delivery must be claimed before send"),
+        }
+    }
+
+    async fn edit(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let state = self.state.lock().unwrap().clone();
+        match state {
+            TurnDeliveryState::Duplicate(_) => Ok(()),
+            TurnDeliveryState::Owned(_) => {
+                match self.inner.edit(bot_id, chat_id, message_id, text).await {
+                    Ok(()) => {
+                        self.persist_message_id(Some(message_id));
+                        *self.state.lock().unwrap() =
+                            TurnDeliveryState::Owned(Some(message_id.to_string()));
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.rearm_after_edit_failure(message_id);
+                        Err(error)
+                    }
+                }
+            }
+            TurnDeliveryState::Fresh => {
+                // Defensive: current conversation paths always send before edit.
+                // If a future caller edits directly, claim it with the same
+                // record-before-act discipline.
+                let claimed = self.claim()?;
+                *self.state.lock().unwrap() = claimed.clone();
+                match claimed {
+                    TurnDeliveryState::Duplicate(_) => Ok(()),
+                    TurnDeliveryState::Owned(_) => {
+                        match self.inner.edit(bot_id, chat_id, message_id, text).await {
+                            Ok(()) => {
+                                self.persist_message_id(Some(message_id));
+                                *self.state.lock().unwrap() =
+                                    TurnDeliveryState::Owned(Some(message_id.to_string()));
+                                Ok(())
+                            }
+                            Err(error) => {
+                                self.rearm_after_edit_failure(message_id);
+                                Err(error)
+                            }
+                        }
+                    }
+                    TurnDeliveryState::Fresh => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+/// Send one explicitly identified logical reply at most once across listener
+/// restarts. A later household turn must pass a different `delivery_id`, even
+/// when its words are identical.
+pub async fn send_reply_once(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+    sink: &dyn ReplySink,
+) -> Result<Option<String>> {
+    let guarded = TurnDeliverySink::new(workgraph_dir, delivery_id, bot_id, chat_id, sink);
+    guarded.send(bot_id, chat_id, text).await
 }
 
 /// Production sink: resolves `bot_id` against the config and sends via that
@@ -1096,19 +1412,122 @@ pub async fn run_conversation_turn(
     composer: Option<&dyn ReplyComposer>,
     sink: &dyn ReplySink,
 ) -> Result<TurnOutcome> {
+    let route = plan.route();
+    let durable_sink = TurnDeliverySink::new(
+        workgraph_dir,
+        request_id,
+        &route.bot_id,
+        &route.chat_id,
+        sink,
+    );
+    if durable_sink.already_claimed() {
+        println!(
+            "[{}] conversation delivery already claimed — skipping physical-turn replay",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+        return Ok(TurnDeliverySink::duplicate_outcome(plan));
+    }
+    let retry_persisted_reply = durable_sink.has_failed_attempt();
+    let retry_ack_message_id = durable_sink.failed_edit_message_id();
+    // Backward compatibility for projects upgraded from before the transport
+    // ledger: composed replies used the matching session outbox row itself as
+    // durable proof that the physical request had already been answered. Keep
+    // honoring that proof so an upgrade replay cannot recompose or repeat task,
+    // correction, inbox, or transport side effects. An explicit retry marker
+    // wins: those rows were persisted before a failed delivery and still need
+    // to be sent or edited by the retry path below.
+    if !retry_persisted_reply
+        && composer.is_some()
+        && !request_id.trim().is_empty()
+        && let ConversationPlan::Converse { session_ref, .. } = plan
+        && chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
+            .map(|outbox| {
+                outbox
+                    .iter()
+                    .any(|message| message.request_id == request_id)
+            })
+            .unwrap_or(false)
+    {
+        println!(
+            "[{}] conversation outbox already records this request — skipping upgrade replay",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+        return Ok(TurnDeliverySink::duplicate_outcome(plan));
+    }
+    // Capture the retry poll baseline before checking for an already-persisted
+    // reply. If the original session answers between that check and the resumed
+    // poll, its outbox row is still newer than this baseline and cannot be
+    // missed. Only the legacy path needs this: composed replies are persisted
+    // by this process before their transport attempt.
+    let retry_legacy_baseline = if retry_persisted_reply && composer.is_none() {
+        match plan {
+            ConversationPlan::Converse { session_ref, .. } => {
+                Some(outbox_baseline(workgraph_dir, session_ref))
+            }
+            ConversationPlan::Onboard { .. } | ConversationPlan::Sessionless { .. } => None,
+        }
+    } else {
+        None
+    };
+    if retry_persisted_reply
+        && !request_id.trim().is_empty()
+        && let ConversationPlan::Converse {
+            session_ref, route, ..
+        } = plan
+        && let Some(reply) = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
+            .ok()
+            .and_then(|out| {
+                out.into_iter()
+                    .rev()
+                    .find(|message| message.request_id == request_id)
+            })
+    {
+        // Composer-owned rows contain their canonical, already-guarded bytes,
+        // including any narrowly authorized owner handoff; do not guard those
+        // a second time. A legacy session row is different: its best-effort
+        // rewrite may have failed before transport did. Reapply the context-free
+        // family guard so a still-dirty row can never bypass it on retry.
+        let reply_text = if composer.is_none() {
+            let family_roster = grounding::load_family_voice_roster(
+                &project_root_of(workgraph_dir),
+                workgraph_dir,
+            );
+            guard_legacy_reply_and_sync_outbox(
+                workgraph_dir,
+                session_ref,
+                &reply,
+                &family_roster,
+            )
+        } else {
+            reply.content.clone()
+        };
+        deliver_persisted_reply(
+            &durable_sink,
+            route,
+            retry_ack_message_id.as_deref(),
+            &reply_text,
+        )
+        .await?;
+        return Ok(TurnOutcome::Replied {
+            acked: retry_ack_message_id.is_some(),
+        });
+    }
+
     match plan {
         ConversationPlan::Onboard { route, .. } => {
             let inviter = family_inviter_name(workgraph_dir);
-            sink.send(
-                &route.bot_id,
-                &route.chat_id,
-                &onboarding_line(inviter.as_deref()),
-            )
-            .await?;
+            durable_sink
+                .send(
+                    &route.bot_id,
+                    &route.chat_id,
+                    &onboarding_line(inviter.as_deref()),
+                )
+                .await?;
             Ok(TurnOutcome::Onboarded)
         }
         ConversationPlan::Sessionless { route, .. } => {
-            sink.send(&route.bot_id, &route.chat_id, &sessionless_line())
+            durable_sink
+                .send(&route.bot_id, &route.chat_id, &sessionless_line())
                 .await?;
             Ok(TurnOutcome::Sessionless)
         }
@@ -1142,9 +1561,11 @@ pub async fn run_conversation_turn(
                     request_id,
                     timing,
                     route,
-                    sink,
+                    &durable_sink,
                     composer,
                     &origin,
+                    retry_ack_message_id.as_deref(),
+                    retry_persisted_reply,
                 )
                 .await
             }
@@ -1153,20 +1574,62 @@ pub async fn run_conversation_turn(
             // produces. Retained for callers/tests that supply their own
             // outbox producer.
             None => {
-                let baseline = outbox_baseline(workgraph_dir, session_ref);
-                chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id)?;
-                await_session_reply(
+                // Any returned transport failure belongs to the inbox turn
+                // already appended by the first attempt. A failed ack send has
+                // no message id, but must still resume rather than enqueue the
+                // same physical turn twice. Only an edit retry carries an id.
+                let resuming_failed_attempt = retry_persisted_reply;
+                let baseline = retry_legacy_baseline
+                    .unwrap_or_else(|| outbox_baseline(workgraph_dir, session_ref));
+                if !resuming_failed_attempt {
+                    chat::append_inbox_ref(
+                        workgraph_dir,
+                        session_ref,
+                        human_message,
+                        request_id,
+                    )?;
+                }
+                let outcome = await_session_reply(
                     workgraph_dir,
                     session_ref,
                     baseline,
                     request_id,
                     timing,
                     route,
-                    sink,
+                    &durable_sink,
+                    retry_ack_message_id.as_deref(),
                 )
-                .await
+                .await?;
+                if matches!(outcome, TurnOutcome::TimedOut { acked: true }) {
+                    // The ack landed, but the logical reply did not. Preserve
+                    // its message id as retry state so a same-key attempt edits
+                    // that ack when the session eventually answers.
+                    durable_sink.rearm_incomplete_ack();
+                }
+                Ok(outcome)
             }
         },
+    }
+}
+
+/// Deliver bytes that were already family-voice guarded before being persisted
+/// to the session outbox. Do not guard them again: a composed reply may contain
+/// a narrowly authorized owner handoff that a context-free second pass would
+/// remove.
+async fn deliver_persisted_reply(
+    sink: &dyn ReplySink,
+    route: &ReplyRoute,
+    ack_mid: Option<&str>,
+    text: &str,
+) -> Result<()> {
+    match ack_mid {
+        Some(mid) if !mid.is_empty() => {
+            sink.edit(&route.bot_id, &route.chat_id, mid, text).await
+        }
+        _ => sink
+            .send(&route.bot_id, &route.chat_id, text)
+            .await
+            .map(|_| ()),
     }
 }
 
@@ -1342,6 +1805,37 @@ fn amend_origin_task(
     Ok(())
 }
 
+/// Persist the guarded fallback before transport so a failed send/edit can
+/// reuse the same canonical bytes on a same-key retry without invoking the
+/// composer again.
+async fn persist_and_deliver_glitch(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    request_id: &str,
+    route: &ReplyRoute,
+    sink: &TurnDeliverySink<'_>,
+    ack_mid: Option<&str>,
+    family_roster: &grounding::FamilyVoiceRoster,
+) -> Result<()> {
+    let reply = grounding::enforce_family_voice(&glitch_line(), family_roster);
+    if let Err(error) = chat::append_outbox_ref(workgraph_dir, session_ref, &reply, request_id) {
+        // If an acknowledgement already landed, release its in-flight claim so
+        // a later same-key attempt can resume and replace it after storage
+        // recovers. With no acknowledgement there is no transport claim yet.
+        sink.rearm_incomplete_ack();
+        return Err(error);
+    }
+    deliver_reply(
+        sink,
+        route,
+        ack_mid,
+        &reply,
+        family_roster,
+        None,
+    )
+    .await
+}
+
 /// Drive a bounded compose turn: race the composer against the ack/timeout
 /// clock. Emits the latency ack once past `ack_after`; on success relays the
 /// answer (editing the ack in place); on failure OR at `reply_timeout` sends the
@@ -1357,9 +1851,11 @@ async fn run_composed_turn(
     request_id: &str,
     timing: AckTiming,
     route: &ReplyRoute,
-    sink: &dyn ReplySink,
+    sink: &TurnDeliverySink<'_>,
     composer: &dyn ReplyComposer,
     origin: &crate::graph::TaskOrigin,
+    retry_ack_message_id: Option<&str>,
+    retrying_delivery: bool,
 ) -> Result<TurnOutcome> {
     // Load the authoritative project-local roster once for every dynamic send
     // this turn. The delivery choke point reuses it for graph answers, compose
@@ -1369,28 +1865,6 @@ async fn run_composed_turn(
         workgraph_dir,
     );
 
-    // ONE REPLY PER TURN (idempotency). A single turn is keyed by `request_id`,
-    // and every reply we send is also appended to the outbox under that id. If an
-    // outbox reply for this exact request already exists, this turn has already
-    // been answered — a re-fire (a listener re-poll, a gateway retry, a
-    // restart-replay) must NOT post a second message. This is the guard against
-    // the back-to-back double-post Luca saw from Otto: one ask, two messages. We
-    // return without composing or sending again. Best-effort read — a missing
-    // outbox simply means "not answered yet".
-    if !request_id.trim().is_empty() {
-        let already_answered = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
-            .map(|out| out.iter().any(|m| m.request_id == request_id))
-            .unwrap_or(false);
-        if already_answered {
-            println!(
-                "[{}] convo idempotency: request {request_id} already answered for {agent_id} — \
-                 skipping duplicate reply",
-                chrono::Utc::now().format("%H:%M:%S"),
-            );
-            return Ok(TurnOutcome::Replied { acked: false });
-        }
-    }
-
     // "Are they done yet?" — a status question from someone with recent
     // origin-stamped tasks is answered from LIVE graph state, not a generic chat
     // turn. This is the honest report-back: what's in progress / done, in the
@@ -1398,7 +1872,10 @@ async fn run_composed_turn(
     if !origin.requester.trim().is_empty() && lifecycle::is_status_question(human_message) {
         if let Some(answer) = answer_status_from_graph(workgraph_dir, &origin.requester) {
             let answer = grounding::enforce_family_voice(&answer, &family_roster);
-            let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+            if !retrying_delivery {
+                let _ =
+                    chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+            }
             let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &answer, request_id);
             deliver_reply(sink, route, None, &answer, &family_roster, None).await?;
             return Ok(TurnOutcome::Replied { acked: false });
@@ -1409,7 +1886,9 @@ async fn run_composed_turn(
     // ("Nadin is not logged so ignore this"), persist it BEFORE we compose so
     // the very reply to this turn honours it (`build_compose_prompt` replays
     // every recorded correction), and so does every future turn. Best-effort.
-    if let Some(correction) = grounding::detect_correction(human_message) {
+    if !retrying_delivery
+        && let Some(correction) = grounding::detect_correction(human_message)
+    {
         let root = project_root_of(workgraph_dir);
         let stored = format!("{}{}", grounding::CORRECTION_PREFIX, correction);
         match parity::PreferenceStore::record(
@@ -1433,14 +1912,16 @@ async fn run_composed_turn(
     // Persist the human turn so a live nex session and the TUI stay consistent
     // with the answer we compose here (best-effort — a write failure must not
     // block the reply).
-    let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+    if !retrying_delivery {
+        let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
+    }
 
     let compose = composer.compose(workgraph_dir, session_ref, agent_id, human_message);
     tokio::pin!(compose);
 
     let start = Instant::now();
-    let mut acked = false;
-    let mut ack_mid: Option<String> = None;
+    let mut acked = retry_ack_message_id.is_some();
+    let mut ack_mid = retry_ack_message_id.map(str::to_string);
 
     loop {
         let elapsed = start.elapsed();
@@ -1486,13 +1967,14 @@ async fn run_composed_turn(
                             "[{}] convo compose failed for {agent_id}: {e:#}",
                             chrono::Utc::now().format("%H:%M:%S"),
                         );
-                        deliver_reply(
-                            sink,
+                        persist_and_deliver_glitch(
+                            workgraph_dir,
+                            session_ref,
+                            request_id,
                             route,
+                            sink,
                             ack_mid.as_deref(),
-                            &glitch_line(),
                             &family_roster,
-                            None,
                         )
                         .await?;
                         return Ok(TurnOutcome::Glitched { acked });
@@ -1511,13 +1993,14 @@ async fn run_composed_turn(
                         chrono::Utc::now().format("%H:%M:%S"),
                         timing.reply_timeout,
                     );
-                    deliver_reply(
-                        sink,
+                    persist_and_deliver_glitch(
+                        workgraph_dir,
+                        session_ref,
+                        request_id,
                         route,
+                        sink,
                         ack_mid.as_deref(),
-                        &glitch_line(),
                         &family_roster,
-                        None,
                     )
                     .await?;
                     return Ok(TurnOutcome::Glitched { acked });
@@ -1706,7 +2189,15 @@ async fn finalize_composed_reply(
     // Read this persona's prior replies (this turn's outbox is not appended
     // yet) for the repetition and style guards.
     let prior_replies: Vec<String> = chat::read_outbox_since_ref(workgraph_dir, session_ref, 0)
-        .map(|out| out.into_iter().map(|m| m.content).collect())
+        .map(|out| {
+            out.into_iter()
+                // A transport-failed attempt is retried under the same request
+                // id. Its persisted draft is this turn, not prior conversation;
+                // excluding it preserves the intended bytes on retry.
+                .filter(|m| m.request_id != request_id)
+                .map(|m| m.content)
+                .collect()
+        })
         .unwrap_or_default();
 
     // STYLE (rule 4): at most one formulaic "Anything specific…?" tail per
@@ -2085,36 +2576,27 @@ async fn await_session_reply(
     timing: AckTiming,
     route: &ReplyRoute,
     sink: &dyn ReplySink,
+    initial_ack_message_id: Option<&str>,
 ) -> Result<TurnOutcome> {
     let family_roster = grounding::load_family_voice_roster(
         &project_root_of(workgraph_dir),
         workgraph_dir,
     );
     let start = Instant::now();
-    let mut acked = false;
+    let mut acked = initial_ack_message_id.is_some();
+    let mut ack_mid = initial_ack_message_id.map(str::to_string);
     loop {
         if let Some(reply) = read_new_reply(workgraph_dir, session_ref, baseline, request_id)? {
-            let guarded = grounding::enforce_family_voice(&reply.content, &family_roster);
-            if guarded != reply.content {
-                // A legacy session produced the outbox entry before this bridge
-                // saw it. Rewrite that exact entry so the persisted/TUI copy
-                // matches the guarded scoped family-reply send.
-                if let Err(error) = chat::edit_outbox_message_ref(
-                    workgraph_dir,
-                    session_ref,
-                    reply.id,
-                    &guarded,
-                ) {
-                    eprintln!(
-                        "[{}] family-voice guard: could not update legacy outbox copy: {error:#}",
-                        chrono::Utc::now().format("%H:%M:%S"),
-                    );
-                }
-            }
+            let guarded = guard_legacy_reply_and_sync_outbox(
+                workgraph_dir,
+                session_ref,
+                &reply,
+                &family_roster,
+            );
             deliver_reply(
                 sink,
                 route,
-                None,
+                ack_mid.as_deref(),
                 &guarded,
                 &family_roster,
                 None,
@@ -2125,7 +2607,9 @@ async fn await_session_reply(
         let elapsed = start.elapsed();
         if !acked && elapsed >= timing.ack_after {
             // The turn is running long — break the silence immediately.
-            sink.send(&route.bot_id, &route.chat_id, &ack_line()).await?;
+            ack_mid = sink
+                .send(&route.bot_id, &route.chat_id, &ack_line())
+                .await?;
             acked = true;
         }
         if elapsed >= timing.reply_timeout {
@@ -2133,6 +2617,33 @@ async fn await_session_reply(
         }
         tokio::time::sleep(timing.poll).await;
     }
+}
+
+/// Guard a reply authored by a legacy session and keep its persisted summary in
+/// sync when possible. Unlike composer-owned rows, legacy rows cannot carry an
+/// authorized owner handoff, so retrying this context-free guard is safe and
+/// required when a previous best-effort rewrite did not land.
+fn guard_legacy_reply_and_sync_outbox(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    reply: &chat::ChatMessage,
+    family_roster: &grounding::FamilyVoiceRoster,
+) -> String {
+    let guarded = grounding::enforce_family_voice(&reply.content, family_roster);
+    if guarded != reply.content {
+        // A legacy session produced the outbox entry before this bridge saw it.
+        // Rewrite that exact entry so the persisted/TUI copy matches the
+        // guarded scoped family-reply send.
+        if let Err(error) =
+            chat::edit_outbox_message_ref(workgraph_dir, session_ref, reply.id, &guarded)
+        {
+            eprintln!(
+                "[{}] family-voice guard: could not update legacy outbox copy: {error:#}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+    }
+    guarded
 }
 
 #[cfg(test)]
@@ -2656,55 +3167,1026 @@ domains = ["calendar", "coordination", "shopping"]
         );
     }
 
-    /// ONE REPLY PER TURN (Luca, 2026-07-17): Otto posted two messages
-    /// back-to-back for a single ask. A re-fire of the SAME turn (same
-    /// `request_id`) — a listener re-poll, a gateway retry, a restart-replay —
-    /// must NOT compose or send a second time. The first turn answers; the
-    /// second is a no-op, so the human sees exactly one message.
+    /// A re-fire of the SAME physical turn (same `request_id`) — a listener
+    /// re-poll, a gateway retry, or a restart replay — must not compose or send
+    /// a second time. A distinct occurrence id admits later identical words.
     #[tokio::test]
-    async fn same_request_id_never_double_posts() {
+    async fn same_request_id_does_not_send_twice() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
-        let cfg = cfg_with_bots(&[("otto", Some("otto"))]);
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "otto", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "otto");
-
-        let plan = plan_conversation(&wg, &cfg, "telegram:otto", "555", "luca-1", Entry::Direct);
+        let plan = ConversationPlan::Converse {
+            session_ref: uuid,
+            agent_id: "persona-7".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-7".to_string(),
+                chat_id: "-100700".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-4".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
         let sink = RecSink::default();
-        let composer = FakeComposer::ok("Yeah, today's Friday the 17th.");
+        let composer = FakeComposer::ok("Dinner is at seven.");
 
         // First delivery of the turn.
         let out1 = run_conversation_turn(
-            &wg, &plan, "what day is it?", "req-dup", fast_timing(), Some(&composer), &sink,
+            &wg,
+            &plan,
+            "what time is dinner?",
+            "physical-turn-a",
+            fast_timing(),
+            Some(&composer),
+            &sink,
         )
         .await
         .unwrap();
         assert!(matches!(out1, TurnOutcome::Replied { .. }));
 
-        // Same request id fires again (the double-post trigger).
+        // A fresh invocation simulates a listener restart. The same request id
+        // finds the durable claim and produces no transport call.
         let out2 = run_conversation_turn(
-            &wg, &plan, "what day is it?", "req-dup", fast_timing(), Some(&composer), &sink,
+            &wg,
+            &plan,
+            "what time is dinner?",
+            "physical-turn-a",
+            fast_timing(),
+            Some(&composer),
+            &sink,
         )
         .await
         .unwrap();
         assert!(matches!(out2, TurnOutcome::Replied { .. }));
 
-        // Exactly ONE human-visible message across BOTH invocations: the fast
-        // compose sends no ack, so the total send count is one and there are no
-        // edits. The second turn produced nothing.
+        // Identical words in a later physical occurrence remain answerable.
+        let out3 = run_conversation_turn(
+            &wg,
+            &plan,
+            "what time is dinner?",
+            "physical-turn-b",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out3, TurnOutcome::Replied { .. }));
+
+        assert_eq!(
+            sink.calls().len(),
+            2,
+            "one send per physical occurrence; refire is silent and later identical words send: {:?}",
+            sink.calls()
+        );
+        assert!(sink.edits().is_empty());
+        assert!(sink.calls().iter().all(|call| call.0 == "voice-7"));
+    }
+
+    /// Before the transport ledger existed, a matching composed outbox row was
+    /// the durable proof that a request had already been answered. An upgrade
+    /// replay must continue to honor that row when no explicit failed-delivery
+    /// marker exists; otherwise it would compose, repeat lifecycle side effects,
+    /// and send the old physical turn again.
+    #[tokio::test]
+    async fn preledger_composed_outbox_reply_remains_authoritative_on_upgrade() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        std::fs::write(
+            wg.join("household.toml"),
+            r#"
+[[agent]]
+id = "archive-voice"
+name = "Archive Voice"
+domains = ["calendar", "coordination"]
+"#,
+        )
+        .unwrap();
+        let session_ref =
+            create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        let request_id = "physical-turn-from-before-ledger";
+        let human_message =
+            "The red calendar is not correct; use the blue calendar and update it.";
+        chat::append_inbox_ref(
+            &wg,
+            &session_ref,
+            human_message,
+            request_id,
+        )
+        .unwrap();
+        chat::append_outbox_ref(
+            &wg,
+            &session_ref,
+            "The calendar update was already delivered.",
+            request_id,
+        )
+        .unwrap();
+        assert!(
+            !wg.join("telegram-deliveries").exists(),
+            "the fixture must model a successful reply from before the ledger",
+        );
+
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "archive-voice".to_string(),
+            route: ReplyRoute {
+                bot_id: "archive-bot".to_string(),
+                chat_id: "-1001500".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "archive-member".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = RecSink::default();
+        let composer = SequenceComposer::new(&[
+            "I will update it again.\nTASK_CREATE: update the blue calendar",
+        ]);
+
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            human_message,
+            request_id,
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, TurnOutcome::Replied { acked: false });
+
+        assert_eq!(
+            composer.call_count(),
+            0,
+            "a pre-ledger successful outbox row must suppress recomposition",
+        );
+        assert!(sink.calls().is_empty(), "upgrade replay must stay silent");
+        assert!(sink.edits().is_empty(), "upgrade replay must not edit");
+
+        let inbox = chat::read_inbox_ref(&wg, &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == request_id)
+                .count(),
+            1,
+            "upgrade replay must not append a second inbox turn",
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &session_ref, 0).unwrap();
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|message| message.request_id == request_id)
+                .count(),
+            1,
+            "upgrade replay must not append a second outbox reply",
+        );
+
+        let task_count = crate::parser::load_graph(wg.join("graph.jsonl"))
+            .map(|graph| graph.tasks().count())
+            .unwrap_or(0);
+        assert_eq!(task_count, 0, "upgrade replay must not create a task");
+        let correction_count = parity::PreferenceStore::all(&wg)
+            .into_iter()
+            .filter(|entry| entry.text.starts_with(grounding::CORRECTION_PREFIX))
+            .count();
+        assert_eq!(
+            correction_count, 0,
+            "upgrade replay must not record the correction a second time",
+        );
+    }
+
+    /// Reservation is not a tombstone for a failed transport. The exact same
+    /// key retries after a confirmed send error, then becomes durable only
+    /// after the retry succeeds.
+    #[tokio::test]
+    async fn failed_send_rearms_same_request_id_then_confirmed_send_deduplicates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailOnceSink {
+            attempts: AtomicUsize,
+            delivered: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailOnceSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub transport failure");
+                }
+                self.delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("stub-{}", attempt + 1)))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let session_ref =
+            create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-9".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-9".to_string(),
+                chat_id: "-100900".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-9".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailOnceSink::default();
+        let composer = FakeComposer::ok("I heard you.");
+
+        let first = run_conversation_turn(
+            dir.path(),
+            &plan,
+            "hello household",
+            "physical-turn-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the stub's first transport call must fail");
+
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "hello household",
+            "physical-turn-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "hello household",
+            "physical-turn-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+        let persisted = chat::read_outbox_since_ref(dir.path(), &session_ref, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.request_id == "physical-turn-retry")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "a failed send and retry share one canonical persisted reply: {persisted:?}",
+        );
+        assert_eq!(persisted[0].content, "I heard you.");
+    }
+
+    /// If the latency acknowledgement itself fails, the composer future is
+    /// dropped before it can persist a final reply. A same-key retry may
+    /// recompose, but must not repeat the already-recorded human turn or
+    /// correction side effects.
+    #[tokio::test]
+    async fn failed_composed_ack_retry_keeps_one_inbox_turn_and_correction() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstAckSink {
+            sends: AtomicUsize,
+            edits: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstAckSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                let attempt = self.sends.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub acknowledgement failure");
+                }
+                Ok(Some("ack-retry-message".to_string()))
+            }
+
+            async fn edit(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                message_id: &str,
+                _text: &str,
+            ) -> Result<()> {
+                assert_eq!(message_id, "ack-retry-message");
+                self.edits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let session_ref =
+            create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-13".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-13".to_string(),
+                chat_id: "-1001300".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-13".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailFirstAckSink::default();
+        let composer =
+            FakeComposer::ok_after("The blue calendar is current.", Duration::from_millis(150));
+        let human_message = "The red calendar is not correct; use the blue calendar.";
+
+        let first = run_conversation_turn(
+            dir.path(),
+            &plan,
+            human_message,
+            "physical-turn-ack-send-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first acknowledgement must fail");
+
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            human_message,
+            "physical-turn-ack-send-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            human_message,
+            "physical-turn-ack-send-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.edits.load(Ordering::SeqCst), 1);
+        let inbox = chat::read_inbox_ref(dir.path(), &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-ack-send-retry")
+                .count(),
+            1,
+            "the retry must reuse the already-persisted composed inbox turn",
+        );
+        let corrections = parity::PreferenceStore::all(dir.path())
+            .into_iter()
+            .filter(|entry| entry.text.starts_with(grounding::CORRECTION_PREFIX))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            corrections.len(),
+            1,
+            "the retry must not record the same correction twice",
+        );
+    }
+
+    /// Composer failures use a stable guarded fallback. Persist it before the
+    /// transport attempt so a same-key retry reuses those bytes without
+    /// invoking the composer or appending another session row.
+    #[tokio::test]
+    async fn failed_glitch_send_reuses_canonical_reply_without_recomposing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingFailComposer {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplyComposer for CountingFailComposer {
+            async fn compose(
+                &self,
+                _workgraph_dir: &Path,
+                _session_ref: &str,
+                _agent_id: &str,
+                _human_message: &str,
+            ) -> Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("stub composer failure")
+            }
+        }
+
+        #[derive(Default)]
+        struct FailFirstGlitchSink {
+            attempts: AtomicUsize,
+            delivered: AtomicUsize,
+            texts: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstGlitchSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                self.texts.lock().unwrap().push(text.to_string());
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub fallback transport failure");
+                }
+                self.delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("glitch-retry-message".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let session_ref =
+            create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-14".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-14".to_string(),
+                chat_id: "-1001400".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-14".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailFirstGlitchSink::default();
+        let composer = CountingFailComposer::default();
+
+        let first = run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check this?",
+            "physical-turn-glitch-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first fallback send must fail");
+
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check this?",
+            "physical-turn-glitch-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check this?",
+            "physical-turn-glitch-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            composer.calls.load(Ordering::SeqCst),
+            1,
+            "the persisted fallback makes retry composition unnecessary",
+        );
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+        let texts = sink.texts.lock().unwrap().clone();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0], texts[1], "retry must reuse canonical bytes");
+
+        let inbox = chat::read_inbox_ref(dir.path(), &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-glitch-retry")
+                .count(),
+            1,
+        );
+        let outbox = chat::read_outbox_since_ref(dir.path(), &session_ref, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.request_id == "physical-turn-glitch-retry")
+            .collect::<Vec<_>>();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].content, texts[0]);
+    }
+
+    /// The legacy session-poll path persists its reply before transport too.
+    /// After a send failure, the same-key retry reuses that reply immediately;
+    /// it neither appends a duplicate inbox turn nor waits for the session to
+    /// answer a second time.
+    #[tokio::test]
+    async fn failed_legacy_send_reuses_persisted_reply_then_deduplicates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailOnceSink {
+            attempts: AtomicUsize,
+            delivered: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailOnceSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub legacy transport failure");
+                }
+                self.delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("legacy-message-2".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let workgraph_dir = dir.path().to_path_buf();
+        let session_ref =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-10".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-10".to_string(),
+                chat_id: "-1001000".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-10".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailOnceSink::default();
+
+        let responder_dir = workgraph_dir.clone();
+        let responder_session = session_ref.clone();
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let inbox =
+                    chat::read_inbox_ref(&responder_dir, &responder_session).unwrap_or_default();
+                if let Some(message) = inbox
+                    .iter()
+                    .find(|message| message.request_id == "physical-turn-legacy-retry")
+                {
+                    chat::append_outbox_ref(
+                        &responder_dir,
+                        &responder_session,
+                        "The session already answered.",
+                        &message.request_id,
+                    )
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("legacy fixture did not receive its inbox turn");
+        });
+
+        let first = run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "is anyone there?",
+            "physical-turn-legacy-retry",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await;
+        responder.await.unwrap();
+        assert!(first.is_err());
+
+        run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "is anyone there?",
+            "physical-turn-legacy-retry",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "is anyone there?",
+            "physical-turn-legacy-retry",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+        let inbox = chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-legacy-retry")
+                .count(),
+            1,
+            "same-key retry must not append a second legacy inbox turn",
+        );
+        let outbox = chat::read_outbox_since_ref(&workgraph_dir, &session_ref, 0).unwrap();
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-legacy-retry")
+                .count(),
+            1,
+        );
+    }
+
+    /// When the latency acknowledgement send itself fails, the failed-attempt
+    /// marker still represents an already-enqueued legacy turn. A same-key
+    /// retry must resume that turn without appending a second inbox row (and
+    /// inviting the live session to produce a second, orphaned reply).
+    #[tokio::test]
+    async fn failed_legacy_ack_send_retry_keeps_one_inbox_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstSendSink {
+            attempts: AtomicUsize,
+            delivered: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstSendSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub acknowledgement transport failure");
+                }
+                self.delivered.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("legacy-final-message".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let workgraph_dir = dir.path().to_path_buf();
+        let session_ref =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-ack-retry".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-ack-retry".to_string(),
+                chat_id: "-1001400".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-ack-retry".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailFirstSendSink::default();
+        let first_timing = AckTiming {
+            ack_after: Duration::from_millis(15),
+            reply_timeout: Duration::from_millis(250),
+            poll: Duration::from_millis(5),
+        };
+
+        let first = run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check?",
+            "physical-turn-legacy-ack-send-retry",
+            first_timing,
+            None,
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first latency acknowledgement must fail");
+
+        let responder_dir = workgraph_dir.clone();
+        let responder_session = session_ref.clone();
+        let responder = tokio::spawn(async move {
+            // Give the retry enough time to append a duplicate inbox row if it
+            // incorrectly treats a failed ack send as a brand-new turn.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let inbox =
+                chat::read_inbox_ref(&responder_dir, &responder_session).unwrap_or_default();
+            let matching = inbox
+                .iter()
+                .filter(|message| {
+                    message.request_id == "physical-turn-legacy-ack-send-retry"
+                })
+                .collect::<Vec<_>>();
+            for (index, message) in matching.iter().enumerate() {
+                chat::append_outbox_ref(
+                    &responder_dir,
+                    &responder_session,
+                    &format!("Session answer {}.", index + 1),
+                    &message.request_id,
+                )
+                .unwrap();
+            }
+        });
+
+        let retry_timing = AckTiming {
+            ack_after: Duration::from_secs(1),
+            reply_timeout: Duration::from_millis(500),
+            poll: Duration::from_millis(5),
+        };
+        run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check?",
+            "physical-turn-legacy-ack-send-retry",
+            retry_timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.delivered.load(Ordering::SeqCst), 1);
+        let inbox = chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| {
+                    message.request_id == "physical-turn-legacy-ack-send-retry"
+                })
+                .count(),
+            1,
+            "the failed ack already belongs to the original inbox turn",
+        );
+        let outbox = chat::read_outbox_since_ref(&workgraph_dir, &session_ref, 0).unwrap();
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|message| {
+                    message.request_id == "physical-turn-legacy-ack-send-retry"
+                })
+                .count(),
+            1,
+            "one physical turn must not leave an orphaned second session reply",
+        );
+    }
+
+    /// A latency acknowledgement can outlive the first polling window while the
+    /// original session is still working. A same-key retry resumes that wait
+    /// and edits the existing acknowledgement; it must not enqueue the same
+    /// human turn a second time.
+    #[tokio::test]
+    async fn timed_out_legacy_retry_resumes_one_inbox_turn_and_edits_original_ack() {
+        let dir = tempdir().unwrap();
+        let workgraph_dir = dir.path().to_path_buf();
+        let session_ref =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-12".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-12".to_string(),
+                chat_id: "-1001200".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-12".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = RecSink::default();
+        let first_timing = AckTiming {
+            ack_after: Duration::from_millis(15),
+            reply_timeout: Duration::from_millis(70),
+            poll: Duration::from_millis(5),
+        };
+
+        let first = run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check the plan?",
+            "physical-turn-timeout-retry",
+            first_timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, TurnOutcome::TimedOut { acked: true });
+        assert_eq!(sink.calls().len(), 1, "the first attempt sends one ack");
+        assert!(sink.edits().is_empty());
+
+        let responder_dir = workgraph_dir.clone();
+        let responder_session = session_ref.clone();
+        let responder = tokio::spawn(async move {
+            // Land the answer after the retry has entered its resumed poll.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let inbox =
+                chat::read_inbox_ref(&responder_dir, &responder_session).unwrap_or_default();
+            let matching = inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-timeout-retry")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "the same physical turn must occupy one legacy inbox row",
+            );
+            chat::append_outbox_ref(
+                &responder_dir,
+                &responder_session,
+                "The original session finished.",
+                &matching[0].request_id,
+            )
+            .unwrap();
+        });
+
+        let retry_timing = AckTiming {
+            ack_after: Duration::from_millis(15),
+            reply_timeout: Duration::from_millis(300),
+            poll: Duration::from_millis(5),
+        };
+        let second = run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check the plan?",
+            "physical-turn-timeout-retry",
+            retry_timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        assert_eq!(second, TurnOutcome::Replied { acked: true });
+
+        // A later refire sees the completed delivery record and stays silent.
+        run_conversation_turn(
+            &workgraph_dir,
+            &plan,
+            "can you check the plan?",
+            "physical-turn-timeout-retry",
+            retry_timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let inbox = chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap();
+        assert_eq!(
+            inbox
+                .iter()
+                .filter(|message| message.request_id == "physical-turn-timeout-retry")
+                .count(),
+            1,
+        );
         assert_eq!(
             sink.calls().len(),
             1,
-            "one turn must post one message; a re-fired request must not double-post: {:?}",
-            sink.calls()
+            "retry edits the original acknowledgement; it never sends another",
         );
-        assert!(
-            sink.edits().is_empty(),
-            "no ack/edit expected on a fast turn: {:?}",
-            sink.edits()
+        let edits = sink.edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].2, "1", "the retry edits the first ack message");
+        assert_eq!(edits[0].3, "The original session finished.");
+    }
+
+    /// A delivered latency acknowledgement is not the completed logical reply.
+    /// If replacing it with the final answer fails, the same-key retry edits the
+    /// original acknowledgement instead of sending a second message or being
+    /// suppressed by the pending claim.
+    #[tokio::test]
+    async fn failed_ack_edit_retries_same_message_then_confirmed_edit_deduplicates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstEditSink {
+            sends: AtomicUsize,
+            edit_attempts: AtomicUsize,
+            edited: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstEditSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                _text: &str,
+            ) -> Result<Option<String>> {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("ack-message-7".to_string()))
+            }
+
+            async fn edit(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                message_id: &str,
+                _text: &str,
+            ) -> Result<()> {
+                assert_eq!(message_id, "ack-message-7");
+                let attempt = self.edit_attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub edit failure");
+                }
+                self.edited.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let session_ref =
+            create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let plan = ConversationPlan::Converse {
+            session_ref: session_ref.clone(),
+            agent_id: "persona-11".to_string(),
+            route: ReplyRoute {
+                bot_id: "voice-11".to_string(),
+                chat_id: "-1001100".to_string(),
+            },
+            entry: Entry::GroupElected,
+            requester: "member-11".to_string(),
+            channel: crate::graph::OriginChannel::TelegramGroup,
+        };
+        let sink = FailFirstEditSink::default();
+        let composer =
+            FakeComposer::ok_after("The answer is ready.", Duration::from_millis(150));
+
+        let first = run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check that?",
+            "physical-turn-edit-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first final-answer edit must fail");
+
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check that?",
+            "physical-turn-edit-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            dir.path(),
+            &plan,
+            "can you check that?",
+            "physical-turn-edit-retry",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sink.sends.load(Ordering::SeqCst),
+            1,
+            "retry edits the original acknowledgement; it never posts another",
         );
-        assert_eq!(sink.calls()[0].0, "otto");
+        assert_eq!(sink.edit_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.edited.load(Ordering::SeqCst), 1);
+        let persisted = chat::read_outbox_since_ref(dir.path(), &session_ref, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.request_id == "physical-turn-edit-retry")
+            .collect::<Vec<_>>();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].content, "The answer is ready.");
     }
 
     /// A 1:1 ask that the persona turns into work stamps the created task with
@@ -3688,13 +5170,15 @@ domains = ["calendar", "coordination", "shopping"]
 
         assert_eq!(outcome, TurnOutcome::Replied { acked: true });
         let calls = sink.calls();
-        assert!(calls.len() >= 2, "expected ack + reply, got {calls:?}");
-        // First send is the ack, in the same chat via the same bot.
+        assert_eq!(calls.len(), 1, "the ack is the only fresh send: {calls:?}");
         assert_eq!(calls[0].0, "otto");
         assert_eq!(calls[0].1, "555");
         assert!(calls[0].2.contains("On it"));
-        // Last send is the actual reply.
-        assert_eq!(calls.last().unwrap().2, "here at last");
+        let edits = sink.edits();
+        assert_eq!(edits.len(), 1, "the final reply replaces the ack: {edits:?}");
+        assert_eq!(edits[0].0, "otto");
+        assert_eq!(edits[0].1, "555");
+        assert_eq!(edits[0].3, "here at last");
     }
 
     #[tokio::test]
@@ -4746,11 +6230,192 @@ name = "The Wayfinder"
         );
     }
 
+    /// A legacy session row is not canonical until the engine guard has run.
+    /// If rewriting the guarded bytes to the outbox fails and transport then
+    /// fails too, a same-key retry must guard the still-dirty row again rather
+    /// than relaying it through the persisted-reply fast path.
+    #[tokio::test]
+    async fn legacy_retry_guards_dirty_outbox_when_rewrite_and_transport_fail() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstRecordingSink {
+            attempts: AtomicUsize,
+            texts: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstRecordingSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                self.texts.lock().unwrap().push(text.to_string());
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub guarded transport failure");
+                }
+                Ok(Some("guarded-legacy-message".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[household]
+members = ["Fixture Member"]
+
+[[agent]]
+id = "fixture-voice"
+name = "Fixture Voice"
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("fixture-voice", Some("fixture-voice"))]);
+        let session_ref = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "fixture-voice", &session_ref).unwrap();
+        add_binding(&wg, "fixture-member", "Household Member", true);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:fixture-voice",
+            "555",
+            "fixture-member",
+            Entry::Direct,
+        );
+
+        // `edit_outbox_message_ref` writes this sibling path before renaming it.
+        // A directory at that exact path deterministically forces the rewrite
+        // to fail while leaving the original outbox readable for retry.
+        let rewrite_blocker =
+            chat::outbox_path_ref(&wg, &session_ref).with_extension("jsonl.tmp");
+        std::fs::create_dir_all(&rewrite_blocker).unwrap();
+
+        let raw = "**Fixture Voice** says dinner is ready for **Fixture Member**.";
+        let family_roster =
+            grounding::load_family_voice_roster(&project_root_of(&wg), &wg);
+        let expected = grounding::enforce_family_voice(raw, &family_roster);
+        assert_ne!(
+            expected, raw,
+            "the fixture must contain bytes that the family guard changes",
+        );
+        let responder_wg = wg.clone();
+        let responder_session = session_ref.clone();
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let inbox =
+                    chat::read_inbox_ref(&responder_wg, &responder_session).unwrap_or_default();
+                if let Some(message) = inbox
+                    .iter()
+                    .find(|message| message.request_id == "legacy-dirty-retry")
+                {
+                    chat::append_outbox_ref(
+                        &responder_wg,
+                        &responder_session,
+                        raw,
+                        &message.request_id,
+                    )
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("legacy fixture never received the inbox turn");
+        });
+
+        let sink = FailFirstRecordingSink::default();
+        let timing = AckTiming {
+            ack_after: Duration::from_secs(1),
+            reply_timeout: Duration::from_millis(500),
+            poll: Duration::from_millis(5),
+        };
+        let first = run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "legacy-dirty-retry",
+            timing,
+            None,
+            &sink,
+        )
+        .await;
+        responder.await.unwrap();
+        assert!(first.is_err(), "the first guarded transport must fail");
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "legacy-dirty-retry",
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "legacy-dirty-retry",
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let texts = sink.texts.lock().unwrap().clone();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(
+            texts,
+            vec![expected.clone(), expected],
+            "both attempts must use guarded bytes even while the persisted row stays dirty",
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &session_ref, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(raw),
+            "the blocker must prove the retry read an unguarded persisted row",
+        );
+    }
+
     /// The single-owner path appends one trusted authored-name handoff after
     /// composition. That exact engine-authored suffix survives; a composer
-    /// cannot grant itself the same exception.
+    /// cannot grant itself the same exception. A transport retry must relay the
+    /// already-guarded outbox bytes verbatim rather than stripping that suffix
+    /// in a second context-free guard pass.
     #[tokio::test]
-    async fn family_voice_guard_preserves_exact_engine_authored_owner_handoff() {
+    async fn family_voice_guard_preserves_owner_handoff_bytes_on_transport_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailFirstHandoffSink {
+            attempts: AtomicUsize,
+            texts: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstHandoffSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                self.texts.lock().unwrap().push(text.to_string());
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub handoff transport failure");
+                }
+                Ok(Some("handoff-retry-message".to_string()))
+            }
+        }
+
         let dir = tempdir().unwrap();
         let wg = dir.path().join(".wg");
         std::fs::create_dir_all(&wg).unwrap();
@@ -4786,10 +6451,32 @@ domains = ["meals"]
             Entry::Direct,
         );
 
-        let sink = RecSink::default();
+        let sink = FailFirstHandoffSink::default();
         let composer = FakeComposer::ok(
             "Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup",
         );
+        let first = run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Thursday dinner to soup",
+            "req-owner-handoff",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await;
+        assert!(first.is_err(), "the first transport attempt must fail");
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Thursday dinner to soup",
+            "req-owner-handoff",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
         run_conversation_turn(
             &wg,
             &plan,
@@ -4802,7 +6489,14 @@ domains = ["meals"]
         .await
         .unwrap();
 
-        let delivered = sink.calls().last().unwrap().2.clone();
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+        let attempted = sink.texts.lock().unwrap().clone();
+        assert_eq!(attempted.len(), 2);
+        assert_eq!(
+            attempted[0], attempted[1],
+            "the persisted retry must preserve the exact authorized bytes",
+        );
+        let delivered = attempted[1].clone();
         let owner_map = ownership::OwnerMap::load(dir.path());
         let trusted =
             ownership::defer_line(&owner_map, "meal-cairn", ownership::Domain::MealPlanning);

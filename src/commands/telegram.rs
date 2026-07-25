@@ -1721,12 +1721,27 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         let cfg_owned = route_config.clone();
                         let human_message = route_body.clone();
                         let sender = msg.sender.clone();
-                        let request_id = format!(
-                            "tg-{}-{}-{}",
-                            reply_target,
-                            msg.message_id.as_deref().unwrap_or("na"),
-                            sender,
-                        );
+                        let request_id = if matches!(entry, convo::Entry::GroupElected) {
+                            // A privacy-off group turn reaches every bot with a
+                            // transport-local message id. Key the elected reply
+                            // by the shared physical fingerprint, exactly like
+                            // collective voices, so a cross-bot/restart replay
+                            // cannot post twice.
+                            collective_request_id(
+                                &reply_target,
+                                &plan.route().bot_id,
+                                &telegram_physical_turn_key(&msg),
+                            )
+                        } else {
+                            // A direct message reaches one bot, so its Telegram
+                            // message id remains a stable occurrence key.
+                            format!(
+                                "tg-{}-{}-{}",
+                                reply_target,
+                                msg.message_id.as_deref().unwrap_or("na"),
+                                sender,
+                            )
+                        };
                         let timing = convo::AckTiming::from_env();
                         // Every reply uses the same scoped final delivery seam:
                         // group-elected answers mirror once; 1:1 replies remain
@@ -3278,10 +3293,22 @@ pub async fn run_group_collective(
             None => (Vec::new(), Vec::new()),
         };
         let post = standup::render_conversational(member, &in_progress, &open);
+        let request_id = collective_request_id(target, &member.bot_id, physical_turn_key);
+        let sink = family_delivery.wrap(
+            convo::BotReplySink::new(config.clone()),
+            ReplyScope::Group,
+            GuardPolicy::Enforce,
+        );
 
-        match family_delivery
-            .send(ReplyScope::Group, &member.bot_id, target, &post.text)
-            .await
+        match convo::send_reply_once(
+            workgraph_dir,
+            &request_id,
+            &member.bot_id,
+            target,
+            &post.text,
+            &sink,
+        )
+        .await
         {
             Ok(sent) => {
                 println!(
@@ -3431,6 +3458,7 @@ pub async fn run_group_discussion(
         &family_roster,
         &sink,
         target,
+        physical_turn_key,
         timing,
     )
     .await?;
@@ -3798,10 +3826,12 @@ fn web_physical_turn_key(reply_chat: &str, body: &str, turn_id: Option<&str>) ->
     format!("web-turn-{:016x}", hash_text(&material))
 }
 
-/// Request id stored in one persona session's outbox for a collective turn.
-/// Voice, chat, and physical turn all participate: the same physical redelivery
-/// is stable, a later turn is distinct, and two voices never suppress each
-/// other even if they share a session implementation.
+/// Request id stored for one persona's reply to a Telegram group turn.
+///
+/// Both collective and elected-single-voice paths use this shape. Voice, chat,
+/// and physical turn all participate: the same physical redelivery is stable, a
+/// later turn is distinct, and two configured voices never suppress each other
+/// even if they share a session implementation.
 fn collective_request_id(reply_chat: &str, bot_id: &str, physical_turn_key: &str) -> String {
     format!(
         "tg-collective-{}-{}-{:016x}",
@@ -8569,6 +8599,310 @@ domains = ["cooking"]
                 Some("turn-fixture-b"),
             ),
             "a later web occurrence gets a fresh collective key even with identical words",
+        );
+    }
+
+    /// Behavior gate for every conversational group-delivery shape. One
+    /// physical Telegram turn is replayed through a fresh invocation, then the
+    /// same words arrive one second later as a distinct turn. The replay sends
+    /// nothing; the later occurrence sends normally.
+    #[tokio::test]
+    async fn physical_turn_refire_deduplicates_all_group_reply_modes() {
+        use std::time::Duration;
+        use worksgood::chat;
+        use worksgood::chat_sessions::{SessionKind, create_session};
+        use worksgood::graph::OriginChannel;
+        use worksgood::notify::grounding::FamilyVoiceRoster;
+        use worksgood::notify::telegram_conversation as convo;
+        use worksgood::notify::telegram_discussion as discussion;
+
+        #[derive(Default)]
+        struct CountingSink {
+            sends: std::sync::Mutex<Vec<(String, String, String)>>,
+        }
+        #[async_trait]
+        impl convo::ReplySink for CountingSink {
+            async fn send(
+                &self,
+                bot_id: &str,
+                chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                let mut sends = self.sends.lock().unwrap();
+                sends.push((bot_id.to_string(), chat_id.to_string(), text.to_string()));
+                Ok(Some(format!("stub-{}", sends.len())))
+            }
+        }
+
+        struct FixedComposer;
+        #[async_trait]
+        impl convo::ReplyComposer for FixedComposer {
+            async fn compose(
+                &self,
+                _workgraph_dir: &Path,
+                _session_ref: &str,
+                _agent_id: &str,
+                _human_message: &str,
+            ) -> Result<String> {
+                Ok("That sounds good to me.".to_string())
+            }
+        }
+
+        async fn append_legacy_reply(
+            workgraph_dir: PathBuf,
+            session_ref: String,
+            request_id: String,
+        ) {
+            for _ in 0..200 {
+                let inbox =
+                    chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap_or_default();
+                if inbox
+                    .iter()
+                    .any(|message| message.request_id == request_id)
+                {
+                    chat::append_outbox_ref(
+                        &workgraph_dir,
+                        &session_ref,
+                        "The legacy session answered.",
+                        &request_id,
+                    )
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("legacy fixture never observed request {request_id}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workgraph_dir = dir.path().join(".wg");
+        std::fs::create_dir_all(&workgraph_dir).unwrap();
+        let chat_id = "-100700";
+        let words = "what does everyone think?";
+
+        let mut first = gate_msg("supergroup", false);
+        first.channel = "telegram:wire-1".to_string();
+        first.sender = "member-4".to_string();
+        first.sender_id = Some("member-id-4".to_string());
+        first.sent_at = Some(1_720_000_000);
+        first.body = words.to_string();
+        first.message_id = Some("41".to_string());
+        first.chat_id = Some(chat_id.to_string());
+        let mut replay = first.clone();
+        replay.channel = "telegram:wire-2".to_string();
+        replay.message_id = Some("907".to_string());
+        let mut later = first.clone();
+        later.sent_at = Some(1_720_000_001);
+        later.message_id = Some("42".to_string());
+
+        let first_key = telegram_physical_turn_key(&first);
+        let replay_key = telegram_physical_turn_key(&replay);
+        let later_key = telegram_physical_turn_key(&later);
+        assert_eq!(first_key, replay_key);
+        assert_ne!(first_key, later_key);
+        let keys = [&first_key, &replay_key, &later_key];
+
+        let sink = CountingSink::default();
+        let timing = convo::AckTiming {
+            ack_after: Duration::from_secs(1),
+            reply_timeout: Duration::from_secs(3),
+            poll: Duration::from_millis(5),
+        };
+
+        // Collective fallback: this is the direct no-session send seam used by
+        // `run_group_collective`.
+        for key in keys {
+            let request_id = collective_request_id(chat_id, "wire-fallback", key);
+            convo::send_reply_once(
+                &workgraph_dir,
+                &request_id,
+                "wire-fallback",
+                chat_id,
+                "I am here.",
+                &sink,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Group sessionless path.
+        let sessionless = convo::ConversationPlan::Sessionless {
+            agent_id: "persona-sessionless".to_string(),
+            route: convo::ReplyRoute {
+                bot_id: "wire-sessionless".to_string(),
+                chat_id: chat_id.to_string(),
+            },
+            entry: convo::Entry::GroupElected,
+        };
+        for key in keys {
+            let request_id = collective_request_id(chat_id, "wire-sessionless", key);
+            convo::run_conversation_turn(
+                &workgraph_dir,
+                &sessionless,
+                words,
+                &request_id,
+                timing,
+                None,
+                &sink,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Legacy session polling path (no injected composer).
+        let legacy_session =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let legacy = convo::ConversationPlan::Converse {
+            session_ref: legacy_session.clone(),
+            agent_id: "persona-legacy".to_string(),
+            route: convo::ReplyRoute {
+                bot_id: "wire-legacy".to_string(),
+                chat_id: chat_id.to_string(),
+            },
+            entry: convo::Entry::GroupElected,
+            requester: "member-4".to_string(),
+            channel: OriginChannel::TelegramGroup,
+        };
+        let first_legacy_id =
+            collective_request_id(chat_id, "wire-legacy", &first_key);
+        let first_responder = tokio::spawn(append_legacy_reply(
+            workgraph_dir.clone(),
+            legacy_session.clone(),
+            first_legacy_id.clone(),
+        ));
+        convo::run_conversation_turn(
+            &workgraph_dir,
+            &legacy,
+            words,
+            &first_legacy_id,
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        first_responder.await.unwrap();
+        convo::run_conversation_turn(
+            &workgraph_dir,
+            &legacy,
+            words,
+            &collective_request_id(chat_id, "wire-legacy", &replay_key),
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        let later_legacy_id =
+            collective_request_id(chat_id, "wire-legacy", &later_key);
+        let later_responder = tokio::spawn(append_legacy_reply(
+            workgraph_dir.clone(),
+            legacy_session,
+            later_legacy_id.clone(),
+        ));
+        convo::run_conversation_turn(
+            &workgraph_dir,
+            &legacy,
+            words,
+            &later_legacy_id,
+            timing,
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        later_responder.await.unwrap();
+
+        // Real elected single-voice compose/finalize path.
+        let single_session =
+            create_session(&workgraph_dir, SessionKind::Interactive, &[], None).unwrap();
+        let single = convo::ConversationPlan::Converse {
+            session_ref: single_session,
+            agent_id: "persona-single".to_string(),
+            route: convo::ReplyRoute {
+                bot_id: "wire-single".to_string(),
+                chat_id: chat_id.to_string(),
+            },
+            entry: convo::Entry::GroupElected,
+            requester: "member-4".to_string(),
+            channel: OriginChannel::TelegramGroup,
+        };
+        let composer = FixedComposer;
+        for key in keys {
+            let request_id = collective_request_id(chat_id, "wire-single", key);
+            convo::run_conversation_turn(
+                &workgraph_dir,
+                &single,
+                words,
+                &request_id,
+                timing,
+                Some(&composer),
+                &sink,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Discussion takes plus synthesis each receive a logical sub-key.
+        let voices = ["wire-discuss-1", "wire-discuss-2", "wire-discuss-3"]
+            .into_iter()
+            .map(|bot_id| discussion::DiscussionVoice {
+                bot_id: bot_id.to_string(),
+                display_name: format!("Voice {bot_id}"),
+                agent_id: format!("persona-{bot_id}"),
+                session_ref: format!("session-{bot_id}"),
+            })
+            .collect::<Vec<_>>();
+        let family_roster = FamilyVoiceRoster::from_names(
+            voices.iter().map(|voice| voice.display_name.as_str()),
+            ["Household Member"],
+        );
+        let discuss_timing = discussion::DiscussionTiming {
+            per_voice: Duration::from_secs(2),
+            overall: Duration::from_secs(10),
+        };
+        for key in keys {
+            discussion::run_discussion_round(
+                &workgraph_dir,
+                words,
+                &voices,
+                "wire-discuss-3",
+                &composer,
+                &family_roster,
+                &sink,
+                chat_id,
+                key,
+                discuss_timing,
+            )
+            .await
+            .unwrap();
+        }
+
+        let sends = sink.sends.lock().unwrap();
+        let count = |bot_id: &str| {
+            sends
+                .iter()
+                .filter(|(actual, _, _)| actual == bot_id)
+                .count()
+        };
+        for bot_id in [
+            "wire-fallback",
+            "wire-sessionless",
+            "wire-legacy",
+            "wire-single",
+        ] {
+            assert_eq!(
+                count(bot_id),
+                2,
+                "{bot_id}: first and later occurrences send; refire does not",
+            );
+        }
+        assert_eq!(count("wire-discuss-1"), 2);
+        assert_eq!(count("wire-discuss-2"), 2);
+        assert_eq!(
+            count("wire-discuss-3"),
+            4,
+            "the configured synthesizer sends one take and one synthesis per distinct occurrence",
         );
     }
 
