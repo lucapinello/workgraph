@@ -1106,6 +1106,41 @@ static ORPHANED_AVATAR_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid handoff-avatar regex")
 });
 
+/// Subject/connector fragments a removed handoff can strand before its verb.
+/// The list is deliberately closed and is consulted only after a terminal,
+/// roster-driven handoff matched.
+const DANGLING_HANDOFF_WORDS: &[&str] =
+    &["and", "but", "so", "then", "plus", "also", "i", "i'll", "we", "we'll"];
+
+fn trim_handoff_head(head: &str) -> String {
+    let without_avatar = ORPHANED_AVATAR_SUFFIX_RE.replace(head.trim_end(), "");
+    let mut out = without_avatar.to_string();
+    for _ in 0..4 {
+        let trimmed = out
+            .trim_end_matches(|c: char| {
+                c.is_whitespace() || matches!(c, '—' | '–' | '-' | ',' | ';' | ':')
+            })
+            .trim_end();
+        if trimmed.ends_with(['.', '!', '?', '…']) {
+            return trimmed.to_string();
+        }
+        let Some(last) = trimmed.split_whitespace().next_back() else {
+            return trimmed.to_string();
+        };
+        let key = last
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '\'' | '’'))
+            .collect::<String>()
+            .to_lowercase()
+            .replace('’', "'");
+        if !DANGLING_HANDOFF_WORDS.contains(&key.as_str()) {
+            return trimmed.to_string();
+        }
+        out = trimmed[..trimmed.len() - last.len()].to_string();
+    }
+    out.trim_end().to_string()
+}
+
 /// Strip a terminal handoff to a configured persona. Patterns are end-anchored,
 /// so a factual mid-sentence mention remains intact.
 pub fn strip_handoff_tail(reply: &str, roster: &FamilyVoiceRoster) -> String {
@@ -1133,18 +1168,11 @@ pub fn strip_handoff_tail(reply: &str, roster: &FamilyVoiceRoster) -> String {
     let Some(cut) = cut else {
         return original;
     };
-    let without_avatar =
-        ORPHANED_AVATAR_SUFFIX_RE.replace(reply[..cut].trim_end(), "");
-    let head = without_avatar
-        .trim()
-        .trim_end_matches(|c: char| {
-            c.is_whitespace() || matches!(c, '—' | '–' | '-' | ',' | ';' | ':')
-        })
-        .trim();
+    let head = trim_handoff_head(&reply[..cut]);
     if head.is_empty() {
         String::new()
     } else {
-        head.to_string()
+        head
     }
 }
 
@@ -3178,6 +3206,14 @@ label = "Fallback Member"
             ),
             "Dinner is ready.",
             "the gateway's person-for-this handoff shape is covered"
+        );
+        assert_eq!(
+            strip_handoff_tail(
+                "Dinner is ready. I'll hand this to The Wayfinder.",
+                &roster,
+            ),
+            "Dinner is ready.",
+            "removing a first-person handoff does not strand its auxiliary"
         );
         assert_eq!(
             enforce_family_voice("The Wayfinder's got this one.", &roster),
