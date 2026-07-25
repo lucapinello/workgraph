@@ -335,38 +335,99 @@ pub fn agent_for_channel_with_default(
     Some(agent_for_bot(config, &bot_id))
 }
 
-/// Resolve a roster agent handle (the notify.toml `agent_id`, which for the
-/// Casa family bots is a human-friendly NAME like `"otto"`) to the **canonical
-/// agency agent id** that `wg agent session` uses as the session-binding key.
+/// Resolve a configured household persona reference to the one agent id whose
+/// bound session may receive the turn.
 ///
-/// This is the fix for the `dedupe-key-fix` converse-hang: `wg agent session
-/// <persona>` binds a session under the agent's full 64-hex id (e.g.
-/// `c10fe2fb…`), but the election/roster surface addresses the persona by name
-/// (`agent_for_bot` returns `"otto"`). Looking a session up by the bare name
-/// therefore missed every real binding — nora/bruno/mira resolved to `None`
-/// (→ generic Sessionless reply, no memory) and otto matched only a stray
-/// name-keyed session with no live agent (→ a full `reply_timeout` hang). By
-/// canonicalising the handle first, the lookup lands on the session `wg agent
-/// session` actually bound.
+/// Session aliases are the stable identity surface. Agent names are mutable
+/// display metadata, so an exact case-sensitive alias is authoritative: it
+/// resolves only when exactly one session owns it, that row carries a nonblank
+/// agent id, and exactly one session is bound to that id. Invalid alias state
+/// fails closed and never falls through to a coincidentally matching name.
 ///
-/// Resolution order: an exact/prefix match on an agency agent **id** wins (so a
-/// config that already uses the canonical id is untouched), then a
-/// case-insensitive match on the agent **name**. Falls back to the input
-/// unchanged when nothing matches — a bot fronting no agency agent, or a test
-/// fixture that binds by the literal handle, both keep working.
-pub fn canonical_agent_id(workgraph_dir: &Path, agent_ref: &str) -> String {
+/// With no exact alias, direct full agent ids and unique id prefixes are
+/// accepted only when exactly one session is bound to the resolved full id. A
+/// uniquely bound raw literal preserves legacy hermetic fixtures. Finally, a
+/// unique case-insensitive Agent.name match is retained as a bounded migration
+/// path, again only with exactly one bound session. Unknown, unbound, duplicate,
+/// or ambiguous references return `None` so the caller plans sessionless.
+pub fn canonical_agent_id(workgraph_dir: &Path, agent_ref: &str) -> Option<String> {
+    if agent_ref.trim().is_empty() {
+        return None;
+    }
+
+    let registry = chat_sessions::load(workgraph_dir).unwrap_or_default();
+    let uniquely_bound = |candidate: &str| {
+        if candidate.is_empty() || candidate != candidate.trim() {
+            return None;
+        }
+        let count = registry
+            .sessions
+            .values()
+            .filter(|meta| meta.agent_id.as_deref() == Some(candidate))
+            .count();
+        (count == 1).then(|| candidate.to_string())
+    };
+
+    let alias_matches: Vec<_> = registry
+        .sessions
+        .values()
+        .filter(|meta| meta.aliases.iter().any(|alias| alias == agent_ref))
+        .collect();
+    if !alias_matches.is_empty() {
+        if alias_matches.len() != 1 {
+            return None;
+        }
+        return alias_matches[0]
+            .agent_id
+            .as_deref()
+            .and_then(uniquely_bound);
+    }
+
     let agents_dir = workgraph_dir.join("agency").join("cache/agents");
     let agents = crate::agency::load_all_agents_or_warn(&agents_dir);
-    if let Some(a) = agents
+    let exact_ids: Vec<_> = agents
         .iter()
-        .find(|a| a.id == agent_ref || a.id.starts_with(agent_ref))
-    {
-        return a.id.clone();
+        .filter(|agent| agent.id == agent_ref)
+        .collect();
+    if !exact_ids.is_empty() {
+        return if exact_ids.len() == 1 {
+            uniquely_bound(&exact_ids[0].id)
+        } else {
+            None
+        };
     }
-    if let Some(a) = agents.iter().find(|a| a.name.eq_ignore_ascii_case(agent_ref)) {
-        return a.id.clone();
+
+    let prefix_ids: Vec<_> = agents
+        .iter()
+        .filter(|agent| agent.id.starts_with(agent_ref))
+        .collect();
+    if !prefix_ids.is_empty() {
+        return if prefix_ids.len() == 1 {
+            uniquely_bound(&prefix_ids[0].id)
+        } else {
+            None
+        };
     }
-    agent_ref.to_string()
+
+    let literal_bindings = registry
+        .sessions
+        .values()
+        .filter(|meta| meta.agent_id.as_deref() == Some(agent_ref))
+        .count();
+    match literal_bindings {
+        1 => return Some(agent_ref.to_string()),
+        2.. => return None,
+        0 => {}
+    }
+
+    let name_matches: Vec<_> = agents
+        .iter()
+        .filter(|agent| agent.name.eq_ignore_ascii_case(agent_ref))
+        .collect();
+    if name_matches.len() == 1 {
+        return uniquely_bound(&name_matches[0].id);
+    }
+    None
 }
 
 /// Is this Telegram sender a *confirmed* human? Unknown or unconfirmed senders
@@ -440,16 +501,17 @@ pub fn plan_conversation(
     }
 
     let agent_id = agent_for_bot(config, &bot_id);
-    // The roster addresses the persona by name ("otto"), but `wg agent session`
-    // binds under the canonical agency id — canonicalise before the lookup so we
-    // find the session that was actually bound (see `canonical_agent_id`).
-    let session_key = canonical_agent_id(workgraph_dir, &agent_id);
+    // Stable household aliases and bounded legacy references resolve to a full
+    // id only when exactly one session binding exists. Any unsafe state plans
+    // sessionless rather than guessing from mutable display metadata.
+    let session_ref = canonical_agent_id(workgraph_dir, &agent_id)
+        .and_then(|session_key| chat_sessions::session_for_agent(workgraph_dir, &session_key));
     let requester = requester_display_name(workgraph_dir, sender);
     let channel = match entry {
         Entry::Direct => crate::graph::OriginChannel::TelegramDirect,
         Entry::GroupElected => crate::graph::OriginChannel::TelegramGroup,
     };
-    match chat_sessions::session_for_agent(workgraph_dir, &session_key) {
+    match session_ref {
         Some(session_ref) => ConversationPlan::Converse {
             session_ref,
             agent_id,
@@ -3441,12 +3503,32 @@ domains = ["calendar", "coordination", "shopping"]
         // `wg agent session <canonical_id>` binds under the full id, NOT "otto".
         bind_agent(wg, canonical, &uuid).unwrap();
 
-        // The resolver: name → canonical id, id-prefix → canonical id, and an
-        // unknown handle falls through unchanged (bot with no agency agent).
-        assert_eq!(canonical_agent_id(wg, "otto"), canonical);
-        assert_eq!(canonical_agent_id(wg, "OTTO"), canonical, "case-insensitive");
-        assert_eq!(canonical_agent_id(wg, "c10fe2fb"), canonical, "id prefix");
-        assert_eq!(canonical_agent_id(wg, "ghost"), "ghost", "unknown falls through");
+        // The resolver accepts a uniquely bound full id, name, and id prefix.
+        // Unknown handles fail closed instead of inventing a session identity.
+        assert_eq!(
+            canonical_agent_id(wg, canonical).as_deref(),
+            Some(canonical),
+            "full id",
+        );
+        assert_eq!(
+            canonical_agent_id(wg, "otto").as_deref(),
+            Some(canonical),
+        );
+        assert_eq!(
+            canonical_agent_id(wg, "OTTO").as_deref(),
+            Some(canonical),
+            "case-insensitive",
+        );
+        assert_eq!(
+            canonical_agent_id(wg, "c10fe2fb").as_deref(),
+            Some(canonical),
+            "id prefix",
+        );
+        assert_eq!(
+            canonical_agent_id(wg, "ghost"),
+            None,
+            "unknown fails closed",
+        );
 
         // The plan lands on the canonical-bound session — Converse, not the
         // pre-fix Sessionless miss.
@@ -3456,6 +3538,192 @@ domains = ["calendar", "coordination", "shopping"]
         match plan {
             ConversationPlan::Converse { session_ref, .. } => assert_eq!(session_ref, uuid),
             other => panic!("expected Converse via the canonical-bound session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_household_alias_resolves_unrelated_agent_name() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path();
+        let alias = "household-slot-a";
+        let canonical =
+            "a4f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500001";
+        let tempting_name_id =
+            "b5f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500002";
+        write_agent(wg, canonical, "Unrelated Display Metadata");
+        write_agent(wg, tempting_name_id, alias);
+
+        let expected_session = create_session(
+            wg,
+            SessionKind::Interactive,
+            &[alias.to_string()],
+            None,
+        )
+        .unwrap();
+        bind_agent(wg, canonical, &expected_session).unwrap();
+        let tempting_session =
+            create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(wg, tempting_name_id, &tempting_session).unwrap();
+
+        assert_eq!(
+            canonical_agent_id(wg, alias).as_deref(),
+            Some(canonical),
+            "an exact session alias must beat a tempting mutable Agent.name",
+        );
+
+        let cfg = cfg_with_bots(&[("voice-router", Some(alias))]);
+        confirm_human(wg, "member-fixture", "human-fixture", "voice-router");
+        let first = plan_conversation(
+            wg,
+            &cfg,
+            "telegram:voice-router",
+            "chat-fixture",
+            "member-fixture",
+            Entry::Direct,
+        );
+        assert!(
+            matches!(
+                &first,
+                ConversationPlan::Converse {
+                    session_ref,
+                    ..
+                } if session_ref == &expected_session
+            ),
+            "alias routed to the wrong session: {first:?}",
+        );
+
+        write_agent(wg, canonical, "Renamed Display Metadata");
+        assert_eq!(
+            canonical_agent_id(wg, alias).as_deref(),
+            Some(canonical),
+        );
+        let renamed = plan_conversation(
+            wg,
+            &cfg,
+            "telegram:voice-router",
+            "chat-fixture",
+            "member-fixture",
+            Entry::Direct,
+        );
+        assert!(
+            matches!(
+                &renamed,
+                ConversationPlan::Converse {
+                    session_ref,
+                    ..
+                } if session_ref == &expected_session
+            ),
+            "renaming display metadata changed alias routing: {renamed:?}",
+        );
+    }
+
+    #[test]
+    fn unbound_or_ambiguous_household_alias_fails_closed() {
+        fn assert_sessionless(wg: &Path, alias: &str) {
+            let cfg = cfg_with_bots(&[("voice-router", Some(alias))]);
+            confirm_human(wg, "member-fixture", "human-fixture", "voice-router");
+            let plan = plan_conversation(
+                wg,
+                &cfg,
+                "telegram:voice-router",
+                "chat-fixture",
+                "member-fixture",
+                Entry::Direct,
+            );
+            assert!(
+                matches!(&plan, ConversationPlan::Sessionless { .. }),
+                "unsafe alias state must not fall through to Agent.name: {plan:?}",
+            );
+        }
+
+        // An exact but unbound alias is authoritative invalid state. A uniquely
+        // bound Agent whose mutable name happens to equal it must not win.
+        {
+            let dir = tempdir().unwrap();
+            let wg = dir.path();
+            let alias = "household-slot-unbound";
+            let tempting =
+                "c6f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500003";
+            write_agent(wg, tempting, alias);
+            create_session(
+                wg,
+                SessionKind::Interactive,
+                &[alias.to_string()],
+                None,
+            )
+            .unwrap();
+            let tempting_session =
+                create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, tempting, &tempting_session).unwrap();
+            assert_sessionless(wg, alias);
+        }
+
+        // A corrupt duplicate alias is ambiguous even when every row is bound.
+        {
+            let dir = tempdir().unwrap();
+            let wg = dir.path();
+            let alias = "household-slot-duplicate";
+            let first_id =
+                "d7f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500004";
+            let tempting =
+                "e8f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500005";
+            write_agent(wg, first_id, "First Unrelated Display");
+            write_agent(wg, tempting, alias);
+            let first = create_session(
+                wg,
+                SessionKind::Interactive,
+                &[alias.to_string()],
+                None,
+            )
+            .unwrap();
+            bind_agent(wg, first_id, &first).unwrap();
+            let second =
+                create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, tempting, &second).unwrap();
+            let mut registry = crate::chat_sessions::load(wg).unwrap();
+            registry
+                .sessions
+                .get_mut(&second)
+                .unwrap()
+                .aliases
+                .push(alias.to_string());
+            crate::chat_sessions::save(wg, &registry).unwrap();
+            assert_sessionless(wg, alias);
+        }
+
+        // A unique alias whose agent id is corruptly bound to two sessions is
+        // also ambiguous and must not migrate through an unrelated name.
+        {
+            let dir = tempdir().unwrap();
+            let wg = dir.path();
+            let alias = "household-slot-ambiguous";
+            let target =
+                "f9f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500006";
+            let tempting =
+                "0af74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500007";
+            write_agent(wg, target, "Second Unrelated Display");
+            write_agent(wg, tempting, alias);
+            let aliased = create_session(
+                wg,
+                SessionKind::Interactive,
+                &[alias.to_string()],
+                None,
+            )
+            .unwrap();
+            bind_agent(wg, target, &aliased).unwrap();
+            let duplicate_binding =
+                create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            let tempting_session =
+                create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, tempting, &tempting_session).unwrap();
+            let mut registry = crate::chat_sessions::load(wg).unwrap();
+            registry
+                .sessions
+                .get_mut(&duplicate_binding)
+                .unwrap()
+                .agent_id = Some(target.to_string());
+            crate::chat_sessions::save(wg, &registry).unwrap();
+            assert_sessionless(wg, alias);
         }
     }
 

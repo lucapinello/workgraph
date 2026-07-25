@@ -2589,3 +2589,13 @@ owners = [
 ]
 description = "Prevents a fresh clone on a case-insensitive filesystem from starting dirty or silently replacing one tracked file with another. The real Git index is normalized and checked for duplicate portable path names."
 timeout_seconds = 15
+
+[[scenario]]
+name = "household_agent_alias_live"
+script = "scenarios/household_agent_alias_live.sh"
+owners = [
+    "p1-engine-household-session-alias",
+    "smoke-gate-is",
+]
+description = "Credential-free scratch-project proof that a configured opaque household alias resolves one bound full \"agent_id\", remains stable when mutable \"name\" metadata changes, and exposes the binding through session-list JSON. The real candidate binary plans two ordinary conversation turns and writes both to the same persistent session without contacting Telegram or an LLM."
+timeout_seconds = 30
