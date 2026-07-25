@@ -2931,6 +2931,58 @@ domains = ["calendar", "coordination", "shopping"]
         cfg
     }
 
+    /// A self-contained, household-independent roster for ownership regression
+    /// tests. The returned ids are routing keys; assertions read the expected
+    /// owner and family-visible label back from the authored configuration.
+    fn setup_opaque_collective(wg: &Path) -> (TelegramConfig, Vec<String>) {
+        std::fs::write(
+            project_root_of(wg).join("household.toml"),
+            r#"
+[[agent]]
+id = "meal-7"
+name = "Copper Ladle"
+domains = ["meals", "nutrition"]
+
+[[agent]]
+id = "recipe-4"
+name = "Kitchen Lantern"
+domains = ["cooking", "recipes"]
+
+[[agent]]
+id = "motion-2"
+name = "Bright Steps"
+domains = ["workouts"]
+
+[[agent]]
+id = "coord-9"
+name = "Home Compass"
+domains = ["calendar", "coordination", "shopping"]
+"#,
+        )
+        .unwrap();
+        let personas: Vec<String> = ["meal-7", "recipe-4", "motion-2", "coord-9"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let bot_specs: Vec<(&str, Option<&str>)> = personas
+            .iter()
+            .map(|id| (id.as_str(), Some(id.as_str())))
+            .collect();
+        let cfg = cfg_with_bots(&bot_specs);
+        for persona in &personas {
+            let uuid = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            bind_agent(wg, persona, &uuid).unwrap();
+        }
+        add_binding_for_bot(
+            wg,
+            "member-1",
+            "Household Member",
+            true,
+            "coord-9",
+        );
+        (cfg, personas)
+    }
+
     /// Run one collective voice's turn: it emits a reply with a `TASK_CREATE`
     /// tail (each voice, as in the live bug, *would* create its own copy).
     async fn run_voice(
@@ -2964,39 +3016,105 @@ domains = ["calendar", "coordination", "shopping"]
         .unwrap();
     }
 
-    /// THE REGRESSION FIXTURE (Luca, 2026-07-13). A single collective ask ("swap
-    /// Thursday dinner to grilled tofu") elects the WHOLE roster; each voice
-    /// composes a reply that would create its own task — exactly the path that
-    /// minted FOUR duplicates, one per persona, including Coach Mira (workouts)
-    /// taking on a cooking task. With the single-owner rule + intent dedupe,
-    /// exactly ONE task survives, owned by Nora (the dietitian — her domain), and
-    /// the off-domain voices defer out loud.
+    async fn run_voice_as(
+        wg: &Path,
+        cfg: &TelegramConfig,
+        persona: &str,
+        chat: &str,
+        requester: &str,
+        ask: &str,
+        reply_with_tail: &str,
+        sink: &RecSink,
+    ) {
+        let plan = plan_conversation(
+            wg,
+            cfg,
+            &format!("telegram:{persona}"),
+            chat,
+            requester,
+            Entry::GroupElected,
+        );
+        let composer = FakeComposer::ok(reply_with_tail);
+        run_conversation_turn(
+            wg,
+            &plan,
+            ask,
+            &format!("req-collective-{persona}"),
+            fast_timing(),
+            Some(&composer),
+            sink,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A single collective meal ask elects the whole configured roster; each
+    /// voice composes a reply that would create its own task. With the
+    /// single-owner rule + intent dedupe, exactly one task survives under the
+    /// configured meal owner, and off-domain voices name only the roster-authored
+    /// family label.
     #[tokio::test]
-    async fn collective_tofu_ask_creates_exactly_one_task_owned_by_nora() {
+    async fn collective_meal_ask_uses_configured_owner() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
-        let cfg = setup_collective(&wg);
+        let (cfg, personas) = setup_opaque_collective(&wg);
         let chat = "-100999";
         let ask = "swap Thursday dinner to grilled tofu";
 
-        // Roster order: nora (owner) runs first, then three off-domain voices —
-        // each with a DIFFERENT title to prove dedupe keys on the ASK, not the
-        // title. Mira's would have been the impossible "add grilled tofu" card.
-        let nora_sink = RecSink::default();
-        run_voice(&wg, &cfg, "nora", chat, ask,
-            "Grilled tofu Thursday it is 🥗\nTASK_CREATE: swap Thursday dinner to grilled tofu",
-            &nora_sink).await;
-        let bruno_sink = RecSink::default();
-        run_voice(&wg, &cfg, "bruno", chat, ask,
-            "Sounds tasty!\nTASK_CREATE: prep grilled tofu for Thursday", &bruno_sink).await;
-        let mira_sink = RecSink::default();
-        run_voice(&wg, &cfg, "mira", chat, ask,
-            "Nice protein swap.\nTASK_CREATE: add grilled tofu", &mira_sink).await;
-        let otto_sink = RecSink::default();
-        run_voice(&wg, &cfg, "otto", chat, ask,
-            "Noted!\nTASK_CREATE: put tofu on the Thursday plan", &otto_sink).await;
+        let owner_map = ownership::OwnerMap::load(&project_root_of(&wg));
+        let expected_owner = owner_map
+            .owner_for_ask(ask)
+            .expect("the opaque roster configures a meal owner")
+            .to_string();
+        let expected_label = owner_map
+            .display_names()
+            .find(|(id, _)| id.eq_ignore_ascii_case(&expected_owner))
+            .map(|(_, name)| name.to_string())
+            .expect("the configured owner has an authored display name");
 
-        // Exactly ONE task exists, and it is Nora's.
+        // Run the configured owner first, then every off-domain voice with a
+        // different title. This proves dedupe keys on the ask rather than title.
+        let owner_sink = RecSink::default();
+        run_voice_as(
+            &wg,
+            &cfg,
+            &expected_owner,
+            chat,
+            "member-1",
+            ask,
+            "Grilled tofu Thursday it is 🥗\nTASK_CREATE: swap Thursday dinner to grilled tofu",
+            &owner_sink,
+        )
+        .await;
+        let mut first_off_domain_delivery = None;
+        for (index, persona) in personas
+            .iter()
+            .filter(|persona| !persona.eq_ignore_ascii_case(&expected_owner))
+            .enumerate()
+        {
+            let sink = RecSink::default();
+            let reply = format!(
+                "That sounds good.\nTASK_CREATE: alternate meal update {}",
+                index + 1
+            );
+            run_voice_as(
+                &wg,
+                &cfg,
+                persona,
+                chat,
+                "member-1",
+                ask,
+                &reply,
+                &sink,
+            )
+            .await;
+            if first_off_domain_delivery.is_none() {
+                first_off_domain_delivery =
+                    sink.calls().last().map(|call| call.2.clone());
+            }
+        }
+
+        // Exactly one task exists, owned by the configured meal owner.
         let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
         let stamped: Vec<_> = graph.tasks().filter(|t| t.origin.is_some()).collect();
         assert_eq!(
@@ -3007,20 +3125,30 @@ domains = ["calendar", "coordination", "shopping"]
             stamped.iter().map(|t| &t.title).collect::<Vec<_>>()
         );
         let owner = stamped[0].origin.as_ref().unwrap();
-        assert_eq!(owner.persona, "nora", "the meal-plan owner (dietitian) owns it");
+        assert_eq!(
+            owner.persona, expected_owner,
+            "the configured meal-domain owner owns the task",
+        );
         assert_eq!(stamped[0].title, "swap Thursday dinner to grilled tofu");
 
-        // Coach Mira never owns a cooking task — the impossible card is impossible.
+        // No off-domain voice can own a meal task.
         assert!(
-            !graph.tasks().any(|t| t.origin.as_ref().map(|o| o.persona.as_str()) == Some("mira")),
-            "Coach Mira must never own a meals/cooking task"
+            graph.tasks().all(|task| task
+                .origin
+                .as_ref()
+                .is_none_or(|origin| origin.persona == expected_owner)),
+            "an off-domain persona acquired the configured meal task",
         );
 
-        // The off-domain voices defer out loud so the ask visibly lands with Nora.
-        let mira_last = mira_sink.calls().last().map(|c| c.2.clone()).unwrap_or_default();
+        // The handoff uses authored family presentation, never the routing id.
+        let handoff = first_off_domain_delivery.expect("an off-domain voice replied");
         assert!(
-            mira_last.contains("Nora"),
-            "an off-domain voice should defer to the owner by name, got: {mira_last:?}"
+            handoff.contains(&expected_label),
+            "the handoff must use the configured owner label: {handoff:?}",
+        );
+        assert!(
+            !handoff.contains(&expected_owner),
+            "the family-visible handoff leaked the opaque routing id: {handoff:?}",
         );
     }
 
