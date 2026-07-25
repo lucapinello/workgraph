@@ -2632,7 +2632,7 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
 /// `wg telegram elect` — show who would respond to a group message in
 /// all-bots-privacy-off mode, without sending anything.
 ///
-/// Runs the exact [`elect_responders`] decision the listener uses on a deduped
+/// Runs the exact [`elect_responders_with_owner_map`] decision the listener uses on a deduped
 /// message and prints the outcome: `mention` / `name` / `reply-chain` route to
 /// one voice, `collective` fans out to the whole roster, `otto` coordinates a
 /// team-directed ask, and `silence` means the bots stay out. Mentions are
@@ -2744,7 +2744,7 @@ pub fn run_elect(
 /// `wg telegram discuss --dry-run` — show whether a group message would run a
 /// DISCUSSION ROUND, and the planned round, without sending anything.
 ///
-/// Runs the exact [`elect_responders`] decision the listener uses, then applies
+/// Runs the exact [`elect_responders_with_owner_map`] decision the listener uses, then applies
 /// the same [`is_discussion_ask`] gate the live `Election::All` handler uses to
 /// split a collective election into a discussion round vs independent roster
 /// replies. Prints the category and, for a round, the household-authored voices
@@ -2920,7 +2920,7 @@ pub fn run_compose_prompt(
 /// Feeds the raw `getUpdates` element through the SAME boundary the live
 /// listener uses: [`decode_update`] (which reads the Telegram entities so a
 /// bare `?` is distinguished from a real `/help`), then [`command_gate`] and
-/// [`elect_responders`]. Prints the decision — is it a command, and if not, who
+/// [`elect_responders_with_owner_map`]. Prints the decision — is it a command, and if not, who
 /// the election routes it to. This is the `fix-command-leaks` proof: a bare `?`
 /// or `@mention ?` must decide `conversation` with ZERO commands and never
 /// touch the operator claim/done path.
@@ -3039,7 +3039,7 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
 ///
 /// Decodes the raw update(s) through the SAME `decode_update` boundary the
 /// listener uses (photo `file_id`, caption, media group), coalesces album
-/// frames into per-turn units, runs the real `elect_responders` decision on the
+/// frames into per-turn units, runs the real `elect_responders_with_owner_map` decision on the
 /// first turn's caption (who a captioned photo routes to), and — when a fixture
 /// `--reply` + `--list` are given — parses the model's `SHOPPING_UPDATE:` tail
 /// and prints the exact mutations that WOULD be applied through the gateway
@@ -4151,7 +4151,7 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 ///
 /// This command runs the SAME pipeline the listener runs on a group message,
 /// without a live socket: it elects responder(s) with the exact
-/// [`elect_responders`] table (@mention / addressed name / collective / concierge
+/// [`elect_responders_with_owner_map`] table (@mention / addressed name / collective / concierge
 /// / silence), then dispatches through the SAME senders + composer the listener
 /// uses — [`run_group_discussion`] / [`run_group_collective`] for a collective
 /// address, or the single-voice [`plan_conversation`] +

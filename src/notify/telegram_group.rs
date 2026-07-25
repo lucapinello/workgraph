@@ -1812,6 +1812,7 @@ fn strip_mention(text: &str, username: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::ownership::OwnerMap;
     use crate::notify::telegram::TelegramBotConfig;
     use std::collections::HashMap;
 
@@ -4058,5 +4059,121 @@ domains = ["cooking"]
             }
             other => panic!("expected One(nora) for the fennel ask, got {other:?}"),
         }
+    }
+
+    // ---- Configured roles, not compiled ids (p1-engine-photo-config-fixture) --
+    //
+    // A household that composes its own family does not inherit starter ids.
+    // Election must read who owns what from that household's roster, so a
+    // message naming nobody reaches the persona it declared for `coordination`
+    // and a food-shaped ask reaches the one it declared for `cooking`.
+
+    /// A two-persona roster whose ids appear on no shipped list and contain no
+    /// domain word — `domains` is the only ownership signal available.
+    fn opaque_config() -> TelegramConfig {
+        cfg_with_bots(&[
+            ("wren", "-100999", Some("wren"), Some("wren_house_bot")),
+            ("tally", "-100999", Some("tally"), Some("tally_house_bot")),
+        ])
+    }
+
+    fn opaque_owners(cooking: &str, coordination: &str) -> OwnerMap {
+        assert_ne!(cooking, coordination);
+        let domains_for = |persona_id: &str| {
+            if persona_id == cooking {
+                vec!["meals", "cooking", "recipes"]
+            } else if persona_id == coordination {
+                vec!["calendar", "coordination", "shopping"]
+            } else {
+                panic!("unexpected opaque test persona: {persona_id}");
+            }
+        };
+
+        // Keep author order fixed while ownership moves. Otherwise a broken
+        // positional router (first = cooking, second = coordination) could
+        // pass the reassignment assertions.
+        OwnerMap::from_pairs(vec![
+            ("wren", domains_for("wren")),
+            ("tally", domains_for("tally")),
+        ])
+    }
+
+    fn elect_opaque(text: &str, owners: &OwnerMap) -> Election {
+        elect_responders_with_owner_map(
+            Some("supergroup"),
+            Some("-100999"),
+            text,
+            &[],
+            None,
+            false,
+            1,
+            &opaque_config(),
+            owners,
+        )
+    }
+
+    fn elected_agent(election: &Election) -> Option<String> {
+        match election {
+            Election::One { bot, .. } => bot.agent_id.clone(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn unaddressed_message_reaches_the_configured_coordinator() {
+        // Nobody is named and the content is not food/workouts — this is the
+        // concierge rule, resolved against the household's own roster. Before the
+        // fix this went to `Silence(NoVoicesConfigured)` because the configured
+        // coordinator was not resolved from this project.
+        let election = elect_opaque(
+            "can someone take a look at this",
+            &opaque_owners("wren", "tally"),
+        );
+        assert_eq!(
+            elected_agent(&election).as_deref(),
+            Some("tally"),
+            "the persona declaring `coordination` fronts the group, got {election:?}"
+        );
+        assert!(
+            matches!(
+                election,
+                Election::One {
+                    addressed_by: AddressedBy::Concierge,
+                    ..
+                }
+            ),
+            "the concierge RULE still fires — only the persona it resolves to is configured"
+        );
+    }
+
+    #[test]
+    fn moving_coordination_domains_with_fixed_order_moves_who_answers() {
+        let text = "can someone take a look at this";
+        assert_eq!(
+            elected_agent(&elect_opaque(text, &opaque_owners("wren", "tally"))).as_deref(),
+            Some("tally")
+        );
+        // Same bot config, author order, and message: only domain ownership moved.
+        assert_eq!(
+            elected_agent(&elect_opaque(text, &opaque_owners("tally", "wren"))).as_deref(),
+            Some("wren"),
+            "routing must follow `domains`, not recognise an id"
+        );
+    }
+
+    #[test]
+    fn food_ask_reaches_the_configured_cook_not_the_coordinator() {
+        let text = "what should we cook for dinner tomorrow?";
+        let election = elect_opaque(text, &opaque_owners("wren", "tally"));
+        assert_eq!(
+            elected_agent(&election).as_deref(),
+            Some("wren"),
+            "the persona declaring `cooking`/`meals` answers a food ask, got {election:?}"
+        );
+        // Reassign the kitchen and the food ask follows it.
+        assert_eq!(
+            elected_agent(&elect_opaque(text, &opaque_owners("tally", "wren"))).as_deref(),
+            Some("tally")
+        );
     }
 }
