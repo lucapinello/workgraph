@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use super::grounding::{self, FamilyVoiceRoster};
 use super::telegram_conversation::{ReplyComposer, ReplySink};
 use super::telegram_group::CONCIERGE_BOT;
 
@@ -202,6 +203,7 @@ async fn compose_bounded(
     agent_id: &str,
     message: &str,
     budget: Duration,
+    family_roster: &FamilyVoiceRoster,
 ) -> Option<String> {
     match tokio::time::timeout(
         budget,
@@ -209,7 +211,12 @@ async fn compose_bounded(
     )
     .await
     {
-        Ok(Ok(text)) if !text.trim().is_empty() => Some(clamp_take(&text)),
+        // Discussion turns do not pass through telegram_conversation's finalizer.
+        // Guard the clamped draft here, before it enters either the Telegram sink
+        // or the mirrored Casa feed.
+        Ok(Ok(text)) if !text.trim().is_empty() => {
+            Some(grounding::enforce_family_voice(&clamp_take(&text), family_roster))
+        }
         _ => None,
     }
 }
@@ -234,6 +241,7 @@ pub async fn run_discussion_round(
     voices: &[DiscussionVoice],
     synthesizer_bot: &str,
     composer: &dyn ReplyComposer,
+    family_roster: &FamilyVoiceRoster,
     sink: &dyn ReplySink,
     chat_id: &str,
     timing: DiscussionTiming,
@@ -258,6 +266,7 @@ pub async fn run_discussion_round(
             &voice.agent_id,
             &message,
             budget,
+            family_roster,
         )
         .await;
         match text {
@@ -299,6 +308,7 @@ pub async fn run_discussion_round(
                     &voice.agent_id,
                     &message,
                     budget,
+                    family_roster,
                 )
                 .await
                 {
@@ -415,6 +425,13 @@ mod tests {
         }
     }
 
+    fn family_roster() -> FamilyVoiceRoster {
+        FamilyVoiceRoster::from_names(
+            ["Nora", "Bruno", "Coach Mira", "Otto"],
+            ["Household Member"],
+        )
+    }
+
     #[tokio::test]
     async fn full_round_sequences_all_voices_then_synthesizes() {
         let replies = [
@@ -435,6 +452,7 @@ mod tests {
             &roster(),
             "otto",
             &composer,
+            &family_roster(),
             &sink,
             "-100",
             generous_timing(),
@@ -496,6 +514,7 @@ mod tests {
             &roster(),
             "otto",
             &composer,
+            &family_roster(),
             &sink,
             "-100",
             generous_timing(),
@@ -540,6 +559,7 @@ mod tests {
             &roster(),
             "otto",
             &composer,
+            &family_roster(),
             &sink,
             "-100",
             generous_timing(),
@@ -577,6 +597,7 @@ mod tests {
             &roster(),
             "otto",
             &composer,
+            &family_roster(),
             &sink,
             "-100",
             generous_timing(),
@@ -588,6 +609,71 @@ mod tests {
         // Otto sent twice: his peer take and the wrap-up.
         let sent = sink.sent.lock().unwrap();
         assert_eq!(sent.iter().filter(|(bot, _)| bot == "otto").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn every_take_and_synthesis_is_family_guarded_before_send() {
+        let replies = [
+            ("nora", Some("Nora 💬 **Pasta** sounds great.")),
+            ("bruno", Some("Pasta sounds great.")),
+            (
+                "mira",
+                Some("A salad works. Zephyra will join us. Otto's got this one."),
+            ),
+            (
+                "otto",
+                Some(concat!(
+                    "I'll pull that from the live gateway. ",
+                    "Dispatcher healthy. W29 is still a draft.",
+                )),
+            ),
+        ]
+        .iter()
+        .map(|(a, r)| (a.to_string(), r.map(|s| s.to_string())))
+        .collect();
+        let composer = FakeComposer { replies };
+        let sink = RecordingSink::default();
+
+        let outcome = run_discussion_round(
+            Path::new("."),
+            "what should we do for dinner?",
+            &roster(),
+            "otto",
+            &composer,
+            &family_roster(),
+            &sink,
+            "-100",
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+
+        let sent = sink.sent.lock().unwrap();
+        assert_eq!(sent.len(), 5, "four takes and the synthesis should still land");
+        for (_, text) in sent.iter() {
+            assert!(!text.contains("Nora 💬"), "self-attribution leaked: {text:?}");
+            assert!(!text.contains("Zephyra"), "off-roster claim leaked: {text:?}");
+            assert!(!text.contains("got this one"), "persona handoff leaked: {text:?}");
+            assert!(
+                !["system", "gateway", "pipeline"]
+                    .iter()
+                    .any(|word| text.to_lowercase().contains(word)),
+                "infrastructure narration leaked: {text:?}",
+            );
+            assert!(!text.contains("W29"), "machine shorthand leaked: {text:?}");
+            assert!(!text.contains("**"), "markdown leaked: {text:?}");
+        }
+        assert_eq!(sent[1].1, "Pasta sounds great.", "safe copy must stay unchanged");
+        assert!(outcome.takes.iter().all(|take| !take.text.contains("Zephyra")));
+        assert!(
+            !outcome
+                .synthesis
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("gateway"),
+            "the stored synthesis must match the guarded delivery",
+        );
     }
 
     #[test]

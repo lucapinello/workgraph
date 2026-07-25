@@ -3167,6 +3167,7 @@ pub async fn run_group_discussion(
 ) -> Result<()> {
     use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_discussion as discussion;
+    use worksgood::notify::grounding;
     use worksgood::notify::telegram_standup as standup;
 
     let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
@@ -3250,6 +3251,8 @@ pub async fn run_group_discussion(
         feed_path.to_path_buf(),
         config.clone(),
     );
+    let family_roster =
+        grounding::load_family_voice_roster(&project_root(workgraph_dir), workgraph_dir);
 
     let outcome = discussion::run_discussion_round(
         workgraph_dir,
@@ -3257,6 +3260,7 @@ pub async fn run_group_discussion(
         &voices,
         CONCIERGE_BOT,
         composer_ref,
+        &family_roster,
         &sink,
         target,
         timing,
