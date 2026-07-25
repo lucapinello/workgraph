@@ -3537,22 +3537,21 @@ fn fast_lane_reply_target(
 /// `owner-pin-engine`).
 ///
 /// THE LAST ROUTING SEAM. When the gateway resolves a domain owner for an
-/// open-ended heavy ask ("tell me the calories" → nutrition → Nora), it drops
+/// open-ended heavy ask, it drops
 /// that persona's crisp "on it" ack AND forwards the pin (`--owner` /
 /// `WG_OWNER_PIN`). Before this, production's shell-out IGNORED the hint — the
 /// fork's election re-resolved ownership and often re-elected the concierge
-/// (Otto), so the async reply came back in a DIFFERENT voice than the one that
-/// acked, talking about the acking persona in the third person. The pin must be
-/// BINDING for voice selection: the composing/delivering bot IS the pinned
-/// persona, not a re-election winner.
+/// so the async reply came back in a DIFFERENT voice than the one that acked.
+/// The pin must be BINDING for voice selection: the composing/delivering bot IS
+/// the pinned persona, not a re-election winner.
 ///
 /// Given the current election, return it with its single voice REBOUND to the
-/// pinned persona's bot. A pin that is empty, is the concierge default
-/// (`otto` — "no owner claimed it, elect as today"), or resolves to no
-/// configured bot leaves the election untouched. The body is preserved from a
-/// One/All election, else the raw `message` — a pinned turn the engine would
-/// have stayed silent on is still forced to answer in the pinned voice, because
-/// the gateway already decided it is a domain-owned heavy ask.
+/// pinned persona's bot. Only a missing, empty, or unconfigured pin leaves the
+/// election untouched; no persona id doubles as a sentinel. The body is
+/// preserved from a One/All election, else the raw `message` — a pinned turn
+/// the engine would have stayed silent on is still forced to answer in the
+/// pinned voice, because the gateway already decided it is a domain-owned
+/// heavy ask.
 fn apply_owner_pin(
     election: Election,
     pin: Option<&str>,
@@ -3561,8 +3560,8 @@ fn apply_owner_pin(
     message: &str,
 ) -> Election {
     let pin = match pin.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) if !p.eq_ignore_ascii_case("otto") => p,
-        _ => return election,
+        Some(p) => p,
+        None => return election,
     };
     let bot = match resolve_mentioned_bot(pin, config) {
         Some(b) => b,
@@ -7406,97 +7405,107 @@ mod tests {
     /// owner's crisp ack and forwards the same persona id, so the async reply
     /// must come back in the SAME voice — not a re-election winner. The engine's
     /// election is BINDING-overridden to the pinned persona's bot. THE LAST
-    /// ROUTING SEAM: before this, production's shell-out re-elected the concierge
-    /// (Otto) and the delivery voice ≠ the ack voice.
+    /// ROUTING SEAM: before this, production's shell-out re-elected the
+    /// concierge and the delivery voice differed from the ack voice.
     #[test]
     fn owner_pin_binds_delivery_voice_to_pinned_persona() {
-        use worksgood::notify::telegram_group::{AddressedBy, ResolvedBot};
+        use worksgood::notify::telegram_group::AddressedBy;
 
         let mut bots = HashMap::new();
-        bots.insert(
-            "otto".to_string(),
-            TelegramBotConfig {
-                bot_token: "111:AAA".to_string(),
-                chat_id: "-100777".to_string(),
-                agent_id: Some("otto".to_string()),
-                username: None,
-            },
-        );
-        bots.insert(
-            "nora".to_string(),
-            TelegramBotConfig {
-                bot_token: "222:BBB".to_string(),
-                chat_id: "-100777".to_string(),
-                agent_id: Some("nora".to_string()),
-                username: None,
-            },
-        );
+        for (id, token) in [
+            ("harbor", "111:AAA"),
+            ("cedar", "222:BBB"),
+            // This id used to be a compiled no-owner sentinel. It is now just
+            // another configured id and must be bindable like any other.
+            ("otto", "333:CCC"),
+        ] {
+            bots.insert(
+                id.to_string(),
+                TelegramBotConfig {
+                    bot_token: token.to_string(),
+                    chat_id: "-100777".to_string(),
+                    agent_id: Some(id.to_string()),
+                    username: None,
+                },
+            );
+        }
         let config = TelegramConfig {
             bot_token: String::new(),
             chat_id: String::new(),
             bots,
         };
 
-        // The engine re-elected Otto (the concierge) for a heavy nutrition ask.
-        let otto_bot = resolve_mentioned_bot("otto", &config).unwrap();
-        let elected_otto = Election::One {
-            bot: otto_bot,
+        let elected = Election::One {
+            bot: resolve_mentioned_bot("harbor", &config).unwrap(),
             reply_chat: "-100777".to_string(),
-            body: "how many calories in the pasta pomodoro?".to_string(),
+            body: "how many calories are in tonight's pasta?".to_string(),
             addressed_by: AddressedBy::ReplyChain,
         };
 
-        // Pin = nora → the delivering voice is rebound to Nora, body preserved.
         let pinned = apply_owner_pin(
-            elected_otto.clone(),
-            Some("nora"),
+            elected.clone(),
+            Some("cedar"),
             &config,
             "-100777",
-            "how many calories in the pasta pomodoro?",
+            "how many calories are in tonight's pasta?",
         );
         match &pinned {
-            Election::One { bot, body, reply_chat, .. } => {
-                assert_eq!(bot.bot_id, "nora", "pin must rebind the delivery voice to Nora:\n{pinned:?}");
-                assert_eq!(bot.agent_id.as_deref(), Some("nora"));
+            Election::One {
+                bot,
+                body,
+                reply_chat,
+                ..
+            } => {
+                assert_eq!(bot.bot_id, "cedar");
+                assert_eq!(bot.agent_id.as_deref(), Some("cedar"));
                 assert_eq!(reply_chat, "-100777");
-                assert_eq!(body, "how many calories in the pasta pomodoro?", "body preserved from the election");
+                assert_eq!(body, "how many calories are in tonight's pasta?");
             }
             other => panic!("pin must yield Election::One, got {other:?}"),
         }
 
-        // No pin → election stands (Otto). Empty / concierge-default / unknown all no-op.
-        for pin in [None, Some(""), Some("  "), Some("otto"), Some("OTTO"), Some("nobody")] {
-            let unchanged = apply_owner_pin(elected_otto.clone(), pin, &config, "-100777", "m");
+        // Only an absent, empty, or unknown pin is a no-op.
+        for pin in [None, Some(""), Some("  "), Some("nobody")] {
+            let unchanged = apply_owner_pin(elected.clone(), pin, &config, "-100777", "m");
             match &unchanged {
                 Election::One { bot, .. } => assert_eq!(
-                    bot.bot_id, "otto",
-                    "pin={pin:?} must leave the election untouched (Otto), got {unchanged:?}"
+                    bot.bot_id, "harbor",
+                    "pin={pin:?} must leave the election untouched, got {unchanged:?}"
                 ),
-                other => panic!("expected Otto One for pin={pin:?}, got {other:?}"),
+                other => panic!("expected the original One election, got {other:?}"),
             }
         }
 
-        // A pinned turn the engine would have stayed SILENT on is still forced to
-        // answer in the pinned voice with the raw message as the body (the
-        // gateway already decided it is a domain-owned heavy ask).
-        let silent = Election::Silence(
-            worksgood::notify::telegram_group::SilenceReason::SmallTalk,
+        // No configured persona id is a sentinel, including an id that matched
+        // an older shipped household fixture.
+        let formerly_special =
+            apply_owner_pin(elected.clone(), Some("otto"), &config, "-100777", "m");
+        match formerly_special {
+            Election::One { bot, .. } => assert_eq!(bot.bot_id, "otto"),
+            other => panic!("every configured pin must bind, got {other:?}"),
+        }
+
+        // A pinned turn the engine would have stayed silent on is still forced
+        // to answer in the pinned voice with the raw message as the body.
+        let silent =
+            Election::Silence(worksgood::notify::telegram_group::SilenceReason::SmallTalk);
+        let forced = apply_owner_pin(
+            silent,
+            Some("cedar"),
+            &config,
+            "-100777",
+            "tell me the calories",
         );
-        let forced = apply_owner_pin(silent, Some("nora"), &config, "-100777", "tell me the calories");
         match &forced {
             Election::One { bot, body, .. } => {
-                assert_eq!(bot.bot_id, "nora");
-                assert_eq!(body, "tell me the calories", "raw message becomes the body on a forced pin");
+                assert_eq!(bot.bot_id, "cedar");
+                assert_eq!(
+                    body, "tell me the calories",
+                    "raw message becomes the body on a forced pin"
+                );
             }
-            other => panic!("pin over silence must force Nora One, got {other:?}"),
+            other => panic!("pin over silence must force a One election, got {other:?}"),
         }
-        // Silence self-check so ResolvedBot import is exercised even if the arms
-        // above change.
-        let _ = ResolvedBot {
-            bot_id: "x".into(),
-            channel_type: "telegram:x".into(),
-            agent_id: None,
-        };
     }
 
     #[test]
