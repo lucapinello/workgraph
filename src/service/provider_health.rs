@@ -403,6 +403,11 @@ pub struct ProviderHealth {
     /// emit the operator alert (mirrors the spawn breaker's one-shot alert).
     #[serde(default)]
     pub pending_pause_alert: bool,
+    /// Armed only when the daemon's reachability probe auto-resumes a paused
+    /// service. A failed private delivery leaves this set across reloads so the
+    /// recovery notice is retried without replaying the pause transition.
+    #[serde(default)]
+    pub pending_resume_alert: bool,
     /// RFC3339 timestamp of the last auto-probe attempt while paused. Drives the
     /// probe cadence so we probe at most once per configured interval.
     #[serde(default)]
@@ -519,6 +524,9 @@ impl ProviderHealth {
         if self.service_paused && !was_service_paused {
             self.pause_generation = self.pause_generation.saturating_add(1);
             self.pending_pause_alert = true;
+            // A fresh outage supersedes an undelivered recovery notice from the
+            // preceding window; reporting "back" after a re-pause would be stale.
+            self.pending_resume_alert = false;
             // A fresh pause window starts fresh: the next probe should fire
             // after one interval, not immediately reuse a stale probe stamp.
             self.last_probe_at = None;
@@ -537,6 +545,7 @@ impl ProviderHealth {
         // pause starts from a clean slate. `pause_generation` is monotonic and
         // deliberately preserved (episode ids must never repeat).
         self.pending_pause_alert = false;
+        self.pending_resume_alert = false;
         self.last_probe_at = None;
 
         // Also resume all paused providers. resume() resets each provider's
@@ -555,6 +564,22 @@ impl ProviderHealth {
     pub fn take_pause_alert(&mut self) -> Option<u32> {
         if self.pending_pause_alert {
             self.pending_pause_alert = false;
+            Some(self.pause_generation)
+        } else {
+            None
+        }
+    }
+
+    /// Arm the recovery notice after an automatic probe-driven resume.
+    pub fn arm_resume_alert(&mut self) {
+        self.pending_resume_alert = true;
+    }
+
+    /// Consume the automatic recovery notice only after its alert helper reports
+    /// a confirmed/durable outcome.
+    pub fn take_resume_alert(&mut self) -> Option<u32> {
+        if self.pending_resume_alert {
+            self.pending_resume_alert = false;
             Some(self.pause_generation)
         } else {
             None

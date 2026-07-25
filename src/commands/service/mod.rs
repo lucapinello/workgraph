@@ -1786,18 +1786,39 @@ fn project_root_for(dir: &Path) -> PathBuf {
 ///
 /// `episode` distinguishes separate open episodes so the digest store's
 /// exactly-once de-dupe doesn't swallow a re-open alert.
-fn emit_operator_alert(dir: &Path, logger: &DaemonLogger, episode: &str, text: &str) {
-    emit_operator_alert_with_sender(dir, logger, episode, text, |tg_config, chat_id, body| {
-        let channel = worksgood::notify::telegram::TelegramChannel::new(tg_config);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("no async runtime: {e}"))?;
-        use worksgood::notify::NotificationChannel;
-        rt.block_on(channel.send_text(chat_id, body))
-            .map(|_| ())
-            .map_err(|e| format!("telegram send failed: {e}"))
-    });
+fn send_operator_alert_telegram(
+    tg_config: worksgood::notify::telegram::TelegramConfig,
+    chat_id: &str,
+    body: &str,
+) -> std::result::Result<(), String> {
+    let channel = worksgood::notify::telegram::TelegramChannel::new(tg_config);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("no async runtime: {e}"))?;
+    use worksgood::notify::NotificationChannel;
+    rt.block_on(channel.send_text(chat_id, body))
+        .map(|_| ())
+        .map_err(|e| format!("telegram send failed: {e}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorAlertDisposition {
+    /// The alert was delivered, durably queued/already recorded, or deliberately
+    /// kept in the daemon log because no proven private route exists.
+    Complete,
+    /// A private transport was attempted but not confirmed. The live caller must
+    /// retain its episode flag and invoke this helper again on a later tick.
+    Retry,
+}
+
+fn emit_operator_alert(
+    dir: &Path,
+    logger: &DaemonLogger,
+    episode: &str,
+    text: &str,
+) -> OperatorAlertDisposition {
+    emit_operator_alert_with_sender(dir, logger, episode, text, send_operator_alert_telegram)
 }
 
 /// Testable core of [`emit_operator_alert`]. The sender seam keeps privacy and
@@ -1809,7 +1830,8 @@ fn emit_operator_alert_with_sender<F>(
     episode: &str,
     text: &str,
     mut send: F,
-) where
+) -> OperatorAlertDisposition
+where
     F: FnMut(
         worksgood::notify::telegram::TelegramConfig,
         &str,
@@ -1825,16 +1847,16 @@ fn emit_operator_alert_with_sender<F>(
     let root = project_root_for(dir);
     let config = match worksgood::notify::config::NotifyConfig::load(Some(&root)) {
         Ok(Some(c)) => c,
-        _ => return, // No notify config → the loud log is the alert.
+        _ => return OperatorAlertDisposition::Complete, // No notify config → the loud log is the alert.
     };
     if !config.has_channel_config("telegram") {
-        return;
+        return OperatorAlertDisposition::Complete;
     }
     let tg_config = match worksgood::notify::telegram::TelegramConfig::from_notify_config(&config) {
         Ok(c) => c,
         Err(e) => {
             logger.warn(&format!("operator alert: invalid telegram config: {}", e));
-            return;
+            return OperatorAlertDisposition::Complete;
         }
     };
     let chat_id = tg_config.chat_id.clone();
@@ -1843,7 +1865,7 @@ fn emit_operator_alert_with_sender<F>(
         // or group target keeps the loud daemon-log alert and stops before
         // pacing state or transport is touched.
         logger.warn("operator alert: no private Telegram chat configured; kept in daemon log");
-        return;
+        return OperatorAlertDisposition::Complete;
     }
 
     let digest_path = DigestStore::path(&root);
@@ -1851,7 +1873,7 @@ fn emit_operator_alert_with_sender<F>(
     let policy = DigestPolicy::new();
     let now = chrono::Local::now().naive_local();
     let nudge = spawn_breaker::operator_alert_nudge("operator", episode, now, text);
-    let mut failed_delivery_rearmed = false;
+    let mut disposition = OperatorAlertDisposition::Complete;
 
     match store.offer(&nudge, now, &policy) {
         Offer::SendNow(body) => match send(tg_config, &chat_id, &body) {
@@ -1859,7 +1881,7 @@ fn emit_operator_alert_with_sender<F>(
             Err(e) => {
                 logger.warn(&format!("operator alert: {e}"));
                 if store.rearm_standalone_proactive(&nudge) {
-                    failed_delivery_rearmed = true;
+                    disposition = OperatorAlertDisposition::Retry;
                     logger.info("operator alert re-armed after unconfirmed delivery");
                 } else {
                     logger.error(
@@ -1876,15 +1898,61 @@ fn emit_operator_alert_with_sender<F>(
     }
 
     if let Err(e) = store.save(&digest_path) {
-        if failed_delivery_rearmed {
+        if disposition == OperatorAlertDisposition::Retry {
             logger.error(&format!(
                 "operator alert: failed to persist re-armed delivery: {}; \
                  next attempt may be suppressed",
                 e
             ));
         } else {
-            logger.warn(&format!("operator alert: failed to persist digest store: {}", e));
+            logger.warn(&format!(
+                "operator alert: failed to persist digest store: {}",
+                e
+            ));
         }
+    }
+    disposition
+}
+
+/// Deliver the spawn breaker's pending alert without consuming its durable
+/// episode flag until the private transport has either been confirmed or
+/// deliberately resolved to the daemon-log-only path.
+///
+/// A failed send leaves `alert_pending=true` on disk. Reloading the breaker on a
+/// later daemon tick therefore invokes the same episode again; the digest helper
+/// has re-armed that exact id, so the retry is admitted instead of suppressed.
+fn emit_pending_spawn_breaker_alert_with_sender<F>(
+    dir: &Path,
+    logger: &DaemonLogger,
+    breaker: &mut spawn_breaker::SpawnBreakerState,
+    breaker_path: &Path,
+    mut send: F,
+) where
+    F: FnMut(
+        worksgood::notify::telegram::TelegramConfig,
+        &str,
+        &str,
+    ) -> std::result::Result<(), String>,
+{
+    if !breaker.alert_pending {
+        return;
+    }
+    let episode = format!("open-{}", breaker.total_opens);
+    if emit_operator_alert_with_sender(
+        dir,
+        logger,
+        &episode,
+        spawn_breaker::OPERATOR_ALERT_TEXT,
+        &mut send,
+    ) == OperatorAlertDisposition::Complete
+    {
+        breaker.take_alert();
+    }
+    if let Err(e) = breaker.save(breaker_path) {
+        logger.warn(&format!(
+            "spawn breaker: failed to persist operator-alert retry intent: {}",
+            e
+        ));
     }
 }
 
@@ -1904,17 +1972,47 @@ const PROVIDER_PROBE_TIMEOUT_SECS: u64 = 90;
 /// Everything is best-effort and wrapped so a missing config / probe hiccup can
 /// never wedge the daemon: the loud logs remain the floor.
 fn maybe_probe_and_resume_provider(dir: &Path, logger: &DaemonLogger) {
-    maybe_probe_and_resume_provider_with(dir, logger, run_provider_probe);
+    maybe_probe_and_resume_provider_with_alert_sender(
+        dir,
+        logger,
+        run_provider_probe,
+        send_operator_alert_telegram,
+    );
 }
 
 /// Testable core of [`maybe_probe_and_resume_provider`] with the reachability
 /// probe injected, so tests can drive the pause→probe-success→auto-resume and
 /// pause→probe-fail→stay-paused edges without spawning a real CLI.
+#[cfg(test)]
 fn maybe_probe_and_resume_provider_with(
     dir: &Path,
     logger: &DaemonLogger,
     probe: impl Fn(&str, &DaemonLogger) -> bool,
 ) {
+    maybe_probe_and_resume_provider_with_alert_sender(
+        dir,
+        logger,
+        probe,
+        send_operator_alert_telegram,
+    );
+}
+
+/// Full provider-health tick with both external effects injected. Keeping the
+/// alert sender beside the real state-machine caller lets tests prove that a
+/// failed private send leaves its durable episode flag armed across a reload.
+fn maybe_probe_and_resume_provider_with_alert_sender<P, F>(
+    dir: &Path,
+    logger: &DaemonLogger,
+    probe: P,
+    mut send: F,
+) where
+    P: Fn(&str, &DaemonLogger) -> bool,
+    F: FnMut(
+        worksgood::notify::telegram::TelegramConfig,
+        &str,
+        &str,
+    ) -> std::result::Result<(), String>,
+{
     let mut health = match worksgood::service::ProviderHealth::load(dir) {
         Ok(h) => h,
         Err(e) => {
@@ -1927,20 +2025,43 @@ fn maybe_probe_and_resume_provider_with(
     };
     let mut dirty = false;
 
-    // (1) One-shot pause alert on the trip edge.
-    if let Some(generation) = health.take_pause_alert() {
+    // Retry an automatic-recovery notice retained by an earlier failed private
+    // send before considering a new outage/probe transition.
+    if health.pending_resume_alert {
+        let generation = health.pause_generation;
+        if emit_operator_alert_with_sender(
+            dir,
+            logger,
+            &format!("provider-resumed-{}", generation),
+            worksgood::service::PROVIDER_RESUMED_ALERT_TEXT,
+            &mut send,
+        ) == OperatorAlertDisposition::Complete
+        {
+            health.take_resume_alert();
+            dirty = true;
+        }
+    }
+
+    // (1) Pause alert on the trip edge. Do not consume the durable flag until a
+    // private send succeeds (or routing deliberately resolves to log-only).
+    if health.pending_pause_alert {
+        let generation = health.pause_generation;
         let reason = health
             .pause_reason
             .as_deref()
             .unwrap_or("provider unreachable");
         logger.warn(&format!("[provider-health] service PAUSED: {}", reason));
-        emit_operator_alert(
+        if emit_operator_alert_with_sender(
             dir,
             logger,
             &format!("provider-paused-{}", generation),
             worksgood::service::PROVIDER_PAUSED_ALERT_TEXT,
-        );
-        dirty = true;
+            &mut send,
+        ) == OperatorAlertDisposition::Complete
+        {
+            health.take_pause_alert();
+            dirty = true;
+        }
     }
 
     // (2) Auto-probe + auto-resume while paused.
@@ -1969,16 +2090,22 @@ fn maybe_probe_and_resume_provider_with(
             if reachable {
                 let generation = health.pause_generation;
                 health.resume_service();
+                health.arm_resume_alert();
+                dirty = true;
                 logger.info(&format!(
                     "[provider-health] probe succeeded — AUTO-RESUMING after {} paused",
                     worksgood::format_duration(paused_for, false),
                 ));
-                emit_operator_alert(
+                if emit_operator_alert_with_sender(
                     dir,
                     logger,
                     &format!("provider-resumed-{}", generation),
                     worksgood::service::PROVIDER_RESUMED_ALERT_TEXT,
-                );
+                    &mut send,
+                ) == OperatorAlertDisposition::Complete
+                {
+                    health.take_resume_alert();
+                }
             } else {
                 logger.warn(
                     "[provider-health] probe still failing — staying paused, will retry next interval",
@@ -1987,9 +2114,7 @@ fn maybe_probe_and_resume_provider_with(
         }
     }
 
-    if dirty
-        && let Err(e) = health.save(dir)
-    {
+    if dirty && let Err(e) = health.save(dir) {
         logger.warn(&format!(
             "[provider-health] failed to persist provider health: {}",
             e
@@ -3572,15 +3697,14 @@ pub fn run_daemon(
                         coord_state.save(&dir);
                     }
 
-                    if breaker.take_alert() {
-                        let episode = format!("open-{}", breaker.total_opens);
-                        emit_operator_alert(
+                    if breaker.alert_pending {
+                        emit_pending_spawn_breaker_alert_with_sender(
                             &dir,
                             &logger,
-                            &episode,
-                            spawn_breaker::OPERATOR_ALERT_TEXT,
+                            &mut breaker,
+                            &breaker_path,
+                            send_operator_alert_telegram,
                         );
-                        let _ = breaker.save(&breaker_path);
                     }
 
                     // Provider-health pause: heal itself + always tell the
@@ -5312,6 +5436,221 @@ chat_id = "900002"
         );
         let final_store = worksgood::notify::daily_digest::DigestStore::load(&digest_path);
         assert_eq!(final_store.state("operator").unwrap().standalone_sent(), 1);
+    }
+
+    fn write_private_alert_config(wg_dir: &Path, chat_id: &str) {
+        fs::create_dir_all(wg_dir).unwrap();
+        fs::write(
+            wg_dir.join("notify.toml"),
+            format!(
+                r#"
+[telegram]
+bot_token = "900003:opaque-fixture-token"
+chat_id = "{chat_id}"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_spawn_alert_retries_after_reload() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        write_private_alert_config(&wg_dir, "900003");
+        let logger = DaemonLogger::open(&wg_dir).unwrap();
+        let breaker_path = spawn_breaker::SpawnBreakerState::path(&wg_dir);
+        let mut seeded = spawn_breaker::SpawnBreakerState {
+            alert_pending: true,
+            total_opens: 7,
+            ..Default::default()
+        };
+        seeded.save(&breaker_path).unwrap();
+
+        let attempts = Cell::new(0_u32);
+        let successes = Cell::new(0_u32);
+        emit_pending_spawn_breaker_alert_with_sender(
+            &wg_dir,
+            &logger,
+            &mut seeded,
+            &breaker_path,
+            |_config, chat_id, _body| {
+                assert_eq!(chat_id, "900003");
+                attempts.set(attempts.get() + 1);
+                Err("fixture private transport refused".to_string())
+            },
+        );
+        assert_eq!(attempts.get(), 1);
+        let mut after_failure = spawn_breaker::SpawnBreakerState::load(&breaker_path);
+        assert!(
+            after_failure.alert_pending,
+            "the live caller must persist its episode after an unconfirmed send"
+        );
+
+        emit_pending_spawn_breaker_alert_with_sender(
+            &wg_dir,
+            &logger,
+            &mut after_failure,
+            &breaker_path,
+            |_config, chat_id, _body| {
+                assert_eq!(chat_id, "900003");
+                attempts.set(attempts.get() + 1);
+                successes.set(successes.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(attempts.get(), 2, "the reloaded next tick retries once");
+        assert_eq!(successes.get(), 1, "exactly one private delivery succeeds");
+
+        let mut after_success = spawn_breaker::SpawnBreakerState::load(&breaker_path);
+        assert!(
+            !after_success.alert_pending,
+            "a confirmed retry durably consumes the breaker episode"
+        );
+        emit_pending_spawn_breaker_alert_with_sender(
+            &wg_dir,
+            &logger,
+            &mut after_success,
+            &breaker_path,
+            |_config, _chat_id, _body| {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            attempts.get(),
+            2,
+            "a later reload must not redeliver the confirmed episode"
+        );
+    }
+
+    #[test]
+    fn failed_provider_health_alert_retries_after_reload() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        write_private_alert_config(&wg_dir, "900004");
+        let logger = DaemonLogger::open(&wg_dir).unwrap();
+        let mut health = worksgood::service::ProviderHealth::default();
+        for _ in 0..3 {
+            health.record_failure(
+                "opaque-provider",
+                worksgood::service::ProviderErrorKind::FatalProvider,
+                "fixture authentication failure".to_string(),
+            );
+        }
+        assert_eq!(
+            health.check_and_apply_pauses(3, "pause"),
+            vec!["opaque-provider".to_string()]
+        );
+        health.save(&wg_dir).unwrap();
+
+        let attempts = Cell::new(0_u32);
+        let successes = Cell::new(0_u32);
+        maybe_probe_and_resume_provider_with_alert_sender(
+            &wg_dir,
+            &logger,
+            |_provider, _logger| false,
+            |_config, chat_id, _body| {
+                assert_eq!(chat_id, "900004");
+                attempts.set(attempts.get() + 1);
+                Err("fixture private transport refused".to_string())
+            },
+        );
+        assert_eq!(attempts.get(), 1);
+        let after_failure = worksgood::service::ProviderHealth::load(&wg_dir).unwrap();
+        assert!(
+            after_failure.pending_pause_alert,
+            "the provider caller must persist its episode after an unconfirmed send"
+        );
+        assert!(after_failure.service_paused);
+
+        maybe_probe_and_resume_provider_with_alert_sender(
+            &wg_dir,
+            &logger,
+            |_provider, _logger| false,
+            |_config, chat_id, _body| {
+                assert_eq!(chat_id, "900004");
+                attempts.set(attempts.get() + 1);
+                successes.set(successes.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(attempts.get(), 2, "the reloaded next tick retries once");
+        assert_eq!(successes.get(), 1, "exactly one private delivery succeeds");
+        let after_success = worksgood::service::ProviderHealth::load(&wg_dir).unwrap();
+        assert!(
+            !after_success.pending_pause_alert,
+            "a confirmed retry durably consumes the provider episode"
+        );
+
+        maybe_probe_and_resume_provider_with_alert_sender(
+            &wg_dir,
+            &logger,
+            |_provider, _logger| false,
+            |_config, _chat_id, _body| {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            attempts.get(),
+            2,
+            "a later reload must not redeliver the confirmed episode"
+        );
+    }
+
+    #[test]
+    fn failed_provider_recovery_alert_retries_after_reload() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        write_private_alert_config(&wg_dir, "900005");
+        let logger = DaemonLogger::open(&wg_dir).unwrap();
+        let mut health = worksgood::service::ProviderHealth::default();
+        for _ in 0..3 {
+            health.record_failure(
+                "opaque-provider",
+                worksgood::service::ProviderErrorKind::FatalProvider,
+                "fixture authentication failure".to_string(),
+            );
+        }
+        health.check_and_apply_pauses(3, "pause");
+        health.take_pause_alert();
+        health.save(&wg_dir).unwrap();
+
+        let attempts = Cell::new(0_u32);
+        maybe_probe_and_resume_provider_with_alert_sender(
+            &wg_dir,
+            &logger,
+            |_provider, _logger| true,
+            |_config, chat_id, _body| {
+                assert_eq!(chat_id, "900005");
+                attempts.set(attempts.get() + 1);
+                Err("fixture recovery transport refused".to_string())
+            },
+        );
+        let after_failure = worksgood::service::ProviderHealth::load(&wg_dir).unwrap();
+        assert!(!after_failure.service_paused);
+        assert!(
+            after_failure.pending_resume_alert,
+            "the automatic recovery episode must survive its failed private send"
+        );
+
+        maybe_probe_and_resume_provider_with_alert_sender(
+            &wg_dir,
+            &logger,
+            |_provider, _logger| panic!("an already-resumed provider must not probe"),
+            |_config, chat_id, _body| {
+                assert_eq!(chat_id, "900005");
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(attempts.get(), 2, "the recovery notice retries once");
+        assert!(
+            !worksgood::service::ProviderHealth::load(&wg_dir)
+                .unwrap()
+                .pending_resume_alert
+        );
     }
 
     /// Build a service-paused ProviderHealth on disk (mirrors what triage does
