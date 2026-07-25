@@ -32,7 +32,15 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./_helpers.sh
 
-require_wg
+repo_root="$(cd ../../.. && pwd)"
+wg_bin="${WG_BIN:-}"
+if [[ -z "$wg_bin" ]]; then
+    wg_bin="$(command -v wg || true)"
+elif [[ "$wg_bin" != /* ]]; then
+    wg_bin="$repo_root/$wg_bin"
+fi
+[[ -n "$wg_bin" && -x "$wg_bin" ]] \
+    || loud_skip "MISSING REVIEW BINARY" "set WG_BIN to an executable locally built wg binary"
 
 fixtures="../fixtures"
 img="$fixtures/fridge_photo.png"
@@ -103,7 +111,7 @@ cat >"$scratch/list.json" <<'JSON'
 {"ok":true,"groups":[{"store":"Market","items":[{"key":"p:market|chickpeas","text":"Chickpeas","checked":false},{"key":"p:market|lemons","text":"Lemons","checked":false}]}]}
 JSON
 
-plan() { (cd "$scratch" && WG_DIR= wg telegram photo-plan "$@" 2>&1); }
+plan() { (cd "$scratch" && WG_DIR= "$wg_bin" telegram photo-plan "$@" 2>&1); }
 
 expect_grep() {
     local desc="$1" out="$2" needle="$3"
