@@ -7423,6 +7423,9 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Kill { .. }
             | Commands::Reap { .. }
             | Commands::Service { .. }
+            | Commands::Session {
+                command: SessionCommands::List { .. },
+            }
             | Commands::Screencast { .. }
             | Commands::Cost { .. }
             | Commands::Check

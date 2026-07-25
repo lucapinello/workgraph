@@ -17,6 +17,16 @@
 # introduced the regression and the task that fixed it.
 
 [[scenario]]
+name = "session_list_json_no_warning"
+script = "scenarios/session_list_json_no_warning.sh"
+owners = [
+    "p2-session-list-json-warning",
+    "smoke-gate-is",
+]
+description = "Real-binary terminal regression: `wg session list --json` must emit a parseable JSON array for a scratch session and must not print the contradictory unsupported/ignored warning on stderr."
+timeout_seconds = 30
+
+[[scenario]]
 name = "protected_cron_survives_cleanup_sweep"
 script = "scenarios/protected_cron_survives_cleanup_sweep.sh"
 owners = [

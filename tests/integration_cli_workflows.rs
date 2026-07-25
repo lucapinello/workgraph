@@ -155,6 +155,31 @@ fn test_list_json_output() {
 }
 
 #[test]
+fn session_list_json_emits_valid_json_without_warning() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = setup_workgraph(&tmp, vec![]);
+
+    let output = wg_cmd(&wg_dir, &["session", "list", "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "session list --json failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("session list --json emitted invalid JSON: {e}\n{stdout}"));
+    assert!(
+        parsed.is_array(),
+        "session list --json should emit a JSON array: {parsed}"
+    );
+    assert!(
+        !stderr.contains("--json flag is not supported") && !stderr.contains("will be ignored"),
+        "session list --json must not contradict its valid JSON output: {stderr}"
+    );
+}
+
+#[test]
 fn test_list_invalid_status_fails() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = setup_workgraph(&tmp, vec![make_task("t1", "Task", Status::Open)]);
