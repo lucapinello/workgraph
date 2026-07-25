@@ -187,7 +187,7 @@ struct RedeemResp {
 
 /// Outcome of a `/start login_<nonce>` confirm against the gateway. The founding
 /// window (item 1) needs to distinguish an EMPTY roster (offer ownership) from a
-/// genuinely unknown user (ask Otto to add you), so the handler branches on this
+/// genuinely unknown user (ask the household founder to add you), so the handler branches on this
 /// rather than only receiving a pre-baked reply string.
 /// The family-voice fallback label when the gateway did not carry a device
 /// descriptor (an older gateway, or a client with no User-Agent). NEVER a raw UA.
@@ -209,7 +209,7 @@ enum WebLoginOutcome {
     /// The roster is EMPTY (fresh deployment) — the handler runs the "are you
     /// the owner?" founding handshake instead of rejecting.
     EmptyRoster,
-    /// The id is not in a (non-empty) roster — ask Otto to add you.
+    /// The id is not in a (non-empty) roster — ask the household founder to add you.
     UnknownUser,
     /// The sign-in link EXPIRED / was unknown (a slow new-device round-trip blew past the pending window). Recovery: reopen the page + tap the fresh link.
     LinkExpired,
@@ -237,7 +237,8 @@ impl WebLoginOutcome {
                 format!("You're signed in on {label} ✋")
             }
             WebLoginOutcome::UnknownUser => {
-                "I don't recognise you yet — ask Otto to add you to the household.".to_string()
+                "I don't recognise you yet — ask the person who set up this home to add you to the household."
+                    .to_string()
             }
             WebLoginOutcome::EmptyRoster | WebLoginOutcome::LinkExpired | WebLoginOutcome::NoSession => {
                 "That sign-in link expired — reopen the Casa page and tap the fresh link.".to_string()
@@ -6893,10 +6894,10 @@ mod tests {
         assert!(reply.starts_with("You're signed in"), "reply: {reply}");
     }
 
-    /// An unknown telegram id → the friendly "ask Otto" reply, no session.
+    /// An unknown telegram id → role-based recovery guidance, no session.
     #[test]
     #[serial_test::serial]
-    fn confirm_web_login_unknown_user_gets_ask_otto_reply() {
+    fn confirm_web_login_unknown_user_gets_role_based_reply() {
         let (url, _rx) = spawn_confirm_stub(r#"{"ok":false,"reason":"unknown-user"}"#);
         unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -6904,7 +6905,10 @@ mod tests {
         let reply = rt.block_on(confirm_web_login(&client, "nonce", "999"));
         unsafe { std::env::remove_var("CASA_AUTH_CONFIRM_URL") };
 
-        assert!(reply.contains("ask Otto"), "reply: {reply}");
+        assert_eq!(
+            reply,
+            "I don't recognise you yet — ask the person who set up this home to add you to the household."
+        );
         assert!(!reply.starts_with("You're signed in"));
     }
 
