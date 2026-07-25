@@ -944,6 +944,21 @@ static WAIT_ADDRESSEE_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid waiting-addressee regex")
 });
 
+static DECLARATIVE_PERSON_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        \b(?P<name>\p{Lu}[\p{L}'’\-]{2,}(?:\s+\p{Lu}[\p{L}'’\-]{2,}){0,2})\s+
+        (?:
+            (?i:(?:will|can|could|might|should)\s+
+                (?:join|come|confirm|reply|answer|help|bring|meet|call)) |
+            (?i:(?:is|was|will\s+be|has\s+been)\s+
+                (?:joining|coming|confirming|replying|answering|helping|bringing|meeting|calling)) |
+            (?i:said|asked|confirmed|replied|answered|offered|promised)
+        )\b",
+    )
+    .expect("valid declarative-person regex")
+});
+
 fn is_not_a_person(name: &str) -> bool {
     matches!(
         name.trim().to_lowercase().as_str(),
@@ -1026,11 +1041,12 @@ fn tidy_family_text(text: &str) -> String {
     .to_string()
 }
 
-/// Remove a capitalised addressee that is absent from a real roster, but only
-/// in strong, unambiguous transfer/check/waiting constructions. A transfer or
-/// waiting clause that depends on a phantom person is dropped whole so the
-/// rewrite cannot leave malformed copy such as "pass when ready" or "we're to
-/// confirm". With no roster evidence this is a no-op; ordinary names elsewhere
+/// Remove a capitalised person reference that is absent from a real roster, but
+/// only in strong, unambiguous transfer/check/waiting constructions or beside a
+/// narrowly human social action ("will join", "confirmed", "replied"). A clause
+/// that depends on a phantom person is dropped whole so the rewrite cannot
+/// leave malformed copy such as "pass when ready", "we're to confirm", or "will
+/// join us". With no roster evidence this is a no-op; ordinary names elsewhere
 /// in a sentence are never guessed at or rewritten.
 pub fn scrub_off_roster_addressees(
     reply: &str,
@@ -1041,7 +1057,8 @@ pub fn scrub_off_roster_addressees(
     }
     let out = scrub_addressee_pattern(reply, &CHECK_ADDRESSEE_RE, roster);
     let has_phantom_clause = has_off_roster_match(&out, &TRANSFER_ADDRESSEE_RE, roster)
-        || has_off_roster_match(&out, &WAIT_ADDRESSEE_RE, roster);
+        || has_off_roster_match(&out, &WAIT_ADDRESSEE_RE, roster)
+        || has_off_roster_match(&out, &DECLARATIVE_PERSON_RE, roster);
     if !has_phantom_clause {
         return if out == reply {
             reply.to_string()
@@ -1054,6 +1071,7 @@ pub fn scrub_off_roster_addressees(
         .filter(|clause| {
             !has_off_roster_match(clause, &TRANSFER_ADDRESSEE_RE, roster)
                 && !has_off_roster_match(clause, &WAIT_ADDRESSEE_RE, roster)
+                && !has_off_roster_match(clause, &DECLARATIVE_PERSON_RE, roster)
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -3220,6 +3238,28 @@ label = "Fallback Member"
             ),
             "Dinner is ready.",
             "a phantom transfer clause is removed instead of leaving a bare verb"
+        );
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Dinner is ready. Zephyra will join us.",
+                &roster,
+            ),
+            "Dinner is ready.",
+            "a declarative phantom-person clause is removed instead of being stated as fact"
+        );
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Dinner is ready. Household Member will join us.",
+                &roster,
+            ),
+            "Dinner is ready. Household Member will join us.",
+            "the same declarative shape survives for a roster-listed person"
+        );
+        let weekday_action = "Friday will join the two lists.";
+        assert_eq!(
+            scrub_off_roster_addressees(weekday_action, &roster),
+            weekday_action,
+            "a date word is not reclassified as an off-roster person"
         );
         let clean_multiline = "Dinner is in progress.\nFriday still works.";
         assert_eq!(
