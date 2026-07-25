@@ -429,6 +429,16 @@ impl FiredLog {
         });
     }
 
+    /// Remove one handled id so a delivery that was not confirmed can be
+    /// attempted by the next scheduler tick.
+    ///
+    /// The scheduler records before transport for crash safety. Its caller must
+    /// therefore re-arm the exact id when transport exhausts its retries, then
+    /// persist this log before returning. Other ids are left untouched.
+    pub fn rearm(&mut self, id: &str) -> bool {
+        self.entries.remove(id).is_some()
+    }
+
     /// Number of handled ids (for status/tests).
     pub fn len(&self) -> usize {
         self.entries.len()

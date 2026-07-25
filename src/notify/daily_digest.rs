@@ -400,6 +400,28 @@ impl DigestStore {
         self.people.get(recipient)
     }
 
+    /// Forget one lifecycle pacing decision after its standalone transport was
+    /// not confirmed, allowing the next scheduler tick to offer it again.
+    ///
+    /// Lifecycle replies bypass both the proactive cap and the pending digest,
+    /// so re-arming removes only the matching `seen` id. This deliberately does
+    /// not apply to queued or cap-counted nudges, whose rollback semantics are
+    /// different.
+    pub fn rearm_lifecycle(&mut self, recipient: &str, id: &str) -> bool {
+        if !id.starts_with("lifecycle:") {
+            return false;
+        }
+        let Some(state) = self.people.get_mut(recipient) else {
+            return false;
+        };
+        if state.pending.iter().any(|item| item.id == id) {
+            return false;
+        }
+        let before = state.seen.len();
+        state.seen.retain(|seen_id| seen_id != id);
+        state.seen.len() != before
+    }
+
     /// Offer one nudge to the pacing layer at `now`.
     ///
     /// * Not yet due → [`Offer::Pending`] (nothing recorded).

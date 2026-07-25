@@ -563,14 +563,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 Err(_) => continue, // no graph yet — nothing to report
             };
             let root = project_root(&lifecycle_dir);
-            let fired = worksgood::notify::reminder::FiredLog::load(
-                &worksgood::notify::reminder::FiredLog::path(&root),
-            );
+            let log_path = worksgood::notify::reminder::FiredLog::path(&root);
+            let fired = worksgood::notify::reminder::FiredLog::load(&log_path);
             let pending = worksgood::notify::lifecycle::pending_fires(
                 graph.tasks(),
                 |id| fired.contains(id),
             );
-            if pending.is_empty() {
+            if pending.is_empty() && !lifecycle_reconciliation_needs_tick(&log_path) {
                 continue; // no unreported transition — stay quiet
             }
             // Something transitioned: deliver every pending report-back (same code
@@ -5179,6 +5178,312 @@ async fn deliver_operator_alert(
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LifecycleDeliverySummary {
+    sent: usize,
+    undelivered: usize,
+    alerted: usize,
+    rearmed: usize,
+}
+
+/// One exact lifecycle suppressor that must be removed before a notification can
+/// be retried. Operator alerts have no pacing entry; family report-backs carry
+/// the one recipient whose `DigestStore.seen` entry must be reconciled.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+struct LifecycleRearmEntry {
+    notification_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipient: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct LifecycleRearmJournal {
+    #[serde(default)]
+    entries: Vec<LifecycleRearmEntry>,
+}
+
+fn lifecycle_rearm_path(log_path: &Path) -> PathBuf {
+    log_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("lifecycle-rearm.json")
+}
+
+fn load_lifecycle_rearm_journal(path: &Path) -> Result<LifecycleRearmJournal> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LifecycleRearmJournal::default());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let mut journal: LifecycleRearmJournal = serde_json::from_str(&body)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    for entry in &journal.entries {
+        let id = entry.notification_id.trim();
+        if id.is_empty()
+            || (!id.starts_with("lifecycle:") && !id.starts_with("lifecycle-alert:"))
+            || entry
+                .recipient
+                .as_deref()
+                .is_some_and(|recipient| recipient.trim().is_empty())
+            || (entry.recipient.is_some() && !id.starts_with("lifecycle:"))
+        {
+            anyhow::bail!(
+                "refusing invalid lifecycle reconciliation entry in {}",
+                path.display()
+            );
+        }
+    }
+    journal.entries.sort();
+    journal.entries.dedup();
+    Ok(journal)
+}
+
+/// Wake the listener's lifecycle runner when an interrupted update needs
+/// reconciliation, even if the stale FiredLog otherwise hides every transition.
+/// An unreadable journal also wakes the runner so the error is surfaced loudly
+/// instead of turning into permanent silence at the cheap pre-run gate.
+fn lifecycle_reconciliation_needs_tick(log_path: &Path) -> bool {
+    let path = lifecycle_rearm_path(log_path);
+    match load_lifecycle_rearm_journal(&path) {
+        Ok(journal) => !journal.entries.is_empty(),
+        Err(_) => path.exists(),
+    }
+}
+
+fn save_lifecycle_rearm_journal(path: &Path, journal: &LifecycleRearmJournal) -> Result<()> {
+    let body = serde_json::to_vec_pretty(journal)
+        .context("failed to serialize lifecycle reconciliation record")?;
+    worksgood::atomic_file::write_atomic(path, body)
+        .with_context(|| format!("failed to persist {}", path.display()))
+}
+
+/// Stage a new exact reconciliation set before either suppressor store changes.
+///
+/// A non-empty prior journal means startup reconciliation was skipped or failed;
+/// overwriting it could lose an older undelivered id, so fail loudly instead.
+fn stage_lifecycle_rearms(path: &Path, mut entries: Vec<LifecycleRearmEntry>) -> Result<()> {
+    entries.sort();
+    entries.dedup();
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if !load_lifecycle_rearm_journal(path)?.entries.is_empty() {
+        anyhow::bail!(
+            "pending lifecycle reconciliation in {}; retry after it succeeds",
+            path.display()
+        );
+    }
+    save_lifecycle_rearm_journal(path, &LifecycleRearmJournal { entries })
+}
+
+fn clear_lifecycle_rearms(path: &Path) -> Result<()> {
+    // Atomically replace with an empty journal instead of unlinking. A crash can
+    // therefore expose either the complete old set or the complete empty set,
+    // never a torn/partly-cleared record.
+    save_lifecycle_rearm_journal(path, &LifecycleRearmJournal::default())
+}
+
+fn apply_lifecycle_rearms(
+    entries: &[LifecycleRearmEntry],
+    log: &mut worksgood::notify::reminder::FiredLog,
+    store: &mut worksgood::notify::daily_digest::DigestStore,
+) {
+    for entry in entries {
+        log.rearm(&entry.notification_id);
+        if let Some(recipient) = &entry.recipient {
+            store.rearm_lifecycle(recipient, &entry.notification_id);
+        }
+    }
+}
+
+/// Finish an interrupted two-file update before computing the next tick.
+///
+/// The journal contains only exact undelivered notification ids and their one
+/// pacing recipient. Reapplying removals is idempotent. The record remains until
+/// BOTH state files save, so a failure after either save is recoverable on the
+/// following process start without broad replay.
+fn reconcile_lifecycle_rearms(
+    log_path: &Path,
+    store_path: &Path,
+    log: &mut worksgood::notify::reminder::FiredLog,
+    store: &mut worksgood::notify::daily_digest::DigestStore,
+) -> Result<usize> {
+    let journal_path = lifecycle_rearm_path(log_path);
+    let journal = load_lifecycle_rearm_journal(&journal_path)?;
+    if journal.entries.is_empty() {
+        return Ok(0);
+    }
+    apply_lifecycle_rearms(&journal.entries, log, store);
+    log.save(log_path).with_context(|| {
+        format!(
+            "failed to reconcile lifecycle state in {}",
+            log_path.display()
+        )
+    })?;
+    store.save(store_path).with_context(|| {
+        format!(
+            "failed to reconcile lifecycle pacing state in {}",
+            store_path.display()
+        )
+    })?;
+    clear_lifecycle_rearms(&journal_path)?;
+    Ok(journal.entries.len())
+}
+
+fn lifecycle_result_rearms(
+    result: &worksgood::notify::lifecycle::LifecycleTickResult,
+) -> Vec<LifecycleRearmEntry> {
+    let family = result
+        .fired
+        .iter()
+        .chain(result.capped.iter())
+        .map(|fire| LifecycleRearmEntry {
+            notification_id: worksgood::notify::lifecycle::notification_id(
+                &fire.task_id,
+                fire.event,
+            ),
+            recipient: Some(fire.origin.requester.clone()),
+        });
+    let alerts = result
+        .operator_alerts
+        .iter()
+        .map(|alert| LifecycleRearmEntry {
+            notification_id: alert.notification_id.clone(),
+            recipient: None,
+        });
+    family.chain(alerts).collect()
+}
+
+/// Persist the record-before-transport state as a recoverable two-file update.
+///
+/// Nothing has been sent yet, so every result id is safe to re-arm if either
+/// state save fails. The exact journal is cleared before transport only after
+/// both saves succeed.
+fn persist_lifecycle_state_before_transport(
+    result: &worksgood::notify::lifecycle::LifecycleTickResult,
+    log: &worksgood::notify::reminder::FiredLog,
+    log_path: &Path,
+    store: &worksgood::notify::daily_digest::DigestStore,
+    store_path: &Path,
+) -> Result<()> {
+    let journal_path = lifecycle_rearm_path(log_path);
+    let entries = lifecycle_result_rearms(result);
+    stage_lifecycle_rearms(&journal_path, entries.clone())?;
+    log.save(log_path).with_context(|| {
+        format!(
+            "failed to persist lifecycle state to {}",
+            log_path.display()
+        )
+    })?;
+    store
+        .save(store_path)
+        .with_context(|| format!("failed to persist pacing state to {}", store_path.display()))?;
+    if !entries.is_empty() {
+        clear_lifecycle_rearms(&journal_path)?;
+    }
+    Ok(())
+}
+
+/// Deliver one tick's report-backs and alerts, then durably re-arm every
+/// notification whose transport was not confirmed.
+///
+/// `lifecycle_tick` records ids before transport so a process crash cannot
+/// duplicate a message that Telegram accepted. Once the process is still alive
+/// and both attempts have failed, keeping that id would instead turn a transient
+/// failure into permanent silence. Remove only the failed id from the fired log
+/// and lifecycle pacing set, then persist both before returning so the next tick
+/// can try again.
+fn deliver_lifecycle_tick_result(
+    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
+    family_delivery: &FamilyReplyDelivery,
+    config: &TelegramConfig,
+    coordination_owner: Option<&str>,
+    result: &worksgood::notify::lifecycle::LifecycleTickResult,
+    log: &mut worksgood::notify::reminder::FiredLog,
+    log_path: &Path,
+    store: &mut worksgood::notify::daily_digest::DigestStore,
+    store_path: &Path,
+) -> Result<LifecycleDeliverySummary> {
+    let mut summary = LifecycleDeliverySummary::default();
+    let mut failed_rearms = Vec::new();
+    if result.fired.is_empty() && result.operator_alerts.is_empty() {
+        return Ok(summary);
+    }
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    rt.block_on(async {
+        // DEAD-END ESCALATION FIRST. A family-origin task that failed with no
+        // retry behind it just told the family "I've flagged it so it isn't
+        // forgotten" — raising the flag is what makes that line true, so it
+        // goes out even if a report-back delivery below fails.
+        for alert in &result.operator_alerts {
+            if deliver_operator_alert(sink, config, coordination_owner, alert).await {
+                summary.alerted += 1;
+            } else {
+                failed_rearms.push(LifecycleRearmEntry {
+                    notification_id: alert.notification_id.clone(),
+                    recipient: None,
+                });
+            }
+        }
+        for fire in &result.fired {
+            match deliver_lifecycle_fire(sink, family_delivery, fire).await {
+                Ok(()) => summary.sent += 1,
+                Err(e) => {
+                    // Both attempts failed — surface it LOUDLY (matching the
+                    // web-inbound "make failure visible" rule) so a dropped
+                    // report-back can never masquerade as delivered in the log.
+                    summary.undelivered += 1;
+                    let notification_id =
+                        worksgood::notify::lifecycle::notification_id(&fire.task_id, fire.event);
+                    failed_rearms.push(LifecycleRearmEntry {
+                        notification_id,
+                        recipient: Some(fire.origin.requester.clone()),
+                    });
+                    eprintln!(
+                        "[{}] UNDELIVERED lifecycle {} for {} after 2 attempts; re-armed for the next tick: {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        fire.event.slug(),
+                        fire.task_id,
+                        worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                    );
+                }
+            }
+        }
+    });
+
+    if !failed_rearms.is_empty() {
+        let journal_path = lifecycle_rearm_path(log_path);
+        stage_lifecycle_rearms(&journal_path, failed_rearms.clone())?;
+        for entry in &failed_rearms {
+            if log.rearm(&entry.notification_id) {
+                summary.rearmed += 1;
+            }
+            if let Some(recipient) = &entry.recipient {
+                store.rearm_lifecycle(recipient, &entry.notification_id);
+            }
+        }
+        log.save(log_path).with_context(|| {
+            format!(
+                "failed to persist re-armed lifecycle state to {}",
+                log_path.display()
+            )
+        })?;
+        store.save(store_path).with_context(|| {
+            format!(
+                "failed to persist re-armed lifecycle pacing state to {}",
+                store_path.display()
+            )
+        })?;
+        clear_lifecycle_rearms(&journal_path)?;
+    }
+    Ok(summary)
+}
+
 /// Report conversational tasks' progress back to the chats they came from — the
 /// `wg telegram lifecycle` seam (see [`crate::cli::TelegramCommands::Lifecycle`]).
 ///
@@ -5188,7 +5493,9 @@ async fn deliver_operator_alert(
 /// daily-digest choke point (time-critical but capped) and delivered to the
 /// origin chat via the origin persona's bot. `--dry-run` prints what would be
 /// sent where and touches no state; the real path persists the FiredLog +
-/// pacing store FIRST (restart-safe), then sends.
+/// pacing store FIRST (restart-safe), then sends. A delivery that exhausts its
+/// retries is removed from both exactly-once stores and persisted again so the
+/// next tick retries it.
 pub fn run_lifecycle(
     workgraph_dir: &Path,
     task_id: Option<&str>,
@@ -5236,6 +5543,16 @@ pub fn run_lifecycle(
     let store_path = DigestStore::path(&root);
     let mut log = FiredLog::load(&log_path);
     let mut store = DigestStore::load(&store_path);
+    if !dry_run {
+        let reconciled = reconcile_lifecycle_rearms(&log_path, &store_path, &mut log, &mut store)?;
+        if reconciled > 0 {
+            eprintln!(
+                "[{}] reconciled {} undelivered lifecycle notification(s) before tick",
+                chrono::Utc::now().format("%H:%M:%S"),
+                reconciled,
+            );
+        }
+    }
     let policy = DigestPolicy::default();
     let config = load_telegram_config().unwrap_or_default();
     let owner_map = ownership::OwnerMap::load(&root);
@@ -5315,11 +5632,7 @@ pub fn run_lifecycle(
 
     // Real firing: persist exactly-once + pacing state FIRST, then deliver.
     let result = lifecycle::lifecycle_tick(&inputs, &mut log, &mut store, now, &policy);
-    log.save(&log_path)
-        .with_context(|| format!("failed to persist lifecycle state to {}", log_path.display()))?;
-    store
-        .save(&store_path)
-        .with_context(|| format!("failed to persist pacing state to {}", store_path.display()))?;
+    persist_lifecycle_state_before_transport(&result, &log, &log_path, &store, &store_path)?;
 
     let config = load_telegram_config().unwrap_or_default();
     let family_delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
@@ -5334,65 +5647,28 @@ pub fn run_lifecycle(
     } else {
         Box::new(BotReplySink::new(config.clone()))
     };
-    let mut sent = 0usize;
-    let mut undelivered = 0usize;
-    let mut alerted = 0usize;
-    if !result.fired.is_empty() || !result.operator_alerts.is_empty() {
-        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-        rt.block_on(async {
-            // DEAD-END ESCALATION FIRST. A family-origin task that failed with no
-            // retry behind it just told the family "I've flagged it so it isn't
-            // forgotten" — raising the flag is what makes that line true, so it
-            // goes out even if a report-back delivery below fails.
-            for a in &result.operator_alerts {
-                if deliver_operator_alert(
-                    sink.as_ref(),
-                    &config,
-                    coordination_owner.as_deref(),
-                    a,
-                )
-                .await
-                {
-                    alerted += 1;
-                }
-            }
-            for f in &result.fired {
-                match deliver_lifecycle_fire(
-                    sink.as_ref(),
-                    &family_delivery,
-                    f,
-                )
-                .await
-                {
-                    Ok(()) => sent += 1,
-                    Err(e) => {
-                        // Both attempts failed — surface it LOUDLY (matching the
-                        // web-inbound "make failure visible" rule) so a dropped
-                        // report-back can never masquerade as delivered in the log.
-                        undelivered += 1;
-                        eprintln!(
-                            "[{}] UNDELIVERED lifecycle {} for {} after 2 attempts: {}",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                            f.event.slug(),
-                            f.task_id,
-                            worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
-                        );
-                    }
-                }
-            }
-        });
-    }
+    let delivery_summary = deliver_lifecycle_tick_result(
+        sink.as_ref(),
+        &family_delivery,
+        &config,
+        coordination_owner.as_deref(),
+        &result,
+        &mut log,
+        &log_path,
+        &mut store,
+        &store_path,
+    )?;
 
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "fired": result.fired.len(),
-                "sent": sent,
-                "undelivered": undelivered,
+                "sent": delivery_summary.sent,
+                "undelivered": delivery_summary.undelivered,
                 "capped": result.capped.len(),
                 "operator_alerts": result.operator_alerts.len(),
-                "operator_alerts_sent": alerted,
+                "operator_alerts_sent": delivery_summary.alerted,
             })
         );
     } else if result.fired.is_empty()
@@ -9071,6 +9347,294 @@ domains = ["cooking"]
             !feed.exists() || feed_lines(&feed).is_empty(),
             "an undelivered report-back must not appear in the pane"
         );
+    }
+
+    #[test]
+    fn pretransport_partial_state_save_reconciles_before_tick() {
+        use worksgood::notify::daily_digest::{DigestPolicy, DigestStore};
+        use worksgood::notify::lifecycle::{self, FailureShape, LifecycleInput};
+        use worksgood::notify::reminder::FiredLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = FiredLog::path(dir.path());
+        let store_path = DigestStore::path(dir.path());
+        let blocked_store_path = dir.path().join(".casa").join("blocked-pretransport");
+        let now = parse_naive_now("2026-07-24T19:30").unwrap();
+        let input = LifecycleInput {
+            task_id: "entry-lamp-check".to_string(),
+            origin: TaskOrigin::new(
+                OriginChannel::TelegramDirect,
+                "private-origin",
+                "Household Member",
+                "harbor",
+                Some("harbor".to_string()),
+            ),
+            event: LifecycleEvent::Started,
+            workers: vec!["configured-worker".to_string()],
+            summary: None,
+            failure: FailureShape::Dropped,
+            what: "check the entry lamp".to_string(),
+        };
+        let policy = DigestPolicy::default();
+        let lifecycle_id = lifecycle::notification_id(&input.task_id, input.event);
+        let mut log = FiredLog::default();
+        let mut store = DigestStore::default();
+        let first = lifecycle::lifecycle_tick(
+            std::slice::from_ref(&input),
+            &mut log,
+            &mut store,
+            now,
+            &policy,
+        );
+        assert_eq!(first.fired.len(), 1);
+
+        std::fs::create_dir_all(&blocked_store_path).unwrap();
+        let failure = persist_lifecycle_state_before_transport(
+            &first,
+            &log,
+            &log_path,
+            &store,
+            &blocked_store_path,
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("failed to persist pacing state"),
+            "the injected second-file failure must be surfaced: {failure:#}",
+        );
+        assert!(
+            FiredLog::load(&log_path).contains(&lifecycle_id),
+            "the first state file was durably written before the injected failure",
+        );
+        assert_eq!(
+            load_lifecycle_rearm_journal(&lifecycle_rearm_path(&log_path))
+                .unwrap()
+                .entries
+                .len(),
+            1,
+        );
+        assert!(
+            lifecycle_reconciliation_needs_tick(&log_path),
+            "the listener gate must wake even though the stale FiredLog suppresses the turn",
+        );
+        std::fs::remove_dir(&blocked_store_path).unwrap();
+
+        let mut reloaded_log = FiredLog::load(&log_path);
+        let mut reloaded_store = DigestStore::load(&store_path);
+        reconcile_lifecycle_rearms(
+            &log_path,
+            &store_path,
+            &mut reloaded_log,
+            &mut reloaded_store,
+        )
+        .unwrap();
+        assert!(
+            !lifecycle_reconciliation_needs_tick(&log_path),
+            "a fully reconciled empty journal lets idle listener ticks stay quiet",
+        );
+        let retry = lifecycle::lifecycle_tick(
+            &[input],
+            &mut reloaded_log,
+            &mut reloaded_store,
+            now,
+            &policy,
+        );
+        assert_eq!(
+            retry.fired.len(),
+            1,
+            "startup reconciliation must restore the unsent exact id",
+        );
+    }
+
+    #[test]
+    fn failed_delivery_rearm_survives_partial_state_save() {
+        use worksgood::notify::daily_digest::{DigestPolicy, DigestStore};
+        use worksgood::notify::lifecycle::{self, FailureShape, LifecycleInput};
+        use worksgood::notify::reminder::FiredLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = FiredLog::path(dir.path());
+        let store_path = DigestStore::path(dir.path());
+        let feed = casa_feed::feed_path_for(dir.path());
+        let delivery = opaque_delivery(&feed);
+        let now = parse_naive_now("2026-07-24T19:30").unwrap();
+        let input = LifecycleInput {
+            task_id: "stalled-porch-light".to_string(),
+            origin: TaskOrigin::new(
+                OriginChannel::TelegramDirect,
+                "private-origin",
+                "Household Member",
+                "harbor",
+                Some("harbor".to_string()),
+            ),
+            event: LifecycleEvent::Failed,
+            workers: vec!["configured-worker".to_string()],
+            summary: None,
+            failure: FailureShape::Final,
+            what: "replace the porch light".to_string(),
+        };
+        let policy = DigestPolicy::default();
+        let lifecycle_id = lifecycle::notification_id(&input.task_id, LifecycleEvent::Failed);
+        let alert_id = lifecycle::alert_notification_id(&input.task_id);
+
+        let mut log = FiredLog::default();
+        let mut store = DigestStore::default();
+        let first = lifecycle::lifecycle_tick(
+            std::slice::from_ref(&input),
+            &mut log,
+            &mut store,
+            now,
+            &policy,
+        );
+        assert_eq!(first.fired.len(), 1);
+        assert_eq!(first.operator_alerts.len(), 1);
+        assert!(log.contains(&lifecycle_id));
+        assert!(log.contains(&alert_id));
+        persist_lifecycle_state_before_transport(&first, &log, &log_path, &store, &store_path)
+            .unwrap();
+
+        let mut bots = HashMap::new();
+        bots.insert(
+            "owner-wire".to_string(),
+            TelegramBotConfig {
+                bot_token: "500:EEE".to_string(),
+                chat_id: "7005".to_string(),
+                agent_id: Some("configured-owner".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: "600:FFF".to_string(),
+            chat_id: "7006".to_string(),
+            bots,
+        };
+        // Operator alert fails once, then both family-send attempts fail.
+        let failing_sink = FlakySink::new(3);
+        let blocked_store_path = dir.path().join(".casa").join("blocked-store");
+        std::fs::create_dir(&blocked_store_path).unwrap();
+        let failure = deliver_lifecycle_tick_result(
+            &failing_sink,
+            &delivery,
+            &config,
+            Some("configured-owner"),
+            &first,
+            &mut log,
+            &log_path,
+            &mut store,
+            &blocked_store_path,
+        )
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("failed to persist re-armed lifecycle pacing state"),
+            "the injected second-file failure must be surfaced: {failure:#}",
+        );
+        assert_eq!(
+            failing_sink.attempts.lock().unwrap().len(),
+            3,
+            "one owner-alert attempt plus two family-delivery attempts",
+        );
+        let journal_path = lifecycle_rearm_path(&log_path);
+        assert_eq!(
+            load_lifecycle_rearm_journal(&journal_path)
+                .unwrap()
+                .entries
+                .len(),
+            2,
+            "both exact undelivered ids remain in the reconciliation record",
+        );
+        std::fs::remove_dir(&blocked_store_path).unwrap();
+
+        // Reload from disk, as the next scheduler process would. The first state
+        // file saved its re-arm, but the second still contains the pacing
+        // suppressor. Startup must reconcile BOTH before computing the tick.
+        let mut reloaded_log = FiredLog::load(&log_path);
+        let mut reloaded_store = DigestStore::load(&store_path);
+        let mut unreconciled_log = reloaded_log.clone();
+        let mut unreconciled_store = reloaded_store.clone();
+        let suppressed = lifecycle::lifecycle_tick(
+            std::slice::from_ref(&input),
+            &mut unreconciled_log,
+            &mut unreconciled_store,
+            now,
+            &policy,
+        );
+        assert!(
+            suppressed.fired.is_empty(),
+            "the stale pacing file really would suppress the family retry",
+        );
+        assert_eq!(
+            reconcile_lifecycle_rearms(
+                &log_path,
+                &store_path,
+                &mut reloaded_log,
+                &mut reloaded_store,
+            )
+            .unwrap(),
+            2,
+        );
+        assert!(
+            load_lifecycle_rearm_journal(&journal_path)
+                .unwrap()
+                .entries
+                .is_empty(),
+            "the record clears only after both reconciled files save",
+        );
+        assert!(!reloaded_log.contains(&lifecycle_id));
+        assert!(!reloaded_log.contains(&alert_id));
+        let second = lifecycle::lifecycle_tick(
+            std::slice::from_ref(&input),
+            &mut reloaded_log,
+            &mut reloaded_store,
+            now,
+            &policy,
+        );
+        assert_eq!(
+            second.fired.len(),
+            1,
+            "the next tick retries the failed family report-back",
+        );
+        assert_eq!(
+            second.operator_alerts.len(),
+            1,
+            "the next tick retries the failed private owner alert",
+        );
+
+        // A confirmed second-tick delivery becomes durable exactly once again.
+        persist_lifecycle_state_before_transport(
+            &second,
+            &reloaded_log,
+            &log_path,
+            &reloaded_store,
+            &store_path,
+        )
+        .unwrap();
+        let succeeding_sink = RecordingSink::default();
+        let delivered = deliver_lifecycle_tick_result(
+            &succeeding_sink,
+            &delivery,
+            &config,
+            Some("configured-owner"),
+            &second,
+            &mut reloaded_log,
+            &log_path,
+            &mut reloaded_store,
+            &store_path,
+        )
+        .unwrap();
+        assert_eq!(delivered.sent, 1);
+        assert_eq!(delivered.alerted, 1);
+        assert_eq!(delivered.rearmed, 0);
+        assert_eq!(succeeding_sink.sends.lock().unwrap().len(), 2);
+
+        let mut final_log = FiredLog::load(&log_path);
+        let mut final_store = DigestStore::load(&store_path);
+        let third =
+            lifecycle::lifecycle_tick(&[input], &mut final_log, &mut final_store, now, &policy);
+        assert!(third.fired.is_empty());
+        assert!(third.operator_alerts.is_empty());
     }
 
     // ── Daily-digest flush delivery (task re-arm-the) ──────────────────────
