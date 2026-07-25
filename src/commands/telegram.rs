@@ -4671,6 +4671,31 @@ fn resolve_owner_pin(pin: Option<&str>, config: &TelegramConfig) -> Result<Optio
     Ok(Some(bot))
 }
 
+/// Rebind a persisted clarification exchange to its exact canonical voice.
+///
+/// The ledger's `voice` is machine-authored continuity state, not a human
+/// mention. A stale, renamed, fuzzy-handle, or multiply claimed identity must
+/// therefore fail closed instead of falling through to a fresh election and
+/// letting a different persona answer the confirmation.
+fn bind_clarify_exchange(
+    exchange: &ownership::ClarifyExchange,
+    config: &TelegramConfig,
+    target: &str,
+) -> Result<Election> {
+    let bot = resolve_machine_bot(&exchange.voice, config).ok_or_else(|| {
+        anyhow::anyhow!(
+            "web-inbound clarification voice '{}' does not resolve to exactly one configured canonical agent id; refusing a fresh election",
+            exchange.voice
+        )
+    })?;
+    Ok(Election::One {
+        bot,
+        reply_chat: target.to_string(),
+        body: exchange.original_ask.clone(),
+        addressed_by: worksgood::notify::telegram_group::AddressedBy::ReplyChain,
+    })
+}
+
 /// Apply the gateway's default-contact declaration only at the web-only
 /// general-election seam.
 ///
@@ -4754,23 +4779,6 @@ pub fn run_web_inbound(
     // treats them as a known human and answers grounded (see `resolve_web_sender`).
     let auth_sender = resolve_web_sender(workgraph_dir, sender);
 
-    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
-    let human_count = human_agent_id_set(workgraph_dir).len();
-
-    // A web-origin message is first-class GROUP inbound — run the exact election
-    // the listener runs, via the shared `elect_group_inbound` seam (supergroup,
-    // no reply-chain, never bot-sent). The path-parity test locks this to the
-    // listener's decision.
-    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-    let mut election = elect_group_inbound_with_owner_map(
-        &target,
-        message,
-        &mention_usernames,
-        human_count,
-        &config,
-        &owner_map,
-    );
-
     // ── CLARIFICATION CONTINUATION ────────────────────────────────────────
     // A bare "yes"/"ok"/"si" from the same human within the clarify window is not
     // a fresh ask — it CONTINUES the exchange a persona just opened by asking a
@@ -4787,31 +4795,49 @@ pub fn run_web_inbound(
     // (task nora-clarify-engine). Sanitised once here and used for BOTH the
     // pending-lookup and the ledger open below so the fingerprint chat matches.
     let clarify_chat = clarify_target(&target, &config);
-    let mut clarify_continued_body: Option<String> = None;
-    if let Some(ex) = ownership::clarify_continuation(
+    let clarification = ownership::clarify_continuation(
         &clarify_root,
         &clarify_chat,
         &auth_sender,
         message,
         clarify_now,
         clarify_window,
-    ) {
-        if let Some(bot) = resolve_mentioned_bot(&ex.voice, &config) {
+    );
+
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let (mut election, clarify_continued_body) = match clarification {
+        Some(ex) => {
+            // Resolve persisted machine identity before running any fresh
+            // election. An invalid/stale voice returns an error here and cannot
+            // fall through to the default contact or another elected persona.
+            let election = bind_clarify_exchange(&ex, &config, &target)?;
             println!(
                 "[{}] web-inbound clarify-continuation from {} -> {} (reusing original ask)",
                 chrono::Utc::now().format("%H:%M:%S"),
                 sender,
                 ex.voice,
             );
-            election = Election::One {
-                bot,
-                reply_chat: target.clone(),
-                body: ex.original_ask.clone(),
-                addressed_by: worksgood::notify::telegram_group::AddressedBy::ReplyChain,
-            };
-            clarify_continued_body = Some(ex.original_ask.clone());
+            (election, Some(ex.original_ask))
         }
-    }
+        None => {
+            // A genuinely fresh web-origin message is first-class GROUP inbound:
+            // run the exact listener election seam (supergroup, no reply-chain,
+            // never bot-sent). Continuations never enter this branch.
+            let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
+            let human_count = human_agent_id_set(workgraph_dir).len();
+            (
+                elect_group_inbound_with_owner_map(
+                    &target,
+                    message,
+                    &mention_usernames,
+                    human_count,
+                    &config,
+                    &owner_map,
+                ),
+                None,
+            )
+        }
+    };
 
     // ── OWNER PIN (task owner-pin-engine) ─────────────────────────────────
     // THE LAST ROUTING SEAM. When the gateway forwarded a pinned domain owner
@@ -9108,6 +9134,121 @@ mod tests {
             resolve_machine_bot("relay-a7", &duplicate),
             None,
             "duplicate explicit bindings must fail closed",
+        );
+    }
+
+    #[test]
+    fn clarification_voice_is_exact_and_preserves_the_original_reply_chain() {
+        use worksgood::notify::telegram_group::AddressedBy;
+
+        let mut bots = HashMap::new();
+        bots.insert(
+            "wire-a7".to_string(),
+            TelegramBotConfig {
+                bot_token: "111:AAA".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("relay-a7".to_string()),
+                username: Some("mutable_relay_handle_bot".to_string()),
+            },
+        );
+        bots.insert(
+            "fallback-b4".to_string(),
+            TelegramBotConfig {
+                bot_token: "222:BBB".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: None,
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+        let exchange = |voice: &str| ownership::ClarifyExchange {
+            ts: 1_000,
+            chat_id: "-100777".to_string(),
+            human: "human-a7".to_string(),
+            voice: voice.to_string(),
+            original_ask: "could somebody help plan the weekend?".to_string(),
+        };
+
+        match bind_clarify_exchange(&exchange("relay-a7"), &config, "-100777").unwrap() {
+            Election::One {
+                bot,
+                reply_chat,
+                body,
+                addressed_by,
+            } => {
+                assert_eq!(bot.bot_id, "wire-a7");
+                assert_eq!(bot.agent_id.as_deref(), Some("relay-a7"));
+                assert_eq!(reply_chat, "-100777");
+                assert_eq!(body, "could somebody help plan the weekend?");
+                assert_eq!(addressed_by, AddressedBy::ReplyChain);
+            }
+            other => panic!("valid persisted voice must continue as one reply chain: {other:?}"),
+        }
+
+        let fallback = bind_clarify_exchange(&exchange("fallback-b4"), &config, "-100777").unwrap();
+        match fallback {
+            Election::One { bot, .. } => {
+                assert_eq!(bot.bot_id, "fallback-b4");
+                assert_eq!(bot.agent_id.as_deref(), Some("fallback-b4"));
+            }
+            other => panic!("valid key fallback must continue: {other:?}"),
+        }
+
+        for invalid in [
+            "wire-a7",
+            "mutable_relay_handle_bot",
+            "@mutable_relay_handle_bot",
+            "relay",
+            "removed-z9",
+        ] {
+            assert!(
+                bind_clarify_exchange(&exchange(invalid), &config, "-100777").is_err(),
+                "persisted alias/handle/prefix/unknown voice {invalid:?} must fail closed",
+            );
+        }
+
+        let mut key_cross_claim = config.clone();
+        key_cross_claim.bots.insert(
+            "wire-c9".to_string(),
+            TelegramBotConfig {
+                bot_token: "333:CCC".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("wire-a7".to_string()),
+                username: None,
+            },
+        );
+        match bind_clarify_exchange(&exchange("wire-a7"), &key_cross_claim, "-100777").unwrap() {
+            Election::One { bot, .. } => assert_eq!(
+                bot.bot_id, "wire-c9",
+                "explicit agent binding wins over another bot's shadowed table key",
+            ),
+            other => panic!("explicit cross-claim must resolve uniquely: {other:?}"),
+        }
+
+        let mut duplicate = config.clone();
+        duplicate.bots.insert(
+            "wire-d2".to_string(),
+            TelegramBotConfig {
+                bot_token: "444:DDD".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("relay-a7".to_string()),
+                username: None,
+            },
+        );
+        assert!(
+            bind_clarify_exchange(&exchange("relay-a7"), &duplicate, "-100777").is_err(),
+            "a duplicate persisted voice binding must fail closed",
+        );
+
+        let mut removed = config;
+        removed.bots.remove("wire-a7");
+        assert!(
+            bind_clarify_exchange(&exchange("relay-a7"), &removed, "-100777").is_err(),
+            "a formerly valid but removed voice must not fall through to fresh routing",
         );
     }
 

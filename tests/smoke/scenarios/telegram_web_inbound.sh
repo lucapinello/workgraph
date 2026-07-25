@@ -171,6 +171,10 @@ $out
     echo "  ok: $desc"
 }
 
+turn_fingerprint() {
+    sed -n 's/.*"turn_fingerprint": "\([^"]*\)".*/\1/p' <<<"$1" | head -1
+}
+
 # --- Collective ask → the whole roster answers (the headline fix) -----------
 out="$(web "$HUMAN_NAME" "hey all, are you around?")"
 expect_grep "collective ask elects the roster" "$out" '"category": "collective"'
@@ -320,6 +324,59 @@ if out="$(
 fi
 expect_grep "explicit blank owner pin cannot fall back to the env pin" "$out" "nonblank canonical agent id"
 
+# --- Persisted clarification voice is exact machine identity ----------------
+# A bare confirmation must return to the voice that asked, carrying the
+# original ask as a ReplyChain even when the bot-table key differs. Compare its
+# fingerprint with the same original ask to prove the word "yes" was not routed
+# as a new turn.
+clarify_ask="could somebody help plan the weekend?"
+original_out="$(web_choice --default-owner "$ALIAS_AGENT_ID" --sender "$HUMAN_NAME" --message "$clarify_ask" 2>&1)"
+original_fp="$(turn_fingerprint "$original_out")"
+[[ -n "$original_fp" ]] || loud_fail "original clarification ask emitted no fingerprint"
+
+mkdir -p "$scratch/.casa"
+clarify_now="$(date +%s)"
+cat >>"$scratch/.casa/clarify.jsonl" <<JSON
+{"ts":$clarify_now,"chat_id":"$GROUP_CHAT","human":"$HUMAN_TELEGRAM","voice":"$ALIAS_AGENT_ID","original_ask":"$clarify_ask"}
+JSON
+
+continued_out="$(web_choice --no-default-owner --sender "$HUMAN_NAME" --message "yes" 2>&1)"
+continued_fp="$(turn_fingerprint "$continued_out")"
+expect_grep "clarification returns to the canonical persisted voice" "$continued_out" "\"who\": \"$ALIAS_AGENT_ID\""
+expect_grep "clarification remains a reply chain" "$continued_out" "rule=reply"
+[[ "$continued_fp" == "$original_fp" ]] \
+    || loud_fail "clarification confirmation did not preserve the original ask fingerprint"
+echo "  ok: clarification replays the original ask"
+
+# Append a newer exchange carrying the shadowed transport key. This must fail
+# nonzero before fresh default routing, compose, feed mutation, or send.
+clarify_now="$(date +%s)"
+cat >>"$scratch/.casa/clarify.jsonl" <<JSON
+{"ts":$clarify_now,"chat_id":"$GROUP_CHAT","human":"$HUMAN_TELEGRAM","voice":"$ALIAS_BOT_KEY","original_ask":"$clarify_ask"}
+JSON
+feed_size_before=0
+if [[ -f "$feed_path" ]]; then
+    feed_size_before="$(wc -c <"$feed_path" | tr -d ' ')"
+fi
+if out="$(
+    cd "$scratch"
+    WG_DIR= \
+    WG_TELEGRAM_API_BASE="http://127.0.0.1:9" \
+    WG_TELEGRAM_COMPOSE_TIMEOUT_SECS=1 \
+        "$review_wg" --json telegram web-inbound \
+            --no-default-owner --sender "$HUMAN_NAME" --message "yes" 2>&1
+)"; then
+    loud_fail "web-inbound fell through from an invalid persisted clarification voice"
+fi
+expect_grep "invalid clarification voice fails at the identity seam" "$out" "web-inbound clarification voice"
+feed_size_after=0
+if [[ -f "$feed_path" ]]; then
+    feed_size_after="$(wc -c <"$feed_path" | tr -d ' ')"
+fi
+[[ "$feed_size_before" == "$feed_size_after" ]] \
+    || loud_fail "invalid clarification voice wrote a family feed reply before failing"
+echo "  ok: invalid clarification voice performs no compose, send, or feed delivery"
+
 # The choice is required and mutually exclusive at the real CLI boundary. This
 # also pins the cross-version handshake: these are ordinary flags, so an older
 # engine that does not know them rejects the new gateway invocation.
@@ -345,9 +402,6 @@ echo "  ok: web-inbound rejects conflicting default-owner choices"
 # --- Gateway occurrence id reaches the engine idempotency seam ---------------
 # The exact same accepted turn id is stable on a dispatcher refire, while a
 # later occurrence with identical words gets a different opaque fingerprint.
-turn_fingerprint() {
-    sed -n 's/.*"turn_fingerprint": "\([^"]*\)".*/\1/p' <<<"$1" | head -1
-}
 same_words="hey all, please help with the weekend"
 first="$(web_turn "$HUMAN_NAME" "$same_words" "turn-smoke-a7")"
 refire="$(web_turn "$HUMAN_NAME" "$same_words" "turn-smoke-a7")"
