@@ -1787,6 +1787,35 @@ fn project_root_for(dir: &Path) -> PathBuf {
 /// `episode` distinguishes separate open episodes so the digest store's
 /// exactly-once de-dupe doesn't swallow a re-open alert.
 fn emit_operator_alert(dir: &Path, logger: &DaemonLogger, episode: &str, text: &str) {
+    emit_operator_alert_with_sender(dir, logger, episode, text, |tg_config, chat_id, body| {
+        let channel = worksgood::notify::telegram::TelegramChannel::new(tg_config);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("no async runtime: {e}"))?;
+        use worksgood::notify::NotificationChannel;
+        rt.block_on(channel.send_text(chat_id, body))
+            .map(|_| ())
+            .map_err(|e| format!("telegram send failed: {e}"))
+    });
+}
+
+/// Testable core of [`emit_operator_alert`]. The sender seam keeps privacy and
+/// pacing regressions hermetic: tests can prove a refused route invokes no
+/// transport without constructing a live Telegram client.
+fn emit_operator_alert_with_sender<F>(
+    dir: &Path,
+    logger: &DaemonLogger,
+    episode: &str,
+    text: &str,
+    mut send: F,
+) where
+    F: FnMut(
+        worksgood::notify::telegram::TelegramConfig,
+        &str,
+        &str,
+    ) -> std::result::Result<(), String>,
+{
     use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, Offer};
 
     // (1) Always loud in the log.
@@ -1809,8 +1838,11 @@ fn emit_operator_alert(dir: &Path, logger: &DaemonLogger, episode: &str, text: &
         }
     };
     let chat_id = tg_config.chat_id.clone();
-    if chat_id.trim().is_empty() {
-        // Multi-bot-only config with no top-level operator chat — nothing to DM.
+    if !worksgood::notify::telegram::is_dm_chat_id(&chat_id) {
+        // Operator details belong only in a private chat. A missing, malformed,
+        // or group target keeps the loud daemon-log alert and stops before
+        // pacing state or transport is touched.
+        logger.warn("operator alert: no private Telegram chat configured; kept in daemon log");
         return;
     }
 
@@ -1821,24 +1853,10 @@ fn emit_operator_alert(dir: &Path, logger: &DaemonLogger, episode: &str, text: &
     let nudge = spawn_breaker::operator_alert_nudge("operator", episode, now, text);
 
     match store.offer(&nudge, now, &policy) {
-        Offer::SendNow(body) => {
-            let channel = worksgood::notify::telegram::TelegramChannel::new(tg_config);
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    logger.warn(&format!("operator alert: no async runtime: {}", e));
-                    return;
-                }
-            };
-            use worksgood::notify::NotificationChannel;
-            match rt.block_on(channel.send_text(&chat_id, &body)) {
-                Ok(_) => logger.info("operator alert DM sent (time-critical)"),
-                Err(e) => logger.warn(&format!("operator alert: telegram send failed: {}", e)),
-            }
-        }
+        Offer::SendNow(body) => match send(tg_config, &chat_id, &body) {
+            Ok(()) => logger.info("operator alert DM sent (time-critical)"),
+            Err(e) => logger.warn(&format!("operator alert: {e}")),
+        },
         Offer::Queued { overflow } => logger.info(&format!(
             "operator alert folded into the next digest (overflow={overflow})"
         )),
@@ -5157,7 +5175,50 @@ fn send_request_inner(dir: &Path, request: &IpcRequest) -> Result<IpcResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use tempfile::TempDir;
+
+    #[test]
+    fn operator_alert_refuses_group_chat_id() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        fs::create_dir_all(&wg_dir).unwrap();
+        fs::write(
+            wg_dir.join("notify.toml"),
+            r#"
+[telegram]
+bot_token = "900001:opaque-fixture-token"
+chat_id = "-100900001"
+"#,
+        )
+        .unwrap();
+        let logger = DaemonLogger::open(&wg_dir).unwrap();
+        let sends = Cell::new(0_u32);
+
+        emit_operator_alert_with_sender(
+            &wg_dir,
+            &logger,
+            "opaque-episode",
+            "Private diagnostic detail.",
+            |_config, _chat_id, _body| {
+                sends.set(sends.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            sends.get(),
+            0,
+            "a family-group target must invoke zero transports"
+        );
+        assert!(
+            !worksgood::notify::daily_digest::DigestStore::path(tmp.path()).exists(),
+            "a refused target must stop before recording pacing state"
+        );
+        let warnings = tail_log(&wg_dir, 20, Some("WARN")).join("\n");
+        assert!(warnings.contains("Private diagnostic detail."));
+        assert!(warnings.contains("no private Telegram chat configured"));
+    }
 
     /// Build a service-paused ProviderHealth on disk (mirrors what triage does
     /// after 3 consecutive fatal-provider errors) and return the temp dir.
