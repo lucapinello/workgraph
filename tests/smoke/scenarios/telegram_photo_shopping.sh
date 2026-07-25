@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Smoke: photo → shopping-list vision pipeline (task photo-to-shopping).
 #
-# "Snap the fridge, Bruno adjusts the pickup list." Pins the credential-free,
-# network-free core of the pipeline by driving the REAL binary through
+# "Snap the fridge, the configured cooking voice adjusts the pickup list." Pins
+# the credential-free, network-free core of the pipeline by driving the REAL
+# binary through
 # `wg telegram photo-plan` (the scripted-test seam, sibling of `wg telegram
 # decide` / `elect`):
 #
-#   1. PHOTO ROUTING     — a captioned fridge photo ("bruno what do we still
-#                          need?") decodes as a photo and ELECTS Bruno by name,
-#                          exactly like a text message with the same caption.
+#   1. PHOTO ROUTING     — a captioned fridge photo naming the configured
+#                          cooking voice decodes as a photo and ELECTS that
+#                          voice by name, exactly like a text message with the
+#                          same caption.
 #   2. ALBUM COALESCING  — three photos sharing a media_group_id collapse to ONE
 #                          vision turn (no loops on albums), gathering all frames.
 #   3. VISION → MUTATION — the model's `SHOPPING_UPDATE: have=[…]; need=[…]` tail
@@ -17,8 +19,9 @@
 #                          leave already-listed items alone.
 #   4. ROUTING RULES     — a non-photo update yields no photo turn; an
 #                          uncaptioned (unaddressed) group photo falls to the
-#                          concierge (Otto) under the SAME election rules as text
-#                          — only a NAMED caption routes to Bruno.
+#                          configured coordinator under the SAME election rules
+#                          as text — only a NAMED caption routes to the cooking
+#                          voice.
 #
 # The fixture image (fridge_photo.png) is the payload a live vision turn would
 # download-and-attach; here we assert it is a real, valid image so the fixture
@@ -43,39 +46,56 @@ head -c 8 "$img" | od -An -tx1 | tr -d ' \n' | grep -qi '^89504e470d0a1a0a$' \
 scratch="$(make_scratch)"
 mkdir -p "$scratch/.wg"
 
-# Fixture: the Casa Pinello voices (Bruno is the food-savvy one).
-cat >"$scratch/.wg/notify.toml" <<'TOML'
-[telegram.bots.bruno]
-bot_token = "0000000000:bruno-dummy-token"
-chat_id   = "-1000000000001"
-username  = "bruno_casapinello_bot"
+# An unfamiliar roster proves both routes come from project configuration, not
+# from compiled persona ids. The cooking and coordination domains are explicit.
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "skillet-7"
+name = "Saffron Skillet"
+emoji = "🥘"
+domains = ["cooking", "recipes"]
 
-[telegram.bots.otto]
-bot_token = "0000000000:otto-dummy-token"
-chat_id   = "-1000000000001"
-username  = "otto_casapinello_bot"
+[[agent]]
+id = "harbor-4"
+name = "Harbor Guide"
+emoji = "🧭"
+domains = ["calendar", "coordination", "shopping"]
+TOML
+
+cat >"$scratch/.wg/notify.toml" <<'TOML'
+[telegram.bots.skillet-7]
+bot_token = "0000000000:skillet-fixture-token"
+chat_id   = "-1007000042"
+username  = "saffron_skillet_house_bot"
+agent_id  = "skillet-7"
+
+[telegram.bots.harbor-4]
+bot_token = "0000000000:harbor-fixture-token"
+chat_id   = "-1007000042"
+username  = "harbor_guide_house_bot"
+agent_id  = "harbor-4"
 TOML
 
 # A captioned fridge photo (largest size last, smaller first — like the wire).
 cat >"$scratch/update.json" <<'JSON'
-{"update_id":1,"message":{"message_id":58,"date":1720000000,"chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"luca"},"caption":"bruno what do we still need?","photo":[{"file_id":"thumb","width":90,"height":60,"file_size":900},{"file_id":"biggest","width":1280,"height":720,"file_size":90000}]}}
+{"update_id":1,"message":{"message_id":58,"date":1720000000,"chat":{"id":-1007000042,"type":"supergroup"},"from":{"id":741020,"is_bot":false,"username":"member_41"},"caption":"Saffron Skillet, what do we still need?","photo":[{"file_id":"thumb","width":90,"height":60,"file_size":900},{"file_id":"biggest","width":1280,"height":720,"file_size":90000}]}}
 JSON
 
 # An album: three frames sharing one media_group_id; caption only on the first.
 cat >"$scratch/album.json" <<'JSON'
-[{"update_id":1,"message":{"message_id":58,"date":1720000000,"media_group_id":"AG9","chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"luca"},"caption":"bruno what do we still need?","photo":[{"file_id":"f1","width":1280,"height":720,"file_size":90000}]}},
-{"update_id":2,"message":{"message_id":59,"date":1720000001,"media_group_id":"AG9","chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"luca"},"photo":[{"file_id":"f2","width":1280,"height":720,"file_size":90000}]}},
-{"update_id":3,"message":{"message_id":60,"date":1720000002,"media_group_id":"AG9","chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"luca"},"photo":[{"file_id":"f3","width":1280,"height":720,"file_size":90000}]}}]
+[{"update_id":1,"message":{"message_id":58,"date":1720000000,"media_group_id":"AG9","chat":{"id":-1007000042,"type":"supergroup"},"from":{"id":741020,"is_bot":false,"username":"member_41"},"caption":"Saffron Skillet, what do we still need?","photo":[{"file_id":"f1","width":1280,"height":720,"file_size":90000}]}},
+{"update_id":2,"message":{"message_id":59,"date":1720000001,"media_group_id":"AG9","chat":{"id":-1007000042,"type":"supergroup"},"from":{"id":741020,"is_bot":false,"username":"member_41"},"photo":[{"file_id":"f2","width":1280,"height":720,"file_size":90000}]}},
+{"update_id":3,"message":{"message_id":60,"date":1720000002,"media_group_id":"AG9","chat":{"id":-1007000042,"type":"supergroup"},"from":{"id":741020,"is_bot":false,"username":"member_41"},"photo":[{"file_id":"f3","width":1280,"height":720,"file_size":90000}]}}]
 JSON
 
-# An uncaptioned group photo (no mention) — must not summon anyone.
+# An uncaptioned group photo (no mention) — the coordinator handles it.
 cat >"$scratch/uncaptioned.json" <<'JSON'
-{"update_id":1,"message":{"message_id":61,"date":1720000000,"chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"luca"},"photo":[{"file_id":"x","width":1280,"height":720,"file_size":90000}]}}
+{"update_id":1,"message":{"message_id":61,"date":1720000000,"chat":{"id":-1007000042,"type":"supergroup"},"from":{"id":741020,"is_bot":false,"username":"member_41"},"photo":[{"file_id":"x","width":1280,"height":720,"file_size":90000}]}}
 JSON
 
 # A plain text update — not a photo at all.
 cat >"$scratch/text.json" <<'JSON'
-{"update_id":1,"message":{"message_id":62,"date":1720000000,"chat":{"id":-1000000000001,"type":"supergroup"},"from":{"id":8905220378,"is_bot":false,"username":"luca"},"text":"hey bruno"}}
+{"update_id":1,"message":{"message_id":62,"date":1720000000,"chat":{"id":-1007000042,"type":"supergroup"},"from":{"id":741020,"is_bot":false,"username":"member_41"},"text":"hello Saffron Skillet"}}
 JSON
 
 # The current shopping list, as GET /shopping.json would return it.
@@ -92,17 +112,17 @@ expect_grep() {
         || loud_fail "$desc: expected '$needle', got: $out"
 }
 
-echo "1. photo routing — captioned fridge photo elects Bruno:"
+echo "1. photo routing — captioned fridge photo elects the configured cooking voice:"
 out="$(plan @update.json)"
 expect_grep "is a photo" "$out" "^photo — "
 expect_grep "largest frame chosen" "$out" "1 image"
-expect_grep "routes to bruno" "$out" "routes to: bruno"
+expect_grep "routes to the cooking voice" "$out" "routes to: skillet-7"
 
 echo "2. album coalescing — 3 frames → ONE turn, all frames gathered:"
 out="$(plan @album.json)"
 expect_grep "one turn" "$out" "1 turn(s), 3 image(s)"
 expect_grep "album group" "$out" "album group AG9"
-expect_grep "album caption carried" "$out" "bruno what do we still need?"
+expect_grep "album caption carried" "$out" "Saffron Skillet, what do we still need?"
 
 echo "3. vision → mutation — SHOPPING_UPDATE tail maps to endpoint calls:"
 reply="You still need lemons and chard; you already have chickpeas — crossing them off.
@@ -126,18 +146,19 @@ JSON
 out="$(plan @update.json --reply $'ok\nSHOPPING_UPDATE: have=[]; need=[milk]' --list @list_crossed.json)"
 expect_grep "restore crossed item" "$out" "restore 'Milk'"
 
-echo "4. routing rules — non-photo, and uncaptioned falls to the concierge:"
+echo "4. routing rules — non-photo, and uncaptioned falls to the configured coordinator:"
 expect_grep "text is not a photo" "$(plan @text.json)" "not a photo"
 # An unaddressed photo (no caption naming a voice) routes like unaddressed text:
-# to Otto, the group concierge — NOT to Bruno (who is only summoned by name).
+# to the configured coordinator — NOT to the cooking voice (which is summoned
+# only by name).
 uncap_out="$(plan @uncaptioned.json)"
-expect_grep "uncaptioned → concierge (otto)" "$uncap_out" "routes to: otto"
-if echo "$uncap_out" | grep -q "routes to: bruno"; then
-    loud_fail "an uncaptioned photo must not be name-routed to Bruno: $uncap_out"
+expect_grep "uncaptioned → configured coordinator" "$uncap_out" "routes to: harbor-4"
+if echo "$uncap_out" | grep -q "routes to: skillet-7"; then
+    loud_fail "an uncaptioned photo must not be name-routed to the cooking voice: $uncap_out"
 fi
 
 echo "5. no token ever leaks into the diagnostic output:"
-if plan @update.json --reply "$reply" --list @list.json | grep -q "dummy-token"; then
+if plan @update.json --reply "$reply" --list @list.json | grep -q "fixture-token"; then
     loud_fail "bot token leaked into photo-plan output"
 fi
 
