@@ -32,6 +32,7 @@ pub mod telegram_dedupe;
 pub mod telegram_discussion;
 pub mod telegram_family_commands;
 pub mod telegram_group;
+pub mod telegram_occurrence;
 pub mod telegram_pacing;
 pub mod telegram_photo;
 pub mod telegram_sender;

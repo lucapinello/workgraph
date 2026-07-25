@@ -3873,6 +3873,183 @@ fn fast_lane_reply_target(
     (bot_id, target.to_string())
 }
 
+const WEB_FAST_LANE_OCCURRENCE_DOMAIN: &str = "web-fast-lane";
+
+/// Exact restart payload for one web fast-lane mutation.
+///
+/// The mutation's report is guarded before this value is persisted, so an
+/// `applied` replay sends these exact bytes and never re-runs classification,
+/// plan editing, graph stamping, election, or target selection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebFastLaneOutcome {
+    op_kind: String,
+    report: String,
+    bot_id: String,
+    chat_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebFastLaneDispatch {
+    PassedThrough,
+    Handled {
+        outcome: WebFastLaneOutcome,
+        resumed_delivery: bool,
+        already_delivered: bool,
+    },
+}
+
+fn web_fast_lane_delivery_id(physical_turn_key: &str) -> String {
+    format!(
+        "web-fast-lane-{}",
+        durable_telegram_digest_v1("web-fast-lane-delivery", &[physical_turn_key]),
+    )
+}
+
+/// Apply and deliver one web fast-lane occurrence with restart-safe ordering.
+///
+/// Record-before-act is intentional:
+///
+/// 1. reserve the opaque occurrence;
+/// 2. apply the plan edit and graph stamp once;
+/// 3. persist the exact guarded reply + original route;
+/// 4. claim/send through the transport delivery ledger;
+/// 5. mark the occurrence delivered.
+///
+/// A crash in step 2 leaves `reserved` and a replay fails closed because it
+/// cannot know whether the plan edit reached disk. A transport failure in step
+/// 4 leaves `applied`; the replay sends the stored bytes to the stored route
+/// without touching the plan again. The transport ledger itself claims before
+/// send, closing the send-success/journal-mark crash window.
+#[allow(clippy::too_many_arguments)]
+async fn run_web_fast_lane_occurrence(
+    workgraph_dir: &Path,
+    root: &Path,
+    message: &str,
+    today: chrono::NaiveDate,
+    calendar_owner: Option<&str>,
+    physical_turn_key: &str,
+    bot_id: &str,
+    chat_id: &str,
+    auth_sender: &str,
+    persona: &str,
+    family_roster: &worksgood::notify::grounding::FamilyVoiceRoster,
+    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
+) -> Result<WebFastLaneDispatch> {
+    use worksgood::notify::fast_lane::{Classification, FastLaneResult};
+    use worksgood::notify::telegram_conversation as convo;
+    use worksgood::notify::telegram_occurrence::{OccurrenceJournal, OccurrenceState};
+
+    // Do not create occurrence records for the ordinary conversation pipeline,
+    // but always reopen an existing record first. Mutable dispatcher inputs may
+    // drift on retry; the durable accepted occurrence still wins.
+    let classified_fast_lane = matches!(
+        fast_lane::classify(message, today),
+        Classification::FastLane(_)
+    );
+    let opened = if classified_fast_lane {
+        Some(OccurrenceJournal::<WebFastLaneOutcome>::claim(
+            workgraph_dir,
+            WEB_FAST_LANE_OCCURRENCE_DOMAIN,
+            physical_turn_key,
+        )?)
+    } else {
+        OccurrenceJournal::<WebFastLaneOutcome>::reopen(
+            workgraph_dir,
+            WEB_FAST_LANE_OCCURRENCE_DOMAIN,
+            physical_turn_key,
+        )?
+    };
+    let Some((journal, state)) = opened else {
+        return Ok(WebFastLaneDispatch::PassedThrough);
+    };
+
+    let (outcome, resumed_delivery) = match state {
+        OccurrenceState::New => {
+            match fast_lane::run_fast_lane_with_calendar_owner(
+                root,
+                message,
+                today,
+                calendar_owner,
+            ) {
+                FastLaneResult::Fallback { .. } => {
+                    // This closed-set classifier did not ultimately own the turn
+                    // (for example, no current plan could be edited). Persist that
+                    // decision so a dispatcher refire takes the same normal path.
+                    journal.mark_passed_through()?;
+                    return Ok(WebFastLaneDispatch::PassedThrough);
+                }
+                FastLaneResult::Applied { report, op, .. } => {
+                    let guarded = worksgood::notify::grounding::enforce_family_voice(
+                        &report,
+                        family_roster,
+                    );
+                    if guarded != report {
+                        eprintln!(
+                            "[{}] family-voice guard: cleaned a web fast-lane reply before journaling",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                        );
+                    }
+
+                    // Graph visibility belongs to the mutation stage. It is
+                    // intentionally never repeated from an `applied` replay.
+                    let origin = worksgood::graph::TaskOrigin::new(
+                        worksgood::graph::OriginChannel::Web,
+                        chat_id.to_string(),
+                        auth_sender.to_string(),
+                        persona.to_string(),
+                        Some(bot_id.to_string()),
+                    );
+                    fast_lane::stamp_graph_node(workgraph_dir, &origin, &op, &guarded);
+
+                    let outcome = WebFastLaneOutcome {
+                        op_kind: op.kind_label().to_string(),
+                        report: guarded,
+                        bot_id: bot_id.to_string(),
+                        chat_id: chat_id.to_string(),
+                    };
+                    // Persist canonical bytes and routing before the first send.
+                    journal.mark_applied(&outcome)?;
+                    (outcome, false)
+                }
+            }
+        }
+        OccurrenceState::Incomplete => {
+            anyhow::bail!(
+                "web fast-lane occurrence is incomplete; refusing to reapply an uncertain plan edit"
+            );
+        }
+        OccurrenceState::Applied(outcome) => (outcome, true),
+        OccurrenceState::Delivered(outcome) => {
+            return Ok(WebFastLaneDispatch::Handled {
+                outcome,
+                resumed_delivery: false,
+                already_delivered: true,
+            });
+        }
+        OccurrenceState::PassedThrough => return Ok(WebFastLaneDispatch::PassedThrough),
+    };
+
+    let delivery_id = web_fast_lane_delivery_id(physical_turn_key);
+    convo::send_reply_once(
+        workgraph_dir,
+        &delivery_id,
+        &outcome.bot_id,
+        &outcome.chat_id,
+        &outcome.report,
+        sink,
+    )
+    .await
+    .context("web fast-lane reply delivery failed; the stored outcome remains retryable")?;
+    journal.mark_delivered(&outcome)?;
+
+    Ok(WebFastLaneDispatch::Handled {
+        outcome,
+        resumed_delivery,
+        already_delivered: false,
+    })
+}
+
 /// Honor a pinned domain owner for a heavy web-inbound turn (task
 /// `owner-pin-engine`).
 ///
@@ -4126,59 +4303,73 @@ pub fn run_web_inbound(
     // exactly as today. Only a confirmed human may trigger a direct write.
     if convo::sender_is_confirmed(workgraph_dir, &auth_sender) {
         let today = chrono::Local::now().date_naive();
-        if let fast_lane::FastLaneResult::Applied { report, op, .. } =
-            fast_lane::run_fast_lane_with_calendar_owner(
-                &project_root(workgraph_dir),
-                message,
-                today,
-                owner_map.owner_for_domain(ownership::Domain::Calendar),
-            )
-        {
-            let (bot_id, chat) = fast_lane_reply_target(&election, &config, &target);
-            let persona = convo::agent_for_bot(&config, &bot_id);
-            println!(
-                "[{}] fast-lane {} applied for {} -> {} ({})",
-                chrono::Utc::now().format("%H:%M:%S"),
-                op.kind_label(),
-                sender,
-                bot_id,
-                report,
-            );
-            let sink = family_delivery.wrap(
-                convo::BotReplySink::new(config.clone()),
-                ReplyScope::Group,
-                GuardPolicy::Enforce,
-            );
-            let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-            rt.block_on(async {
-                use convo::ReplySink as _;
-                let _ = sink.send(&bot_id, &chat, &report).await;
-            });
-            // Origin-stamp + brief graph visibility (a queued→done light) so the
-            // fast-lane edit still shows in the constellation/timeline.
-            let origin = worksgood::graph::TaskOrigin::new(
-                worksgood::graph::OriginChannel::Web,
-                chat.clone(),
-                auth_sender.clone(),
-                persona,
-                Some(bot_id.clone()),
-            );
-            fast_lane::stamp_graph_node(workgraph_dir, &origin, &op, &report);
+        let (bot_id, chat) = fast_lane_reply_target(&election, &config, &target);
+        let persona = convo::agent_for_bot(&config, &bot_id);
+        // The occurrence helper guards the reply before journaling it. Delivery
+        // must preserve those exact canonical bytes on an `applied` retry.
+        let sink = family_delivery.wrap(
+            convo::BotReplySink::new(config.clone()),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+        match rt.block_on(run_web_fast_lane_occurrence(
+            workgraph_dir,
+            &project_root(workgraph_dir),
+            message,
+            today,
+            owner_map.owner_for_domain(ownership::Domain::Calendar),
+            &physical_turn_key,
+            &bot_id,
+            &chat,
+            &auth_sender,
+            &persona,
+            &family_delivery.family_roster,
+            &sink,
+        ))? {
+            WebFastLaneDispatch::PassedThrough => {}
+            WebFastLaneDispatch::Handled {
+                outcome,
+                resumed_delivery,
+                already_delivered,
+            } => {
+                let phase = if already_delivered {
+                    "already delivered"
+                } else if resumed_delivery {
+                    "stored delivery resumed"
+                } else {
+                    "applied"
+                };
+                println!(
+                    "[{}] fast-lane {} {} for {} -> {} ({})",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    outcome.op_kind,
+                    phase,
+                    sender,
+                    outcome.bot_id,
+                    outcome.report,
+                );
 
-            if json {
-                let out = serde_json::json!({
-                    "category": "fast-lane",
-                    "fast_lane_op": op.kind_label(),
-                    "sender": sender,
-                    "auth_sender": auth_sender,
-                    "target": chat,
-                    "outcome": report,
-                });
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            } else {
-                println!("web-inbound [fast-lane {}] from {sender}: {report}", op.kind_label());
+                if json {
+                    let out = serde_json::json!({
+                        "category": "fast-lane",
+                        "fast_lane_op": outcome.op_kind,
+                        "sender": sender,
+                        "auth_sender": auth_sender,
+                        "target": outcome.chat_id,
+                        "outcome": outcome.report,
+                        "replayed": resumed_delivery || already_delivered,
+                        "already_delivered": already_delivered,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    println!(
+                        "web-inbound [fast-lane {}] from {sender}: {}",
+                        outcome.op_kind, outcome.report,
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
         }
     }
 
@@ -8648,6 +8839,221 @@ domains = ["cooking"]
         assert_eq!(
             web_inbound_request_id("-100700", "voice-7", &web_turn),
             "web-request-b3-v1-96ebd0939919bcb2a67b9baf8c50cb15fcc489edb598f3d5d1085e8e210f5115",
+        );
+    }
+
+    /// Permanent behavior gate at the mutation boundary. A fresh invocation
+    /// retries only the stored delivery after transport failure, a completed
+    /// same-turn refire is silent, and a distinct occurrence id admits the same
+    /// household words later.
+    #[tokio::test]
+    async fn web_fast_lane_same_turn_mutates_and_sends_once_after_restart() {
+        #[derive(Default)]
+        struct ReplaySink {
+            fail_next: std::sync::atomic::AtomicBool,
+            attempts: std::sync::Mutex<Vec<(String, String, String)>>,
+            delivered: std::sync::Mutex<Vec<(String, String, String)>>,
+        }
+
+        #[async_trait]
+        impl worksgood::notify::telegram_conversation::ReplySink for ReplaySink {
+            async fn send(
+                &self,
+                bot_id: &str,
+                chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                let row = (
+                    bot_id.to_string(),
+                    chat_id.to_string(),
+                    text.to_string(),
+                );
+                self.attempts.lock().unwrap().push(row.clone());
+                if self
+                    .fail_next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    anyhow::bail!("fixture transport failure");
+                }
+                let mut delivered = self.delivered.lock().unwrap();
+                delivered.push(row);
+                Ok(Some(format!("fixture-{}", delivered.len())))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let workgraph_dir = root.join(".wg");
+        let plans_dir = root.join("plans");
+        std::fs::create_dir_all(&workgraph_dir).unwrap();
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        let plan_path = plans_dir.join("2026-W30-family-plan.md");
+        std::fs::write(
+            &plan_path,
+            r#"# Household weekly plan · 2026-W30
+
+**Week of Monday 2026-07-20 → Sunday 2026-07-26**
+
+## 1. Dinners (Cedar Signal → Copper Ladle)
+
+| Day | Slot type | Dinner | Prep | Note |
+|-----|-----------|--------|------|------|
+| Wed 07-22 | Vegetarian | Miso aubergine noodles | ~30 min | pantry |
+
+## 2. Calendar (Open Door)
+
+| Day | Time | Event | Source |
+|-----|------|-------|--------|
+| Wed 07-22 | 18:30 | Cook: miso aubergine noodles | Copper Ladle |
+
+## 3. Shopping list (Open Door)
+
+### Produce
+- Aubergines ×2
+"#,
+        )
+        .unwrap();
+
+        let roster = worksgood::notify::grounding::FamilyVoiceRoster::from_names(
+            ["Open Door"],
+            ["River Guest"],
+        );
+        let sink = ReplaySink::default();
+        sink.fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 22).unwrap();
+        let words = "add oat milk to the shopping list";
+        let first_key = web_physical_turn_key("-100700", words, Some("turn-a"));
+
+        // First invocation applies once and retains canonical bytes when the
+        // transport fails.
+        let first = run_web_fast_lane_occurrence(
+            &workgraph_dir,
+            root,
+            words,
+            today,
+            None,
+            &first_key,
+            "helper-9",
+            "-100700",
+            "member-41",
+            "helper-9",
+            &roster,
+            &sink,
+        )
+        .await;
+        assert!(first.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&plan_path)
+                .unwrap()
+                .matches("- oat milk")
+                .count(),
+            1,
+        );
+
+        // A fresh-process refire may carry drifted mutable inputs. The persisted
+        // outcome still wins even when the body no longer classifies as a fast
+        // edit: original route and exact oat-milk reply.
+        let retry = run_web_fast_lane_occurrence(
+            &workgraph_dir,
+            root,
+            "please help me with this",
+            today,
+            None,
+            &first_key,
+            "decoy-bot",
+            "-100999",
+            "different-member",
+            "decoy-persona",
+            &roster,
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            retry,
+            WebFastLaneDispatch::Handled {
+                resumed_delivery: true,
+                already_delivered: false,
+                ..
+            }
+        ));
+        let plan = std::fs::read_to_string(&plan_path).unwrap();
+        assert_eq!(plan.matches("- oat milk").count(), 1);
+        let delivered = sink.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(&delivered[0].0, "helper-9");
+        assert_eq!(&delivered[0].1, "-100700");
+        assert!(delivered[0].2.contains("oat milk"));
+
+        // Once delivered, the same occurrence is a full no-op.
+        let completed = run_web_fast_lane_occurrence(
+            &workgraph_dir,
+            root,
+            words,
+            today,
+            None,
+            &first_key,
+            "helper-9",
+            "-100700",
+            "member-41",
+            "helper-9",
+            &roster,
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            completed,
+            WebFastLaneDispatch::Handled {
+                already_delivered: true,
+                ..
+            }
+        ));
+        assert_eq!(sink.attempts.lock().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&plan_path)
+                .unwrap()
+                .matches("- oat milk")
+                .count(),
+            1,
+        );
+
+        // Identical words with a later occurrence id remain a new household
+        // turn and therefore apply + deliver once of their own.
+        let later_key = web_physical_turn_key("-100700", words, Some("turn-b"));
+        run_web_fast_lane_occurrence(
+            &workgraph_dir,
+            root,
+            words,
+            today,
+            None,
+            &later_key,
+            "helper-9",
+            "-100700",
+            "member-41",
+            "helper-9",
+            &roster,
+            &sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sink.attempts.lock().unwrap().len(), 3);
+        assert_eq!(sink.delivered.lock().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&plan_path)
+                .unwrap()
+                .matches("- oat milk")
+                .count(),
+            2,
+        );
+        let graph = worksgood::parser::load_graph(workgraph_dir.join("graph.jsonl")).unwrap();
+        assert_eq!(
+            graph
+                .tasks()
+                .filter(|task| task.tags.iter().any(|tag| tag == "fast-lane"))
+                .count(),
+            2,
         );
     }
 

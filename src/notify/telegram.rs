@@ -330,8 +330,10 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!(
-            "https://api.telegram.org/bot{}/{}",
-            self.bot.bot_token, method
+            "{}/bot{}/{}",
+            telegram_api_base(),
+            self.bot.bot_token,
+            method,
         )
     }
 
@@ -807,6 +809,40 @@ impl TelegramChannel {
 /// Telegram Bot API base URL. A constant (rather than inlined) so the
 /// resilience tests can point [`get_updates_once`] at a local mock server.
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
+/// Optional loopback-only Telegram API base used by hermetic real-binary
+/// scenarios. The production default remains Telegram itself; an override is
+/// accepted only for plain HTTP on an exact loopback IP, so a stray environment
+/// value cannot redirect bot credentials to another host.
+const TELEGRAM_API_BASE_OVERRIDE: &str = "WG_TELEGRAM_API_BASE";
+
+fn validated_telegram_api_base(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    if url.scheme() != "http"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(
+            url.host_str(),
+            Some("127.0.0.1") | Some("::1") | Some("[::1]")
+        )
+    {
+        return None;
+    }
+    let mut base = url.to_string();
+    while base.ends_with('/') {
+        base.pop();
+    }
+    Some(base)
+}
+
+fn telegram_api_base() -> String {
+    std::env::var(TELEGRAM_API_BASE_OVERRIDE)
+        .ok()
+        .and_then(|value| validated_telegram_api_base(&value))
+        .unwrap_or_else(|| TELEGRAM_API_BASE.to_string())
+}
 
 /// Server-side long-poll timeout (seconds) sent to `getUpdates`. Telegram holds
 /// the request open up to this long when no update is pending, so the loop
@@ -1323,6 +1359,31 @@ chat_id = "456"
             ch.api_url("sendMessage"),
             "https://api.telegram.org/bot123:ABC/sendMessage"
         );
+    }
+
+    #[test]
+    fn telegram_api_override_accepts_only_plain_http_loopback() {
+        assert_eq!(
+            validated_telegram_api_base("http://127.0.0.1:7788/").as_deref(),
+            Some("http://127.0.0.1:7788"),
+        );
+        assert_eq!(
+            validated_telegram_api_base("http://[::1]:7788/").as_deref(),
+            Some("http://[::1]:7788"),
+        );
+        for rejected in [
+            "https://127.0.0.1:7788",
+            "http://localhost:7788",
+            "http://192.0.2.8:7788",
+            "http://user:pass@127.0.0.1:7788",
+            "not-a-url",
+        ] {
+            assert_eq!(
+                validated_telegram_api_base(rejected),
+                None,
+                "unsafe test endpoint was accepted: {rejected}",
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
