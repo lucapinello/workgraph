@@ -263,8 +263,8 @@ pub fn build_vision_prompt(
         }
         _ => {
             p.push_str(
-                "You are Bruno, a warm, food-savvy member of the family team who helps \
-                 keep the shopping list right.\n\n",
+                "You are the household helper who received this photo. Reply warmly and \
+                 help keep the shared shopping list accurate.\n\n",
             );
         }
     }
@@ -974,6 +974,31 @@ mod tests {
         let turns = coalesce_album(&msgs);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].file_ids, vec!["f2"]);
+    }
+
+    #[test]
+    fn photo_prompt_uses_configured_voice_or_a_name_free_fallback() {
+        let image_refs = vec!["@/tmp/scratch-photo.jpg".to_string()];
+        let configured = build_vision_prompt(
+            Some("Zephyra is the household's pantry guide."),
+            &[],
+            "What do we need?",
+            &image_refs,
+        );
+        assert!(
+            configured.contains("Zephyra is the household's pantry guide."),
+            "the elected voice summary must remain authoritative"
+        );
+
+        let fallback = build_vision_prompt(None, &[], "What do we need?", &image_refs);
+        assert!(
+            fallback.starts_with("You are the household helper who received this photo."),
+            "a missing session summary must use a role-neutral prompt"
+        );
+        assert!(
+            !fallback.contains("Zephyra"),
+            "the neutral fallback must not invent the configured fixture voice"
+        );
     }
 
     // --- verdict parsing ---------------------------------------------------
