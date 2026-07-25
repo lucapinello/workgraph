@@ -649,6 +649,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
         // six display-safe fields — never a token, chat id, or user id. See
         // `notify::casa_feed` and docs/15 §chat-split.
         let feed_path = casa_feed::feed_path_for(&project_root(&workgraph_dir));
+        let feed_personas = load_feed_persona_catalog(&project_root(&workgraph_dir));
 
         // Fix #1 (startup stale-backlog) + Fix #2 (burst coalescing) state. The
         // start timestamp anchors the staleness test; `backlog_notified` ensures
@@ -766,8 +767,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // Telegram id a username-less person decodes to — task
                 // mirrored-telegram-sender). Unbound bare id → the neutral label.
                 let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
-                let entry =
-                    casa_feed::group_entry(&feed_sender, &msg.body, casa_feed::now_ms(), src_id);
+                let entry = casa_feed::group_entry(
+                    &feed_personas,
+                    &feed_sender,
+                    &msg.body,
+                    casa_feed::now_ms(),
+                    src_id,
+                );
                 if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
                     eprintln!(
                         "[{}] casa feed: failed to mirror inbound group message: {e}",
@@ -929,6 +935,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             // raw numeric id (task mirrored-telegram-sender).
                             let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
                             let entry = casa_feed::group_entry(
+                                &feed_personas,
                                 &feed_sender,
                                 &spoken,
                                 casa_feed::now_ms(),
@@ -1657,6 +1664,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         // and must never land in the shared group feed.
                         let mirror_group = matches!(entry, convo::Entry::GroupElected);
                         let feed_path_owned = feed_path.clone();
+                        let feed_personas_owned = feed_personas.clone();
                         let wg_config_owned = wg_config.clone();
                         // Hand the coalescer + admitted agent into the spawn so it
                         // marks the reply *sent* when it finishes — ending the
@@ -1666,7 +1674,12 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         tokio::spawn(async move {
                             let base = convo::BotReplySink::new(cfg_owned.clone());
                             let sink: Box<dyn convo::ReplySink> = if mirror_group {
-                                Box::new(FeedMirrorSink::new(base, feed_path_owned, cfg_owned))
+                                Box::new(FeedMirrorSink::new(
+                                    base,
+                                    feed_path_owned,
+                                    cfg_owned,
+                                    feed_personas_owned,
+                                ))
                             } else {
                                 Box::new(base)
                             };
@@ -3089,6 +3102,7 @@ pub async fn run_group_collective(
     use worksgood::notify::telegram_standup as standup;
 
     let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
+    let feed_personas = load_feed_persona_catalog(&project_root(workgraph_dir));
     if roster.is_empty() {
         eprintln!("No household roster entries have matching Telegram bots.");
         return Ok(());
@@ -3135,6 +3149,7 @@ pub async fn run_group_collective(
                 convo::BotReplySink::new(config.clone()),
                 feed_path.to_path_buf(),
                 config.clone(),
+                feed_personas.clone(),
             );
             let request_id = format!("tg-collective-{}-{}", target, member.bot_id);
             let composer = wg_config
@@ -3182,8 +3197,12 @@ pub async fn run_group_collective(
                 );
                 // Mirror this voice's reply into the conversation pane's feed as
                 // an `agent` line (the persona's answer relayed into the group).
-                let entry =
-                    casa_feed::agent_entry(member.agent_id(), &post.text, casa_feed::now_ms());
+                let entry = casa_feed::agent_entry(
+                    &feed_personas,
+                    member.agent_id(),
+                    &post.text,
+                    casa_feed::now_ms(),
+                );
                 if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
                     eprintln!("collective: failed to mirror {} reply to feed: {e}", post.bot_id);
                 }
@@ -3225,6 +3244,7 @@ pub async fn run_group_discussion(
     use worksgood::notify::telegram_standup as standup;
 
     let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
+    let feed_personas = load_feed_persona_catalog(&project_root(workgraph_dir));
     if roster.is_empty() {
         eprintln!("No household roster entries have matching Telegram bots.");
         return Ok(());
@@ -3310,6 +3330,7 @@ pub async fn run_group_discussion(
         convo::BotReplySink::new(config.clone()),
         feed_path.to_path_buf(),
         config.clone(),
+        feed_personas,
     );
     let family_roster =
         grounding::load_family_voice_roster(&project_root(workgraph_dir), workgraph_dir);
@@ -3355,6 +3376,7 @@ struct FeedMirrorSink {
     inner: worksgood::notify::telegram_conversation::BotReplySink,
     feed_path: PathBuf,
     config: TelegramConfig,
+    personas: casa_feed::PersonaCatalog,
 }
 
 impl FeedMirrorSink {
@@ -3362,11 +3384,13 @@ impl FeedMirrorSink {
         inner: worksgood::notify::telegram_conversation::BotReplySink,
         feed_path: PathBuf,
         config: TelegramConfig,
+        personas: casa_feed::PersonaCatalog,
     ) -> Self {
         Self {
             inner,
             feed_path,
             config,
+            personas,
         }
     }
 }
@@ -3381,12 +3405,30 @@ impl FeedMirrorSink {
             return;
         }
         let agent_id = convo::agent_for_bot(&self.config, bot_id);
-        let entry = casa_feed::agent_entry(&agent_id, text, casa_feed::now_ms());
+        let entry =
+            casa_feed::agent_entry(&self.personas, &agent_id, text, casa_feed::now_ms());
         if let Err(e) = casa_feed::append_entry(&self.feed_path, &entry) {
             eprintln!(
                 "[{}] casa feed: failed to mirror agent reply: {e}",
                 chrono::Utc::now().format("%H:%M:%S"),
             );
+        }
+    }
+}
+
+/// Load the committable household presentation used by the shared feed.
+///
+/// Delivery remains available when the presentation file is absent or invalid,
+/// but the fallback catalog is intentionally empty: feed entries use a neutral
+/// id-derived label and no emoji instead of a compiled or guessed identity.
+fn load_feed_persona_catalog(project_root: &Path) -> casa_feed::PersonaCatalog {
+    match casa_feed::PersonaCatalog::load(project_root) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!(
+                "[telegram] could not load household presentation for the shared feed ({e:#})"
+            );
+            casa_feed::PersonaCatalog::default()
         }
     }
 }
@@ -3707,6 +3749,7 @@ pub fn run_web_inbound(
     );
 
     let feed_path = casa_feed::feed_path_for(&project_root(workgraph_dir));
+    let feed_personas = load_feed_persona_catalog(&project_root(workgraph_dir));
 
     let category = match &election {
         Election::Silence(_) => "silence",
@@ -3796,6 +3839,7 @@ pub fn run_web_inbound(
                 convo::BotReplySink::new(config.clone()),
                 feed_path.clone(),
                 config.clone(),
+                feed_personas.clone(),
             );
             let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
             rt.block_on(async {
@@ -3890,6 +3934,7 @@ pub fn run_web_inbound(
                     convo::BotReplySink::new(config.clone()),
                     feed_path.clone(),
                     config.clone(),
+                    feed_personas.clone(),
                 );
                 let request_id = web_inbound_request_id(reply_chat, &bot.bot_id, body);
                 let timing = convo::AckTiming::from_env();
@@ -3967,17 +4012,24 @@ pub fn run_feed_write(
     text: &str,
     src_id: Option<&str>,
 ) -> Result<()> {
+    let personas = load_feed_persona_catalog(root);
     let entry = match kind {
         "group" => {
             let sender = sender.context("--kind group requires --sender")?;
             // Thread the caller-supplied opaque source id (docs/20 §2) so a smoke
             // test can drive the real writer with the SAME id twice and prove the
             // reader's srcId dedupe collapses the re-delivery to one pane line.
-            casa_feed::group_entry(sender, text, casa_feed::now_ms(), src_id.map(str::to_string))
+            casa_feed::group_entry(
+                &personas,
+                sender,
+                text,
+                casa_feed::now_ms(),
+                src_id.map(str::to_string),
+            )
         }
         "agent" => {
             let agent_id = agent_id.context("--kind agent requires --agent-id")?;
-            casa_feed::agent_entry(agent_id, text, casa_feed::now_ms())
+            casa_feed::agent_entry(&personas, agent_id, text, casa_feed::now_ms())
         }
         other => anyhow::bail!("--kind must be 'group' or 'agent', got '{other}'"),
     };
@@ -4778,6 +4830,7 @@ async fn deliver_lifecycle_fire(
     sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
     config: &TelegramConfig,
     feed_path: &Path,
+    personas: &casa_feed::PersonaCatalog,
     fire: &worksgood::notify::lifecycle::LifecycleFire,
 ) -> Result<()> {
     use worksgood::graph::OriginChannel;
@@ -4822,7 +4875,8 @@ async fn deliver_lifecycle_fire(
     // exact same `casa_feed` writer the conversation replies use.
     if matches!(fire.origin.channel, OriginChannel::TelegramGroup) {
         let agent_id = convo::agent_for_bot(config, &bot_id);
-        let entry = casa_feed::agent_entry(&agent_id, &fire.text, casa_feed::now_ms());
+        let entry =
+            casa_feed::agent_entry(personas, &agent_id, &fire.text, casa_feed::now_ms());
         if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
             eprintln!(
                 "[{}] casa feed: failed to mirror lifecycle {} for {}: {e}",
@@ -5057,6 +5111,7 @@ pub fn run_lifecycle(
 
     let config = load_telegram_config().unwrap_or_default();
     let feed_path = casa_feed::feed_path_for(&root);
+    let feed_personas = load_feed_persona_catalog(&root);
     // The ONE-PATH writer: lifecycle report-backs leave through the same
     // `ReplySink` the conversation replies use, so a group report-back both
     // reaches Telegram AND lands in the canonical `.casa/group-feed.jsonl` the
@@ -5084,7 +5139,15 @@ pub fn run_lifecycle(
                 }
             }
             for f in &result.fired {
-                match deliver_lifecycle_fire(sink.as_ref(), &config, &feed_path, f).await {
+                match deliver_lifecycle_fire(
+                    sink.as_ref(),
+                    &config,
+                    &feed_path,
+                    &feed_personas,
+                    f,
+                )
+                .await
+                {
                     Ok(()) => sent += 1,
                     Err(e) => {
                         // Both attempts failed — surface it LOUDLY (matching the
@@ -5214,6 +5277,7 @@ pub fn run_digest(
     }
 
     let feed_path = casa_feed::feed_path_for(&root);
+    let feed_personas = load_feed_persona_catalog(&root);
     // `--mock-send` swaps in a network-free recorder so the cross-surface smoke
     // exercises the real tick + real feed mirror without a live bot.
     let sink: Box<dyn ReplySink> = if mock_send {
@@ -5247,6 +5311,7 @@ pub fn run_digest(
                     sink.as_ref(),
                     &config,
                     &feed_path,
+                    &feed_personas,
                     &bot_id,
                     &target,
                     text,
@@ -5317,6 +5382,7 @@ async fn deliver_digest_fire(
     sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
     config: &TelegramConfig,
     feed_path: &Path,
+    personas: &casa_feed::PersonaCatalog,
     bot_id: &str,
     chat_id: &str,
     text: &str,
@@ -5339,7 +5405,7 @@ async fn deliver_digest_fire(
     // LEDGER MIRROR — the morning digest lands in the canonical feed the pane
     // reads, via the exact same `casa_feed` writer the conversation replies use.
     let agent_id = convo::agent_for_bot(config, bot_id);
-    let entry = casa_feed::agent_entry(&agent_id, text, casa_feed::now_ms());
+    let entry = casa_feed::agent_entry(personas, &agent_id, text, casa_feed::now_ms());
     if let Err(e) = casa_feed::append_entry(feed_path, &entry) {
         eprintln!(
             "[{}] casa feed: failed to mirror digest to ledger: {e}",
@@ -8199,11 +8265,21 @@ mod tests {
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
-            .unwrap();
+        rt.block_on(deliver_lifecycle_fire(
+            &sink,
+            &config,
+            &feed,
+            &casa_feed::PersonaCatalog::default(),
+            &fire,
+        ))
+        .unwrap();
 
         // Telegram: exactly one send.
-        assert_eq!(sink.sends.lock().unwrap().len(), 1, "exactly one telegram send");
+        assert_eq!(
+            sink.sends.lock().unwrap().len(),
+            1,
+            "exactly one telegram send"
+        );
         // Pane feed: exactly one `agent` line carrying the report-back.
         let lines = feed_lines(&feed);
         assert_eq!(lines.len(), 1, "exactly one feed line, got {lines:?}");
@@ -8231,10 +8307,20 @@ mod tests {
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
-            .unwrap();
+        rt.block_on(deliver_lifecycle_fire(
+            &sink,
+            &config,
+            &feed,
+            &casa_feed::PersonaCatalog::default(),
+            &fire,
+        ))
+        .unwrap();
 
-        assert_eq!(sink.sends.lock().unwrap().len(), 1, "the 1:1 DM is still sent");
+        assert_eq!(
+            sink.sends.lock().unwrap().len(),
+            1,
+            "the 1:1 DM is still sent"
+        );
         assert!(
             !feed.exists() || feed_lines(&feed).is_empty(),
             "a 1:1 DM report-back must not touch the shared group feed"
@@ -8254,8 +8340,14 @@ mod tests {
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire))
-            .unwrap();
+        rt.block_on(deliver_lifecycle_fire(
+            &sink,
+            &config,
+            &feed,
+            &casa_feed::PersonaCatalog::default(),
+            &fire,
+        ))
+        .unwrap();
 
         assert_eq!(
             sink.attempts.lock().unwrap().len(),
@@ -8284,9 +8376,18 @@ mod tests {
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let res = rt.block_on(deliver_lifecycle_fire(&sink, &config, &feed, &fire));
+        let res = rt.block_on(deliver_lifecycle_fire(
+            &sink,
+            &config,
+            &feed,
+            &casa_feed::PersonaCatalog::default(),
+            &fire,
+        ));
 
-        assert!(res.is_err(), "two failures surface an error for the caller to re-arm");
+        assert!(
+            res.is_err(),
+            "two failures surface an error for the caller to re-arm"
+        );
         assert_eq!(
             sink.attempts.lock().unwrap().len(),
             2,
@@ -8315,7 +8416,13 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(deliver_digest_fire(
-            &sink, &config, &feed, "otto", "-100777", text,
+            &sink,
+            &config,
+            &feed,
+            &casa_feed::PersonaCatalog::default(),
+            "otto",
+            "-100777",
+            text,
         ))
         .unwrap();
 
@@ -8349,10 +8456,19 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let res = rt.block_on(deliver_digest_fire(
-            &sink, &config, &feed, "otto", "-100777", "Today: something",
+            &sink,
+            &config,
+            &feed,
+            &casa_feed::PersonaCatalog::default(),
+            "otto",
+            "-100777",
+            "Today: something",
         ));
 
-        assert!(res.is_err(), "two failures surface an error so the queue is kept");
+        assert!(
+            res.is_err(),
+            "two failures surface an error so the queue is kept"
+        );
         assert_eq!(
             sink.attempts.lock().unwrap().len(),
             2,
