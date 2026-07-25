@@ -7138,6 +7138,35 @@ pub enum TelegramCommands {
         dry_run: bool,
     },
 
+    /// Print the assembled compose prompt for a message (diagnostic, no model)
+    ///
+    /// The credential-free scripted-test seam for the composer's CONTEXT
+    /// (sibling of `wg telegram elect` / `discuss` / `decide` / `photo-plan`).
+    /// Runs the exact production prompt assembly the conversation composer uses
+    /// — the persona's session summary, the family's real calendar/week
+    /// grounding, its corrections, and the three gateway-forwarded context
+    /// blocks (`WG_THREAD_CONTEXT`, `WG_WEEK_CONTEXT`, `WG_MEMORY_CONTEXT`) — and
+    /// prints the prompt to stdout. NO model is spawned, nothing is sent, and no
+    /// credential is needed: composition is stubbed by simply stopping at the
+    /// prompt. Use it to prove what the model is really handed (e.g. that
+    /// durable family memory is injected, and ranked below live state).
+    ComposePrompt {
+        /// The message a human sent (the turn to assemble a prompt for).
+        #[arg(long)]
+        message: String,
+
+        /// The persona whose voice the prompt is assembled for. Defaults to the
+        /// household concierge.
+        #[arg(long, default_value = "otto")]
+        agent: String,
+
+        /// The bound chat session to read voice + recent turns from (a session
+        /// uuid or a bound agent name). Defaults to `--agent`; an unknown ref
+        /// just yields no summary/history (the fresh-session prompt).
+        #[arg(long)]
+        session: Option<String>,
+    },
+
     /// Diagnose the PHOTO → shopping-list vision pipeline WITHOUT a network
     ///
     /// The credential-free scripted-test seam for task `photo-to-shopping`

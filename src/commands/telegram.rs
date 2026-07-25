@@ -2554,6 +2554,68 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
     Ok(())
 }
 
+/// `wg telegram compose-prompt` — print the assembled compose prompt for a
+/// message, WITHOUT spawning a model or sending anything.
+///
+/// The credential-free scripted-test seam for the composer's CONTEXT (sibling of
+/// `run_discuss` / `run_decide`). It runs the real production assembly
+/// (`telegram_conversation::compose_prompt_preview` → `build_compose_prompt`), so
+/// it reads the family's live grounding from disk AND the three gateway-forwarded
+/// env blocks — `WG_THREAD_CONTEXT`, `WG_WEEK_CONTEXT`, `WG_MEMORY_CONTEXT`.
+/// Composition itself is stubbed by stopping at the prompt, which is exactly what
+/// makes this a token-free proof of what the model is handed: a scratch project
+/// plus one env var shows whether durable family memory really reaches the
+/// composer, and whether it is ranked below live state (docs/39 §5.3, §6).
+///
+/// `--json` reports which context blocks landed alongside the prompt, so a script
+/// can assert on the blocks without pattern-matching prose.
+pub fn run_compose_prompt(
+    workgraph_dir: &Path,
+    message: &str,
+    agent: &str,
+    session: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::telegram_conversation;
+
+    let agent_id = agent.trim();
+    if agent_id.is_empty() {
+        anyhow::bail!("--agent must not be empty");
+    }
+    // Default the session ref to the persona id: a bound agent name resolves to
+    // its session, and an unknown ref simply yields no summary/history (the
+    // fresh-session prompt) rather than an error — so a scratch project works.
+    let session_ref = session
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(agent_id);
+
+    let prompt =
+        telegram_conversation::compose_prompt_preview(workgraph_dir, session_ref, agent_id, message);
+
+    if json {
+        // Which forwarded blocks are present in the ASSEMBLED prompt (not merely
+        // set in the environment) — that distinction is the whole point: an env
+        // var the binary never reads would show `false` here.
+        let out = serde_json::json!({
+            "agent": agent_id,
+            "session": session_ref,
+            "message": message,
+            "blocks": {
+                "thread": prompt.contains("Recent messages in this conversation"),
+                "week": prompt.contains("THIS WEEK'S DINNERS"),
+                "memory": prompt.contains("FAMILY MEMORY"),
+                "corrections": prompt.contains("correction"),
+            },
+            "prompt": prompt,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("{prompt}");
+    }
+    Ok(())
+}
+
 /// `wg telegram decide` — run the listener's command-vs-election decision on a
 /// raw Telegram update, without sending anything.
 ///

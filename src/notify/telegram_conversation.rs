@@ -644,6 +644,29 @@ impl OneshotComposer {
     }
 }
 
+/// The context blocks the GATEWAY builds and forwards to this process over
+/// forward-compatible env vars (a binary that hasn't learned one simply ignores
+/// it — never a "no such flag" break). Grouped in one struct so the compose-prompt
+/// builder can't have two `Option<&str>` swapped at a call site, and so adding a
+/// fourth forwarded block is one field rather than another positional argument.
+///
+/// | field    | env var              | built by (gateway)                        |
+/// |----------|----------------------|-------------------------------------------|
+/// | `thread` | `WG_THREAD_CONTEXT`  | the originating pane's recent turns       |
+/// | `week`   | `WG_WEEK_CONTEXT`    | `weekSource.buildWeekContext` (Dinners)   |
+/// | `memory` | `WG_MEMORY_CONTEXT`  | `memoryInject.buildMemoryContext` (Tier 1)|
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ForwardedContext<'a> {
+    /// Recent turns of the originating conversation (task `nora-clarify-engine`).
+    pub thread: Option<&'a str>,
+    /// The parsed Dinners table + today/tomorrow markers (task
+    /// `week-grounding-engine`).
+    pub week: Option<&'a str>,
+    /// The acting member's scoped, non-authoritative Tier-1 family memory (task
+    /// `p1-engine-memory-reader`, docs/39 §6).
+    pub memory: Option<&'a str>,
+}
+
 /// Assemble the composer prompt: the persona's session-summary (voice + role),
 /// a short slice of recent conversation for continuity, and the human's new
 /// message — with explicit family-voice guidance (warm, no jargon, no task ids;
@@ -678,6 +701,20 @@ fn build_compose_prompt(
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // FAMILY MEMORY (task p1-engine-memory-reader): the gateway builds the
+    // acting-member-scoped, NON-AUTHORITATIVE, token-budgeted Tier-1 memory block
+    // (`memoryInject.buildMemoryContext`, docs/39 §6) and forwards it via
+    // `WG_MEMORY_CONTEXT` — the third of the same family of forward-compatible env
+    // vars. Until now THIS process never read it: the block was built, budgeted,
+    // logged and dropped, so on a real deploy every remembered preference was
+    // invisible to the model that answers the family (the hermetic human-flow stub
+    // reflected it, which is exactly why the gap stayed green). Read at the
+    // production boundary and threaded into the pure `_at` builder; unset (the
+    // Telegram-listener path, or nothing remembered) → `None`, prompt unchanged.
+    let memory = std::env::var("WG_MEMORY_CONTEXT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     // Household local time is the existing `chrono::Local` seam (same as the
     // fast lane and task-stamping). Threaded through the `_at` variant so the
     // scope/clock rules are testable with a fixed clock.
@@ -687,9 +724,27 @@ fn build_compose_prompt(
         agent_id,
         human_message,
         chrono::Local::now().naive_local(),
-        thread.as_deref(),
-        week.as_deref(),
+        ForwardedContext {
+            thread: thread.as_deref(),
+            week: week.as_deref(),
+            memory: memory.as_deref(),
+        },
     )
+}
+
+/// `wg telegram compose-prompt` — the credential-free diagnostic view of the
+/// assembled compose prompt (sibling of `wg telegram elect` / `discuss` /
+/// `decide`). Runs the REAL production assembly, including the gateway-forwarded
+/// `WG_THREAD_CONTEXT` / `WG_WEEK_CONTEXT` / `WG_MEMORY_CONTEXT` env blocks, and
+/// returns the prompt WITHOUT spawning a model or sending anything — so a
+/// scratch-project script can prove what the composer is really handed.
+pub fn compose_prompt_preview(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    agent_id: &str,
+    human_message: &str,
+) -> String {
+    build_compose_prompt(workgraph_dir, session_ref, agent_id, human_message)
 }
 
 /// [`build_compose_prompt`] with the household's local time injected, so the
@@ -701,9 +756,13 @@ fn build_compose_prompt_at(
     agent_id: &str,
     human_message: &str,
     now: chrono::NaiveDateTime,
-    thread_context: Option<&str>,
-    week_context: Option<&str>,
+    forwarded: ForwardedContext<'_>,
 ) -> String {
+    let ForwardedContext {
+        thread: thread_context,
+        week: week_context,
+        memory: memory_context,
+    } = forwarded;
     let summary = read_session_summary(workgraph_dir, session_ref);
 
     // A few recent turns for continuity (best-effort; empty on a fresh session).
@@ -866,6 +925,22 @@ fn build_compose_prompt_at(
     if let Some(block) = grounding::corrections_block(&corrections) {
         prompt.push_str(&block);
         prompt.push('\n');
+    }
+
+    // FAMILY MEMORY (task p1-engine-memory-reader): the gateway's scoped, budgeted
+    // Tier-1 block, wrapped with the "soft priors — everything above WINS"
+    // instruction. It is injected LAST on purpose (docs/39 §6): the model reads the
+    // live calendar line, the read-shaped week grounding, the forwarded Dinners
+    // table and the family's corrections FIRST, so precedence — Tier 0 live >
+    // config > Tier 1 durable, and corrections outrank distilled facts (§5.2) — is
+    // legible in reading order, and a remembered pattern can never be presented as
+    // this week's schedule. Absent (Telegram-listener path, or nothing remembered)
+    // → omitted, prompt unchanged.
+    if let Some(memory) = memory_context {
+        if let Some(block) = grounding::memory_context_block(memory) {
+            prompt.push_str(&block);
+            prompt.push('\n');
+        }
     }
 
     prompt.push_str(&format!("Message: {}\n\nYour reply:", human_message.trim()));
@@ -3620,7 +3695,7 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
         let grounded =
-            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now, None, None);
+            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now, ForwardedContext::default());
         assert!(
             grounded.contains("Dentist"),
             "tomorrow's appointment missing from prompt:\n{grounded}"
@@ -3633,13 +3708,13 @@ mod tests {
         assert!(!grounded.contains("Chickpea"), "Mon meal leaked:\n{grounded}");
 
         // A whole-week ask still surfaces the full week's meals.
-        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now, None, None);
+        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now, ForwardedContext::default());
         assert!(week.contains("Baked salmon"));
         assert!(week.contains("Luca PT check-in"));
         assert!(week.to_lowercase().contains("do not stall"));
 
         // Small talk carries no read-shaped WEEK block (no meal dump)...
-        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now, None, None);
+        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now, ForwardedContext::default());
         assert!(!plain.contains("Baked salmon"));
         // ...but it DOES now carry the always-on anti-fabrication calendar-truth
         // line (rule 5, §6.7). Wed 07-15 has no calendar events → the model is
@@ -3657,7 +3732,7 @@ mod tests {
             .unwrap()
             .and_hms_opt(15, 0, 0)
             .unwrap();
-        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon, None, None);
+        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon, ForwardedContext::default());
         assert!(greet.contains("PT check-in"), "real event missing from greeting prompt:\n{greet}");
         assert!(greet.to_lowercase().contains("do not invent"), "{greet}");
     }
@@ -3693,8 +3768,7 @@ mod tests {
             "otto",
             "tell me the calories",
             now,
-            Some(thread),
-            None,
+            ForwardedContext { thread: Some(thread), ..Default::default() },
         );
         assert!(
             followup.contains("pasta pomodoro"),
@@ -3709,7 +3783,7 @@ mod tests {
         // WITHOUT thread context: the same ambiguous ask carries no referent and
         // no follow-up instruction — this is exactly the state that made the engine
         // clarify instead of answer.
-        let bare = build_compose_prompt_at(&wg, &uuid, "otto", "tell me the calories", now, None, None);
+        let bare = build_compose_prompt_at(&wg, &uuid, "otto", "tell me the calories", now, ForwardedContext::default());
         assert!(!bare.contains("pasta pomodoro"), "referent leaked without a thread:\n{bare}");
         assert!(
             !bare.to_lowercase().contains("do not ask what they mean"),
@@ -3723,8 +3797,7 @@ mod tests {
             "otto",
             "tell me the calories",
             now,
-            Some("   "),
-            None,
+            ForwardedContext { thread: Some("   "), ..Default::default() },
         );
         assert!(!blank.to_lowercase().contains("do not ask what they mean"), "{blank}");
     }
@@ -3763,8 +3836,7 @@ mod tests {
             "nora",
             "what's for dinner tomorrow?",
             now,
-            None,
-            Some(week),
+            ForwardedContext { week: Some(week), ..Default::default() },
         );
         assert!(
             grounded.contains("Baked white fish with tomato, olives & capers"),
@@ -3783,12 +3855,216 @@ mod tests {
             "nora",
             "what's for dinner tomorrow?",
             now,
-            None,
-            None,
+            ForwardedContext::default(),
         );
         assert!(
             !bare.to_lowercase().contains("never say it is empty"),
             "the week instruction leaked without a forwarded table:\n{bare}"
+        );
+    }
+
+    /// The gateway's real Tier-1 memory block shape
+    /// (`claw3d-bridge/src/memoryInject.mjs` `buildMemoryContext`): banner +
+    /// preamble + one line per scoped fact, the acting member's own facts tagged
+    /// "(you)". Carries a pattern that DISAGREES with the live week on purpose —
+    /// remembered "fish on Friday" vs the plan's Friday chicken tray bake.
+    fn sample_memory_block() -> &'static str {
+        "Family memory — remembered preferences & patterns, NOT the current schedule.\n\
+         These are things the family has said or settled over time.\n\
+         \n\
+         - Nina is allergic to peanuts\n\
+         - Friday is usually a fish night (you)\n\
+         - Gym is usually Wednesday evening (you)"
+    }
+
+    /// FAMILY MEMORY (task p1-engine-memory-reader): the gateway forwards its
+    /// scoped Tier-1 block via `WG_MEMORY_CONTEXT`; the engine composer must
+    /// INJECT it — and inject it ranked BELOW live state (docs/39 §5.3/§6). Before
+    /// this the production Rust path read only `WG_THREAD_CONTEXT` /
+    /// `WG_WEEK_CONTEXT`, so the block the gateway built, scoped and budgeted was
+    /// silently dropped on every real deploy.
+    #[test]
+    fn memory_context_is_injected_and_ranked_below_live_state() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "nora", &uuid).unwrap();
+        // A live plan on disk, so the read-shaped grounding + calendar-truth line
+        // are really in the prompt to be ranked against.
+        let plans = dir.path().join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("2026-W29-family-plan.md"), W29_FIXTURE_PLAN).unwrap();
+        // A family correction, which outranks distilled memory (docs/39 §5.2).
+        parity::PreferenceStore::record(
+            dir.path(),
+            &format!("{}Nadin is not logged so ignore this", grounding::CORRECTION_PREFIX),
+            "luca",
+            "nora",
+        )
+        .unwrap();
+
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let week = "This week's dinners, parsed from the family plan's Dinners table:\n\
+                    - Friday (July 24): Chicken tray bake\n\
+                    Today is Wednesday — dinner: Chickpea curry.";
+
+        let prompt = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "nora",
+            "what's the plan for the week?",
+            now,
+            ForwardedContext {
+                week: Some(week),
+                memory: Some(sample_memory_block()),
+                ..Default::default()
+            },
+        );
+
+        // 1 · the remembered facts are actually THERE (the reader exists at all).
+        assert!(
+            prompt.contains("Nina is allergic to peanuts")
+                && prompt.contains("Friday is usually a fish night (you)"),
+            "the forwarded memory block is missing from the compose prompt:\n{prompt}"
+        );
+        // 2 · it is labelled non-authoritative — live wins, patterns are OFFERED.
+        let lower = prompt.to_lowercase();
+        assert!(
+            lower.contains("not the current schedule")
+                && lower.contains("live truth and it wins")
+                && lower.contains("never present a remembered pattern as this week's plan"),
+            "the live-wins labelling is missing from the memory block:\n{prompt}"
+        );
+        // 3 · ORDER: memory lands AFTER every live source and after the family's
+        // corrections, so precedence is legible in reading order (docs/39 §6).
+        let mem_pos = prompt.find("FAMILY MEMORY").expect("memory block present");
+        let calendar_pos = lower
+            .find("calendar")
+            .expect("the always-on calendar-truth line is present");
+        let week_pos = prompt
+            .find("THIS WEEK'S DINNERS")
+            .expect("forwarded week block present");
+        let plan_pos = prompt.find("Chickpea").expect("read-shaped week grounding present");
+        let corr_pos = prompt
+            .find("Nadin is not logged")
+            .expect("corrections block present");
+        let msg_pos = prompt.find("Message: ").expect("the human message tail is present");
+        for (label, pos) in [
+            ("the calendar-truth line", calendar_pos),
+            ("the read-shaped week grounding", plan_pos),
+            ("the forwarded Dinners table", week_pos),
+            ("the family's corrections", corr_pos),
+        ] {
+            assert!(
+                mem_pos > pos,
+                "memory was injected BEFORE {label} — live state must be read first:\n{prompt}"
+            );
+        }
+        assert!(
+            mem_pos < msg_pos,
+            "memory landed after the human message — it would not ground the reply:\n{prompt}"
+        );
+    }
+
+    /// Nothing remembered (or the Telegram-listener path, where the gateway never
+    /// set the env var) leaves the compose prompt BYTE-FOR-BYTE unchanged: an
+    /// absent, empty or whitespace-only block adds nothing at all.
+    #[test]
+    fn memory_context_absent_leaves_the_prompt_byte_identical() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        let none = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "what's for dinner?",
+            now,
+            ForwardedContext::default(),
+        );
+        let blank = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "what's for dinner?",
+            now,
+            ForwardedContext { memory: Some("  \n \n"), ..Default::default() },
+        );
+        assert_eq!(
+            none, blank,
+            "a blank forwarded memory block changed the prompt"
+        );
+        assert!(
+            !none.contains("FAMILY MEMORY"),
+            "a memory block appeared with nothing forwarded:\n{none}"
+        );
+
+        // And with a real block it DOES change — otherwise the equality above
+        // would pass trivially if the injection were deleted.
+        let with = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "what's for dinner?",
+            now,
+            ForwardedContext { memory: Some(sample_memory_block()), ..Default::default() },
+        );
+        assert_ne!(with, none, "the memory block is not being injected at all");
+        assert!(with.contains("FAMILY MEMORY"), "{with}");
+    }
+
+    /// BUDGET (docs/39 §6, no-silent-caps): a runaway forwarded block — a
+    /// distiller bug upstream — cannot balloon the engine's compose prompt. The
+    /// engine is a separate process reading an env var it does not own, so it
+    /// re-guards: the block is trimmed at line boundaries and SAYS it is partial.
+    #[test]
+    fn memory_context_is_budget_guarded_in_the_compose_prompt() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "otto", &uuid).unwrap();
+
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        let mut huge = String::from("- Nina is allergic to peanuts\n");
+        for i in 0..800 {
+            huge.push_str(&format!("- remembered filler fact number {i}\n"));
+        }
+        let prompt = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "what's for dinner?",
+            now,
+            ForwardedContext { memory: Some(&huge), ..Default::default() },
+        );
+        assert!(
+            prompt.contains("Nina is allergic to peanuts"),
+            "the highest-priority remembered line was dropped by the budget:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("left out to keep this small"),
+            "the budget trim was SILENT — no-silent-caps posture broken:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("filler fact number 799"),
+            "the runaway block was injected whole — no budget guard:\n{prompt}"
         );
     }
 
@@ -3824,8 +4100,7 @@ mod tests {
             "nora",
             "tell me the calories",
             now,
-            Some(thread),
-            None,
+            ForwardedContext { thread: Some(thread), ..Default::default() },
         );
 
         // The recency instruction is present: lead with the most recent, close

@@ -1505,6 +1505,112 @@ pub fn week_grounding_rewrite(days: &[(String, String)]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// TIER-1 DURABLE MEMORY (task p1-engine-memory-reader) — the engine-side READER
+// for the block the gateway already builds and forwards.
+//
+// THE GAP THIS CLOSES. The gateway builds an acting-member-SCOPED,
+// NON-AUTHORITATIVE, token-budgeted family-memory block
+// (`claw3d-bridge/src/memoryInject.mjs` `buildMemoryContext`) and forwards it to
+// the engine over the `WG_MEMORY_CONTEXT` env var
+// (`claw3d-bridge/src/webInbound.mjs`), exactly like `WG_THREAD_CONTEXT` /
+// `WG_WEEK_CONTEXT`. The hermetic human-flow stub reflects it, so the flow suite
+// was green — but the PRODUCTION Rust compose path read only the thread and week
+// vars, so on a real deploy the block was built, budgeted, logged … and dropped
+// on the floor. Every remembered preference was invisible to the model that
+// actually answers the family.
+//
+// THE CARDINAL RULE (docs/39 §5.3): **live wins**. Tier-1 memory is a soft prior,
+// never state. If memory says "gym is usually Wednesday" and the live calendar is
+// clear, the persona states the live truth and at most OFFERS the pattern. Two
+// mechanisms enforce it here:
+//
+//   1. ORDER (docs/39 §6): the block is injected LAST — after the always-on
+//      calendar-truth line, after the read-shaped week grounding, after the
+//      forwarded Dinners table, and after the family's corrections (which
+//      outrank distilled facts, docs/39 §5.2). Precedence is legible to the
+//      model in the order it reads.
+//   2. LABEL: the block leads with an explicit "soft priors, NOT live state —
+//      everything above wins" instruction, so a remembered pattern can never be
+//      presented as this week's schedule.
+//
+// BUDGET (docs/39 §6 + the no-silent-caps posture): the gateway budgets the block
+// before forwarding, but the engine is a separate process reading an env var it
+// does not own, so it guards again — deterministic, line-bounded truncation with a
+// VISIBLE note in the block itself, never a silent trim.
+// ---------------------------------------------------------------------------
+
+/// Character ceiling for the forwarded memory block, ~4 chars/token against the
+/// Tier-1 budget of ≈1500 tokens (docs/39 §6, the same rule of thumb the
+/// gateway's `estimateTokens` uses). A block at or under this is passed through
+/// whole; a longer one is truncated at a line boundary with a visible note.
+pub const MEMORY_CONTEXT_MAX_CHARS: usize = 6000;
+
+/// The compose-prompt block for a forwarded `WG_MEMORY_CONTEXT`: the gateway's
+/// scoped Tier-1 memory wrapped with the standing "these are soft priors, the
+/// live facts above win" instruction (docs/39 §5.3). `None` when the forwarded
+/// context is blank — the Telegram-listener path and any deploy with nothing
+/// remembered leave the prompt byte-for-byte unchanged.
+///
+/// Over-budget input is truncated DETERMINISTICALLY at a line boundary and the
+/// block says so, so a distiller bug shows up as a visible note instead of a
+/// silently ballooned prompt.
+pub fn memory_context_block(memory_context: &str) -> Option<String> {
+    let text = memory_context.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (body, trimmed_lines) = clamp_memory_context(text);
+    if body.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str(
+        "FAMILY MEMORY — remembered preferences and patterns, NOT the current schedule. \
+         These are soft priors the family has settled over time. Everything above (today's \
+         calendar, this week's dinners, the family's corrections) is the LIVE truth and it \
+         WINS: if memory disagrees with it, say the live fact and at most OFFER the \
+         remembered pattern (\"the calendar's clear then — want me to pencil in your \
+         usual?\"). Never present a remembered pattern as this week's plan, never invent a \
+         schedule from it, and never read this list out as if it were news:\n",
+    );
+    out.push_str(&body);
+    out.push('\n');
+    if trimmed_lines > 0 {
+        out.push_str(&format!(
+            "(…and {trimmed_lines} more remembered line(s) left out to keep this small — \
+             treat this list as partial.)\n",
+        ));
+    }
+    Some(out)
+}
+
+/// Clamp the forwarded memory text to [`MEMORY_CONTEXT_MAX_CHARS`], cutting only
+/// at line boundaries so a fact is never sliced mid-sentence. Returns the kept
+/// body and how many lines were dropped. At least the first line always survives
+/// (a pathological single-line block over budget is kept whole rather than
+/// vanishing — losing an allergy line to a budget is the bug the gateway's
+/// injector protects against, and this guard honours the same posture).
+fn clamp_memory_context(text: &str) -> (String, usize) {
+    if text.len() <= MEMORY_CONTEXT_MAX_CHARS {
+        return (text.to_string(), 0);
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in &lines {
+        // +1 for the newline the join re-adds.
+        let cost = line.len() + 1;
+        if !kept.is_empty() && used + cost > MEMORY_CONTEXT_MAX_CHARS {
+            break;
+        }
+        kept.push(line);
+        used += cost;
+    }
+    let dropped = lines.len().saturating_sub(kept.len());
+    (kept.join("\n"), dropped)
+}
+
+// ---------------------------------------------------------------------------
 // FAMILY VOICE (task p1-engine-reply-guards) — the engine-side twin of the
 // gateway's `claw3d-bridge/src/familyVoice.mjs` finalize gate.
 //
@@ -3391,6 +3497,88 @@ mod tests {
         let lower = block.to_lowercase();
         assert!(lower.contains("never say it is empty"), "{block}");
         assert!(lower.contains("from this table"), "{block}");
+    }
+
+    // -----------------------------------------------------------------------
+    // TIER-1 DURABLE MEMORY (task p1-engine-memory-reader) — the engine-side
+    // reader for the gateway's forwarded `WG_MEMORY_CONTEXT` block.
+    // -----------------------------------------------------------------------
+
+    /// The gateway's real `buildMemoryContext` output shape
+    /// (`claw3d-bridge/src/memoryInject.mjs`): banner + preamble + one line per
+    /// scoped fact, the person's own facts tagged "(you)".
+    fn sample_memory_context() -> String {
+        "Family memory — remembered preferences & patterns, NOT the current schedule.\n\
+         These are things the family has said or settled over time. They are soft priors, \
+         not live state: if a live fact says otherwise, the LIVE fact is correct.\n\
+         \n\
+         - Nina is allergic to peanuts\n\
+         - Prefers fish twice a week (you)\n\
+         - Gym is usually Wednesday evening (you)"
+            .to_string()
+    }
+
+    /// Nothing forwarded → no block at all, so the Telegram-listener path (env
+    /// unset) and a deploy with nothing remembered keep the prompt unchanged.
+    #[test]
+    fn memory_context_absent_is_a_noop() {
+        assert!(memory_context_block("").is_none());
+        assert!(memory_context_block("   \n  \n").is_none());
+    }
+
+    /// The injected block carries the remembered facts AND the explicit
+    /// live-wins labelling (docs/39 §5.3, the cardinal rule): soft priors, the
+    /// live facts win, offer — never assert — a remembered pattern.
+    #[test]
+    fn memory_context_block_carries_facts_and_the_live_wins_label() {
+        let block = memory_context_block(&sample_memory_context()).expect("block present");
+        assert!(block.contains("Nina is allergic to peanuts"), "{block}");
+        assert!(block.contains("Gym is usually Wednesday evening (you)"), "{block}");
+        let lower = block.to_lowercase();
+        assert!(lower.contains("not the current schedule"), "{block}");
+        assert!(lower.contains("live truth and it wins"), "{block}");
+        assert!(lower.contains("soft priors"), "{block}");
+        // A pattern is OFFERED, never asserted as this week's plan.
+        assert!(lower.contains("offer the"), "{block}");
+        assert!(
+            lower.contains("never present a remembered pattern as this week's plan"),
+            "{block}"
+        );
+        // No truncation note when the block is inside budget.
+        assert!(!lower.contains("left out to keep this small"), "{block}");
+    }
+
+    /// BUDGET GUARD (docs/39 §6, no-silent-caps): an over-budget forwarded block
+    /// — always a distiller/injector bug upstream — is truncated
+    /// DETERMINISTICALLY at a line boundary, the earliest (highest keep-priority)
+    /// lines survive, and the block SAYS it is partial rather than silently
+    /// ballooning the compose prompt.
+    #[test]
+    fn memory_context_over_budget_is_trimmed_loudly_at_line_boundaries() {
+        let mut huge = String::from("- Nina is allergic to peanuts\n");
+        for i in 0..600 {
+            huge.push_str(&format!("- remembered filler fact number {i} about the week\n"));
+        }
+        assert!(huge.len() > MEMORY_CONTEXT_MAX_CHARS);
+
+        let block = memory_context_block(&huge).expect("block present");
+        // The first (protected) line always survives a budget trim.
+        assert!(block.contains("Nina is allergic to peanuts"), "{block}");
+        // Loud, not silent.
+        assert!(
+            block.contains("more remembered line(s) left out to keep this small"),
+            "{block}"
+        );
+        // Bounded, and cut only at line boundaries — no half-sentence facts.
+        assert!(block.len() < MEMORY_CONTEXT_MAX_CHARS + 1200, "block len {}", block.len());
+        for line in block.lines().filter(|l| l.starts_with("- remembered filler")) {
+            assert!(
+                line.ends_with("about the week"),
+                "a fact was sliced mid-line: {line}"
+            );
+        }
+        // Deterministic: the same input trims to the same block every time.
+        assert_eq!(block, memory_context_block(&huge).expect("block present"));
     }
 
     // -----------------------------------------------------------------------

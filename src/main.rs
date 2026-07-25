@@ -4012,6 +4012,17 @@ fn main() -> Result<()> {
             TelegramCommands::Decide { update } => {
                 commands::telegram::run_decide(&workgraph_dir, &update, cli.json)
             }
+            TelegramCommands::ComposePrompt {
+                message,
+                agent,
+                session,
+            } => commands::telegram::run_compose_prompt(
+                &workgraph_dir,
+                &message,
+                &agent,
+                session.as_deref(),
+                cli.json,
+            ),
             TelegramCommands::WebInbound {
                 sender,
                 message,
