@@ -4,6 +4,7 @@ use worksgood::agency;
 use worksgood::agency::composition_rules::{
     CompositionRulesOverlay, default_overlay_path, load_composition_rules,
 };
+use worksgood::assignment_eligibility::{ConfiguredMetaAgents, MetaAgentKind};
 use worksgood::config::Config;
 use worksgood::parser::{load_graph, modify_graph};
 
@@ -29,15 +30,24 @@ fn load_overlay() -> CompositionRulesOverlay {
     }
 }
 
-/// Bucket an `agency::Agent`'s role into a composition-rules `agent_type`
-/// using the role's well-known name (Assigner / Evaluator / Evolver /
-/// Agent Creator) or the role's typed scope on its components.
-fn agent_type_for_role(role_name: &str) -> &'static str {
+/// Bucket an agent into a composition-rules `agent_type`.
+///
+/// Configured meta-agent hashes are authoritative and survive arbitrary role
+/// renames/swaps. The name match is an explicitly legacy fallback for agency
+/// stores created before those config slots existed.
+fn agent_type_for_agent(
+    agent: &agency::Agent,
+    role_name: &str,
+    configured_meta_agents: &ConfiguredMetaAgents,
+) -> &'static str {
+    if let Some(kind) = configured_meta_agents.kind_for_agent(agent) {
+        return kind.composition_agent_type();
+    }
     match role_name {
-        "Assigner" => "assigner",
-        "Evaluator" => "evaluator",
-        "Evolver" => "evolver",
-        "Agent Creator" | "AgentCreator" => "agent_creator",
+        "Assigner" => MetaAgentKind::Assigner.composition_agent_type(),
+        "Evaluator" => MetaAgentKind::Evaluator.composition_agent_type(),
+        "Evolver" => MetaAgentKind::Evolver.composition_agent_type(),
+        "Agent Creator" | "AgentCreator" => MetaAgentKind::AgentCreator.composition_agent_type(),
         _ => "task",
     }
 }
@@ -54,6 +64,7 @@ fn apply_caps(
     overlay: &CompositionRulesOverlay,
     agents: &[agency::Agent],
     roles_dir: &Path,
+    configured_meta_agents: &ConfiguredMetaAgents,
 ) -> Vec<agency::Agent> {
     let mut filtered: Vec<agency::Agent> = Vec::with_capacity(agents.len());
     let mut dropped = Vec::new();
@@ -67,7 +78,7 @@ fn apply_caps(
                 continue;
             }
         };
-        let agent_type = agent_type_for_role(&role.name);
+        let agent_type = agent_type_for_agent(agent, &role.name, configured_meta_agents);
         let Some(rule) = overlay.rule_for(agent_type) else {
             filtered.push(agent.clone());
             continue;
@@ -281,7 +292,8 @@ fn run_auto_assign(dir: &Path, path: &Path, task_id: &str) -> Result<()> {
     let overlay = load_overlay();
     let roles_dir = agency_dir.join("cache/roles");
     let components_dir = agency_dir.join("primitives/components");
-    let all_agents = apply_caps(&overlay, &all_agents, &roles_dir);
+    let configured_meta_agents = ConfiguredMetaAgents::from_config(&config.agency);
+    let all_agents = apply_caps(&overlay, &all_agents, &roles_dir, &configured_meta_agents);
 
     // Structural pool separation: a normal work task (anything that is NOT
     // an evaluation/review primitive — `.evaluate-*` / `.flip-*` / `.assign-*`
@@ -303,10 +315,11 @@ fn run_auto_assign(dir: &Path, path: &Path, task_id: &str) -> Result<()> {
     };
     let pool: Vec<agency::Agent> = if task_uses_work_pool {
         let work_pool: Vec<agency::Agent> =
-            worksgood::assignment_eligibility::filter_work_pool_agents(
+            worksgood::assignment_eligibility::filter_work_pool_agents_with_context(
                 &all_agents,
                 &roles_dir,
                 &components_dir,
+                &configured_meta_agents,
             )
             .into_iter()
             .cloned()
@@ -315,11 +328,14 @@ fn run_auto_assign(dir: &Path, path: &Path, task_id: &str) -> Result<()> {
             // No work agent available — try a default implementation-capable
             // fallback before refusing, but NEVER silently pick a system
             // evaluation agent.
-            if let Some(fb) = worksgood::assignment_eligibility::pick_implementation_capable_agent(
-                &all_agents,
-                &roles_dir,
-                &components_dir,
-            ) {
+            if let Some(fb) =
+                worksgood::assignment_eligibility::pick_implementation_capable_agent_with_context(
+                    &all_agents,
+                    &roles_dir,
+                    &components_dir,
+                    &configured_meta_agents,
+                )
+            {
                 eprintln!(
                     "[assign] POOL SEPARATION: task '{}' needs a work agent but the work \
                      pool is empty — falling back to the default implementation-capable \
@@ -357,7 +373,7 @@ fn run_auto_assign(dir: &Path, path: &Path, task_id: &str) -> Result<()> {
         history_class.label(),
         task_id
     );
-    let selected_agent = pool
+    let mut selected_agent = pool
         .iter()
         .max_by(|a, b| {
             let a_score = crate::commands::service::assignment::scoped_performance_for_agent(
@@ -379,23 +395,70 @@ fn run_auto_assign(dir: &Path, path: &Path, task_id: &str) -> Result<()> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .ok_or_else(|| anyhow::anyhow!("No agents found"))?
-        .id
         .clone();
+
+    // Post-pick backstop: the candidate filter above is the primary boundary,
+    // but never trust a future selector/bypass to preserve it. Stable
+    // configured meta-agent identity must still be rejected after selection,
+    // even when the role has been renamed to look like ordinary work.
+    let selected_role = agency::find_role_by_prefix(&roles_dir, &selected_agent.role_id).ok();
+    let selected_components = selected_role
+        .as_ref()
+        .map(|role| {
+            worksgood::assignment_eligibility::resolve_role_component_names(role, &components_dir)
+        })
+        .unwrap_or_default();
+    if task_uses_work_pool
+        && worksgood::assignment_eligibility::agent_is_system_evaluation_with_components(
+            &selected_agent,
+            selected_role.as_ref(),
+            &selected_components,
+            &configured_meta_agents,
+        )
+    {
+        let fallback =
+            worksgood::assignment_eligibility::pick_implementation_capable_agent_with_context(
+                &all_agents,
+                &roles_dir,
+                &components_dir,
+                &configured_meta_agents,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Automatic assignment selected configured system agent '{}' for work task \
+                 '{}', and no eligible work-agent fallback exists; refusing the assignment",
+                    selected_agent.name,
+                    task_id,
+                )
+            })?;
+        eprintln!(
+            "[assign] POOL SEPARATION: selector returned configured system agent '{}' ({}) \
+             for work task '{}'; reassigning to work agent '{}' ({}).",
+            selected_agent.name,
+            agency::short_hash(&selected_agent.id),
+            task_id,
+            fallback.name,
+            agency::short_hash(&fallback.id),
+        );
+        selected_agent = fallback.clone();
+    }
 
     eprintln!(
         "[assign] Auto-selecting agent: {} for task '{}'",
-        agency::short_hash(&selected_agent),
+        agency::short_hash(&selected_agent.id),
         task_id
     );
 
     // Perform the explicit assignment with the selected agent
-    run_explicit_assign(dir, path, task_id, &selected_agent)
+    run_explicit_assign(dir, path, task_id, &selected_agent.id)
 }
 
 /// Explicitly assign an agent (by hash or prefix) to a task.
 fn run_explicit_assign(dir: &Path, path: &Path, task_id: &str, agent_hash: &str) -> Result<()> {
     let agency_dir = dir.join("agency");
     let agents_dir = agency_dir.join("cache/agents");
+    let config = Config::load_or_default(dir);
+    let configured_meta_agents = ConfiguredMetaAgents::from_config(&config.agency);
 
     // Resolve agent by prefix
     let agent = agency::find_agent_by_prefix(&agents_dir, agent_hash).with_context(|| {
@@ -409,39 +472,38 @@ fn run_explicit_assign(dir: &Path, path: &Path, task_id: &str, agent_hash: &str)
     })?;
 
     // Structural pool separation (explicit pin): a human pin always wins,
-    // but warn LOUDLY when the pinned agent is a system evaluation persona
-    // (Reviewer / Evaluator / Assigner / Evolver / Agent Creator) for a normal
-    // work task — that is a role/pool mismatch. Evaluation/review primitives
-    // (`.evaluate-*` / `.flip-*` / tagged `review`) keep their system agents
-    // without warning. See `assignment_eligibility` and task
-    // `make-evaluator-and`.
+    // but warn LOUDLY when the pinned agent is a configured meta identity or
+    // a review-only persona for a normal work task. The configured content
+    // hash remains authoritative after arbitrary role/agent renames.
     let graph = load_graph(path).ok();
     if let Some(task) = graph.as_ref().and_then(|g| g.get_task(task_id)) {
-        if worksgood::assignment_eligibility::task_uses_work_pool(task) {
-            let roles_dir = agency_dir.join("cache/roles");
-            let components_dir = agency_dir.join("primitives/components");
-            if let Ok(role) = agency::find_role_by_prefix(&roles_dir, &agent.role_id) {
-                let comp_names = worksgood::assignment_eligibility::resolve_role_component_names(
-                    &role,
+        let roles_dir = agency_dir.join("cache/roles");
+        let components_dir = agency_dir.join("primitives/components");
+        let role = agency::find_role_by_prefix(&roles_dir, &agent.role_id).ok();
+        let comp_names = role
+            .as_ref()
+            .map(|role| {
+                worksgood::assignment_eligibility::resolve_role_component_names(
+                    role,
                     &components_dir,
-                );
-                if worksgood::assignment_eligibility::role_is_system_evaluation_with_components(
-                    &role,
-                    &comp_names,
-                ) {
-                    eprintln!(
-                        "[assign] POOL MISMATCH WARNING (explicit pin kept): task '{}' is a \
-                         normal work task and must use the work pool, but pinned agent '{}' \
-                         has system role '{}' ({}), which is an evaluation/review/agency \
-                         persona. This is a role/pool mismatch — consider pinning an \
-                         implementation-capable worker instead.",
-                        task_id,
-                        agent.name,
-                        role.name,
-                        agency::short_hash(&agent.id),
-                    );
-                }
-            }
+                )
+            })
+            .unwrap_or_default();
+        if let worksgood::assignment_eligibility::EligibilityVerdict::Warn { reason } =
+            worksgood::assignment_eligibility::check_assignment_eligibility_with_context(
+                task,
+                &agent,
+                role.as_ref(),
+                &comp_names,
+                &configured_meta_agents,
+                true,
+                None,
+            )
+        {
+            eprintln!(
+                "[assign] POOL MISMATCH WARNING (explicit pin kept): {}",
+                reason,
+            );
         }
     }
 
@@ -466,7 +528,6 @@ fn run_explicit_assign(dir: &Path, path: &Path, task_id: &str, agent_hash: &str)
     super::notify_graph_changed(dir);
 
     // Record operation
-    let config = Config::load_or_default(dir);
     let _ = worksgood::provenance::record(
         dir,
         "assign",
@@ -1278,6 +1339,162 @@ mod tests {
         let prog_id = make_agent(&programmer_role, "prog-agent", Some(0.5));
         let rev_id = make_agent(&reviewer_role, "review-agent", Some(0.99));
         (prog_id, rev_id)
+    }
+
+    /// Create an ordinary work agent plus a configured evaluator whose agent
+    /// and role display names are deliberately opaque. The evaluator's
+    /// swapped role contains an implementation component, so only stable
+    /// config identity can keep it out of the work pool.
+    fn setup_opaque_configured_meta_and_worker(dir: &Path) -> (String, String) {
+        let agency_dir = dir.join("agency");
+        agency::seed_starters(&agency_dir).unwrap();
+
+        let roles_dir = agency_dir.join("cache/roles");
+        let tradeoffs_dir = agency_dir.join("primitives/tradeoffs");
+        let agents_dir = agency_dir.join("cache/agents");
+        let components_dir = agency_dir.join("primitives/components");
+
+        let worker_role = agency::load_all_roles(&roles_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|role| role.name == "Programmer")
+            .unwrap();
+        let code_component = agency::load_all_components(&components_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|component| {
+                matches!(
+                    &component.content,
+                    agency::ContentRef::Name(name) if name == "code-writing"
+                )
+            })
+            .unwrap();
+        let opaque_meta_role = agency::build_role(
+            "Prism Route",
+            "Opaque role name after a meta-agent role swap",
+            vec![code_component.id],
+            "opaque-meta-outcome",
+        );
+        agency::save_role(&opaque_meta_role, &roles_dir).unwrap();
+
+        let tradeoff = agency::build_tradeoff(
+            "Neutral",
+            "Fixture tradeoff",
+            vec!["Measured".to_string()],
+            vec!["Unbounded".to_string()],
+        );
+        agency::save_tradeoff(&tradeoff, &tradeoffs_dir).unwrap();
+
+        let make_agent = |role: &agency::Role, name: &str| -> String {
+            let id = agency::content_hash_agent(&role.id, &tradeoff.id);
+            let agent = agency::Agent {
+                id: id.clone(),
+                role_id: role.id.clone(),
+                tradeoff_id: tradeoff.id.clone(),
+                name: name.to_string(),
+                performance: PerformanceRecord::default(),
+                lineage: Lineage::default(),
+                capabilities: Vec::new(),
+                rate: None,
+                capacity: None,
+                trust_level: Default::default(),
+                contact: None,
+                executor: "claude".to_string(),
+                preferred_model: None,
+                preferred_provider: None,
+                attractor_weight: 1.0,
+                deployment_history: vec![],
+                staleness_flags: vec![],
+            };
+            agency::save_agent(&agent, &agents_dir).unwrap();
+            id
+        };
+
+        let worker_id = make_agent(&worker_role, "Kiln Worker");
+        let configured_meta_id = make_agent(&opaque_meta_role, "Relay Four");
+        let mut config = Config::load_or_default(dir);
+        config.agency.evaluator_agent = Some(configured_meta_id.clone());
+        config.save(dir).unwrap();
+
+        (worker_id, configured_meta_id)
+    }
+
+    #[test]
+    fn composition_caps_use_configured_meta_hash_after_role_rename() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        let (worker_id, configured_meta_id) = setup_opaque_configured_meta_and_worker(dir_path);
+        let agency_dir = dir_path.join("agency");
+        let agents = agency::load_all_agents_or_warn(&agency_dir.join("cache/agents"));
+        let config = Config::load_or_default(dir_path);
+        let configured = ConfiguredMetaAgents::from_config(&config.agency);
+        let overlay = CompositionRulesOverlay {
+            rules: vec![agency::composition_rules::CompositionRule {
+                agent_type: "evaluator".to_string(),
+                rule: "fixture".to_string(),
+                max_role_components: Some(0),
+                max_desired_outcomes: None,
+                max_trade_off_configs: None,
+                all_projects: true,
+                project_ids: Vec::new(),
+            }],
+        };
+
+        let filtered = apply_caps(
+            &overlay,
+            &agents,
+            &agency_dir.join("cache/roles"),
+            &configured,
+        );
+        assert!(
+            filtered.iter().any(|agent| agent.id == worker_id),
+            "ordinary work agent must remain under the task bucket"
+        );
+        assert!(
+            filtered.iter().all(|agent| agent.id != configured_meta_id),
+            "renamed configured evaluator must receive the evaluator cap"
+        );
+    }
+
+    #[test]
+    fn auto_assign_excludes_opaque_configured_meta_identity() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        setup_workgraph(
+            dir_path,
+            vec![make_task("ordinary-work", "Triage the incoming queue")],
+        );
+        let (worker_id, configured_meta_id) = setup_opaque_configured_meta_and_worker(dir_path);
+
+        let result = run(dir_path, "ordinary-work", None, false, true);
+        assert!(result.is_ok(), "auto-assign failed: {:?}", result.err());
+
+        let graph = load_graph(&graph_path(dir_path)).unwrap();
+        let task = graph.get_task("ordinary-work").unwrap();
+        assert_eq!(task.agent.as_deref(), Some(worker_id.as_str()));
+        assert_ne!(task.agent.as_deref(), Some(configured_meta_id.as_str()));
+    }
+
+    #[test]
+    fn fallback_picker_never_returns_configured_meta_with_work_components() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        let (worker_id, configured_meta_id) = setup_opaque_configured_meta_and_worker(dir_path);
+        let agency_dir = dir_path.join("agency");
+        let agents = agency::load_all_agents_or_warn(&agency_dir.join("cache/agents"));
+        let config = Config::load_or_default(dir_path);
+        let configured = ConfiguredMetaAgents::from_config(&config.agency);
+
+        let picked =
+            worksgood::assignment_eligibility::pick_implementation_capable_agent_with_context(
+                &agents,
+                &agency_dir.join("cache/roles"),
+                &agency_dir.join("primitives/components"),
+                &configured,
+            )
+            .expect("ordinary work fallback should exist");
+        assert_eq!(picked.id, worker_id);
+        assert_ne!(picked.id, configured_meta_id);
     }
 
     /// Regression: an implementation task with concrete deliverables + build

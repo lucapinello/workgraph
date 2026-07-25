@@ -1323,6 +1323,8 @@ fn build_auto_assign_tasks(
         let all_agents = agency::load_all_agents_or_warn(&agents_dir);
         let roles_dir = agency_dir.join("cache/roles");
         let tradeoffs_dir = agency_dir.join("primitives/tradeoffs");
+        let configured_meta_agents =
+            worksgood::assignment_eligibility::ConfiguredMetaAgents::from_config(&config.agency);
 
         // Build a temporary Task with the gathered data for the prompt builder
         let task_snapshot = Task {
@@ -1436,11 +1438,13 @@ fn build_auto_assign_tasks(
         let components_dir = agency_dir.join("primitives/components");
         let assignment_pool: Vec<agency::Agent> =
             if worksgood::assignment_eligibility::task_uses_work_pool(&task_snapshot) {
-                let work_pool = worksgood::assignment_eligibility::filter_work_pool_agents(
-                    &all_agents,
-                    &roles_dir,
-                    &components_dir,
-                );
+                let work_pool =
+                    worksgood::assignment_eligibility::filter_work_pool_agents_with_context(
+                        &all_agents,
+                        &roles_dir,
+                        &components_dir,
+                        &configured_meta_agents,
+                    );
                 if work_pool.is_empty() {
                     // No work agent — refuse to hand a system agent to a work
                     // task. Skip this tick loudly so the task stays unassigned
@@ -1515,23 +1519,23 @@ fn build_auto_assign_tasks(
                     )
                 })
                 .unwrap_or_default();
-            let is_system = role
-                .as_ref()
-                .map(|r| {
-                    worksgood::assignment_eligibility::role_is_system_evaluation_with_components(
-                        r,
-                        &comp_names,
-                    )
-                })
-                .unwrap_or(false);
+            let is_system =
+                worksgood::assignment_eligibility::agent_is_system_evaluation_with_components(
+                    &resolved_agent,
+                    role.as_ref(),
+                    &comp_names,
+                    &configured_meta_agents,
+                );
             if is_system && worksgood::assignment_eligibility::task_uses_work_pool(task) {
                 let original_name = resolved_agent.name.clone();
                 let original_role = role.as_ref().map(|r| r.name.clone()).unwrap_or_default();
-                let fallback = worksgood::assignment_eligibility::pick_implementation_capable_agent(
-                    &all_agents,
-                    &roles_dir,
-                    &components_dir,
-                );
+                let fallback =
+                    worksgood::assignment_eligibility::pick_implementation_capable_agent_with_context(
+                        &all_agents,
+                        &roles_dir,
+                        &components_dir,
+                        &configured_meta_agents,
+                    );
                 match fallback {
                     Some(fb) => {
                         eprintln!(

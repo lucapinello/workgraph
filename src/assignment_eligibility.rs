@@ -58,6 +58,7 @@
 //! longer the gate — the pool kind is.
 
 use crate::agency::{Agent, Role};
+use crate::config::AgencyConfig;
 use crate::graph::{Task, is_agency_scaffold_task};
 use std::path::Path;
 
@@ -98,26 +99,25 @@ const IMPLEMENTATION_SKILLS: &[&str] = &[
     "engineering",
 ];
 
-/// Role names for the agency **meta** personas (Assigner / Evaluator /
-/// Evolver / Agent Creator). These are never implementation workers — they
-/// run the agency lifecycle, not task code. Matched case-sensitively against
-/// the canonical starter names (they are not free-form user labels).
-const META_ROLE_NAMES: &[&str] = &["Assigner", "Evaluator", "Evolver", "Agent Creator"];
-
-/// Role names that are explicitly review/evaluator-only personas.
-const REVIEW_ROLE_NAMES: &[&str] = &["Reviewer", "Evaluator"];
-
-/// **System evaluation role names** — the union of the agency meta personas
-/// and the review persona. An agent whose role name is in this set is a
-/// system evaluation agent and is excluded from the work pool. This is the
-/// structural split: it does NOT depend on task verb guessing.
+/// Legacy starter role names for agency meta personas.
 ///
-/// This set is the single source of truth for "system evaluation agent" —
-/// [`crate::service::llm::is_agency_oneshot_role`] names the matching
-/// `DispatchRole` set (Evaluator / FlipInference / FlipComparison / Assigner /
-/// Reviewer) on the dispatch side; this constant names the matching *role*
-/// set on the assignment side. The two are kept in lock-step by the unit
-/// tests in this module and `service::llm`.
+/// These names are a compatibility fallback for pre-configuration agency
+/// stores. Active meta-agent identity is keyed by the content-hash slots in
+/// [`AgencyConfig`] via [`ConfiguredMetaAgents`]; changing a role's display
+/// name must not change which pool its configured agent belongs to.
+const LEGACY_META_ROLE_NAMES: &[&str] = &["Assigner", "Evaluator", "Evolver", "Agent Creator"];
+
+/// Legacy starter role names that are explicitly review/evaluator-only.
+///
+/// Custom reviewers are classified by their component content instead.
+const LEGACY_REVIEW_ROLE_NAMES: &[&str] = &["Reviewer", "Evaluator"];
+
+/// Legacy starter-name compatibility set for system evaluation roles.
+///
+/// This is deliberately not the primary identity source. Configured meta
+/// agents are matched by stable content hash, while review-only custom roles
+/// are matched by components. Keeping these starter names prevents an older
+/// store without meta-agent config from silently losing its pool boundary.
 pub(crate) const SYSTEM_EVALUATION_ROLE_NAMES: &[&str] = &[
     "Reviewer",
     "Evaluator",
@@ -125,6 +125,92 @@ pub(crate) const SYSTEM_EVALUATION_ROLE_NAMES: &[&str] = &[
     "Evolver",
     "Agent Creator",
 ];
+
+/// Stable agency meta-agent slot.
+///
+/// The enum names the configuration function, not an agent or role display
+/// name. It therefore survives arbitrary agent/role renames and role swaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaAgentKind {
+    Assigner,
+    Evaluator,
+    Evolver,
+    AgentCreator,
+}
+
+impl MetaAgentKind {
+    /// Composition-rules bucket for this configured meta-agent slot.
+    pub fn composition_agent_type(self) -> &'static str {
+        match self {
+            Self::Assigner => "assigner",
+            Self::Evaluator => "evaluator",
+            Self::Evolver => "evolver",
+            Self::AgentCreator => "agent_creator",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Assigner => "assigner",
+            Self::Evaluator => "evaluator",
+            Self::Evolver => "evolver",
+            Self::AgentCreator => "agent creator",
+        }
+    }
+}
+
+/// Stable configured identities for the agency meta-agent slots.
+///
+/// Config normally stores full content hashes. Prefixes remain accepted for
+/// compatibility with the CLI's existing hash-prefix behavior; an empty
+/// reference never matches. If an operator supplies an ambiguous prefix, all
+/// matching agents are treated as meta agents (the safe failure direction)
+/// until the configuration is corrected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfiguredMetaAgents {
+    assigner: Option<String>,
+    evaluator: Option<String>,
+    evolver: Option<String>,
+    creator: Option<String>,
+}
+
+impl ConfiguredMetaAgents {
+    pub fn from_config(config: &AgencyConfig) -> Self {
+        Self {
+            assigner: normalized_agent_ref(config.assigner_agent.as_deref()),
+            evaluator: normalized_agent_ref(config.evaluator_agent.as_deref()),
+            evolver: normalized_agent_ref(config.evolver_agent.as_deref()),
+            creator: normalized_agent_ref(config.creator_agent.as_deref()),
+        }
+    }
+
+    /// Return the stable meta function configured for `agent`, if any.
+    pub fn kind_for_agent(&self, agent: &Agent) -> Option<MetaAgentKind> {
+        [
+            (MetaAgentKind::Assigner, self.assigner.as_deref()),
+            (MetaAgentKind::Evaluator, self.evaluator.as_deref()),
+            (MetaAgentKind::Evolver, self.evolver.as_deref()),
+            (MetaAgentKind::AgentCreator, self.creator.as_deref()),
+        ]
+        .into_iter()
+        .find_map(|(kind, configured)| {
+            configured
+                .is_some_and(|reference| agent.id.starts_with(reference))
+                .then_some(kind)
+        })
+    }
+
+    pub fn contains(&self, agent: &Agent) -> bool {
+        self.kind_for_agent(agent).is_some()
+    }
+}
+
+fn normalized_agent_ref(reference: Option<&str>) -> Option<String> {
+    reference
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+        .map(str::to_string)
+}
 
 /// Role names that are explicitly implementation-capable personas.
 const IMPLEMENTATION_ROLE_NAMES: &[&str] = &[
@@ -245,21 +331,27 @@ pub fn task_uses_work_pool(task: &Task) -> bool {
     !task_is_evaluation_or_review(task)
 }
 
-/// Is this role a **system evaluation/agency persona** — i.e. excluded from
-/// the work pool? Name-only path; for custom / evolved roles use
-/// [`role_is_system_evaluation_with_components`].
+/// Is this role a **system evaluation/agency persona** by legacy starter-name
+/// compatibility — i.e. excluded from the work pool?
 ///
 /// True for the agency meta personas (`Assigner`, `Evaluator`, `Evolver`,
 /// `Agent Creator`) and the review persona (`Reviewer`). These run the
-/// evaluation/review/assignment *primitives*, not implementation work.
+/// evaluation/review/assignment *primitives*, not implementation work. New
+/// callers that have an [`Agent`] must use
+/// [`agent_is_system_evaluation_with_components`] so configured hash identity
+/// wins across arbitrary role renames.
 pub fn role_is_system_evaluation(role: &Role) -> bool {
     SYSTEM_EVALUATION_ROLE_NAMES.contains(&role.name.as_str())
         || classify_role(&role.name, &[]) == RoleCapability::ReviewOnly
 }
 
-/// Component-aware system-pool check — resolves component content *names* for
-/// custom / evolved roles so a review-only custom role (every component is a
-/// review component) is also treated as a system evaluation agent.
+/// Legacy role-based, component-aware system-pool check.
+///
+/// This preserves reviewer detection for custom/evolved review roles and
+/// starter-name compatibility for stores that predate configured meta-agent
+/// slots. New assignment paths should call
+/// [`agent_is_system_evaluation_with_components`] so active meta agents are
+/// identified by hash before this compatibility path runs.
 pub fn role_is_system_evaluation_with_components(role: &Role, component_names: &[String]) -> bool {
     if SYSTEM_EVALUATION_ROLE_NAMES.contains(&role.name.as_str()) {
         return true;
@@ -267,12 +359,19 @@ pub fn role_is_system_evaluation_with_components(role: &Role, component_names: &
     classify_role(&role.name, component_names) == RoleCapability::ReviewOnly
 }
 
-/// Convenience: is this agent a system evaluation agent? Requires the resolved
-/// [`Role`] (the caller looks it up by `agent.role_id`). `None` role ⇒ `false`
-/// (fail open — we can't classify without a role, and the caller should have
-/// resolved one).
-pub fn agent_is_system_evaluation(_agent: &Agent, role: Option<&Role>) -> bool {
-    role.is_some_and(role_is_system_evaluation)
+/// Is this agent excluded from the work pool?
+///
+/// Stable configured meta-agent hash identity wins. The role/component path
+/// remains as a compatibility fallback for built-in names and for custom
+/// reviewer roles composed entirely from review components.
+pub fn agent_is_system_evaluation_with_components(
+    agent: &Agent,
+    role: Option<&Role>,
+    component_names: &[String],
+    configured_meta_agents: &ConfiguredMetaAgents,
+) -> bool {
+    configured_meta_agents.contains(agent)
+        || role.is_some_and(|role| role_is_system_evaluation_with_components(role, component_names))
 }
 
 /// Build the **work pool** for a normal work task — the subset of `agents`
@@ -290,6 +389,21 @@ pub fn filter_work_pool_agents<'a>(
     roles_dir: &Path,
     components_dir: &Path,
 ) -> Vec<&'a Agent> {
+    filter_work_pool_agents_with_context(
+        agents,
+        roles_dir,
+        components_dir,
+        &ConfiguredMetaAgents::default(),
+    )
+}
+
+/// Config-aware work-pool filter used by live assignment paths.
+pub fn filter_work_pool_agents_with_context<'a>(
+    agents: &'a [Agent],
+    roles_dir: &Path,
+    components_dir: &Path,
+    configured_meta_agents: &ConfiguredMetaAgents,
+) -> Vec<&'a Agent> {
     agents
         .iter()
         .filter(|a| {
@@ -301,7 +415,12 @@ pub fn filter_work_pool_agents<'a>(
                 Err(_) => return false,
             };
             let comp_names = resolve_role_component_names(&role, components_dir);
-            !role_is_system_evaluation_with_components(&role, &comp_names)
+            !agent_is_system_evaluation_with_components(
+                a,
+                Some(&role),
+                &comp_names,
+                configured_meta_agents,
+            )
         })
         .collect()
 }
@@ -333,10 +452,11 @@ fn classify_role(name: &str, comp_names: &[String]) -> RoleCapability {
     if IMPLEMENTATION_ROLE_NAMES.contains(&name) {
         return RoleCapability::ImplementationCapable;
     }
-    if REVIEW_ROLE_NAMES.contains(&name) || META_ROLE_NAMES.contains(&name) {
+    if LEGACY_REVIEW_ROLE_NAMES.contains(&name) || LEGACY_META_ROLE_NAMES.contains(&name) {
         // Meta personas (Assigner/Evolver/Agent Creator) are not reviewers, but
         // they are equally not implementation workers — for the purposes of
-        // this guard they must not be assigned to implementation tasks.
+        // this legacy compatibility path they must not be assigned to
+        // implementation tasks.
         return RoleCapability::ReviewOnly;
     }
 
@@ -409,30 +529,62 @@ pub fn check_assignment_eligibility(
     explicit: bool,
     fallback_agent_id: Option<String>,
 ) -> EligibilityVerdict {
+    check_assignment_eligibility_with_context(
+        task,
+        agent,
+        role,
+        &[],
+        &ConfiguredMetaAgents::default(),
+        explicit,
+        fallback_agent_id,
+    )
+}
+
+/// Component- and config-aware assignment check used at live assignment
+/// seams. Prefer this over [`check_assignment_eligibility`] whenever the
+/// caller has loaded agency configuration and role components.
+pub fn check_assignment_eligibility_with_context(
+    task: &Task,
+    agent: &Agent,
+    role: Option<&Role>,
+    component_names: &[String],
+    configured_meta_agents: &ConfiguredMetaAgents,
+    explicit: bool,
+    fallback_agent_id: Option<String>,
+) -> EligibilityVerdict {
     // Evaluation/review primitives use the system pool — system agents are
     // the correct (and only) candidates there.
     if task_is_evaluation_or_review(task) {
         return EligibilityVerdict::Allow;
     }
-    // No role resolved — can't classify. Fail open (don't block) but the
-    // caller should ideally have resolved one.
-    let Some(role) = role else {
-        return EligibilityVerdict::Allow;
-    };
     // Structural pool separation: a system evaluation agent on a normal work
-    // task is a pool mismatch regardless of task wording, score, or usage.
-    if !role_is_system_evaluation(role) {
+    // task is a pool mismatch regardless of task wording, score, usage, or
+    // the current display name of its role.
+    if !agent_is_system_evaluation_with_components(
+        agent,
+        role,
+        component_names,
+        configured_meta_agents,
+    ) {
         return EligibilityVerdict::Allow;
     }
+    let role_name = role
+        .map(|role| role.name.as_str())
+        .unwrap_or("(role unavailable)");
+    let identity = configured_meta_agents
+        .kind_for_agent(agent)
+        .map(|kind| format!("is the configured {} meta agent", kind.label()))
+        .unwrap_or_else(|| format!("has review/system role '{}'", role_name));
     let reason = format!(
         "task '{}' is a normal work task and must draw from the work pool, but \
-         agent '{}' has system role '{}' ({}), which is an \
-         evaluation/review/agency persona excluded from work assignment; \
-         assign an implementation-capable worker instead",
+         agent '{}' ({}) {} (current role '{}'); this system \
+         evaluation/agency identity is excluded from work assignment; assign \
+         an implementation-capable worker instead",
         task.id,
         agent.name,
-        role.name,
         crate::agency::short_hash(&agent.id),
+        identity,
+        role_name,
     );
     if explicit {
         EligibilityVerdict::Warn { reason }
@@ -457,6 +609,23 @@ pub fn pick_implementation_capable_agent<'a>(
     roles_dir: &Path,
     components_dir: &Path,
 ) -> Option<&'a Agent> {
+    pick_implementation_capable_agent_with_context(
+        agents,
+        roles_dir,
+        components_dir,
+        &ConfiguredMetaAgents::default(),
+    )
+}
+
+/// Config-aware fallback picker used by live assignment paths. Configured
+/// meta agents are never returned, even if their swapped role contains
+/// implementation components.
+pub fn pick_implementation_capable_agent_with_context<'a>(
+    agents: &'a [Agent],
+    roles_dir: &Path,
+    components_dir: &Path,
+    configured_meta_agents: &ConfiguredMetaAgents,
+) -> Option<&'a Agent> {
     let mut best: Option<&Agent> = None;
     let mut best_score = f64::MIN;
     for agent in agents {
@@ -468,6 +637,14 @@ pub fn pick_implementation_capable_agent<'a>(
             Err(_) => continue,
         };
         let comp_names = resolve_role_component_names(&role, components_dir);
+        if agent_is_system_evaluation_with_components(
+            agent,
+            Some(&role),
+            &comp_names,
+            configured_meta_agents,
+        ) {
+            continue;
+        }
         if role_implementation_capability_with_components(&role, &comp_names)
             != RoleCapability::ImplementationCapable
         {
@@ -679,6 +856,118 @@ mod tests {
             RoleCapability::Unknown
         );
         assert!(!role_blocks_implementation(&role_named("Wibble Wrangler")));
+    }
+
+    #[test]
+    fn configured_meta_hash_survives_opaque_role_rename_and_swap() {
+        let role = role_named("Prism Route");
+        let agent = agent_with("relay-4", &role);
+        let mut config = AgencyConfig::default();
+        // A prefix is accepted for compatibility with normal agent lookup.
+        config.evaluator_agent = Some("agent-relay".to_string());
+        let configured = ConfiguredMetaAgents::from_config(&config);
+
+        assert_eq!(
+            configured.kind_for_agent(&agent),
+            Some(MetaAgentKind::Evaluator)
+        );
+        assert!(
+            agent_is_system_evaluation_with_components(
+                &agent,
+                Some(&role),
+                &["code-writing".to_string()],
+                &configured,
+            ),
+            "configured identity must win even when the swapped role looks implementation-capable"
+        );
+
+        let task = task_with("ordinary-work", "Triage the incoming queue");
+        let verdict = check_assignment_eligibility_with_context(
+            &task,
+            &agent,
+            Some(&role),
+            &["code-writing".to_string()],
+            &configured,
+            false,
+            None,
+        );
+        assert!(
+            matches!(verdict, EligibilityVerdict::Reassign { .. }),
+            "renaming the configured evaluator role must not admit it to the work pool"
+        );
+        let explicit = check_assignment_eligibility_with_context(
+            &task,
+            &agent,
+            Some(&role),
+            &["code-writing".to_string()],
+            &configured,
+            true,
+            None,
+        );
+        match explicit {
+            EligibilityVerdict::Warn { reason } => {
+                assert!(reason.contains("configured evaluator meta agent"));
+                assert!(reason.contains("Prism Route"));
+            }
+            other => panic!("explicit opaque meta pin must warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_configured_meta_slots_use_hash_identity_not_display_names() {
+        let role = role_named("Opaque Rotating Role");
+        let agents = [
+            (
+                agent_with("north-17", &role),
+                MetaAgentKind::Assigner,
+                "assigner",
+            ),
+            (
+                agent_with("east-28", &role),
+                MetaAgentKind::Evaluator,
+                "evaluator",
+            ),
+            (
+                agent_with("south-39", &role),
+                MetaAgentKind::Evolver,
+                "evolver",
+            ),
+            (
+                agent_with("west-40", &role),
+                MetaAgentKind::AgentCreator,
+                "agent_creator",
+            ),
+        ];
+        let mut config = AgencyConfig::default();
+        config.assigner_agent = Some("agent-north".to_string());
+        config.evaluator_agent = Some("agent-east".to_string());
+        config.evolver_agent = Some("agent-south".to_string());
+        config.creator_agent = Some("agent-west".to_string());
+        let configured = ConfiguredMetaAgents::from_config(&config);
+
+        for (agent, expected_kind, expected_bucket) in agents {
+            let actual_kind = configured.kind_for_agent(&agent);
+            assert_eq!(actual_kind, Some(expected_kind));
+            assert_eq!(
+                actual_kind.map(MetaAgentKind::composition_agent_type),
+                Some(expected_bucket)
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_component_based_reviewer_detection_is_preserved() {
+        let role = role_named("Copper Lens");
+        let agent = agent_with("audit-9", &role);
+        assert!(
+            agent_is_system_evaluation_with_components(
+                &agent,
+                Some(&role),
+                &["code-review".to_string(), "security-audit".to_string()],
+                &ConfiguredMetaAgents::default(),
+            ),
+            "review-only components must identify an opaque custom reviewer"
+        );
     }
 
     // --- verdict -------------------------------------------------------------
