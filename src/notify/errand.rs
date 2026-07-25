@@ -59,9 +59,10 @@ use serde::Deserialize;
 
 use crate::notify::daily_digest::{DigestPolicy, DigestStore, Nudge, NudgeKind, Offer};
 use crate::notify::family_plan::{CalendarEvent, PlanDoc};
+use crate::notify::ownership::OwnerMap;
 use crate::notify::reminder::{
-    decide, first_member, hash64, normalize_bot, parse_clock, FireDecision, FiredLog, FirePolicy,
-    Outcome,
+    decide, first_member, hash64, parse_clock, resolve_plan_source, FireDecision, FiredLog,
+    FirePolicy, Outcome,
 };
 
 /// The shopping-cart emoji that marks an errand row in the plan and prefixes the
@@ -145,6 +146,7 @@ impl ErrandReminder {
         week_code: &str,
         ev: &CalendarEvent,
         members: &[String],
+        owners: &OwnerMap,
         lead: Duration,
     ) -> Option<ErrandReminder> {
         if !is_errand_event(&ev.event) {
@@ -155,7 +157,7 @@ impl ErrandReminder {
         let errand_at = date.and_time(time);
         let due = errand_at - lead;
         let recipient = first_member(&ev.event, members).unwrap_or_default();
-        let bot = normalize_bot(&ev.source);
+        let bot = resolve_plan_source(&ev.source, owners)?;
         let label = clean_errand_label(&ev.event);
         // Stable id: week + date + time + label hash. NOT a function of `lead`, so
         // changing the lead reuses the same id (one nudge per errand, always).
@@ -215,11 +217,14 @@ impl ErrandReminder {
 pub fn errands_from_plan(
     plan: &PlanDoc,
     members: &[String],
+    owners: &OwnerMap,
     lead: Duration,
 ) -> Vec<ErrandReminder> {
     plan.calendar
         .iter()
-        .filter_map(|ev| ErrandReminder::from_calendar_event(&plan.week_code, ev, members, lead))
+        .filter_map(|ev| {
+            ErrandReminder::from_calendar_event(&plan.week_code, ev, members, owners, lead)
+        })
         .collect()
 }
 
@@ -440,6 +445,16 @@ mod tests {
         vec!["Luca".to_string(), "Nadin".to_string()]
     }
 
+    fn owners() -> OwnerMap {
+        OwnerMap::casa_default()
+    }
+
+    fn owners_from_toml(body: &str) -> OwnerMap {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("household.toml"), body).unwrap();
+        OwnerMap::from_household_toml(dir.path()).expect("valid household fixture")
+    }
+
     fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, mo, d)
             .unwrap()
@@ -463,6 +478,7 @@ mod tests {
             "2026-W29",
             &errand_row(),
             &members(),
+            &owners(),
             Duration::minutes(15),
         )
         .expect("errand-shaped")
@@ -503,11 +519,40 @@ mod tests {
     }
 
     #[test]
+    fn renamed_source_resolves_unique_stable_owner() {
+        let owners = owners_from_toml(
+            r#"
+[[agent]]
+id = "shopping-anchor-8"
+name = "Market Lantern Renamed"
+domains = ["shopping", "coordination"]
+"#,
+        );
+        let row = CalendarEvent {
+            source: "Market Lantern Renamed \u{2192} \u{a7}4".into(),
+            ..errand_row()
+        };
+        let errand = ErrandReminder::from_calendar_event(
+            "2026-W29",
+            &row,
+            &members(),
+            &owners,
+            Duration::minutes(15),
+        )
+        .expect("renamed authored source resolves");
+        assert_eq!(
+            errand.bot, "shopping-anchor-8",
+            "routing must retain the stable id instead of deriving one from the display name",
+        );
+    }
+
+    #[test]
     fn errand_lead_is_configurable() {
         let e = ErrandReminder::from_calendar_event(
             "2026-W29",
             &errand_row(),
             &members(),
+            &owners(),
             Duration::minutes(30),
         )
         .unwrap();
@@ -521,6 +566,7 @@ mod tests {
             "2026-W29",
             &errand_row(),
             &members(),
+            &owners(),
             Duration::minutes(45), // different lead …
         )
         .unwrap();
@@ -539,7 +585,13 @@ mod tests {
             source: "Bruno".into(),
         };
         assert!(
-            ErrandReminder::from_calendar_event("2026-W29", &cook, &members(), Duration::minutes(15))
+            ErrandReminder::from_calendar_event(
+                "2026-W29",
+                &cook,
+                &members(),
+                &owners(),
+                Duration::minutes(15),
+            )
                 .is_none()
         );
         // A ⏰ reminder row is NOT an errand (the two engines never overlap).
@@ -555,6 +607,7 @@ mod tests {
                 "2026-W29",
                 &reminder,
                 &members(),
+                &owners(),
                 Duration::minutes(15)
             )
             .is_none()
@@ -763,6 +816,7 @@ mod tests {
             "2026-W29",
             &stale_row,
             &members(),
+            &owners(),
             Duration::minutes(15),
         )
         .unwrap(); // due 05:45
@@ -798,7 +852,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let es = errands_from_plan(&plan, &members(), Duration::minutes(15));
+        let es = errands_from_plan(&plan, &members(), &owners(), Duration::minutes(15));
         assert_eq!(es.len(), 1, "only the errand row, not the cook slot");
         assert_eq!(es[0].recipient, "Luca");
     }

@@ -2131,6 +2131,15 @@ description = "Runs three hermetic rounds of typical household conversation thro
 timeout_seconds = 30
 
 [[scenario]]
+name = "telegram_plan_source_stable_identity"
+script = "scenarios/telegram_plan_source_stable_identity.sh"
+owners = [
+    "p1-engine-plan-source-stable-identity",
+]
+description = "Runs the real review binary against a scratch numbered `## 1. Dinners (...)` and Calendar plan. A multiword authored Source resolves to one opaque stable household id for both a reminder and an errand, wins over the recipient's unrelated bot binding, remains unchanged in the plan, and routes identically after the roster order is reversed. Shopping is served by a loopback fixture; Telegram delivery is dry-run only."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_standup_roster_order"
 script = "scenarios/telegram_standup_roster_order.sh"
 owners = [

@@ -550,6 +550,41 @@ impl OwnerMap {
             .map(|(id, name)| (id.as_str(), name.as_str()))
     }
 
+    /// Resolve one exact household persona reference without using roster order.
+    ///
+    /// Stable ids win when exactly one configured entry matches
+    /// case-insensitively. Otherwise an exact display-name match is accepted only
+    /// when it is unique. Duplicate authored display names deliberately return
+    /// `None`: callers must not silently select whichever helper appeared first.
+    pub fn resolve_unique_persona_ref(&self, reference: &str) -> Option<&str> {
+        let wanted = reference.trim();
+        if wanted.is_empty() {
+            return None;
+        }
+
+        let mut id_matches = self
+            .entries
+            .iter()
+            .filter(|(id, _)| id.eq_ignore_ascii_case(wanted))
+            .map(|(id, _)| id.as_str());
+        let first_id = id_matches.next();
+        if first_id.is_some() && id_matches.next().is_none() {
+            return first_id;
+        }
+
+        let mut name_matches = self
+            .display_names
+            .iter()
+            .filter(|(_, name)| name.eq_ignore_ascii_case(wanted))
+            .map(|(id, _)| id.as_str());
+        let first_name = name_matches.next();
+        if first_name.is_some() && name_matches.next().is_none() {
+            first_name
+        } else {
+            None
+        }
+    }
+
     /// The persona id that owns the ask (classify + resolve).
     pub fn owner_for_ask(&self, ask: &str) -> Option<&str> {
         self.owner_for_domain(classify_domain(ask))

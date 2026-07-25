@@ -1868,7 +1868,11 @@ fn try_register_reminder(
     let agency_dir = workgraph_dir.join("agency");
     let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
     let root = project_root(workgraph_dir);
-    let coordination_owner = coordination_owner_hint(&root);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let coordination_owner = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .unwrap_or_default()
+        .to_string();
     // The sender must be a confirmed human; resolve their display name + bot.
     let binding = bindings.find_by_identity(Some(sender), Some(sender_display));
     let (recipient, bot) = match binding {
@@ -4902,7 +4906,11 @@ pub fn run_remind(
     };
 
     let root = project_root(workgraph_dir);
-    let coordination_owner = coordination_owner_hint(&root);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let coordination_owner = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .unwrap_or_default()
+        .to_string();
     let now = match now_override {
         Some(s) => parse_naive_now(s)
             .with_context(|| format!("invalid --now '{s}', expected YYYY-MM-DDTHH:MM"))?,
@@ -4971,7 +4979,7 @@ pub fn run_remind(
     let plans = family_plan::load_plans(&root);
     let current = family_plan::current_plan(&plans, now.date());
     let mut reminders: Vec<Reminder> = current
-        .map(|p| reminder::reminders_from_plan(p, &members))
+        .map(|p| reminder::reminders_from_plan(p, &members, &owner_map))
         .unwrap_or_default();
     let store = AdHocStore::load(&AdHocStore::path(&root));
     reminders.extend(store.reminders.iter().cloned());
@@ -5078,6 +5086,7 @@ pub fn run_remind(
                 now,
                 current,
                 &members,
+                &owner_map,
                 &bindings,
                 &config,
                 true,
@@ -5151,6 +5160,7 @@ pub fn run_remind(
         now,
         current,
         &members,
+        &owner_map,
         &bindings,
         &config,
         false,
@@ -5168,9 +5178,12 @@ pub fn run_remind(
     Ok(())
 }
 
-/// Resolve which bot fronts a reminder's recipient and the chat to DM: prefer the
-/// recipient's own bound bot + chat, else a bot whose `agent_id` matches the
-/// reminder's owning voice, else any configured bot to the recipient's chat.
+/// Resolve which bot fronts a reminder's recipient and the chat to DM.
+///
+/// A non-empty plan Source is already a roster-resolved stable persona id, so
+/// its matching bot must win. If that bot is not configured, fail closed rather
+/// than speaking in an unrelated voice. Only a reminder with no Source may use
+/// the recipient's explicitly bound bot.
 fn resolve_reminder_target(
     config: &TelegramConfig,
     bindings: &worksgood::agency::TelegramBindingMap,
@@ -6098,9 +6111,9 @@ pub fn run_digest(
         let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
         rt.block_on(async {
             for (member, text) in &due {
-                // Resolve the recipient's DM target. A bound bot wins; otherwise
-                // prefer the project-configured coordination owner, then let
-                // `resolve_dm_target` fall back explicitly to any configured bot.
+                // Resolve the recipient's DM target through the project-authored
+                // coordination owner. Without one, only the recipient's explicit
+                // bot binding may send; roster/map order is never a fallback.
                 let (target, bot_id, _bot) =
                     match resolve_dm_target(
                         &config,
@@ -6233,9 +6246,10 @@ fn lifecycle_workers(task: &worksgood::graph::Task) -> Vec<String> {
 }
 
 /// Resolve the DM target (chat + bot) for a proactive nudge to `recipient`, sent
-/// in the voice `bot`: prefer the recipient's own bound bot + chat, else a bot
-/// whose `agent_id` matches the owning voice, else any configured bot. Shared by
-/// the reminder tick and the errand tick so both DMs leave via the same rule.
+/// in the stable voice `bot`. A resolved Source voice wins; if it has no
+/// configured bot, delivery fails closed. With an empty Source only, the
+/// recipient's explicit bot binding may send. Shared by the reminder and errand
+/// ticks so neither path depends on roster or map iteration order.
 fn resolve_dm_target(
     config: &TelegramConfig,
     bindings: &worksgood::agency::TelegramBindingMap,
@@ -6245,27 +6259,27 @@ fn resolve_dm_target(
     let binding = bindings.find_by_name_ci(recipient)?;
     let target = binding.telegram_user.clone();
     let bots = config.all_bots();
-    // 1) the recipient's configured bot.
-    if let Some(bid) = &binding.bot_id {
-        if let Some((id, b)) = bots.iter().find(|(id, _)| id == bid) {
-            return Some((target, id.clone(), b.clone()));
-        }
+    if !bot.trim().is_empty() {
+        return bots
+            .iter()
+            .find(|(id, b)| id.eq_ignore_ascii_case(bot) || {
+                b.agent_id
+                    .as_deref()
+                    .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case(bot))
+            })
+            .map(|(id, b)| (target, id.clone(), b.clone()));
     }
-    // 2) a bot fronting the nudge's owning voice.
-    if let Some((id, b)) = bots
-        .iter()
-        .find(|(id, b)| id == &bot || b.agent_id.as_deref() == Some(bot))
-    {
-        return Some((target, id.clone(), b.clone()));
-    }
-    // 3) any bot.
-    bots.first().map(|(id, b)| (target, id.clone(), b.clone()))
+    binding.bot_id.as_ref().and_then(|bound_id| {
+        bots.iter()
+            .find(|(id, _)| id == bound_id)
+            .map(|(id, b)| (target, id.clone(), b.clone()))
+    })
 }
 
 /// The project-authored voice for proactive coordination messages.
 ///
 /// An empty result is intentional: callers then persist no guessed persona and
-/// [`resolve_dm_target`] falls through to an explicitly configured bot.
+/// [`resolve_dm_target`] may use only the recipient's explicit bot binding.
 fn coordination_owner_hint(root: &Path) -> String {
     ownership::OwnerMap::load(root)
         .owner_for_domain(ownership::Domain::Coordination)
@@ -6291,6 +6305,7 @@ fn fire_errands(
     now: chrono::NaiveDateTime,
     current: Option<&worksgood::notify::family_plan::PlanDoc>,
     members: &[String],
+    owner_map: &ownership::OwnerMap,
     bindings: &worksgood::agency::TelegramBindingMap,
     config: &TelegramConfig,
     dry_run: bool,
@@ -6303,7 +6318,7 @@ fn fire_errands(
         Some(p) => p,
         None => return Ok(0),
     };
-    let errands = errand::errands_from_plan(plan, members, errand::resolve_lead());
+    let errands = errand::errands_from_plan(plan, members, owner_map, errand::resolve_lead());
     if errands.is_empty() {
         return Ok(0);
     }
@@ -8499,6 +8514,96 @@ domains = ["cooking"]
             "",
             "malformed configuration must not manufacture a persona id",
         );
+    }
+
+    #[test]
+    fn ambiguous_plan_source_never_selects_first_bot() {
+        use worksgood::notify::family_plan::CalendarEvent;
+        use worksgood::notify::reminder::Reminder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "coordination-anchor-a"
+name = "Shared Lantern"
+domains = ["coordination"]
+
+[[agent]]
+id = "coordination-anchor-b"
+name = "Shared Lantern"
+domains = ["calendar"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
+        let bindings = TelegramBindingMap::load(&wg.join("agency")).unwrap();
+        let owners = ownership::OwnerMap::load(root);
+        let event = CalendarEvent {
+            weekday: "Tue".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 7, 28),
+            time: "08:00".into(),
+            event: "\u{23f0} Reminder: Household Member set out the bins".into(),
+            source: "Shared Lantern".into(),
+        };
+        assert!(
+            Reminder::from_calendar_event(
+                "2026-W31",
+                &event,
+                &["Household Member".to_string()],
+                &owners,
+            )
+            .is_none(),
+            "duplicate display labels must not become a guessed stable owner",
+        );
+
+        for reverse in [false, true] {
+            let entries = [
+                (
+                    "first-wire",
+                    TelegramBotConfig {
+                        bot_token: "100:AAA".to_string(),
+                        chat_id: "-1001".to_string(),
+                        agent_id: Some("coordination-anchor-a".to_string()),
+                        username: None,
+                    },
+                ),
+                (
+                    "second-wire",
+                    TelegramBotConfig {
+                        bot_token: "200:BBB".to_string(),
+                        chat_id: "-1002".to_string(),
+                        agent_id: Some("coordination-anchor-b".to_string()),
+                        username: None,
+                    },
+                ),
+            ];
+            let mut bots = HashMap::new();
+            let order: &[usize] = if reverse { &[1, 0] } else { &[0, 1] };
+            for index in order {
+                let (id, bot) = &entries[*index];
+                bots.insert((*id).to_string(), bot.clone());
+            }
+            let config = TelegramConfig {
+                bot_token: String::new(),
+                chat_id: String::new(),
+                bots,
+            };
+            assert!(
+                resolve_dm_target(
+                    &config,
+                    &bindings,
+                    "Household Member",
+                    "unresolved-source",
+                )
+                .is_none(),
+                "an unresolved non-empty Source must never fall through to map order",
+            );
+        }
     }
 
     #[test]

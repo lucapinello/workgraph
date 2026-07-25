@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::write_atomic;
 use crate::notify::family_plan::{CalendarEvent, PlanDoc};
+use crate::notify::ownership::OwnerMap;
 
 /// The alarm-clock emoji that prefixes a reminder, both in the plan and the DM.
 const ALARM: char = '\u{23f0}';
@@ -91,6 +92,7 @@ impl Reminder {
         week_code: &str,
         ev: &CalendarEvent,
         members: &[String],
+        owners: &OwnerMap,
     ) -> Option<Reminder> {
         if !is_reminder_event(&ev.event) {
             return None;
@@ -100,7 +102,7 @@ impl Reminder {
         let due = due_date.and_time(time);
         let body = clean_reminder_body(&ev.event);
         let recipient = first_member(&ev.event, members).unwrap_or_default();
-        let bot = normalize_bot(&ev.source);
+        let bot = resolve_plan_source(&ev.source, owners)?;
         // Stable id: week + date + time + a hash of the body, so a re-parse of the
         // same plan yields the same key (exactly-once across restarts) but two
         // different reminder rows never collide.
@@ -133,10 +135,14 @@ impl Reminder {
 }
 
 /// Collect every reminder-shaped row in a parsed plan into [`Reminder`]s.
-pub fn reminders_from_plan(plan: &PlanDoc, members: &[String]) -> Vec<Reminder> {
+pub fn reminders_from_plan(
+    plan: &PlanDoc,
+    members: &[String],
+    owners: &OwnerMap,
+) -> Vec<Reminder> {
     plan.calendar
         .iter()
-        .filter_map(|ev| Reminder::from_calendar_event(&plan.week_code, ev, members))
+        .filter_map(|ev| Reminder::from_calendar_event(&plan.week_code, ev, members, owners))
         .collect()
 }
 
@@ -165,18 +171,29 @@ fn clean_reminder_body(event: &str) -> String {
     s.to_string()
 }
 
-/// Lower-case a Source cell into a bot/agent id: `"Otto"` → `"otto"`, and
-/// `"Mira/Otto"` → the first voice (`"mira"`) which owns the row.
+/// Resolve a plan Source cell to one stable household persona id.
 ///
-/// `pub(crate)` so the errand engine ([`crate::notify::errand`]) resolves the
-/// owning voice of a `🛒 Market run` row with the identical rule.
-pub(crate) fn normalize_bot(source: &str) -> String {
-    source
-        .split(['/', '(', ' '])
+/// Plan authors write display text, which may contain spaces and may change over
+/// time. Preserve the first authored reference (before plan annotations such as
+/// `/`, `(`, `§`, or `→`) and resolve it through the current household roster.
+/// A non-empty unknown or ambiguous reference is rejected rather than guessed
+/// from roster order. An empty Source remains empty so delivery may use only the
+/// recipient's explicit bot binding.
+///
+/// `pub(crate)` so the errand engine ([`crate::notify::errand`]) uses the exact
+/// same stable-identity rule.
+pub(crate) fn resolve_plan_source(source: &str, owners: &OwnerMap) -> Option<String> {
+    if source.trim().is_empty() {
+        return Some(String::new());
+    }
+    let reference = source
+        .split(['/', '(', '\u{00a7}', '\u{2192}'])
         .map(|s| s.trim())
         .find(|s| !s.is_empty())
-        .unwrap_or("")
-        .to_ascii_lowercase()
+        .unwrap_or("");
+    owners
+        .resolve_unique_persona_ref(reference)
+        .map(str::to_string)
 }
 
 /// Find the first known member display name that appears in `text`, matched
@@ -831,6 +848,16 @@ mod tests {
         ]
     }
 
+    fn owners() -> OwnerMap {
+        OwnerMap::casa_default()
+    }
+
+    fn owners_from_toml(body: &str) -> OwnerMap {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("household.toml"), body).unwrap();
+        OwnerMap::from_household_toml(dir.path()).expect("valid household fixture")
+    }
+
     fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, mo, d)
             .unwrap()
@@ -846,7 +873,8 @@ mod tests {
             event: "\u{23f0} Reminder: Luca PT check-in (if unanswered)".into(),
             source: "Otto".into(),
         };
-        Reminder::from_calendar_event("2026-W29", &ev, &members()).expect("reminder-shaped")
+        Reminder::from_calendar_event("2026-W29", &ev, &members(), &owners())
+            .expect("reminder-shaped")
     }
 
     #[test]
@@ -869,7 +897,9 @@ mod tests {
             event: "Cook: chickpea & spinach curry".into(),
             source: "Bruno".into(),
         };
-        assert!(Reminder::from_calendar_event("2026-W29", &ev, &members()).is_none());
+        assert!(
+            Reminder::from_calendar_event("2026-W29", &ev, &members(), &owners()).is_none()
+        );
     }
 
     #[test]
@@ -1068,8 +1098,66 @@ mod tests {
     }
 
     #[test]
-    fn source_with_slash_picks_first_voice() {
-        assert_eq!(normalize_bot("Mira/Otto"), "mira");
-        assert_eq!(normalize_bot("Otto (§4)"), "otto");
+    fn multiword_source_resolves_unique_stable_owner() {
+        let owners = owners_from_toml(
+            r#"
+[[agent]]
+id = "coordination-anchor-7"
+name = "Harbor Keeper"
+domains = ["coordination", "calendar"]
+
+[[agent]]
+id = "meal-anchor-4"
+name = "Pantry Lantern"
+domains = ["meals"]
+"#,
+        );
+        let plan = PlanDoc::parse(
+            "2026-W31",
+            r#"
+**Week of Monday 2026-07-27 → Sunday 2026-08-02**
+
+## 1. Dinners (Mon 07-27 → Sun 08-02)
+| Day | Slot | Dish | Prep |
+|---|---|---|---|
+| Mon 07-27 | Vegetarian | Summer pasta | ~20 min |
+
+## 3. Calendar
+| Day | Time | Event | Source |
+|---|---|---|---|
+| Tue 07-28 | 19:30 | ⏰ Reminder: Luca PT check-in | Harbor Keeper (§4) |
+"#,
+        );
+        assert_eq!(
+            plan.meals.len(),
+            1,
+            "the fixture must exercise the production `## 1. Dinners (…)` shape",
+        );
+        let reminders = reminders_from_plan(&plan, &members(), &owners);
+        let reminder = reminders.first().expect("live-shaped reminder row resolves");
+        assert_eq!(
+            reminder.bot, "coordination-anchor-7",
+            "the complete authored display name must resolve to its stable id",
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_unknown_nonempty_source_fails_closed() {
+        let owners = owners_from_toml(
+            r#"
+[[agent]]
+id = "coordination-anchor-a"
+name = "Shared Lantern"
+domains = ["coordination"]
+
+[[agent]]
+id = "coordination-anchor-b"
+name = "Shared Lantern"
+domains = ["calendar"]
+"#,
+        );
+        assert_eq!(resolve_plan_source("Shared Lantern", &owners), None);
+        assert_eq!(resolve_plan_source("Unknown Lantern", &owners), None);
+        assert_eq!(resolve_plan_source("", &owners), Some(String::new()));
     }
 }
