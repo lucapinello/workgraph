@@ -2122,6 +2122,15 @@ description = "Pins the disposable ingest step from docs/14-disposable-lifecycle
 timeout_seconds = 60
 
 [[scenario]]
+name = "telegram_household_conversation_matrix"
+script = "scenarios/telegram_household_conversation_matrix.sh"
+owners = [
+    "full-pass-conversation-matrix",
+]
+description = "Runs three hermetic rounds of typical household conversation through the real engine CLI using only opaque persona ids and authored display names: group routing (name, handle, reply chain, meal/recipe/workout domains, coordinator fallback, chatter silence, solo greeting, private passthrough); grounded family reads from the live numbered `## 1. Dinners (...)` plan shape; and unknown-member/private/group session delivery. It asserts config-derived owners, exact destination bot/chat, generic onboarding copy, grounded plan facts, and no fixture-token leak. Credential-free: all plans, bindings, replies, and bot tokens are scratch fixtures; sends are recording-only."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_standup_roster_order"
 script = "scenarios/telegram_standup_roster_order.sh"
 owners = [
