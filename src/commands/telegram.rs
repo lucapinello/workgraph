@@ -1850,18 +1850,21 @@ fn try_register_reminder(
 
     let agency_dir = workgraph_dir.join("agency");
     let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+    let root = project_root(workgraph_dir);
+    let coordination_owner = coordination_owner_hint(&root);
     // The sender must be a confirmed human; resolve their display name + bot.
     let binding = bindings.find_by_identity(Some(sender), Some(sender_display));
     let (recipient, bot) = match binding {
         Some(b) if b.confirmed => (
             b.name.clone(),
-            b.bot_id.clone().unwrap_or_else(|| "otto".to_string()),
+            b.bot_id
+                .clone()
+                .unwrap_or_else(|| coordination_owner.clone()),
         ),
         _ => return None,
     };
 
     let rem = reminder::intent_to_reminder(&intent, &recipient, &bot);
-    let root = project_root(workgraph_dir);
     let path = AdHocStore::path(&root);
     let mut store = AdHocStore::load(&path);
     if store.add(rem) {
@@ -4585,6 +4588,7 @@ pub fn run_remind(
     };
 
     let root = project_root(workgraph_dir);
+    let coordination_owner = coordination_owner_hint(&root);
     let now = match now_override {
         Some(s) => parse_naive_now(s)
             .with_context(|| format!("invalid --now '{s}', expected YYYY-MM-DDTHH:MM"))?,
@@ -4623,7 +4627,7 @@ pub fn run_remind(
         let bot = bindings
             .find_by_name_ci(&who)
             .and_then(|b| b.bot_id.clone())
-            .unwrap_or_else(|| "otto".to_string());
+            .unwrap_or_else(|| coordination_owner.clone());
         let rem = reminder::intent_to_reminder(&intent, &who, &bot);
 
         let path = AdHocStore::path(&root);
@@ -5438,6 +5442,7 @@ pub fn run_digest(
         .collect();
 
     let config = load_telegram_config().unwrap_or_default();
+    let coordination_owner = coordination_owner_hint(&root);
     let policy = DigestPolicy::default();
     let store_path = DigestStore::path(&root);
     let mut store = DigestStore::load(&store_path);
@@ -5490,11 +5495,16 @@ pub fn run_digest(
         let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
         rt.block_on(async {
             for (member, text) in &due {
-                // Resolve the recipient's DM target; the digest is the household
-                // concierge's calm summary, so it fronts as the recipient's own
-                // bot when bound, else Otto (see `resolve_dm_target`).
+                // Resolve the recipient's DM target. A bound bot wins; otherwise
+                // prefer the project-configured coordination owner, then let
+                // `resolve_dm_target` fall back explicitly to any configured bot.
                 let (target, bot_id, _bot) =
-                    match resolve_dm_target(&config, &bindings, member, "otto") {
+                    match resolve_dm_target(
+                        &config,
+                        &bindings,
+                        member,
+                        &coordination_owner,
+                    ) {
                         Some(t) => t,
                         None => {
                             eprintln!(
@@ -5647,6 +5657,17 @@ fn resolve_dm_target(
     }
     // 3) any bot.
     bots.first().map(|(id, b)| (target, id.clone(), b.clone()))
+}
+
+/// The project-authored voice for proactive coordination messages.
+///
+/// An empty result is intentional: callers then persist no guessed persona and
+/// [`resolve_dm_target`] falls through to an explicitly configured bot.
+fn coordination_owner_hint(root: &Path) -> String {
+    ownership::OwnerMap::load(root)
+        .owner_for_domain(ownership::Domain::Coordination)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Fire due errand nudges as part of the `wg telegram remind` tick.
@@ -7762,6 +7783,119 @@ mod tests {
             }
             other => panic!("pin over silence must force a One election, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn proactive_messages_use_the_configured_coordination_owner() {
+        use worksgood::notify::reminder::AdHocStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "garden-relay"
+name = "Garden Relay"
+domains = ["coordination"]
+
+[[agent]]
+id = "pantry-relay"
+name = "Pantry Relay"
+domains = ["cooking"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
+
+        let now =
+            chrono::NaiveDateTime::parse_from_str("2026-07-12T10:00", "%Y-%m-%dT%H:%M").unwrap();
+        assert!(
+            try_register_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "remind me tomorrow at 7pm to lock the patio",
+                now,
+            )
+            .is_some()
+        );
+        run_remind(
+            &wg,
+            false,
+            false,
+            Some("remind me Tuesday at 8am to set out the bins"),
+            Some("Household Member"),
+            Some("2026-07-12T10:00"),
+            false,
+        )
+        .unwrap();
+
+        let store = AdHocStore::load(&AdHocStore::path(root));
+        assert_eq!(store.reminders.len(), 2);
+        assert!(
+            store
+                .reminders
+                .iter()
+                .all(|reminder| reminder.bot == "garden-relay"),
+            "both registration seams must persist only the configured coordination owner: {:?}",
+            store.reminders,
+        );
+
+        let bindings = TelegramBindingMap::load(&wg.join("agency")).unwrap();
+        assert!(
+            bindings
+                .bindings
+                .iter()
+                .all(|binding| binding.bot_id.is_none()),
+            "the fixture must exercise the missing-bot binding path",
+        );
+        let mut bots = HashMap::new();
+        bots.insert(
+            "first-fallback".to_string(),
+            TelegramBotConfig {
+                bot_token: "100:AAA".to_string(),
+                chat_id: "-1001".to_string(),
+                agent_id: Some("pantry-relay".to_string()),
+                username: None,
+            },
+        );
+        bots.insert(
+            "coordination-channel".to_string(),
+            TelegramBotConfig {
+                bot_token: "200:BBB".to_string(),
+                chat_id: "-1002".to_string(),
+                agent_id: Some("garden-relay".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+        let hint = coordination_owner_hint(root);
+        let (_, bot_id, _) =
+            resolve_dm_target(&config, &bindings, "Household Member", &hint).unwrap();
+        assert_eq!(
+            bot_id, "coordination-channel",
+            "a digest for an unbound member must use the configured coordination voice",
+        );
+    }
+
+    #[test]
+    fn proactive_owner_hint_is_empty_without_a_valid_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(coordination_owner_hint(dir.path()), "");
+
+        std::fs::write(dir.path().join("household.toml"), "agent = [").unwrap();
+        assert_eq!(
+            coordination_owner_hint(dir.path()),
+            "",
+            "malformed configuration must not manufacture a persona id",
+        );
     }
 
     #[test]
