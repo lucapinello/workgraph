@@ -6,11 +6,11 @@
 //! Every command is one row of [`FAMILY_COMMANDS`]. A row declares:
 //!
 //! * `keyword` — the slash word (`"/dinner"`),
-//! * `owner` — the bot id whose voice answers in the group (`"bruno"`),
+//! * `domain` — the household domain whose configured owner answers in the group,
 //! * `description` — the one-line `/help` + Telegram autocomplete blurb
 //!   (family voice, docs/04),
 //! * `data_source` — a short label of where the answer comes from (docs/debug),
-//! * `kind` — [`CommandKind::Single`] (one reply from `owner`) or
+//! * `kind` — [`CommandKind::Single`] (one reply from the domain owner) or
 //!   [`CommandKind::Roster`] (`/standup`: one post per voice), and
 //! * `compose` — a **pure** function `fn(&CommandContext) -> String` that
 //!   renders the reply from live data (the graph, `notify.toml`, and the parsed
@@ -24,19 +24,18 @@
 //! # Exactly-once and all-bots-off safe
 //!
 //! Commands ride on the same dedupe + election layer as everything else. The
-//! single `wg telegram listen` process de-duplicates the four copies of a group
+//! single `wg telegram listen` process de-duplicates the copies of a group
 //! message (privacy-off delivers each `/command` to every bot) down to one, then
-//! composes a single reply and sends it **as the owner bot**. One orchestrator,
+//! composes a single reply and sends it **as the configured owner bot**. One orchestrator,
 //! one send ⇒ exactly-once, regardless of how many bots are muted.
 //!
 //! # Group vs 1:1 (the voice choice)
 //!
-//! * **Group** — the *owner* answers: `/dinner` is always Bruno's voice, even if
-//!   another bot happened to receive the copy that won dedupe. This keeps each
-//!   command in its natural persona.
+//! * **Group** — the command domain's configured owner answers, even if another
+//!   bot happened to receive the copy that won dedupe.
 //! * **1:1** — the bot **you messaged** answers, in its own send path, with the
 //!   same composed content. We deliberately do *not* relay a 1:1 `/dinner` over
-//!   to Bruno's DM thread: the person asked *this* bot, so *this* bot replies.
+//!   to another DM thread: the person asked *this* bot, so *this* bot replies.
 //!   The content is identical (same `compose`), only the sending bot differs.
 //!   Documented in docs/09 §commands.
 
@@ -45,6 +44,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use super::family_plan::{self, PlanDoc};
+use super::ownership::{Domain, OwnerMap};
 use super::telegram::TelegramConfig;
 use super::telegram_standup::{self, humanize_title, DEFAULT_ROSTER};
 use crate::graph::{Status, WorkGraph};
@@ -68,8 +68,8 @@ pub type ComposeFn = fn(&CommandContext<'_>) -> String;
 pub struct FamilyCommand {
     /// The slash keyword, lowercase, with leading slash, e.g. `"/dinner"`.
     pub keyword: &'static str,
-    /// The bot id whose voice owns this command in the group, e.g. `"bruno"`.
-    pub owner: &'static str,
+    /// The household domain whose configured owner answers in the group.
+    pub domain: Domain,
     /// One-line description (family voice) for `/help` and `setMyCommands`.
     pub description: &'static str,
     /// Where the answer comes from — a short label for docs / diagnostics.
@@ -84,6 +84,11 @@ impl FamilyCommand {
     /// The bare command name (no slash) as Telegram's `setMyCommands` wants it.
     pub fn name(&self) -> &str {
         self.keyword.trim_start_matches('/')
+    }
+
+    /// Resolve this command's voice from project-local household ownership.
+    pub fn owner<'a>(&self, owner_map: &'a OwnerMap) -> Option<&'a str> {
+        owner_map.owner_for_domain(self.domain)
     }
 }
 
@@ -113,7 +118,7 @@ pub struct CommandContext<'a> {
 pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     FamilyCommand {
         keyword: "/dinner",
-        owner: "bruno",
+        domain: Domain::Cooking,
         description: "What's for dinner tonight",
         data_source: "current week plan — today's dinner",
         kind: CommandKind::Single,
@@ -121,7 +126,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/shopping",
-        owner: "otto",
+        domain: Domain::Shopping,
         description: "This week's shopping list",
         data_source: "current week plan — shopping list",
         kind: CommandKind::Single,
@@ -129,7 +134,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/week",
-        owner: "otto",
+        domain: Domain::Coordination,
         description: "The week at a glance",
         data_source: "current week plan — meals + workouts; graph — confirmations",
         kind: CommandKind::Single,
@@ -137,7 +142,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/reminders",
-        owner: "otto",
+        domain: Domain::Calendar,
         description: "What's pending or coming up",
         data_source: "graph — parked human tasks + cron next-fire",
         kind: CommandKind::Single,
@@ -145,7 +150,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/standup",
-        owner: "otto",
+        domain: Domain::Coordination,
         description: "A quick check-in from the whole team",
         data_source: "graph — each voice's live tasks",
         kind: CommandKind::Roster,
@@ -153,7 +158,7 @@ pub static FAMILY_COMMANDS: &[FamilyCommand] = &[
     },
     FamilyCommand {
         keyword: "/help",
-        owner: "otto",
+        domain: Domain::Coordination,
         description: "Show what you can ask us",
         data_source: "the command table itself",
         kind: CommandKind::Single,
@@ -729,12 +734,19 @@ mod tests {
     }
 
     #[test]
-    fn owners_are_the_expected_voices() {
+    fn opaque_domain_owners_drive_command_voice() {
         let by = |kw: &str| FAMILY_COMMANDS.iter().find(|c| c.keyword == kw).unwrap();
-        assert_eq!(by("/dinner").owner, "bruno");
-        assert_eq!(by("/shopping").owner, "otto");
-        assert_eq!(by("/week").owner, "otto");
-        assert_eq!(by("/reminders").owner, "otto");
+        let owners = OwnerMap::from_pairs([
+            ("quartz", vec!["cooking", "recipes"]),
+            (
+                "harbor",
+                vec!["shopping", "calendar", "coordination"],
+            ),
+        ]);
+        assert_eq!(by("/dinner").owner(&owners), Some("quartz"));
+        assert_eq!(by("/shopping").owner(&owners), Some("harbor"));
+        assert_eq!(by("/week").owner(&owners), Some("harbor"));
+        assert_eq!(by("/reminders").owner(&owners), Some("harbor"));
         assert_eq!(by("/standup").kind, CommandKind::Roster);
     }
 }

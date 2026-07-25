@@ -4015,8 +4015,8 @@ fn human_agent_id_set(workgraph_dir: &Path) -> HashSet<String> {
 /// Orchestrate a single family command (`/dinner`, `/shopping`, `/week`,
 /// `/reminders`, `/help`) or the whole-roster `/standup`.
 ///
-/// * **Group** — a single-reply command is composed once and sent AS the
-///   command's owner bot (Bruno for `/dinner`), regardless of which bot's queue
+/// * **Group** — a single-reply command is composed once and sent as the
+///   command domain's project-configured owner, regardless of which bot's queue
 ///   delivered the surviving (deduped) copy. `/standup` fans out to the whole
 ///   roster via [`run_group_standup`].
 /// * **1:1** — the bot the user messaged (identified by `receiving_channel`,
@@ -4060,29 +4060,56 @@ pub async fn run_family_command(
         return Ok(());
     }
 
-    // Which bot sends: in a group, the command's owner; in a 1:1, the bot the
-    // user actually messaged (mapped from its channel_type). Fall back to the
-    // owner, then to any configured bot, so a reply always goes out.
+    // Which bot sends: in a group, the project-local domain owner; in a 1:1,
+    // the bot the user actually messaged. Ambiguous/missing mappings fail
+    // loudly rather than attributing the reply to an arbitrary configured bot.
     let bots = config.all_bots();
-    let want_id = if is_group {
-        cmd.owner.to_string()
+    let resolved = if is_group {
+        let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+        let owner = cmd.owner(&owner_map).with_context(|| {
+            format!(
+                "household.toml has no owner for the {} command domain",
+                cmd.domain.slug()
+            )
+        })?;
+        resolve_mentioned_bot(owner, config).with_context(|| {
+            format!(
+                "configured {} owner '{}' has no Telegram bot",
+                cmd.domain.slug(),
+                owner
+            )
+        })?
     } else {
-        receiving_channel
+        let receiving = receiving_channel
             .strip_prefix("telegram:")
-            .unwrap_or(receiving_channel)
-            .to_string()
+            .unwrap_or(receiving_channel);
+        if receiving.is_empty() || receiving == "telegram" || receiving == "default" {
+            if bots.len() != 1 {
+                anyhow::bail!(
+                    "direct {} reply has no unambiguous receiving Telegram bot",
+                    cmd.keyword
+                );
+            }
+            resolve_mentioned_bot(&bots[0].0, config)
+                .context("the sole configured Telegram bot could not be resolved")?
+        } else {
+            resolve_mentioned_bot(receiving, config).with_context(|| {
+                format!(
+                    "direct {} reply names unknown receiving bot '{}'",
+                    cmd.keyword, receiving
+                )
+            })?
+        }
     };
     let chosen = bots
         .iter()
-        .find(|(id, _)| id == &want_id)
-        .or_else(|| bots.iter().find(|(id, _)| id == cmd.owner))
-        .or_else(|| bots.first());
+        .find(|(id, _)| id == &resolved.bot_id);
     let (bot_id, bot) = match chosen {
         Some((id, bot)) => (id.clone(), bot.clone()),
-        None => {
-            eprintln!("No Telegram bots configured — cannot answer {}.", cmd.keyword);
-            return Ok(());
-        }
+        None => anyhow::bail!(
+            "resolved Telegram bot '{}' is not configured",
+            resolved.bot_id
+        ),
     };
 
     let channel = TelegramChannel::from_bot(bot_id.clone(), bot);
@@ -4253,13 +4280,16 @@ pub fn run_command(
         .unwrap_or_else(chrono::Utc::now);
 
     let text = compose_family_reply_on(workgraph_dir, &config, cmd, today, now);
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let owner = cmd.owner(&owner_map);
 
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "command": cmd.keyword,
-                "owner": cmd.owner,
+                "domain": cmd.domain.slug(),
+                "owner": owner,
                 "kind": format!("{:?}", cmd.kind),
                 "data_source": cmd.data_source,
                 "text": text,
