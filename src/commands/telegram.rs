@@ -237,7 +237,7 @@ impl WebLoginOutcome {
                 format!("You're signed in on {label} ✋")
             }
             WebLoginOutcome::UnknownUser => {
-                "I don't recognise you yet — ask the person who set up this home to add you to the household."
+                "I don't recognise you yet — ask someone already in the household to add you."
                     .to_string()
             }
             WebLoginOutcome::EmptyRoster | WebLoginOutcome::LinkExpired | WebLoginOutcome::NoSession => {
@@ -6921,7 +6921,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "I don't recognise you yet — ask the person who set up this home to add you to the household."
+            "I don't recognise you yet — ask someone already in the household to add you."
         );
         assert!(!reply.starts_with("You're signed in"));
     }
