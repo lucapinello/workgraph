@@ -1211,7 +1211,7 @@ pub fn has_infra_narration(reply: &str) -> bool {
 }
 
 static CLAUSE_SPLIT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:[.!?…]\s+|\s+[-•·—–]\s+|\r?\n+)")
+    Regex::new(r"(?:[.!?…;；]\s+|\s+[-•·—–]\s+|\r?\n+)")
         .expect("valid family-clause splitter")
 });
 
@@ -1226,9 +1226,14 @@ fn family_clauses(text: &str) -> Vec<String> {
         } else {
             separator.start()
         };
-        let clause = text[start..end].trim();
+        let mut clause = text[start..end].trim().to_string();
+        if first.is_some_and(|c| matches!(c, ';' | '；'))
+            && !clause.ends_with(['.', '!', '?', '…'])
+        {
+            clause.push('.');
+        }
         if !clause.is_empty() {
-            clauses.push(clause.to_string());
+            clauses.push(clause);
         }
         start = separator.end();
     }
@@ -3280,6 +3285,20 @@ label = "Fallback Member"
                 &roster
             ),
             "Check before serving, then pass it to Household Member."
+        );
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Dinner is ready; Zephyra will join us.",
+                &roster,
+            ),
+            "Dinner is ready.",
+            "a semicolon boundary preserves the grounded clause before a phantom claim",
+        );
+        let ordinary = "Dinner is ready; dessert follows, with fruit and cream.";
+        assert_eq!(
+            scrub_off_roster_addressees(ordinary, &roster),
+            ordinary,
+            "safe semicolon and comma punctuation stays byte-identical",
         );
         let unconfigured = FamilyVoiceRoster::default();
         let raw = "Check with Zephyra before serving.";
