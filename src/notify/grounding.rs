@@ -2061,7 +2061,7 @@ pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
 // locked in for Saturday yet" while the table has "Saturday: Baked white fish" —
 // is rewritten to the honest answer (the dish). The gateway's never-claim-empty
 // guard cannot catch these because engine-composed replies write to the feed via
-// FeedMirrorSink in the ENGINE process, so the guard MUST live here.
+// the scoped family-reply sink in the ENGINE process, so the guard MUST live here.
 // ---------------------------------------------------------------------------
 
 /// The parsed `WG_WEEK_CONTEXT`: which weekdays have a planned dinner (keyed by

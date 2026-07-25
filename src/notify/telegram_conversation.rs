@@ -1181,7 +1181,7 @@ async fn deliver_reply(
     authorized_handoff: Option<&str>,
 ) -> Result<()> {
     // Engine-originated replies never pass through the gateway finalizer:
-    // FeedMirrorSink mirrors the bytes sent here. Keep this as the single
+    // The scoped family-reply sink mirrors the bytes sent here. Keep this as the single
     // dynamic-delivery choke point so composed replies, graph status, graceful
     // glitches, and legacy session replies all receive the same guard.
     let guarded = grounding::enforce_family_voice_with(
@@ -1783,7 +1783,7 @@ async fn finalize_composed_reply(
     // that asserts a planned day is empty (and doesn't already name the dish) is
     // rewritten to the honest answer. Runs on EVERY reply (like anti-fabrication)
     // and only when the env carries a table — unset → no-op. MUST live here in the
-    // ENGINE process: engine-composed replies write to the feed via FeedMirrorSink
+    // ENGINE process: engine-composed replies write through the scoped family-reply sink
     // here, so the gateway's own never-claim-empty guard never sees them.
     if let Ok(raw) = std::env::var("WG_WEEK_CONTEXT") {
         let wc = grounding::parse_week_context(&raw);
@@ -1816,7 +1816,7 @@ async fn finalize_composed_reply(
 
     // FAMILY-VISIBLE COPY GUARD. This is intentionally the LAST transform
     // before both persistence and delivery: engine replies flow from here into
-    // the session outbox and the listener's FeedMirrorSink, so the gateway's
+    // the session outbox and the listener's scoped family-reply sink, so the gateway's
     // JavaScript finalizer never sees them. Load names only from this project's
     // household personas + live/fallback human roster, then remove self-attribution,
     // terminal persona handoffs, plumbing/process narration, machine jargon,
@@ -2101,7 +2101,7 @@ async fn await_session_reply(
             if guarded != reply.content {
                 // A legacy session produced the outbox entry before this bridge
                 // saw it. Rewrite that exact entry so the persisted/TUI copy
-                // matches the guarded FeedMirrorSink send.
+                // matches the guarded scoped family-reply send.
                 if let Err(error) = chat::edit_outbox_message_ref(
                     workgraph_dir,
                     session_ref,
@@ -4476,7 +4476,7 @@ domains = ["calendar"]
         assert_eq!(
             outbox.last().map(|m| m.content.as_str()),
             Some(delivered.as_str()),
-            "the guarded copy is persisted before FeedMirrorSink can mirror it"
+            "the guarded copy is persisted before the scoped reply sink can mirror it"
         );
     }
 
