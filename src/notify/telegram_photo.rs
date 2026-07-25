@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use super::grounding::{self, FamilyVoiceRoster};
 use super::IncomingMessage;
 
 // ---------------------------------------------------------------------------
@@ -765,6 +766,7 @@ pub async fn run_photo_shopping_turn(
     downloader: &dyn PhotoDownloader,
     composer: &dyn VisionComposer,
     gateway: &dyn ShoppingGateway,
+    family_roster: &FamilyVoiceRoster,
     scratch_dir: &Path,
 ) -> Result<PhotoTurnResult> {
     // 1. Download (cap the album; the cap is the caller's responsibility to
@@ -830,6 +832,10 @@ pub async fn run_photo_shopping_turn(
     } else {
         verdict.reply_text
     };
+    // Photo replies bypass telegram_conversation's finalizer and go straight to
+    // BotReplySink. Guard the model copy here so every caller receives exactly
+    // the family-safe text that may be delivered.
+    let reply_text = grounding::enforce_family_voice(&reply_text, family_roster);
 
     Ok(PhotoTurnResult { reply_text, actions })
 }
@@ -1152,6 +1158,13 @@ mod tests {
         }
     }
 
+    fn family_roster() -> FamilyVoiceRoster {
+        FamilyVoiceRoster::from_names(
+            ["Nora", "Bruno", "Coach Mira", "Otto"],
+            ["Household Member"],
+        )
+    }
+
     #[tokio::test]
     async fn photo_turn_composes_with_image_and_list_then_applies_via_endpoints() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1182,6 +1195,7 @@ mod tests {
             &FakeDownloader,
             &composer,
             &gateway,
+            &family_roster(),
             tmp.path(),
         )
         .await
@@ -1205,5 +1219,65 @@ mod tests {
 
         // Temp files cleaned up.
         assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn photo_turn_guards_model_copy_without_losing_shopping_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let turn = CoalescedPhotoTurn {
+            media_group_id: None,
+            file_ids: vec!["f1".into()],
+            caption: "what do we still need?".into(),
+            chat_id: Some("-100".into()),
+            chat_type: Some("group".into()),
+            sender: "member-1".into(),
+        };
+        let composer = RecordingComposer {
+            reply: concat!(
+                "Bruno 💬 **Chard** is still needed. ",
+                "Zephyra will join us. ",
+                "I'll pull that from the live gateway. ",
+                "Dispatcher healthy. Otto's got this one.\n",
+                "SHOPPING_UPDATE: have=[chickpeas]; need=[chard]",
+            )
+            .into(),
+            seen_images: std::sync::Mutex::new(Vec::new()),
+            seen_prompt: std::sync::Mutex::new(String::new()),
+        };
+        let gateway = FakeGateway {
+            items: vec![item("p:s|chickpeas", "Chickpeas", false)],
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let result = run_photo_shopping_turn(
+            &turn,
+            None,
+            &PhotoLimits::default(),
+            &FakeDownloader,
+            &composer,
+            &gateway,
+            &family_roster(),
+            tmp.path(),
+        )
+        .await
+        .expect("turn ok");
+
+        assert_eq!(result.reply_text, "Chard is still needed.");
+        assert_eq!(
+            result.actions,
+            vec![
+                ShoppingAction::CrossOff {
+                    key: "p:s|chickpeas".into(),
+                    text: "Chickpeas".into(),
+                },
+                ShoppingAction::Add {
+                    text: "chard".into(),
+                },
+            ],
+            "guarding the reply must not discard the already-planned list mutations",
+        );
+        let calls = gateway.calls.lock().unwrap().clone();
+        assert!(calls.contains(&"toggle p:s|chickpeas true".to_string()));
+        assert!(calls.contains(&"add chard".to_string()));
     }
 }

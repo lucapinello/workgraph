@@ -1881,6 +1881,7 @@ async fn handle_photo_shopping_turn(
 ) -> Result<()> {
     use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_conversation::ReplySink as _;
+    use worksgood::notify::grounding;
     use worksgood::notify::telegram_photo as photo;
 
     // The photo `file_id` is only valid for the bot that received it, so we must
@@ -1915,6 +1916,8 @@ async fn handle_photo_shopping_turn(
         .session_ref()
         .and_then(|s| convo::read_session_summary(workgraph_dir, s));
     let gateway = photo::HttpShoppingGateway::from_env();
+    let family_roster =
+        grounding::load_family_voice_roster(&project_root(workgraph_dir), workgraph_dir);
 
     // A per-message scratch dir for the temp image(s); removed after the turn.
     let scratch = std::env::temp_dir().join(format!(
@@ -1931,6 +1934,7 @@ async fn handle_photo_shopping_turn(
         receiving,
         &composer,
         &gateway,
+        &family_roster,
         &scratch,
     )
     .await;
