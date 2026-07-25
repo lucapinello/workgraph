@@ -1372,30 +1372,68 @@ pub fn is_team_directed_ask(text: &str) -> bool {
 /// never configured is never elected. Explicit addressing (mention / name / reply)
 /// is resolved BEFORE this in [`elect_responders`], so a named voice always wins.
 ///
-/// The owner map is the shipped Casa roster ([`OwnerMap::casa_default`]); a
-/// household that reassigns domains still gets authoritative ownership at the
-/// creation choke point (which reads `household.toml`), and its election voice
-/// follows the default roster.
+/// `owners` is the household's OWN roster (`household.toml` via
+/// [`OwnerMap::load`], the shipped Casa roster when a household declares none),
+/// so the VOICE that answers is the persona that household configured — not a
+/// name compiled into the binary.
 ///
 /// [`ownership::classify_domain`]: crate::notify::ownership::classify_domain
-/// [`OwnerMap::casa_default`]: crate::notify::ownership::OwnerMap::casa_default
+/// [`OwnerMap::load`]: crate::notify::ownership::OwnerMap::load
 fn domain_voice(
     text: &str,
     config: &TelegramConfig,
+    owners: &crate::notify::ownership::OwnerMap,
 ) -> Option<(ResolvedBot, crate::notify::ownership::Domain)> {
-    use crate::notify::ownership::{classify_domain, OwnerMap};
+    use crate::notify::ownership::classify_domain;
     let domain = classify_domain(text);
-    let map = OwnerMap::casa_default();
-    let owner = map.owner_for_domain(domain)?;
-    // An Otto-owned domain (calendar / shopping / coordination) or ambiguous ask
-    // keeps the concierge rule — only a more-specific in-domain voice refines it.
-    if owner.eq_ignore_ascii_case(CONCIERGE_BOT) {
+    let owner = owners.owner_for_domain(domain)?;
+    // A coordination-owned domain (calendar / shopping / coordination) or an
+    // ambiguous ask keeps the concierge rule — only a more-specific in-domain
+    // voice refines it.
+    if owner.eq_ignore_ascii_case(&coordination_voice_id(owners)) {
         return None;
     }
     let bot = resolve_mentioned_bot(owner, config)?;
     Some((bot, domain))
 }
 
+/// The persona id that fronts the group when a message names no one — resolved
+/// from the household's own roster, NOT compiled in.
+///
+/// [`CONCIERGE_BOT`] is the shipped Casa *default*, not a law. A household whose
+/// `household.toml` hands `coordination` to some other persona has that persona
+/// front its group; the compiled id is used only when the roster declares no
+/// coordination owner at all. For the shipped roster the two agree, so this
+/// changes nothing there.
+pub fn coordination_voice_id(owners: &crate::notify::ownership::OwnerMap) -> String {
+    use crate::notify::ownership::Domain;
+    owners
+        .owner_for_domain(Domain::Coordination)
+        .unwrap_or(CONCIERGE_BOT)
+        .to_string()
+}
+
+/// Resolve the bot that fronts the group's coordination role (see
+/// [`coordination_voice_id`]), falling back to the compiled [`CONCIERGE_BOT`]
+/// handle when the configured coordination persona has no bot of its own — a
+/// mixed config (roster renamed, notify.toml not yet) still answers instead of
+/// going silent.
+fn resolve_coordination_bot(
+    config: &TelegramConfig,
+    owners: &crate::notify::ownership::OwnerMap,
+) -> Option<ResolvedBot> {
+    resolve_mentioned_bot(&coordination_voice_id(owners), config)
+        .or_else(|| resolve_mentioned_bot(CONCIERGE_BOT, config))
+}
+
+/// Elect against the shipped Casa roster — the compatibility shape for callers
+/// that have no project root to read `household.toml` from (and for the unit
+/// tests, which assert the shipped roster's behaviour).
+///
+/// Live listener paths call [`elect_responders_with_owners`] with
+/// [`OwnerMap::load`] so a household's OWN roster decides who fronts the group.
+///
+/// [`OwnerMap::load`]: crate::notify::ownership::OwnerMap::load
 pub fn elect_responders(
     chat_type: Option<&str>,
     chat_id: Option<&str>,
@@ -1405,6 +1443,34 @@ pub fn elect_responders(
     sender_is_bot: bool,
     human_count: usize,
     config: &TelegramConfig,
+) -> Election {
+    elect_responders_with_owners(
+        chat_type,
+        chat_id,
+        text,
+        mention_usernames,
+        reply_to_bot,
+        sender_is_bot,
+        human_count,
+        config,
+        &crate::notify::ownership::OwnerMap::casa_default(),
+    )
+}
+
+/// [`elect_responders`], but with the household's own roster supplied so the
+/// domain voice and the group-fronting concierge are both CONFIGURED roles
+/// rather than compiled ids.
+#[allow(clippy::too_many_arguments)]
+pub fn elect_responders_with_owners(
+    chat_type: Option<&str>,
+    chat_id: Option<&str>,
+    text: &str,
+    mention_usernames: &[String],
+    reply_to_bot: Option<&str>,
+    sender_is_bot: bool,
+    human_count: usize,
+    config: &TelegramConfig,
+    owners: &crate::notify::ownership::OwnerMap,
 ) -> Election {
     // Fix #0 — the bot-loop guard. UNCONDITIONAL and first: a message sent by a
     // bot (ANY bot, including our own four seen on a sibling bot's poller) is
@@ -1508,7 +1574,7 @@ pub fn elect_responders(
         // whose owner is not the concierge (food → Bruno/Nora, workouts → Mira),
         // that owner ANSWERS as the voice. Otherwise the unaddressed ask is the
         // concierge's (Otto), exactly as before.
-        if let Some((bot, domain)) = domain_voice(text, config) {
+        if let Some((bot, domain)) = domain_voice(text, config, owners) {
             return Election::One {
                 bot,
                 reply_chat,
@@ -1516,7 +1582,7 @@ pub fn elect_responders(
                 addressed_by: AddressedBy::Domain(domain),
             };
         }
-        return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
+        return match resolve_coordination_bot(config, owners) {
             Some(bot) => Election::One {
                 bot,
                 reply_chat,
@@ -1540,7 +1606,7 @@ pub fn elect_responders(
     // yields, falling through to the domain routing below.
     if is_collective_address(text) {
         let explicit_broadcast = has_collective_trigger(text) || is_greeting_collective(text);
-        if explicit_broadcast || domain_voice(text, config).is_none() {
+        if explicit_broadcast || domain_voice(text, config, owners).is_none() {
             return Election::All {
                 reply_chat,
                 body: text.to_string(),
@@ -1567,7 +1633,7 @@ pub fn elect_responders(
         // NOT classifiable into a non-concierge domain (a bare "hey", "goodnight",
         // "hey guys are you around?") does the greeting shape earn a collective
         // whole-roster greeting.
-        let domain = domain_voice(text, config);
+        let domain = domain_voice(text, config, owners);
         if domain.is_none() && is_greeting_shaped(text) {
             return Election::All {
                 reply_chat,
@@ -1585,7 +1651,7 @@ pub fn elect_responders(
                 addressed_by: AddressedBy::Domain(domain),
             };
         }
-        return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
+        return match resolve_coordination_bot(config, owners) {
             Some(bot) => Election::One {
                 bot,
                 reply_chat,
@@ -1659,6 +1725,7 @@ fn strip_mention(text: &str, username: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::ownership::OwnerMap;
     use crate::notify::telegram::TelegramBotConfig;
     use std::collections::HashMap;
 
@@ -3709,5 +3776,159 @@ mod tests {
             }
             other => panic!("expected One(nora) for the fennel ask, got {other:?}"),
         }
+    }
+
+    // ---- Configured roles, not compiled ids (p1-engine-photo-config-fixture) --
+    //
+    // A household that composes its OWN family gets no `otto` and no `bruno`.
+    // Election must read WHO OWNS WHAT from that household's roster, so a
+    // message naming nobody reaches the persona it declared for `coordination`
+    // and a food-shaped ask reaches the one it declared for `cooking`.
+
+    /// A two-persona roster whose ids appear on no shipped list and contain no
+    /// domain word — `domains` is the only ownership signal available.
+    fn opaque_config() -> TelegramConfig {
+        cfg_with_bots(&[
+            ("wren", "-100999", Some("wren"), Some("wren_house_bot")),
+            ("tally", "-100999", Some("tally"), Some("tally_house_bot")),
+        ])
+    }
+
+    fn opaque_owners(cooking: &str, coordination: &str) -> OwnerMap {
+        OwnerMap::from_pairs(vec![
+            (cooking, vec!["meals", "cooking", "recipes"]),
+            (coordination, vec!["calendar", "coordination", "shopping"]),
+        ])
+    }
+
+    fn elect_opaque(text: &str, owners: &OwnerMap) -> Election {
+        elect_responders_with_owners(
+            Some("supergroup"),
+            Some("-100999"),
+            text,
+            &[],
+            None,
+            false,
+            1,
+            &opaque_config(),
+            owners,
+        )
+    }
+
+    fn elected_agent(election: &Election) -> Option<String> {
+        match election {
+            Election::One { bot, .. } => bot.agent_id.clone(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn coordination_voice_comes_from_the_household_not_the_compiled_default() {
+        // Declared coordination owner wins…
+        assert_eq!(
+            coordination_voice_id(&opaque_owners("wren", "tally")),
+            "tally"
+        );
+        // …and reassigning it in the roster moves who fronts the group.
+        assert_eq!(
+            coordination_voice_id(&opaque_owners("tally", "wren")),
+            "wren"
+        );
+        // The shipped roster still resolves to the shipped concierge, so nothing
+        // changes for a household that never renamed its cast.
+        assert_eq!(
+            coordination_voice_id(&OwnerMap::casa_default()),
+            CONCIERGE_BOT
+        );
+        // A roster that declares no coordination owner at all falls back to the
+        // compiled default rather than going silent.
+        assert_eq!(
+            coordination_voice_id(&OwnerMap::from_pairs(vec![("wren", vec!["cooking"])])),
+            CONCIERGE_BOT
+        );
+    }
+
+    #[test]
+    fn unaddressed_message_reaches_the_configured_coordinator() {
+        // Nobody is named and the content is not food/workouts — this is the
+        // concierge rule, resolved against the household's own roster. Before the
+        // fix this went to `Silence(NoVoicesConfigured)` because the compiled
+        // `otto` had no bot in this config.
+        let election = elect_opaque("can someone take a look at this", &opaque_owners("wren", "tally"));
+        assert_eq!(
+            elected_agent(&election).as_deref(),
+            Some("tally"),
+            "the persona declaring `coordination` fronts the group, got {election:?}"
+        );
+        assert!(
+            matches!(
+                election,
+                Election::One {
+                    addressed_by: AddressedBy::Concierge,
+                    ..
+                }
+            ),
+            "the concierge RULE still fires — only the persona it resolves to is configured"
+        );
+    }
+
+    #[test]
+    fn moving_coordination_in_the_roster_moves_who_answers() {
+        let text = "can someone take a look at this";
+        assert_eq!(
+            elected_agent(&elect_opaque(text, &opaque_owners("wren", "tally"))).as_deref(),
+            Some("tally")
+        );
+        // Same config, same message: only the roster moved.
+        assert_eq!(
+            elected_agent(&elect_opaque(text, &opaque_owners("tally", "wren"))).as_deref(),
+            Some("wren"),
+            "routing must follow `domains`, not recognise an id"
+        );
+    }
+
+    #[test]
+    fn food_ask_reaches_the_configured_cook_not_the_coordinator() {
+        let text = "what should we cook for dinner tomorrow?";
+        let election = elect_opaque(text, &opaque_owners("wren", "tally"));
+        assert_eq!(
+            elected_agent(&election).as_deref(),
+            Some("wren"),
+            "the persona declaring `cooking`/`meals` answers a food ask, got {election:?}"
+        );
+        // Reassign the kitchen and the food ask follows it.
+        assert_eq!(
+            elected_agent(&elect_opaque(text, &opaque_owners("tally", "wren"))).as_deref(),
+            Some("tally")
+        );
+    }
+
+    #[test]
+    fn shipped_roster_election_is_unchanged_by_the_owner_map_seam() {
+        // The compatibility entry point must keep behaving exactly as before:
+        // an unaddressed ask is the shipped concierge's, a food ask the cook's.
+        let cfg = casa_config();
+        let unaddressed = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "can someone take a look at this",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+        );
+        assert_eq!(elected_agent(&unaddressed).as_deref(), Some(CONCIERGE_BOT));
+        let food = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "how do I cook this risotto?",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+        );
+        assert_eq!(elected_agent(&food).as_deref(), Some("bruno"));
     }
 }

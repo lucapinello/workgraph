@@ -20,10 +20,11 @@ use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_voice;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::ownership;
+use worksgood::notify::ownership::OwnerMap;
 use worksgood::notify::telegram_group::{
-    CONCIERGE_BOT, Election, NaturalRoute, elect_group_inbound, elect_responders,
-    election_decision_summary, is_discussion_ask, parse_at_mention_tokens, resolve_mentioned_bot,
-    route_natural,
+    CONCIERGE_BOT, Election, NaturalRoute, elect_group_inbound,
+    elect_responders_with_owners, election_decision_summary, is_discussion_ask,
+    parse_at_mention_tokens, resolve_mentioned_bot, route_natural,
 };
 
 /// Whether an inbound listener message may fire a FAMILY command and/or the
@@ -1200,7 +1201,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // the group back to the conservative silence rule without a restart.
             let human_count = human_agent_id_set(&workgraph_dir).len();
 
-            let election = elect_responders(
+            let election = elect_responders_with_owners(
                 msg.chat_type.as_deref(),
                 msg.chat_id.as_deref(),
                 &msg.body,
@@ -1211,6 +1212,9 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 msg.sender_is_bot,
                 human_count,
                 &route_config,
+                // The household's OWN roster decides the domain voice and who
+                // fronts the group when nobody is named — never a compiled id.
+                &OwnerMap::load(&project_root(&workgraph_dir)),
             );
 
             // Observability: exactly ONE decision line per consumed message —
@@ -2354,7 +2358,7 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
 /// `wg telegram elect` — show who would respond to a group message in
 /// all-bots-privacy-off mode, without sending anything.
 ///
-/// Runs the exact [`elect_responders`] decision the listener uses on a deduped
+/// Runs the exact [`elect_responders_with_owners`] decision the listener uses on a deduped
 /// message and prints the outcome: `mention` / `name` / `reply-chain` route to
 /// one voice, `collective` fans out to the whole roster, `otto` coordinates a
 /// team-directed ask, and `silence` means the bots stay out. Mentions are
@@ -2380,7 +2384,7 @@ pub fn run_elect(
     let human_count =
         human_count_override.unwrap_or_else(|| human_agent_id_set(workgraph_dir).len());
 
-    let election = elect_responders(
+    let election = elect_responders_with_owners(
         Some(chat_type),
         Some(chat_id),
         message,
@@ -2391,6 +2395,7 @@ pub fn run_elect(
         false,
         human_count,
         &config,
+        &OwnerMap::load(&project_root(workgraph_dir)),
     );
 
     // (kind, who, addressed_by, body) — `who` is the elected agent for the
@@ -2464,7 +2469,7 @@ pub fn run_elect(
 /// `wg telegram discuss --dry-run` — show whether a group message would run a
 /// DISCUSSION ROUND, and the planned round, without sending anything.
 ///
-/// Runs the exact [`elect_responders`] decision the listener uses, then applies
+/// Runs the exact [`elect_responders_with_owners`] decision the listener uses, then applies
 /// the same [`is_discussion_ask`] gate the live `Election::All` handler uses to
 /// split a collective election into a discussion round vs today's four
 /// independent hellos. Prints the category and, for a round, the voices in
@@ -2480,7 +2485,7 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
     let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
     let human_count = human_agent_id_set(workgraph_dir).len();
 
-    let election = elect_responders(
+    let election = elect_responders_with_owners(
         Some("supergroup"),
         Some("-1000000000001"),
         message,
@@ -2490,6 +2495,7 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
         false,
         human_count,
         &config,
+        &OwnerMap::load(&project_root(workgraph_dir)),
     );
 
     let is_discussion = is_discussion_ask(message);
@@ -2622,7 +2628,7 @@ pub fn run_compose_prompt(
 /// Feeds the raw `getUpdates` element through the SAME boundary the live
 /// listener uses: [`decode_update`] (which reads the Telegram entities so a
 /// bare `?` is distinguished from a real `/help`), then [`command_gate`] and
-/// [`elect_responders`]. Prints the decision — is it a command, and if not, who
+/// [`elect_responders_with_owners`]. Prints the decision — is it a command, and if not, who
 /// the election routes it to. This is the `fix-command-leaks` proof: a bare `?`
 /// or `@mention ?` must decide `conversation` with ZERO commands and never
 /// touch the operator claim/done path.
@@ -2692,7 +2698,7 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
     // Membership-aware silence: mirror the listener by counting onboarded humans
     // so the diagnostic's election matches the live decision.
     let human_count = human_agent_id_set(workgraph_dir).len();
-    let election = elect_responders(
+    let election = elect_responders_with_owners(
         msg.chat_type.as_deref(),
         msg.chat_id.as_deref(),
         &msg.body,
@@ -2701,6 +2707,7 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
         msg.sender_is_bot,
         human_count,
         &config,
+        &OwnerMap::load(&project_root(workgraph_dir)),
     );
     let (elected, addressed_by): (Option<String>, Option<String>) = match &election {
         Election::One { bot, addressed_by, .. } => (
@@ -2739,7 +2746,7 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
 ///
 /// Decodes the raw update(s) through the SAME `decode_update` boundary the
 /// listener uses (photo `file_id`, caption, media group), coalesces album
-/// frames into per-turn units, runs the real `elect_responders` decision on the
+/// frames into per-turn units, runs the real `elect_responders_with_owners` decision on the
 /// first turn's caption (who a captioned photo routes to), and — when a fixture
 /// `--reply` + `--list` are given — parses the model's `SHOPPING_UPDATE:` tail
 /// and prints the exact mutations that WOULD be applied through the gateway
@@ -2785,7 +2792,7 @@ pub fn run_photo_plan(
         Some(turn) => {
             let mention_usernames = parse_at_mention_tokens(&turn.caption);
             let human_count = human_agent_id_set(workgraph_dir).len();
-            let election = elect_responders(
+            let election = elect_responders_with_owners(
                 turn.chat_type.as_deref(),
                 turn.chat_id.as_deref(),
                 &turn.caption,
@@ -2794,6 +2801,9 @@ pub fn run_photo_plan(
                 false,
                 human_count,
                 &config,
+                // An UNCAPTIONED photo names nobody, so it falls to whichever
+                // persona this household's `household.toml` gives coordination.
+                &OwnerMap::load(&project_root(workgraph_dir)),
             );
             let who = match &election {
                 Election::One { bot, .. } => {
@@ -3402,7 +3412,7 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 ///
 /// This command runs the SAME pipeline the listener runs on a group message,
 /// without a live socket: it elects responder(s) with the exact
-/// [`elect_responders`] table (@mention / addressed name / collective / concierge
+/// [`elect_responders_with_owners`] table (@mention / addressed name / collective / concierge
 /// / silence), then dispatches through the SAME senders + composer the listener
 /// uses — [`run_group_discussion`] / [`run_group_collective`] for a collective
 /// address, or the single-voice [`plan_conversation`] +
