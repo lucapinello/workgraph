@@ -990,7 +990,7 @@ fn edit_meal_dish(content: &str, day: Weekday, edit: &DishEdit) -> Option<String
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(h2) = trimmed.strip_prefix("## ") {
-            in_meals = h2.to_lowercase().contains("meal");
+            in_meals = family_plan::is_meals_section_heading(h2);
             out.push(line.to_string());
             continue;
         }
@@ -1416,6 +1416,23 @@ mod tests {
         }
     }
 
+    fn with_meals_heading(replacement: &str) -> String {
+        W29.lines()
+            .map(|line| {
+                if line
+                    .strip_prefix("## ")
+                    .map(family_plan::is_meals_section_heading)
+                    .unwrap_or(false)
+                {
+                    replacement
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     // ---- classification: each fast-lane op -------------------------------
 
     #[test]
@@ -1598,6 +1615,34 @@ mod tests {
         // Untouched days survive.
         assert!(doc.meals.iter().any(|m| m.weekday == "Mon" && m.dish.contains("curry")));
         assert_eq!(doc.meals.len(), 7, "no rows lost");
+    }
+
+    #[test]
+    fn fast_lane_apply_meal_swap_accepts_legacy_meals_heading() {
+        let legacy = with_meals_heading("## Meals");
+        let op = FastLaneOp::MealSwap {
+            day: Weekday::Fri,
+            dish: "tacos".into(),
+        };
+        let edited = apply_to_content("2026-W29", &legacy, &op).expect("legacy swap applies");
+        let doc = PlanDoc::parse("2026-W29", &edited);
+        assert_eq!(
+            doc.meals.iter().find(|m| m.weekday == "Fri").unwrap().dish,
+            "tacos"
+        );
+    }
+
+    #[test]
+    fn fast_lane_meal_edit_without_a_meals_heading_is_refused() {
+        let no_heading = with_meals_heading("## Supper notes");
+        let op = FastLaneOp::MealSwap {
+            day: Weekday::Fri,
+            dish: "tacos".into(),
+        };
+        assert_eq!(
+            apply_to_content("2026-W29", &no_heading, &op),
+            Err(FastLaneError::DayNotFound)
+        );
     }
 
     #[test]

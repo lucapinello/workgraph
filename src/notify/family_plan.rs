@@ -27,6 +27,16 @@ use std::path::Path;
 
 use chrono::{Datelike, NaiveDate, Weekday};
 
+/// True when an H2 title names the weekly meals table. Production plans use a
+/// numbered `Dinners` heading while older fixtures and hand-written plans use
+/// `Meal plan` or `Meals`; every reader and writer must share this predicate.
+pub fn is_meals_section_heading(heading: &str) -> bool {
+    heading
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| matches!(word, "meal" | "meals" | "dinner" | "dinners"))
+}
+
 /// One dinner slot from the meal-plan table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Meal {
@@ -160,7 +170,7 @@ impl PlanDoc {
             // --- Section headings ---------------------------------------------
             if let Some(h2) = line.strip_prefix("## ") {
                 let low = h2.to_ascii_lowercase();
-                section = if low.contains("meal") || low.contains("dinner") {
+                section = if is_meals_section_heading(h2) {
                     Section::Meals
                 } else if low.contains("shopping") {
                     Section::Shopping
@@ -503,7 +513,21 @@ mod tests {
 
     #[test]
     fn legacy_meals_heading_remains_supported() {
-        let legacy = W29.replacen("## 1. Dinners (Nora → Bruno)", "## 1. Meals", 1);
+        let legacy = W29
+            .lines()
+            .map(|line| {
+                if line
+                    .strip_prefix("## ")
+                    .map(is_meals_section_heading)
+                    .unwrap_or(false)
+                {
+                    "## 1. Meals"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let doc = PlanDoc::parse("2026-W29", &legacy);
         assert_eq!(doc.meals.len(), 7, "legacy Meals alias lost dinner rows");
         assert_eq!(doc.meals[0].dish, "Chickpea & spinach curry, brown rice");
