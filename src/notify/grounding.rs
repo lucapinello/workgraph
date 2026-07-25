@@ -689,12 +689,19 @@ impl FamilyVoiceRoster {
             return;
         }
         add_name_aliases(&mut self.allowed_names, &name);
-        if !self
-            .persona_names
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(name.trim()))
-        {
-            self.persona_names.push(name.trim().to_string());
+        let trimmed = name.trim();
+        let alias = trimmed
+            .split_whitespace()
+            .find(|part| !is_name_alias_stopword(&part.to_lowercase()));
+        for pattern in [Some(trimmed), alias].into_iter().flatten() {
+            if pattern.chars().count() >= 2
+                && !self
+                    .persona_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(pattern))
+            {
+                self.persona_names.push(pattern.to_string());
+            }
         }
     }
 
@@ -3164,6 +3171,27 @@ label = "Fallback Member"
             strip_self_attribution(quoted, &roster),
             quoted,
             "leading quotation punctuation is not an avatar"
+        );
+
+        let alias_roster =
+            FamilyVoiceRoster::from_names(["fitness", "Coach Rowan"], ["Household Member"]);
+        assert_eq!(
+            strip_self_attribution("Rowan 💬 Let's take a walk.", &alias_roster),
+            "Let's take a walk.",
+            "a bare alias derived from an honorific persona name is attribution too",
+        );
+        assert_eq!(
+            strip_self_attribution(
+                "Coach Rowan 💬 Let's take a walk.",
+                &alias_roster,
+            ),
+            "Let's take a walk.",
+        );
+        let ordinary = "Rowan says a walk sounds good.";
+        assert_eq!(
+            strip_self_attribution(ordinary, &alias_roster),
+            ordinary,
+            "a bare persona alias without an attribution separator stays ordinary content",
         );
     }
 
