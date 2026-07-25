@@ -1739,7 +1739,7 @@ async fn finalize_composed_reply(
     // ONLY the trailing deferral clause, never emptying the reply. The persona
     // IS the delivering voice; there is no one to defer to.
     {
-        let deferred = grounding::enforce_no_deferral(&reply_text);
+        let deferred = grounding::enforce_no_deferral(&reply_text, &family_roster);
         if deferred != reply_text {
             eprintln!(
                 "[{}] deferral guard: stripped a dangling-promise tail from {agent_id}'s draft",

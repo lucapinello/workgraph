@@ -518,15 +518,15 @@ pub fn enforce_answer_shape(reply: &str, allow_question: bool) -> String {
 
 /// Deferral phrases that turn a DELIVERED answer into a fresh dangling promise.
 ///
-/// The 17:5x repro (task owner-pin-engine): Nora acked "on it", the compose
-/// delivered the calorie answer — and then tacked on "…let me get Nora's exact
-/// take". On a delivered turn there is no one left to defer to: the persona IS
-/// the voice and already answered, so a trailing clause opening with one of
-/// these is a new promise that will never be kept. Matched as substrings against
-/// the NORMALISED trailing clause (apostrophe-free — see [`normalize`] — so
-/// "I'll" -> "ill", "Nora's" -> "noras"). Kept SPECIFIC (multi-word, never a bare
-/// "let me get") so a legitimate action-ack ("on it, I'll change the week") is
-/// never mistaken for a deferral.
+/// The production repro delivered the answer and then tacked on a promise to
+/// ask another configured persona for their exact take. On a delivered turn
+/// there is no one left to defer to: the persona IS the voice and already
+/// answered. Generic promises are matched as substrings against the NORMALISED
+/// trailing clause (apostrophe-free — see [`normalize`] — so "I'll" -> "ill").
+/// Persona-specific "let me ask …" promises are matched separately against the
+/// project-local [`FamilyVoiceRoster`], never against names compiled here.
+/// Markers stay SPECIFIC (multi-word, never a bare "let me get") so a legitimate
+/// action-ack ("on it, I'll change the week") is never mistaken for a deferral.
 const DEFERRAL_MARKERS: &[&str] = &[
     "get back to you",
     "getting back to you",
@@ -539,7 +539,6 @@ const DEFERRAL_MARKERS: &[&str] = &[
     "let me confirm with",
     "let me double check with",
     "let me verify with",
-    "let me ask nora",
     "let me get the exact",
     "let me get you the exact",
     "let me get an exact",
@@ -569,15 +568,70 @@ const DEFERRAL_MARKERS: &[&str] = &[
     "get the exact numbers",
 ];
 
+/// Tokenise a family-visible clause for configured-identity matching.
+///
+/// Unlike [`normalize`], punctuation (including apostrophes) is a boundary.
+/// That makes an authored name match both `Blue Lantern` and
+/// `Blue Lantern's`, without weakening the boundary enough for `Arc` to match
+/// inside `Parcel`.
+fn identity_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            word.extend(ch.to_lowercase());
+        } else if !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// True when a narrow ask-deferral lead-in is immediately followed by a
+/// configured persona id, authored display name, or roster-derived alias.
+///
+/// Human names are intentionally excluded: asking a household member is not
+/// third-person self-deferral by an engine persona. An empty/malformed roster
+/// therefore fails open and never guesses that an unfamiliar word is a persona.
+fn configured_persona_deferral(clause: &str, roster: &FamilyVoiceRoster) -> bool {
+    const LEAD_INS: &[&[&str]] = &[&["let", "me", "ask"], &["i", "ll", "ask"]];
+
+    let clause_words = identity_words(clause);
+    if clause_words.is_empty() {
+        return false;
+    }
+
+    roster.persona_names.iter().any(|configured| {
+        let name_words = identity_words(configured);
+        if name_words.is_empty() {
+            return false;
+        }
+        LEAD_INS.iter().any(|lead_in| {
+            let needed = lead_in.len() + name_words.len();
+            clause_words.windows(needed).any(|window| {
+                window[..lead_in.len()]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(lead_in.iter().copied())
+                    && window[lead_in.len()..] == name_words
+            })
+        })
+    })
+}
+
 /// True when `clause` (a single trailing sentence/clause) is a dangling-promise
 /// deferral — a fresh "let me get X's exact take / I'll get back to you" tacked
-/// onto an answer that was already delivered. Pure.
-pub fn is_deferral_tail(clause: &str) -> bool {
+/// onto an answer that was already delivered. Persona-specific forms are
+/// resolved only from `roster`. Pure.
+pub fn is_deferral_tail(clause: &str, roster: &FamilyVoiceRoster) -> bool {
     let norm = normalize(clause);
     if norm.is_empty() {
         return false;
     }
-    DEFERRAL_MARKERS.iter().any(|m| norm.contains(m))
+    DEFERRAL_MARKERS.iter().any(|m| norm.contains(m)) || configured_persona_deferral(clause, roster)
 }
 
 /// Byte offset where the reply's final clause begins: just after the last
@@ -608,14 +662,14 @@ fn final_clause_start(trimmed: &str) -> usize {
 /// return `(body_without_it, Some(the_deferral))`. Otherwise `(reply, None)`
 /// unchanged. Pure; the caller (a delivered-answer guard) decides whether to
 /// drop it, and never empties the reply.
-pub fn strip_deferral_tail(reply: &str) -> (String, Option<String>) {
+pub fn strip_deferral_tail(reply: &str, roster: &FamilyVoiceRoster) -> (String, Option<String>) {
     let trimmed = reply.trim_end();
     if trimmed.is_empty() {
         return (reply.to_string(), None);
     }
     let start = final_clause_start(trimmed);
     let tail = trimmed[start..].trim();
-    if tail.is_empty() || !is_deferral_tail(tail) {
+    if tail.is_empty() || !is_deferral_tail(tail, roster) {
         return (reply.to_string(), None);
     }
     // Trim the boundary char that introduced the tail if it was a *soft*
@@ -636,8 +690,8 @@ pub fn strip_deferral_tail(reply: &str) -> (String, Option<String>) {
 /// empty — a reply that is *only* a deferral — is returned unchanged, so we
 /// never send nothing (the compose prompt's first-person/no-promise instruction
 /// keeps that degenerate case vanishingly rare).
-pub fn enforce_no_deferral(reply: &str) -> String {
-    let (body, stripped) = strip_deferral_tail(reply);
+pub fn enforce_no_deferral(reply: &str, roster: &FamilyVoiceRoster) -> String {
+    let (body, stripped) = strip_deferral_tail(reply, roster);
     match stripped {
         Some(_) if !body.trim().is_empty() => body,
         _ => reply.to_string(),
@@ -2987,14 +3041,21 @@ mod tests {
 
     // --- Rule 6: no dangling-promise deferral tail (task owner-pin-engine) ---
 
-    /// THE 17:5x REPRO: the answer lands, then dangles "…let me get Nora's exact
-    /// take" — a fresh promise to no one. The guard strips ONLY that trailing
-    /// clause and leaves the delivered answer intact.
+    fn fixture_deferral_roster() -> FamilyVoiceRoster {
+        FamilyVoiceRoster::from_names(
+            ["garden-7", "Blue Lantern", "pantry-4", "Copper Finch"],
+            std::iter::empty::<&str>(),
+        )
+    }
+
+    /// The answer lands, then dangles a promise to get a configured persona's
+    /// exact take. The guard strips ONLY that trailing clause and leaves the
+    /// delivered answer intact.
     #[test]
     fn deferral_tail_is_stripped_from_delivered_answer() {
-        // The exact repro tail (ellipsis-appended, third-person self-reference).
-        let repro = "Pasta pomodoro is solid at 400-450 calories a plate. Let me get Nora's exact take.";
-        let cleaned = enforce_no_deferral(repro);
+        let roster = fixture_deferral_roster();
+        let repro = "Pasta pomodoro is solid at 400-450 calories a plate. Let me ask Blue Lantern's exact take.";
+        let cleaned = enforce_no_deferral(repro, &roster);
         assert!(
             cleaned.contains("400-450"),
             "the delivered answer must survive the strip:\n{cleaned}"
@@ -3008,12 +3069,13 @@ mod tests {
         for tail in [
             "…let me get her exact take",
             "I'll get back to you with the exact numbers.",
-            "Let me check with Nora on that.",
+            "Let me check with someone on that.",
             "let me confirm the exact figure",
             "I'll circle back on it.",
+            "I'll ask garden-7 for a second look.",
         ] {
             let reply = format!("It's about 450 calories. {tail}");
-            let out = enforce_no_deferral(&reply);
+            let out = enforce_no_deferral(&reply, &roster);
             assert!(
                 out.to_lowercase().contains("450 calories"),
                 "answer lost for tail {tail:?}:\n{out}"
@@ -3025,19 +3087,79 @@ mod tests {
         }
     }
 
+    /// Permanent config contract: authored display names and opaque ids come
+    /// from household.toml, so renaming either one changes the guard without a
+    /// binary change. Unconfigured or partial-token lookalikes remain ordinary
+    /// family copy.
+    #[test]
+    fn configured_persona_deferral_is_roster_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "garden-7"
+name = "Blue Lantern"
+
+[[agent]]
+id = "pantry-4"
+name = "Copper Finch"
+"#,
+        )
+        .unwrap();
+        let roster = load_family_voice_roster(dir.path(), &dir.path().join(".wg"));
+
+        for tail in [
+            "Let me ask Blue Lantern about that.",
+            "Let me ask Blue Lantern's exact take.",
+            "I'll ask pantry-4 and get back to you.",
+        ] {
+            assert!(
+                is_deferral_tail(tail, &roster),
+                "configured deferral was not detected: {tail:?}"
+            );
+            let reply = format!("Dinner is already settled. {tail}");
+            assert_eq!(
+                enforce_no_deferral(&reply, &roster),
+                "Dinner is already settled.",
+                "configured deferral was not stripped: {tail:?}"
+            );
+        }
+
+        for safe in [
+            "Let me ask a question about Friday.",
+            "Let me ask Marigold about that.",
+            "I asked Blue Lantern and dinner is already settled.",
+        ] {
+            assert!(
+                !is_deferral_tail(safe, &roster),
+                "ordinary or unconfigured ask was misclassified: {safe:?}"
+            );
+        }
+
+        let overlap =
+            FamilyVoiceRoster::from_names(["arc-2", "Arc"], std::iter::empty::<&str>());
+        assert!(
+            !is_deferral_tail("Let me ask Parcel about that.", &overlap),
+            "a configured name must not match inside another name"
+        );
+    }
+
     /// A legitimate action-ack ("on it, I'll change the week") is NOT a deferral
     /// — the markers are specific enough not to swallow real commitments, and a
     /// plain answer with no tail is returned unchanged.
     #[test]
     fn deferral_guard_leaves_legitimate_replies_untouched() {
+        let roster = fixture_deferral_roster();
         for ok in [
             "On it — I'll change the week to duck on Thursday.",
             "Pasta pomodoro is about 450 calories a plate.",
             "Sounds good, see you tonight!",
             "I'll add it to the shopping list right now.",
+            "Let me ask a question about the recipe.",
         ] {
             assert_eq!(
-                enforce_no_deferral(ok),
+                enforce_no_deferral(ok, &roster),
                 ok,
                 "a legitimate reply was mangled by the deferral guard:\n{ok}"
             );
@@ -3048,15 +3170,23 @@ mod tests {
     /// guard never sends nothing.
     #[test]
     fn deferral_guard_never_empties_the_reply() {
-        let only = "Let me get Nora's exact take.";
-        assert_eq!(enforce_no_deferral(only), only, "must never strip to empty");
+        let roster = fixture_deferral_roster();
+        let only = "Let me ask Blue Lantern's exact take.";
+        assert_eq!(
+            enforce_no_deferral(only, &roster),
+            only,
+            "must never strip to empty"
+        );
 
         // strip_deferral_tail still reports the tail for a body-bearing reply,
         // and reports None when there is no deferral.
-        let (body, tail) = strip_deferral_tail("It's 450 calories. Let me get her exact take.");
+        let (body, tail) = strip_deferral_tail(
+            "It's 450 calories. Let me get her exact take.",
+            &roster,
+        );
         assert!(body.contains("450"), "{body}");
         assert!(tail.is_some(), "tail should be detected");
-        let (body2, tail2) = strip_deferral_tail("It's 450 calories, enjoy!");
+        let (body2, tail2) = strip_deferral_tail("It's 450 calories, enjoy!", &roster);
         assert_eq!(body2, "It's 450 calories, enjoy!");
         assert!(tail2.is_none());
     }
