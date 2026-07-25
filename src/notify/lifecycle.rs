@@ -973,8 +973,8 @@ pub struct LifecycleTickResult {
     pub operator_alerts: Vec<OperatorAlert>,
 }
 
-/// A dead-end family ask, escalated to the household owner (delivered as an Otto
-/// DM by the caller). Raised exactly once per task, keyed by
+/// A dead-end family ask, escalated to the household owner through the
+/// project-configured coordination voice. Raised exactly once per task, keyed by
 /// [`alert_notification_id`] in the same [`FiredLog`] the family lines use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorAlert {
@@ -1008,10 +1008,6 @@ pub fn operator_alert_text(task_id: &str, what: &str, requester: &str) -> String
          \"{what}\". I told them it's flagged, not fixed. Task `{task_id}` — worth a look."
     )
 }
-
-/// The bot that carries an operator alert: the concierge/coordinator persona,
-/// whose DM chat is the household owner's.
-pub const OPERATOR_ALERT_BOT: &str = "otto";
 
 /// Scan `inputs`, firing each not-yet-sent `(task, event)` notification exactly
 /// once, paced through the daily-digest choke point.
@@ -1117,12 +1113,20 @@ pub fn dry_run_line(fire: &LifecycleFire) -> String {
     )
 }
 
-/// Format a dead-end [`OperatorAlert`] for the `--dry-run` seam: who it goes to
-/// and as whom.
-pub fn dry_run_alert_line(alert: &OperatorAlert) -> String {
+/// Format a dead-end [`OperatorAlert`] for the `--dry-run` seam using the route
+/// the caller actually resolved from project configuration.
+///
+/// `Some("")` denotes the legacy single-bot route. `None` is reported honestly
+/// as log-only rather than inventing a persona that cannot receive the alert.
+pub fn dry_run_alert_line(alert: &OperatorAlert, resolved_bot: Option<&str>) -> String {
+    let route = match resolved_bot {
+        Some(bot) if !bot.trim().is_empty() => format!("via bot '{}'", bot.trim()),
+        Some(_) => "via legacy bot".to_string(),
+        None => "with no configured bot (logged only)".to_string(),
+    };
     format!(
-        "[dry-run] operator-alert for {} → owner DM via bot '{}': {}",
-        alert.task_id, OPERATOR_ALERT_BOT, alert.text,
+        "[dry-run] operator-alert for {} → owner DM {route}: {}",
+        alert.task_id, alert.text,
     )
 }
 

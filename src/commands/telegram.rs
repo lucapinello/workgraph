@@ -5098,33 +5098,36 @@ async fn deliver_lifecycle_fire(
 
 /// The owner's DM chat for a dead-end escalation, and the bot that speaks it.
 ///
-/// Prefers the concierge persona ([`OPERATOR_ALERT_BOT`] — Otto), whose 1:1 chat
-/// id IS the household owner's DM; falls back to the legacy top-level operator
-/// `chat_id`, then to any configured bot, so a household that named its
-/// coordinator something else still gets the alert. `None` when nothing is
-/// configured — the caller then relies on the loud stderr line.
-///
-/// [`OPERATOR_ALERT_BOT`]: worksgood::notify::lifecycle::OPERATOR_ALERT_BOT
-fn operator_alert_route(config: &TelegramConfig) -> Option<(String, String)> {
-    use worksgood::notify::lifecycle::OPERATOR_ALERT_BOT;
+/// Prefers the project-configured coordination owner. If that owner has no
+/// usable bot, falls back to the legacy top-level operator chat and then to any
+/// configured bot. `None` means the caller must retain only its loud stderr
+/// record; no compiled persona is guessed.
+fn operator_alert_route(
+    config: &TelegramConfig,
+    coordination_owner: Option<&str>,
+) -> Option<(String, String)> {
     let usable = |id: &String, bot: &worksgood::notify::telegram::TelegramBotConfig| {
         (!bot.bot_token.trim().is_empty() && !bot.chat_id.trim().is_empty())
             .then(|| (id.clone(), bot.chat_id.clone()))
     };
-    // Otto by bot key or by the agent id he fronts.
-    if let Some(hit) = config
-        .bots
-        .iter()
-        .find(|(id, bot)| {
-            id.eq_ignore_ascii_case(OPERATOR_ALERT_BOT)
-                || bot
-                    .agent_id
-                    .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(OPERATOR_ALERT_BOT))
-        })
-        .and_then(|(id, bot)| usable(id, bot))
+    if let Some(owner) = coordination_owner
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
     {
-        return Some(hit);
+        if let Some(hit) = config
+            .bots
+            .iter()
+            .find(|(id, bot)| {
+                id.eq_ignore_ascii_case(owner)
+                    || bot
+                        .agent_id
+                        .as_deref()
+                        .is_some_and(|agent| agent.eq_ignore_ascii_case(owner))
+            })
+            .and_then(|(id, bot)| usable(id, bot))
+        {
+            return Some(hit);
+        }
     }
     // Legacy single-bot operator chat.
     if !config.bot_token.trim().is_empty() && !config.chat_id.trim().is_empty() {
@@ -5142,11 +5145,13 @@ fn operator_alert_route(config: &TelegramConfig) -> Option<(String, String)> {
 /// line; this is the flag being raised, so the ask is never a dead end.
 ///
 /// Loud on stderr FIRST (that record survives a missing/broken bot config),
-/// then best-effort DM'd to the owner as Otto. Errors are reported, never
-/// propagated: a failed escalation must not abort the remaining report-backs.
+/// then best-effort DM'd through the configured coordination owner. Errors are
+/// reported, never propagated: a failed escalation must not abort the remaining
+/// report-backs.
 async fn deliver_operator_alert(
     sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
     config: &TelegramConfig,
+    coordination_owner: Option<&str>,
     alert: &worksgood::notify::lifecycle::OperatorAlert,
 ) -> bool {
     eprintln!(
@@ -5160,7 +5165,7 @@ async fn deliver_operator_alert(
         },
         alert.text,
     );
-    let Some((bot_id, chat_id)) = operator_alert_route(config) else {
+    let Some((bot_id, chat_id)) = operator_alert_route(config, coordination_owner) else {
         eprintln!(
             "[{}] operator alert for {} not DM'd: no telegram bot/chat configured (logged only)",
             chrono::Utc::now().format("%H:%M:%S"),
@@ -5249,6 +5254,11 @@ pub fn run_lifecycle(
     let mut log = FiredLog::load(&log_path);
     let mut store = DigestStore::load(&store_path);
     let policy = DigestPolicy::default();
+    let config = load_telegram_config().unwrap_or_default();
+    let owner_map = ownership::OwnerMap::load(&root);
+    let coordination_owner = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .map(str::to_string);
 
     if dry_run {
         // Compute against throwaway copies so a dry run records nothing.
@@ -5278,10 +5288,14 @@ pub fn run_lifecycle(
                 .operator_alerts
                 .iter()
                 .map(|a| {
+                    let route =
+                        operator_alert_route(&config, coordination_owner.as_deref());
                     serde_json::json!({
                         "task": a.task_id,
                         "operator_alert": true,
                         "requester": a.requester,
+                        "bot": route.as_ref().map(|(bot, _)| if bot.is_empty() { "legacy bot" } else { bot.as_str() }),
+                        "chat": route.as_ref().map(|(_, chat)| chat.as_str()),
                         "text": a.text,
                     })
                 })
@@ -5302,7 +5316,15 @@ pub fn run_lifecycle(
                 println!("[dry-run] (capped → folds into digest) {}", lifecycle::dry_run_line(f));
             }
             for a in &result.operator_alerts {
-                println!("{}", lifecycle::dry_run_alert_line(a));
+                let route =
+                    operator_alert_route(&config, coordination_owner.as_deref());
+                println!(
+                    "{}",
+                    lifecycle::dry_run_alert_line(
+                        a,
+                        route.as_ref().map(|(bot, _)| bot.as_str()),
+                    )
+                );
             }
         }
         return Ok(());
@@ -5340,7 +5362,14 @@ pub fn run_lifecycle(
             // forgotten" — raising the flag is what makes that line true, so it
             // goes out even if a report-back delivery below fails.
             for a in &result.operator_alerts {
-                if deliver_operator_alert(sink.as_ref(), &config, a).await {
+                if deliver_operator_alert(
+                    sink.as_ref(),
+                    &config,
+                    coordination_owner.as_deref(),
+                    a,
+                )
+                .await
+                {
                     alerted += 1;
                 }
             }
@@ -7895,6 +7924,128 @@ domains = ["cooking"]
             coordination_owner_hint(dir.path()),
             "",
             "malformed configuration must not manufacture a persona id",
+        );
+    }
+
+    #[test]
+    fn operator_alert_route_uses_the_configured_owner_in_any_map_order() {
+        use worksgood::notify::lifecycle::OperatorAlert;
+
+        fn config_with_order(reverse: bool) -> TelegramConfig {
+            let entries = [
+                (
+                    "fallback-wire",
+                    TelegramBotConfig {
+                        bot_token: "100:AAA".to_string(),
+                        chat_id: "7001".to_string(),
+                        agent_id: Some("pantry-orbit".to_string()),
+                        username: None,
+                    },
+                ),
+                (
+                    "coordination-wire",
+                    TelegramBotConfig {
+                        bot_token: "200:BBB".to_string(),
+                        chat_id: "7002".to_string(),
+                        agent_id: Some("night-orbit".to_string()),
+                        username: None,
+                    },
+                ),
+            ];
+            let mut bots = HashMap::new();
+            let order: &[usize] = if reverse { &[1, 0] } else { &[0, 1] };
+            for index in order {
+                let (id, bot) = &entries[*index];
+                bots.insert((*id).to_string(), bot.clone());
+            }
+            TelegramConfig {
+                bot_token: String::new(),
+                chat_id: String::new(),
+                bots,
+            }
+        }
+
+        let alert = OperatorAlert {
+            task_id: "stalled-porch-light".to_string(),
+            requester: "Household Member".to_string(),
+            text: "The porch-light request needs a look.".to_string(),
+            notification_id: "alert-stalled-porch-light".to_string(),
+        };
+        for reverse in [false, true] {
+            let config = config_with_order(reverse);
+            let route = operator_alert_route(&config, Some("night-orbit")).unwrap();
+            assert_eq!(
+                route,
+                ("coordination-wire".to_string(), "7002".to_string()),
+                "the authored coordination owner must beat map order",
+            );
+            let line =
+                worksgood::notify::lifecycle::dry_run_alert_line(&alert, Some(&route.0));
+            assert!(
+                line.contains("bot 'coordination-wire'"),
+                "dry-run must report the bot actually selected: {line}",
+            );
+            assert!(
+                !line.contains("night-orbit"),
+                "dry-run names the resolved bot key, not an inferred route: {line}",
+            );
+        }
+    }
+
+    #[test]
+    fn operator_alert_route_falls_back_honestly_without_a_valid_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = TelegramConfig {
+            bot_token: "300:CCC".to_string(),
+            chat_id: "7003".to_string(),
+            bots: HashMap::new(),
+        };
+        for invalid_household in [None, Some("agent = [")] {
+            if let Some(body) = invalid_household {
+                std::fs::write(dir.path().join("household.toml"), body).unwrap();
+            }
+            let owner_map = ownership::OwnerMap::load(dir.path());
+            let owner = owner_map.owner_for_domain(ownership::Domain::Coordination);
+            assert_eq!(owner, None);
+            assert_eq!(
+                operator_alert_route(&legacy, owner),
+                Some((String::new(), "7003".to_string())),
+                "missing or malformed ownership must retain the explicit legacy route",
+            );
+        }
+
+        let mut bots = HashMap::new();
+        bots.insert(
+            "only-configured-wire".to_string(),
+            TelegramBotConfig {
+                bot_token: "400:DDD".to_string(),
+                chat_id: "7004".to_string(),
+                agent_id: Some("unowned-orbit".to_string()),
+                username: None,
+            },
+        );
+        let one_bot = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+        assert_eq!(
+            operator_alert_route(&one_bot, None),
+            Some(("only-configured-wire".to_string(), "7004".to_string())),
+            "one explicit configured bot remains the final delivery fallback",
+        );
+
+        assert_eq!(operator_alert_route(&TelegramConfig::default(), None), None);
+        let alert = worksgood::notify::lifecycle::OperatorAlert {
+            task_id: "stalled-entry-key".to_string(),
+            requester: "Household Member".to_string(),
+            text: "The entry-key request needs a look.".to_string(),
+            notification_id: "alert-stalled-entry-key".to_string(),
+        };
+        let line = worksgood::notify::lifecycle::dry_run_alert_line(&alert, None);
+        assert!(
+            line.contains("no configured bot") && line.contains("logged only"),
+            "an unavailable route must be visible in dry-run output: {line}",
         );
     }
 
