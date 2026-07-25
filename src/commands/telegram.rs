@@ -21,9 +21,9 @@ use worksgood::notify::telegram_conversation::durable_telegram_digest_v1;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_group::{
-    Election, NaturalRoute, elect_group_inbound_with_owner_map, elect_responders_with_owner_map,
-    election_decision_summary, is_discussion_ask, parse_at_mention_tokens, resolve_mentioned_bot,
-    route_natural_with_owner_map,
+    Election, NaturalRoute, ResolvedBot, elect_group_inbound_with_owner_map,
+    elect_responders_with_owner_map, election_decision_summary, is_discussion_ask,
+    parse_at_mention_tokens, resolve_mentioned_bot, route_natural_with_owner_map,
 };
 use worksgood::notify::telegram_voice;
 
@@ -4174,8 +4174,10 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
     sender.to_string()
 }
 
-/// `wg telegram web-inbound --sender <humanId> --message <text>` — make a
-/// web-origin (kiosk conversation-pane) message a **first-class group turn**.
+/// `wg telegram web-inbound --default-owner <opaque-id> --sender <humanId>
+/// --message <text>` — make a web-origin (kiosk conversation-pane) message a
+/// **first-class group turn**. A caller with no designated contact passes
+/// `--no-default-owner` instead.
 ///
 /// The live gap this closes: the kiosk send box only RELAYED a line into the
 /// family Telegram group via a bot, and Telegram bots never see other bots'
@@ -4536,26 +4538,20 @@ async fn run_web_fast_lane_occurrence(
 /// The pin must be BINDING for voice selection: the composing/delivering bot IS
 /// the pinned persona, not a re-election winner.
 ///
-/// Given the current election, return it with its single voice REBOUND to the
-/// pinned persona's bot. Only a missing, empty, or unconfigured pin leaves the
-/// election untouched; no persona id doubles as a sentinel. The body is
-/// preserved from a One/All election, else the raw `message` — a pinned turn
-/// the engine would have stayed silent on is still forced to answer in the
-/// pinned voice, because the gateway already decided it is a domain-owned
-/// heavy ask.
+/// Given the current election and an already-resolved pin, return it with its
+/// single voice REBOUND to the pinned persona's bot. An absent pin leaves the
+/// election untouched. The body is preserved from a One/All election, else the
+/// raw `message` — a pinned turn the engine would have stayed silent on is
+/// still forced to answer in the pinned voice, because the gateway already
+/// decided it is a domain-owned heavy ask.
 fn apply_owner_pin(
     election: Election,
-    pin: Option<&str>,
-    config: &TelegramConfig,
+    pin: Option<&ResolvedBot>,
     target: &str,
     message: &str,
 ) -> Election {
-    let pin = match pin.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) => p,
-        None => return election,
-    };
-    let bot = match resolve_mentioned_bot(pin, config) {
-        Some(b) => b,
+    let bot = match pin {
+        Some(bot) => bot.clone(),
         None => return election,
     };
     let body = match &election {
@@ -4571,11 +4567,163 @@ fn apply_owner_pin(
     }
 }
 
+/// The gateway's explicit choice for an otherwise unaddressed, general
+/// web-origin ask.
+///
+/// This is a CLI argument rather than an environment variable on purpose: a
+/// new gateway invoking an old engine must fail loudly on the unknown flag
+/// instead of silently falling back to an engine-local coordination owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebDefaultOwner<'a> {
+    /// Route a general ask to this configured opaque persona id.
+    Designated(&'a str),
+    /// There is currently no designated default contact.
+    NoneDesignated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NeedsContactReason {
+    NoDefaultOwner,
+    UnknownDefaultOwner,
+}
+
+impl NeedsContactReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoDefaultOwner => "no-default-owner",
+            Self::UnknownDefaultOwner => "unknown-default-owner",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebDefaultOwnerResolution {
+    Routed(Election),
+    NeedsContact(NeedsContactReason),
+}
+
+/// Return the one stable machine identity a bot binding declares.
+///
+/// A canonical nonblank `agent_id` is authoritative. The free-form bot-table
+/// key is only the compatibility identity when no nonblank binding exists; it
+/// never remains a second alias after an explicit binding is configured.
+/// Nonblank bindings with surrounding whitespace are invalid rather than
+/// normalized here, because downstream live composition reads the original
+/// binding and must not disagree with this routing seam.
+fn configured_machine_id<'a>(bot_id: &'a str, bot: &'a TelegramBotConfig) -> Option<&'a str> {
+    match bot.agent_id.as_deref() {
+        None => Some(bot_id),
+        Some(agent_id) if agent_id.trim().is_empty() => Some(bot_id),
+        Some(agent_id) if agent_id == agent_id.trim() => Some(agent_id),
+        Some(_) => None,
+    }
+}
+
+/// Resolve an opaque machine identity without the fuzzy username, handle, or
+/// prefix fallbacks used for human-authored `@mention`s.
+///
+/// Exactly one configured bot may claim the exact canonical id. Zero claims,
+/// duplicate explicit bindings, and a key-vs-binding cross-claim are all unsafe
+/// and fail closed.
+fn resolve_machine_bot(machine_id: &str, config: &TelegramConfig) -> Option<ResolvedBot> {
+    if machine_id.is_empty() || machine_id != machine_id.trim() {
+        return None;
+    }
+    let mut matches = config.all_bots().into_iter().filter_map(|(bot_id, bot)| {
+        let canonical_id = configured_machine_id(&bot_id, &bot)?.to_string();
+        if canonical_id != machine_id {
+            return None;
+        }
+        let channel_type = if bot_id == "default" {
+            "telegram".to_string()
+        } else {
+            format!("telegram:{bot_id}")
+        };
+        Some(ResolvedBot {
+            bot_id,
+            channel_type,
+            agent_id: Some(canonical_id),
+        })
+    });
+    let resolved = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// Validate a gateway-supplied owner pin before any default routing, compose,
+/// feed mutation, or send. A present pin is a binding machine contract: if it
+/// cannot resolve exactly and uniquely, continuing with a newly elected voice
+/// would break the acknowledgement/reply identity guarantee.
+fn resolve_owner_pin(pin: Option<&str>, config: &TelegramConfig) -> Result<Option<ResolvedBot>> {
+    let Some(pin) = pin else {
+        return Ok(None);
+    };
+    if pin.trim().is_empty() {
+        anyhow::bail!("web-inbound owner pin must be a nonblank canonical agent id");
+    }
+    let bot = resolve_machine_bot(pin, config).ok_or_else(|| {
+        anyhow::anyhow!(
+            "web-inbound owner pin '{pin}' does not resolve to exactly one configured canonical agent id"
+        )
+    })?;
+    Ok(Some(bot))
+}
+
+/// Apply the gateway's default-contact declaration only at the web-only
+/// general-election seam.
+///
+/// Explicit addressing, domain routing, collective asks, reply continuity, and
+/// a positive owner pin have already made a stronger choice and pass through
+/// byte-for-byte. `NoVoicesConfigured` is also a general-election shape: an
+/// explicit designated owner may recover it, while no/unknown designation must
+/// fail closed rather than inventing a voice.
+fn apply_web_default_owner(
+    election: Election,
+    choice: WebDefaultOwner<'_>,
+    config: &TelegramConfig,
+    target: &str,
+    message: &str,
+) -> WebDefaultOwnerResolution {
+    let is_general = matches!(
+        &election,
+        Election::One {
+            addressed_by: worksgood::notify::telegram_group::AddressedBy::Concierge,
+            ..
+        } | Election::Silence(worksgood::notify::telegram_group::SilenceReason::NoVoicesConfigured)
+    );
+    if !is_general {
+        return WebDefaultOwnerResolution::Routed(election);
+    }
+
+    let owner = match choice {
+        WebDefaultOwner::Designated(owner) => owner,
+        WebDefaultOwner::NoneDesignated => {
+            return WebDefaultOwnerResolution::NeedsContact(NeedsContactReason::NoDefaultOwner);
+        }
+    };
+    let Some(bot) = resolve_machine_bot(owner, config) else {
+        return WebDefaultOwnerResolution::NeedsContact(NeedsContactReason::UnknownDefaultOwner);
+    };
+    let body = match &election {
+        Election::One { body, .. } => body.clone(),
+        _ => message.to_string(),
+    };
+    WebDefaultOwnerResolution::Routed(Election::One {
+        bot,
+        reply_chat: target.to_string(),
+        body,
+        addressed_by: worksgood::notify::telegram_group::AddressedBy::Concierge,
+    })
+}
+
 pub fn run_web_inbound(
     workgraph_dir: &Path,
     sender: &str,
     message: &str,
     chat_id_override: Option<&str>,
+    default_owner: WebDefaultOwner<'_>,
     owner_pin: Option<&str>,
     turn_id: Option<&str>,
     dry_run: bool,
@@ -4585,6 +4733,7 @@ pub fn run_web_inbound(
     use worksgood::notify::telegram_standup as standup;
 
     let config = load_telegram_config()?;
+    let owner_pin = resolve_owner_pin(owner_pin, &config)?;
 
     // Reply target: an explicit override wins, else the configured family group.
     // A recent engine change made the multi-bot `[telegram.bots.*]` map the norm
@@ -4668,14 +4817,15 @@ pub fn run_web_inbound(
     // THE LAST ROUTING SEAM. When the gateway forwarded a pinned domain owner
     // for a heavy turn (it dropped that persona's crisp ack), the pin is BINDING
     // for voice selection: the composing/delivering bot IS the pinned persona,
-    // not a re-election winner. No pin (or `otto` / an unknown persona) → the
-    // election stands exactly as today. Skipped when this turn is a clarify
+    // not a re-election winner. No pin leaves the election unchanged; a
+    // supplied invalid/ambiguous pin was rejected above before reaching any
+    // compose or delivery seam. Skipped when this turn is a clarify
     // continuation — that path already binds the ORIGINAL voice carrying the
     // original ask, which must win over a fresh pin. Placed BEFORE the dry-run
     // and decision-summary emits so both report the pinned voice.
     if clarify_continued_body.is_none() {
-        if let Some(pin) = owner_pin.map(str::trim).filter(|p| !p.is_empty()) {
-            let rebound = apply_owner_pin(election.clone(), Some(pin), &config, &target, message);
+        if let Some(pin) = owner_pin.as_ref() {
+            let rebound = apply_owner_pin(election.clone(), Some(pin), &target, message);
             if let Election::One { bot, .. } = &rebound {
                 if !matches!(&election, Election::One { bot: b, .. } if b.bot_id == bot.bot_id) {
                     println!(
@@ -4689,6 +4839,41 @@ pub fn run_web_inbound(
             election = rebound;
         }
     }
+
+    // ── DEFAULT CONTACT (web-only contract) ───────────────────────────────
+    // Only an otherwise-general/concierge election consults this declaration.
+    // It runs AFTER clarification and positive owner pin so those stronger
+    // continuity/ownership signals remain binding, and BEFORE constructing any
+    // delivery sink, fast-lane mutation, composer, or send.
+    election = match apply_web_default_owner(election, default_owner, &config, &target, message) {
+        WebDefaultOwnerResolution::Routed(election) => election,
+        WebDefaultOwnerResolution::NeedsContact(reason) => {
+            println!(
+                "[{}] web-inbound election from {} -> msg=none chat=supergroup rule=needs-contact:{} target=none",
+                chrono::Utc::now().format("%H:%M:%S"),
+                sender,
+                reason.as_str(),
+            );
+            if json {
+                let out = serde_json::json!({
+                    "dry_run": dry_run,
+                    "category": "needs-contact",
+                    "sender": sender,
+                    "auth_sender": auth_sender,
+                    "target": target,
+                    "outcome": "needs-contact",
+                    "reason": reason.as_str(),
+                    "who": serde_json::Value::Null,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!(
+                    "web-inbound [needs-contact] from {sender}: no default contact is available"
+                );
+            }
+            return Ok(());
+        }
+    };
 
     // Observability: one decision line, PII-safe (no tokens, no chat id text).
     println!(
@@ -8803,31 +8988,159 @@ mod tests {
         );
     }
 
-    /// OWNER PIN (task owner-pin-engine): the gateway drops the pinned domain
-    /// owner's crisp ack and forwards the same persona id, so the async reply
-    /// must come back in the SAME voice — not a re-election winner. The engine's
-    /// election is BINDING-overridden to the pinned persona's bot. THE LAST
-    /// ROUTING SEAM: before this, production's shell-out re-elected the
-    /// concierge and the delivery voice differed from the ack voice.
     #[test]
-    fn owner_pin_binds_delivery_voice_to_pinned_persona() {
+    fn machine_routing_resolves_only_exact_unique_canonical_agent_ids() {
+        let mut bots = HashMap::new();
+        bots.insert(
+            "wire-a7".to_string(),
+            TelegramBotConfig {
+                bot_token: "111:AAA".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("relay-a7".to_string()),
+                username: Some("mutable_relay_handle_bot".to_string()),
+            },
+        );
+        bots.insert(
+            "fallback-b4".to_string(),
+            TelegramBotConfig {
+                bot_token: "222:BBB".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: None,
+                username: None,
+            },
+        );
+        bots.insert(
+            "fallback-c9".to_string(),
+            TelegramBotConfig {
+                bot_token: "333:CCC".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("   ".to_string()),
+                username: None,
+            },
+        );
+        bots.insert(
+            "invalid-d2".to_string(),
+            TelegramBotConfig {
+                bot_token: "444:DDD".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some(" relay-d2 ".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+
+        let explicit = resolve_machine_bot("relay-a7", &config).unwrap();
+        assert_eq!(explicit.bot_id, "wire-a7");
+        assert_eq!(explicit.agent_id.as_deref(), Some("relay-a7"));
+        for non_identity in [
+            "wire-a7",
+            "mutable_relay_handle_bot",
+            "@mutable_relay_handle_bot",
+            "Relay-A7",
+        ] {
+            assert_eq!(
+                resolve_machine_bot(non_identity, &config),
+                None,
+                "{non_identity:?} is not the exact canonical machine id",
+            );
+        }
+        for invalid_binding in ["invalid-d2", "relay-d2", " relay-d2 "] {
+            assert_eq!(
+                resolve_machine_bot(invalid_binding, &config),
+                None,
+                "a padded nonblank binding has no safe canonical machine identity",
+            );
+        }
+
+        for fallback in ["fallback-b4", "fallback-c9"] {
+            let resolved = resolve_machine_bot(fallback, &config).unwrap();
+            assert_eq!(resolved.bot_id, fallback);
+            assert_eq!(resolved.agent_id.as_deref(), Some(fallback));
+        }
+
+        let mut key_shadow = config.clone();
+        key_shadow.bots.insert(
+            "wire-d2".to_string(),
+            TelegramBotConfig {
+                bot_token: "444:DDD".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("wire-a7".to_string()),
+                username: None,
+            },
+        );
+        let explicit_cross_claim = resolve_machine_bot("wire-a7", &key_shadow).unwrap();
+        assert_eq!(
+            explicit_cross_claim.bot_id, "wire-d2",
+            "an explicit binding must win; another bot's shadowed table key is not identity",
+        );
+
+        let mut fallback_cross_claim = config.clone();
+        fallback_cross_claim.bots.insert(
+            "relay-a7".to_string(),
+            TelegramBotConfig {
+                bot_token: "555:EEE".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: None,
+                username: None,
+            },
+        );
+        assert_eq!(
+            resolve_machine_bot("relay-a7", &fallback_cross_claim),
+            None,
+            "an explicit binding and a fallback table key must not cross-claim one id",
+        );
+
+        let mut duplicate = config;
+        duplicate.bots.insert(
+            "wire-e5".to_string(),
+            TelegramBotConfig {
+                bot_token: "666:FFF".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("relay-a7".to_string()),
+                username: None,
+            },
+        );
+        assert_eq!(
+            resolve_machine_bot("relay-a7", &duplicate),
+            None,
+            "duplicate explicit bindings must fail closed",
+        );
+    }
+
+    /// OWNER PIN (task owner-pin-engine): the gateway drops the pinned domain
+    /// owner's crisp ack and forwards the same canonical id, so the async reply
+    /// must come back in the SAME voice — not a re-election winner.
+    #[test]
+    fn owner_pin_binds_exact_machine_identity_and_rejects_invalid_pins() {
         use worksgood::notify::telegram_group::AddressedBy;
 
         let mut bots = HashMap::new();
-        for (id, token) in [
-            ("harbor", "111:AAA"),
-            ("cedar", "222:BBB"),
-            // This id used to be a compiled no-owner sentinel. It is now just
-            // another configured id and must be bindable like any other.
-            ("otto", "333:CCC"),
+        for (bot_id, agent_id, token, username) in [
+            (
+                "wire-a7",
+                Some("relay-a7"),
+                "111:AAA",
+                Some("mutable_a7_bot"),
+            ),
+            (
+                "wire-b4",
+                Some("relay-b4"),
+                "222:BBB",
+                Some("mutable_b4_bot"),
+            ),
+            ("fallback-c9", None, "333:CCC", None),
         ] {
             bots.insert(
-                id.to_string(),
+                bot_id.to_string(),
                 TelegramBotConfig {
                     bot_token: token.to_string(),
                     chat_id: "-100777".to_string(),
-                    agent_id: Some(id.to_string()),
-                    username: None,
+                    agent_id: agent_id.map(str::to_string),
+                    username: username.map(str::to_string),
                 },
             );
         }
@@ -8838,16 +9151,16 @@ mod tests {
         };
 
         let elected = Election::One {
-            bot: resolve_mentioned_bot("harbor", &config).unwrap(),
+            bot: resolve_machine_bot("relay-a7", &config).unwrap(),
             reply_chat: "-100777".to_string(),
             body: "how many calories are in tonight's pasta?".to_string(),
             addressed_by: AddressedBy::ReplyChain,
         };
 
+        let pin = resolve_owner_pin(Some("relay-b4"), &config).unwrap();
         let pinned = apply_owner_pin(
             elected.clone(),
-            Some("cedar"),
-            &config,
+            pin.as_ref(),
             "-100777",
             "how many calories are in tonight's pasta?",
         );
@@ -8858,54 +9171,274 @@ mod tests {
                 reply_chat,
                 ..
             } => {
-                assert_eq!(bot.bot_id, "cedar");
-                assert_eq!(bot.agent_id.as_deref(), Some("cedar"));
+                assert_eq!(bot.bot_id, "wire-b4");
+                assert_eq!(bot.agent_id.as_deref(), Some("relay-b4"));
                 assert_eq!(reply_chat, "-100777");
                 assert_eq!(body, "how many calories are in tonight's pasta?");
             }
             other => panic!("pin must yield Election::One, got {other:?}"),
         }
 
-        // Only an absent, empty, or unknown pin is a no-op.
-        for pin in [None, Some(""), Some("  "), Some("nobody")] {
-            let unchanged = apply_owner_pin(elected.clone(), pin, &config, "-100777", "m");
-            match &unchanged {
-                Election::One { bot, .. } => assert_eq!(
-                    bot.bot_id, "harbor",
-                    "pin={pin:?} must leave the election untouched, got {unchanged:?}"
-                ),
-                other => panic!("expected the original One election, got {other:?}"),
-            }
+        let no_pin = resolve_owner_pin(None, &config).unwrap();
+        assert_eq!(
+            apply_owner_pin(elected.clone(), no_pin.as_ref(), "-100777", "m"),
+            elected,
+            "an absent pin is the only no-op",
+        );
+        for invalid in [
+            "",
+            "  ",
+            "not-configured",
+            "wire-b4",
+            "mutable_b4_bot",
+            "@mutable_b4_bot",
+            "Relay-B4",
+            " relay-b4 ",
+        ] {
+            assert!(
+                resolve_owner_pin(Some(invalid), &config).is_err(),
+                "supplied invalid pin {invalid:?} must fail closed",
+            );
         }
+        let mut ambiguous = config.clone();
+        ambiguous.bots.insert(
+            "wire-d2".to_string(),
+            TelegramBotConfig {
+                bot_token: "444:DDD".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("relay-b4".to_string()),
+                username: None,
+            },
+        );
+        assert!(
+            resolve_owner_pin(Some("relay-b4"), &ambiguous).is_err(),
+            "a duplicate owner-pin binding must fail closed",
+        );
 
-        // No configured persona id is a sentinel, including an id that matched
-        // an older shipped household fixture.
-        let formerly_special =
-            apply_owner_pin(elected.clone(), Some("otto"), &config, "-100777", "m");
-        match formerly_special {
-            Election::One { bot, .. } => assert_eq!(bot.bot_id, "otto"),
-            other => panic!("every configured pin must bind, got {other:?}"),
-        }
+        let fallback = resolve_owner_pin(Some("fallback-c9"), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.bot_id, "fallback-c9");
+        assert_eq!(fallback.agent_id.as_deref(), Some("fallback-c9"));
 
         // A pinned turn the engine would have stayed silent on is still forced
         // to answer in the pinned voice with the raw message as the body.
         let silent = Election::Silence(worksgood::notify::telegram_group::SilenceReason::SmallTalk);
-        let forced = apply_owner_pin(
-            silent,
-            Some("cedar"),
-            &config,
-            "-100777",
-            "tell me the calories",
-        );
+        let forced = apply_owner_pin(silent, Some(&fallback), "-100777", "tell me the calories");
         match &forced {
             Election::One { bot, body, .. } => {
-                assert_eq!(bot.bot_id, "cedar");
+                assert_eq!(bot.bot_id, "fallback-c9");
                 assert_eq!(
                     body, "tell me the calories",
                     "raw message becomes the body on a forced pin"
                 );
             }
             other => panic!("pin over silence must force a One election, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_default_contact_is_fail_closed_and_only_rebinds_general_elections() {
+        use worksgood::notify::ownership::Domain;
+        use worksgood::notify::telegram_group::{AddressedBy, SilenceReason};
+
+        let mut bots = HashMap::new();
+        for (bot_id, agent_id, token) in [
+            ("wire-a7", "relay-a7", "111:AAA"),
+            ("wire-b4", "relay-b4", "222:BBB"),
+            ("wire-c9", "relay-c9", "333:CCC"),
+        ] {
+            bots.insert(
+                bot_id.to_string(),
+                TelegramBotConfig {
+                    bot_token: token.to_string(),
+                    chat_id: "-100777".to_string(),
+                    agent_id: Some(agent_id.to_string()),
+                    username: Some(format!("{bot_id}_house_bot")),
+                },
+            );
+        }
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+        let one = |id: &str, addressed_by| Election::One {
+            bot: resolve_mentioned_bot(id, &config).unwrap(),
+            reply_chat: "-100777".to_string(),
+            body: "could somebody help with this?".to_string(),
+            addressed_by,
+        };
+
+        // Non-vacuity: the engine-local concierge election points at relay-a7,
+        // while the gateway explicitly designates a different opaque id.
+        let general = one("relay-a7", AddressedBy::Concierge);
+        let rebound = apply_web_default_owner(
+            general.clone(),
+            WebDefaultOwner::Designated("relay-b4"),
+            &config,
+            "-100777",
+            "could somebody help with this?",
+        );
+        match rebound {
+            WebDefaultOwnerResolution::Routed(Election::One {
+                bot,
+                addressed_by,
+                body,
+                ..
+            }) => {
+                assert_eq!(bot.agent_id.as_deref(), Some("relay-b4"));
+                assert_eq!(addressed_by, AddressedBy::Concierge);
+                assert_eq!(body, "could somebody help with this?");
+            }
+            other => panic!("designated contact must rebind a general ask: {other:?}"),
+        }
+        match apply_web_default_owner(
+            Election::Silence(SilenceReason::NoVoicesConfigured),
+            WebDefaultOwner::Designated("relay-b4"),
+            &config,
+            "-100777",
+            "could somebody help with this?",
+        ) {
+            WebDefaultOwnerResolution::Routed(Election::One { bot, body, .. }) => {
+                assert_eq!(bot.agent_id.as_deref(), Some("relay-b4"));
+                assert_eq!(body, "could somebody help with this?");
+            }
+            other => {
+                panic!("an explicit contact must recover a general no-voice election: {other:?}")
+            }
+        }
+
+        for (choice, expected) in [
+            (
+                WebDefaultOwner::NoneDesignated,
+                NeedsContactReason::NoDefaultOwner,
+            ),
+            (
+                WebDefaultOwner::Designated("not-in-config"),
+                NeedsContactReason::UnknownDefaultOwner,
+            ),
+            (
+                // A mutable Telegram handle is not the opaque persona id.
+                WebDefaultOwner::Designated("wire-b4_house_bot"),
+                NeedsContactReason::UnknownDefaultOwner,
+            ),
+            (
+                // An explicit binding supersedes the free-form bot-table key.
+                WebDefaultOwner::Designated("wire-b4"),
+                NeedsContactReason::UnknownDefaultOwner,
+            ),
+            (
+                // Machine ids are exact, unlike human-authored mentions.
+                WebDefaultOwner::Designated("Relay-B4"),
+                NeedsContactReason::UnknownDefaultOwner,
+            ),
+            (
+                // Surrounding whitespace is not normalized into machine identity.
+                WebDefaultOwner::Designated(" relay-b4 "),
+                NeedsContactReason::UnknownDefaultOwner,
+            ),
+        ] {
+            assert_eq!(
+                apply_web_default_owner(
+                    general.clone(),
+                    choice,
+                    &config,
+                    "-100777",
+                    "could somebody help with this?",
+                ),
+                WebDefaultOwnerResolution::NeedsContact(expected),
+            );
+            // A missing engine-local concierge is the same general-election
+            // seam: an unknown/no designation must not invent a responder.
+            assert_eq!(
+                apply_web_default_owner(
+                    Election::Silence(SilenceReason::NoVoicesConfigured),
+                    choice,
+                    &config,
+                    "-100777",
+                    "could somebody help with this?",
+                ),
+                WebDefaultOwnerResolution::NeedsContact(expected),
+            );
+        }
+
+        let mut ambiguous = config.clone();
+        ambiguous.bots.insert(
+            "second-binding".to_string(),
+            TelegramBotConfig {
+                bot_token: "444:DDD".to_string(),
+                chat_id: "-100777".to_string(),
+                agent_id: Some("relay-b4".to_string()),
+                username: None,
+            },
+        );
+        assert_eq!(
+            apply_web_default_owner(
+                general.clone(),
+                WebDefaultOwner::Designated("relay-b4"),
+                &ambiguous,
+                "-100777",
+                "could somebody help with this?",
+            ),
+            WebDefaultOwnerResolution::NeedsContact(NeedsContactReason::UnknownDefaultOwner),
+            "an opaque id claimed by two bot bindings must fail closed",
+        );
+
+        // Stronger election signals must remain byte-for-byte unchanged even
+        // when there is no usable default contact.
+        for election in [
+            one("relay-a7", AddressedBy::Mention),
+            one("relay-a7", AddressedBy::Name),
+            one("relay-a7", AddressedBy::ReplyChain),
+            one("relay-a7", AddressedBy::Domain(Domain::Cooking)),
+            Election::All {
+                reply_chat: "-100777".to_string(),
+                body: "what do you all think?".to_string(),
+            },
+            Election::Silence(SilenceReason::SmallTalk),
+        ] {
+            for choice in [
+                WebDefaultOwner::NoneDesignated,
+                WebDefaultOwner::Designated("not-in-config"),
+            ] {
+                assert_eq!(
+                    apply_web_default_owner(
+                        election.clone(),
+                        choice,
+                        &config,
+                        "-100777",
+                        "raw message",
+                    ),
+                    WebDefaultOwnerResolution::Routed(election.clone()),
+                    "stronger election {election:?} must ignore {choice:?}",
+                );
+            }
+        }
+
+        // A configured owner pin runs first and becomes a reply-continuity
+        // election, so the no-default declaration cannot erase it.
+        let owner_pin = resolve_owner_pin(Some("relay-c9"), &config).unwrap();
+        let pinned = apply_owner_pin(
+            general,
+            owner_pin.as_ref(),
+            "-100777",
+            "could somebody help with this?",
+        );
+        match apply_web_default_owner(
+            pinned,
+            WebDefaultOwner::NoneDesignated,
+            &config,
+            "-100777",
+            "could somebody help with this?",
+        ) {
+            WebDefaultOwnerResolution::Routed(Election::One {
+                bot, addressed_by, ..
+            }) => {
+                assert_eq!(bot.agent_id.as_deref(), Some("relay-c9"));
+                assert_eq!(addressed_by, AddressedBy::ReplyChain);
+            }
+            other => panic!("positive owner pin must outrank no-default: {other:?}"),
         }
     }
 

@@ -7130,15 +7130,38 @@ pub enum TelegramCommands {
         #[arg(long)]
         chat_id: Option<String>,
 
-        /// Pin the DELIVERING voice to this persona (agent/bot id, e.g. `nora`)
-        /// for a domain-owned heavy turn (task `owner-pin-engine`). When the
-        /// gateway resolves a domain owner and drops that persona's crisp ack,
-        /// it forwards the same id here so the async reply comes back in the
-        /// SAME voice — not a re-election winner. The gateway forwards it via
-        /// the `WG_OWNER_PIN` env var (forward-compatible: an older binary that
-        /// hasn't learned this flag simply ignores the env var); this flag is
-        /// the explicit CLI twin for the scratch-project/dry-run proof. Omitted
-        /// / `otto` / an unknown persona → elect as today.
+        /// Use this configured persona as the default contact for an otherwise
+        /// unaddressed general ask. The id is opaque and must resolve through the
+        /// current bot configuration. This is deliberately an explicit CLI
+        /// contract with the gateway: exactly one of `--default-owner` and
+        /// `--no-default-owner` is required, so an older engine rejects a new
+        /// gateway's invocation instead of silently choosing another voice.
+        #[arg(
+            long,
+            value_name = "OPAQUE_ID",
+            required_unless_present = "no_default_owner",
+            conflicts_with = "no_default_owner"
+        )]
+        default_owner: Option<String>,
+
+        /// Declare that this household currently has no designated default
+        /// contact. General asks return `needs-contact` without composing or
+        /// sending; explicit names, domains, collective asks, replies, and a
+        /// positive owner pin keep their normal routing.
+        #[arg(
+            long,
+            required_unless_present = "default_owner",
+            conflicts_with = "default_owner"
+        )]
+        no_default_owner: bool,
+
+        /// Pin the DELIVERING voice to one exact canonical agent id for a
+        /// domain-owned heavy turn (task `owner-pin-engine`). A configured
+        /// nonblank `agent_id` is authoritative; the bot-table key is used only
+        /// when that binding is absent or blank. The explicit flag wins over the
+        /// internal/manual `WG_OWNER_PIN` compatibility transport. An
+        /// unresolved or ambiguous supplied pin is rejected before compose or
+        /// send instead of silently re-electing another voice.
         #[arg(long)]
         owner: Option<String>,
 

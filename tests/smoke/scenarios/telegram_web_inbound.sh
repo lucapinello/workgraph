@@ -54,6 +54,8 @@ TRAIN_ID="trail-9"
 TRAIN_NAME="North Compass"
 COORD_ID="relay-4"
 COORD_NAME="Open Door"
+ALIAS_BOT_KEY="wire-z8"
+ALIAS_AGENT_ID="orbit-z8"
 ROSTER=("$MEALS_ID" "$COOK_ID" "$TRAIN_ID" "$COORD_ID")
 
 # The one confirmed human. `agency human add` slugifies the authored name into
@@ -126,11 +128,36 @@ bot_token = "0000000000:relay-fixture-token"
 chat_id   = "$GROUP_CHAT"
 agent_id  = "$COORD_ID"
 username  = "open_door_house_bot"
+
+[telegram.bots.$ALIAS_BOT_KEY]
+bot_token = "0000000000:alias-fixture-token"
+chat_id   = "$GROUP_CHAT"
+agent_id  = "$ALIAS_AGENT_ID"
+username  = "mutable_alias_house_bot"
 TOML
 
-web() { (cd "$scratch" && WG_DIR= "$review_wg" --json telegram web-inbound --dry-run --sender "$1" --message "$2" 2>&1); }
+web() {
+    (
+        cd "$scratch"
+        WG_DIR= "$review_wg" --json telegram web-inbound --dry-run \
+            --default-owner "$COORD_ID" --sender "$1" --message "$2" 2>&1
+    )
+}
 web_turn() {
-    (cd "$scratch" && WG_DIR= WG_TURN_ID="$3" "$review_wg" --json telegram web-inbound --dry-run --sender "$1" --message "$2" 2>&1)
+    (
+        cd "$scratch"
+        WG_DIR= WG_TURN_ID="$3" "$review_wg" --json telegram web-inbound --dry-run \
+            --default-owner "$COORD_ID" --sender "$1" --message "$2" 2>&1
+    )
+}
+web_choice() {
+    local choice_flag="$1"
+    shift
+    (
+        cd "$scratch"
+        WG_DIR= "$review_wg" --json telegram web-inbound --dry-run \
+            "$choice_flag" "$@"
+    )
 }
 
 expect_grep() {
@@ -175,6 +202,146 @@ expect_grep "the second named voice is the configured coordinator" "$out" "\"who
 out="$(web "$HUMAN_HANDLE" "$MEALS_NAME?")"
 expect_grep "web humanId resolves to the confirmed human" "$out" "\"auth_sender\": \"$HUMAN_TELEGRAM\""
 
+# --- Explicit default-contact contract --------------------------------------
+# An otherwise-general ask follows the gateway's declared opaque default, not
+# the engine-local coordination owner. The two ids deliberately differ so this
+# assertion cannot pass vacuously.
+general_ask="can someone help with the front door?"
+out="$(web_choice --default-owner "$TRAIN_ID" --sender "$HUMAN_NAME" --message "$general_ask" 2>&1)"
+expect_grep "general ask follows the explicit default contact" "$out" "\"who\": \"$TRAIN_ID\""
+
+# Non-vacuity for key-vs-binding identity: the same extra binding whose table
+# key is rejected below must route successfully through its canonical agent id.
+out="$(web_choice --default-owner "$ALIAS_AGENT_ID" --sender "$HUMAN_NAME" --message "$general_ask" 2>&1)"
+expect_grep "canonical id routes when its bot-table key differs" "$out" "\"who\": \"$ALIAS_AGENT_ID\""
+
+# No designated contact and an unknown declared id both fail closed as a
+# distinct successful outcome. `who` stays null: the engine must not invent a
+# voice and the caller can render the contact-needed state honestly.
+out="$(web_choice --no-default-owner --sender "$HUMAN_NAME" --message "$general_ask" 2>&1)"
+expect_grep "no default contact returns needs-contact" "$out" '"category": "needs-contact"'
+expect_grep "needs-contact has no responder" "$out" '"who": null'
+expect_grep "no-default reason is machine readable" "$out" '"reason": "no-default-owner"'
+
+# Drive the same no-default outcome without `--dry-run`. The deliberately
+# closed loopback endpoint makes any accidental send fail, while the one-second
+# composer timeout keeps a misplaced compose from hanging the gate. Success and
+# an unchanged feed prove the terminal outcome occurs before compose/delivery.
+feed_path="$scratch/.casa/group-feed.jsonl"
+feed_size_before=0
+if [[ -f "$feed_path" ]]; then
+    feed_size_before="$(wc -c <"$feed_path" | tr -d ' ')"
+fi
+out="$(
+    cd "$scratch"
+    WG_DIR= \
+    WG_TELEGRAM_API_BASE="http://127.0.0.1:9" \
+    WG_TELEGRAM_COMPOSE_TIMEOUT_SECS=1 \
+        "$review_wg" --json telegram web-inbound \
+            --no-default-owner --sender "$HUMAN_NAME" --message "$general_ask" 2>&1
+)"
+expect_grep "live no-default path terminates as needs-contact" "$out" '"category": "needs-contact"'
+feed_size_after=0
+if [[ -f "$feed_path" ]]; then
+    feed_size_after="$(wc -c <"$feed_path" | tr -d ' ')"
+fi
+[[ "$feed_size_before" == "$feed_size_after" ]] \
+    || loud_fail "needs-contact wrote a family feed reply before a contact was designated"
+echo "  ok: needs-contact performs no compose, send, or feed delivery"
+
+out="$(web_choice --default-owner "not-in-this-house" --sender "$HUMAN_NAME" --message "$general_ask" 2>&1)"
+expect_grep "unknown default contact fails closed" "$out" '"category": "needs-contact"'
+expect_grep "unknown default has no responder" "$out" '"who": null'
+expect_grep "unknown-default reason is machine readable" "$out" '"reason": "unknown-default-owner"'
+
+# A bot-table key is transport identity only once an explicit stable agent id
+# is configured. It must not remain an alternate persona id.
+out="$(web_choice --default-owner "$ALIAS_BOT_KEY" --sender "$HUMAN_NAME" --message "$general_ask" 2>&1)"
+expect_grep "bot-table alias is not a default-contact identity" "$out" '"category": "needs-contact"'
+expect_grep "bot-table alias cannot choose a responder" "$out" '"who": null'
+
+# The default declaration applies ONLY to general/concierge routing. Explicit
+# names, domains, collective asks, and a positive owner pin all stay stronger.
+out="$(web_choice --no-default-owner --sender "$HUMAN_NAME" --message "$MEALS_NAME, can you help?" 2>&1)"
+expect_grep "named voice outranks no-default" "$out" "\"who\": \"$MEALS_ID\""
+
+out="$(web_choice --no-default-owner --sender "$HUMAN_NAME" --message "what should we eat for dinner tonight?" 2>&1)"
+expect_grep "domain owner outranks no-default" "$out" "\"who\": \"$MEALS_ID\""
+
+out="$(web_choice --no-default-owner --sender "$HUMAN_NAME" --message "hey all, are you around?" 2>&1)"
+expect_grep "collective ask outranks no-default" "$out" '"category": "collective"'
+
+out="$(
+    cd "$scratch"
+    WG_DIR= "$review_wg" --json telegram web-inbound --dry-run \
+        --no-default-owner --owner "$COOK_ID" \
+        --sender "$HUMAN_NAME" --message "$general_ask" 2>&1
+)"
+expect_grep "positive owner pin outranks no-default" "$out" "\"who\": \"$COOK_ID\""
+
+# A supplied owner pin is binding, so a mutable handle or bot-table alias must
+# fail before compose, feed mutation, or send instead of silently re-electing a
+# different voice. Run the real non-dry seam against a closed endpoint; the
+# specific owner-pin diagnostic and unchanged feed prove the early exit.
+feed_size_before=0
+if [[ -f "$feed_path" ]]; then
+    feed_size_before="$(wc -c <"$feed_path" | tr -d ' ')"
+fi
+if out="$(
+    cd "$scratch"
+    WG_DIR= \
+    WG_TELEGRAM_API_BASE="http://127.0.0.1:9" \
+    WG_TELEGRAM_COMPOSE_TIMEOUT_SECS=1 \
+        "$review_wg" --json telegram web-inbound \
+            --no-default-owner --owner "$ALIAS_BOT_KEY" \
+            --sender "$HUMAN_NAME" --message "$general_ask" 2>&1
+)"; then
+    loud_fail "web-inbound accepted a bot-table alias as an owner pin"
+fi
+expect_grep "invalid owner pin fails at the identity seam" "$out" "web-inbound owner pin"
+feed_size_after=0
+if [[ -f "$feed_path" ]]; then
+    feed_size_after="$(wc -c <"$feed_path" | tr -d ' ')"
+fi
+[[ "$feed_size_before" == "$feed_size_after" ]] \
+    || loud_fail "invalid owner pin wrote a family feed reply before failing"
+echo "  ok: invalid owner pin performs no compose, send, or feed delivery"
+
+# An explicitly blank CLI value must not disappear and fall through to a valid
+# compatibility env pin. The explicit argument wins and is rejected as invalid.
+if out="$(
+    cd "$scratch"
+    WG_DIR= WG_OWNER_PIN="$COOK_ID" \
+        "$review_wg" --json telegram web-inbound --dry-run \
+            --no-default-owner --owner "" \
+            --sender "$HUMAN_NAME" --message "$general_ask" 2>&1
+)"; then
+    loud_fail "web-inbound erased an explicit blank owner pin"
+fi
+expect_grep "explicit blank owner pin cannot fall back to the env pin" "$out" "nonblank canonical agent id"
+
+# The choice is required and mutually exclusive at the real CLI boundary. This
+# also pins the cross-version handshake: these are ordinary flags, so an older
+# engine that does not know them rejects the new gateway invocation.
+if (
+    cd "$scratch"
+    WG_DIR= "$review_wg" telegram web-inbound --dry-run \
+        --sender "$HUMAN_NAME" --message "$general_ask" >/dev/null 2>&1
+); then
+    loud_fail "web-inbound accepted an ambiguous invocation with no default-owner choice"
+fi
+echo "  ok: web-inbound requires an explicit default-owner choice"
+
+if (
+    cd "$scratch"
+    WG_DIR= "$review_wg" telegram web-inbound --dry-run \
+        --default-owner "$COORD_ID" --no-default-owner \
+        --sender "$HUMAN_NAME" --message "$general_ask" >/dev/null 2>&1
+); then
+    loud_fail "web-inbound accepted both default-owner choices"
+fi
+echo "  ok: web-inbound rejects conflicting default-owner choices"
+
 # --- Gateway occurrence id reaches the engine idempotency seam ---------------
 # The exact same accepted turn id is stable on a dispatcher refire, while a
 # later occurrence with identical words gets a different opaque fingerprint.
@@ -193,12 +360,15 @@ later_fp="$(turn_fingerprint "$later")"
 [[ "$first_fp" != "$later_fp" ]] || loud_fail "different WG_TURN_ID values collapsed for identical words"
 echo "  ok: WG_TURN_ID is stable on refire and distinct for a later identical ask"
 
-# --- Small talk with a second human present → silence (no double-answering) --
-# With 2+ humans the membership-aware rule protects human-to-human chatter: the
-# web message is silenced just as the same words would be on Telegram.
-out="$(cd "$scratch" && WG_DIR= "$review_wg" --json telegram web-inbound --dry-run --sender "$HUMAN_NAME" --message "lol ok sounds good" 2>&1 || true)"
-# In a single-human group even small talk may draw the concierge; that is fine.
-# The invariant we pin: a dry-run never errors and always reports a category.
+# --- Small talk remains a valid dry-run decision ----------------------------
+out="$(
+    cd "$scratch"
+    WG_DIR= "$review_wg" --json telegram web-inbound --dry-run \
+        --default-owner "$COORD_ID" --sender "$HUMAN_NAME" \
+        --message "lol ok sounds good" 2>&1 || true
+)"
+# This fixture has one confirmed human, so either a concierge response or
+# silence is valid. The invariant here is only that dry-run reports a category.
 expect_grep "dry-run always reports a category" "$out" '"category"'
 
 echo "PASS: telegram_web_inbound"

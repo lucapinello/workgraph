@@ -305,15 +305,21 @@ pub fn bot_id_for_channel(config: &TelegramConfig, channel_type: &str) -> Option
     bot_id_for_channel_with_default(config, channel_type, None)
 }
 
-/// The agency agent a bot fronts (its `agent_id`), falling back to the bot id
-/// itself when no explicit binding is configured. Exposed for the listener's
-/// casa-feed mirror, which maps the replying `bot_id` back to its persona id.
+/// The agency agent a bot fronts (its nonblank `agent_id`), falling back to the
+/// bot id itself when no usable binding is configured. Exposed for the
+/// listener's casa-feed mirror, which maps the replying `bot_id` back to its
+/// persona id.
 pub fn agent_for_bot(config: &TelegramConfig, bot_id: &str) -> String {
     config
         .all_bots()
         .iter()
         .find(|(id, _)| id == bot_id)
-        .and_then(|(_, b)| b.agent_id.clone())
+        .and_then(|(_, b)| {
+            b.agent_id
+                .as_ref()
+                .filter(|agent_id| !agent_id.trim().is_empty())
+                .cloned()
+        })
         .unwrap_or_else(|| bot_id.to_string())
 }
 
@@ -3313,6 +3319,18 @@ domains = ["calendar", "coordination", "shopping"]
             Some("otto")
         );
         assert_eq!(bot_id_for_channel(&cfg, "telegram"), None);
+    }
+
+    #[test]
+    fn agent_for_bot_uses_only_a_nonblank_explicit_binding() {
+        let cfg = cfg_with_bots(&[
+            ("wire-a7", Some("relay-a7")),
+            ("fallback-b4", None),
+            ("fallback-c9", Some("   ")),
+        ]);
+        assert_eq!(agent_for_bot(&cfg, "wire-a7"), "relay-a7");
+        assert_eq!(agent_for_bot(&cfg, "fallback-b4"), "fallback-b4");
+        assert_eq!(agent_for_bot(&cfg, "fallback-c9"), "fallback-c9");
     }
 
     #[test]
