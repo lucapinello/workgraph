@@ -29,7 +29,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::grounding::{self, FamilyVoiceRoster};
-use super::telegram_conversation::{ReplyComposer, ReplySink, send_reply_once};
+use super::telegram_conversation::{
+    CanonicalDeliveryState, ReplyComposer, ReplySink, canonical_delivery_state,
+    send_canonical_reply_once,
+};
 
 /// Hard character cap for a single voice's take, applied after compose as a
 /// safety net (the prompt already asks for one or two sentences). Cut on a word
@@ -228,6 +231,48 @@ fn discussion_delivery_id(physical_turn_key: &str, part: &str, bot_id: &str) -> 
     }
 }
 
+enum DiscussionPartResolution {
+    Delivered(String),
+    Skipped,
+    Blocked,
+}
+
+async fn send_discussion_canonical(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+    sink: &dyn ReplySink,
+) -> DiscussionPartResolution {
+    match send_canonical_reply_once(
+        workgraph_dir,
+        delivery_id,
+        bot_id,
+        chat_id,
+        text,
+        sink,
+    )
+    .await
+    {
+        Ok(CanonicalDeliveryState::Confirmed(text)) => {
+            DiscussionPartResolution::Delivered(text)
+        }
+        Ok(CanonicalDeliveryState::Skipped) => {
+            DiscussionPartResolution::Skipped
+        }
+        // A transport error, in-flight claim, or legacy/corrupt state is not a
+        // family-visible take. Keep it out of subsequent compose context.
+        Ok(
+            CanonicalDeliveryState::Missing
+            | CanonicalDeliveryState::Ready(_)
+            | CanonicalDeliveryState::Pending
+            | CanonicalDeliveryState::Unavailable,
+        )
+        | Err(_) => DiscussionPartResolution::Blocked,
+    }
+}
+
 /// Run a discussion round: sequenced in-voice takes then an optional synthesis,
 /// sending via `sink`.
 ///
@@ -237,6 +282,8 @@ fn discussion_delivery_id(physical_turn_key: &str, part: &str, bot_id: &str) -> 
 /// *other* voices contributed a take. `timing` bounds each voice and the round
 /// as a whole; a voice that errors or does not answer within its budget is
 /// skipped, never blocking the round and never leaking an error to the group.
+/// For replayable rounds, an unconfirmed transport becomes an ordering barrier:
+/// no later take or synthesis may land until an exact retry confirms it.
 /// `physical_turn_key` is the opaque occurrence key shared by every contribution
 /// in this round. Each take and synthesis derives a distinct durable delivery
 /// claim from it, so replaying one physical turn sends nothing twice while a
@@ -256,31 +303,30 @@ pub async fn run_discussion_round(
     let started = Instant::now();
     let mut takes: Vec<Take> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut delivery_barrier = false;
 
     for voice in voices {
-        let left = remaining(timing.overall, started);
-        if left.is_zero() {
-            // Round budget spent — skip the rest rather than block the family.
+        if delivery_barrier {
             skipped.push(voice.bot_id.clone());
             continue;
         }
-        let budget = timing.per_voice.min(left);
-        let message = discussion_take_message(topic, &takes);
-        let text = compose_bounded(
-            composer,
+        let delivery_id =
+            discussion_delivery_id(physical_turn_key, "take", &voice.bot_id);
+        let state = canonical_delivery_state(
             workgraph_dir,
-            &voice.session_ref,
-            &voice.agent_id,
-            &message,
-            budget,
-            family_roster,
-        )
-        .await;
-        match text {
-            Some(text) => {
-                let delivery_id =
-                    discussion_delivery_id(physical_turn_key, "take", &voice.bot_id);
-                match send_reply_once(
+            &delivery_id,
+            &voice.bot_id,
+            chat_id,
+        )?;
+        let resolution = match state {
+            CanonicalDeliveryState::Confirmed(text) => {
+                DiscussionPartResolution::Delivered(text)
+            }
+            CanonicalDeliveryState::Skipped => {
+                DiscussionPartResolution::Skipped
+            }
+            CanonicalDeliveryState::Ready(text) => {
+                send_discussion_canonical(
                     workgraph_dir,
                     &delivery_id,
                     &voice.bot_id,
@@ -289,18 +335,82 @@ pub async fn run_discussion_round(
                     sink,
                 )
                 .await
-                {
-                    Ok(_) => takes.push(Take {
-                        bot_id: voice.bot_id.clone(),
-                        display_name: voice.display_name.clone(),
-                        text,
-                    }),
-                    // A send failure is a delivery problem, not an error to surface —
-                    // record the skip and keep the round moving.
-                    Err(_) => skipped.push(voice.bot_id.clone()),
+            }
+            CanonicalDeliveryState::Pending
+            | CanonicalDeliveryState::Unavailable => {
+                DiscussionPartResolution::Blocked
+            }
+            CanonicalDeliveryState::Missing => {
+                let left = remaining(timing.overall, started);
+                if left.is_zero() {
+                    send_discussion_canonical(
+                        workgraph_dir,
+                        &delivery_id,
+                        &voice.bot_id,
+                        chat_id,
+                        "",
+                        sink,
+                    )
+                    .await
+                } else {
+                    let budget = timing.per_voice.min(left);
+                    let message = discussion_take_message(topic, &takes);
+                    match compose_bounded(
+                        composer,
+                        workgraph_dir,
+                        &voice.session_ref,
+                        &voice.agent_id,
+                        &message,
+                        budget,
+                        family_roster,
+                    )
+                    .await
+                    {
+                        Some(text) => {
+                            send_discussion_canonical(
+                                workgraph_dir,
+                                &delivery_id,
+                                &voice.bot_id,
+                                chat_id,
+                                &text,
+                                sink,
+                            )
+                            .await
+                        }
+                        None => {
+                            send_discussion_canonical(
+                                workgraph_dir,
+                                &delivery_id,
+                                &voice.bot_id,
+                                chat_id,
+                                "",
+                                sink,
+                            )
+                            .await
+                        }
+                    }
                 }
             }
-            None => skipped.push(voice.bot_id.clone()),
+        };
+        match resolution {
+            DiscussionPartResolution::Delivered(text) => takes.push(Take {
+                bot_id: voice.bot_id.clone(),
+                display_name: voice.display_name.clone(),
+                text,
+            }),
+            DiscussionPartResolution::Skipped => {
+                skipped.push(voice.bot_id.clone());
+            }
+            DiscussionPartResolution::Blocked => {
+                skipped.push(voice.bot_id.clone());
+                // Without a stable physical key there is no replay to order, so
+                // preserve the legacy best-effort skip-and-continue behavior.
+                // Durable rounds stop here: a later voice must never land before
+                // this canonical part has transport confirmation.
+                if !delivery_id.is_empty() {
+                    delivery_barrier = true;
+                }
+            }
         }
     }
 
@@ -310,33 +420,25 @@ pub async fn run_discussion_round(
     // "the consensus is…".
     let non_synth_takes = takes.iter().filter(|t| t.bot_id != synthesizer_bot).count();
     let mut synthesis = None;
-    if non_synth_takes >= 2 {
+    if !delivery_barrier && non_synth_takes >= 2 {
         if let Some(voice) = voices.iter().find(|v| v.bot_id == synthesizer_bot) {
-            let left = remaining(timing.overall, started);
-            // Give the wrap-up a full per-voice budget even at the tail of the
-            // round (it is the payload the discussion ask wanted); only skip it
-            // when the round budget is fully spent.
-            let budget = if left.is_zero() {
-                Duration::ZERO
-            } else {
-                timing.per_voice.min(left.max(Duration::from_secs(1)))
-            };
-            if !budget.is_zero() {
-                let message = synthesis_message(topic, &takes);
-                if let Some(text) = compose_bounded(
-                    composer,
-                    workgraph_dir,
-                    &voice.session_ref,
-                    &voice.agent_id,
-                    &message,
-                    budget,
-                    family_roster,
-                )
-                .await
-                {
-                    let delivery_id =
-                        discussion_delivery_id(physical_turn_key, "synthesis", &voice.bot_id);
-                    if send_reply_once(
+            let delivery_id =
+                discussion_delivery_id(physical_turn_key, "synthesis", &voice.bot_id);
+            let state = canonical_delivery_state(
+                workgraph_dir,
+                &delivery_id,
+                &voice.bot_id,
+                chat_id,
+            )?;
+            let resolution = match state {
+                CanonicalDeliveryState::Confirmed(text) => {
+                    DiscussionPartResolution::Delivered(text)
+                }
+                CanonicalDeliveryState::Skipped => {
+                    DiscussionPartResolution::Skipped
+                }
+                CanonicalDeliveryState::Ready(text) => {
+                    send_discussion_canonical(
                         workgraph_dir,
                         &delivery_id,
                         &voice.bot_id,
@@ -345,12 +447,75 @@ pub async fn run_discussion_round(
                         sink,
                     )
                     .await
-                    .is_ok()
-                    {
-                        synthesis = Some(text);
+                }
+                CanonicalDeliveryState::Pending
+                | CanonicalDeliveryState::Unavailable => {
+                    DiscussionPartResolution::Blocked
+                }
+                CanonicalDeliveryState::Missing => {
+                    let left = remaining(timing.overall, started);
+                    // Give the wrap-up a full per-voice budget even at the tail
+                    // of the round (it is the payload the discussion ask wanted);
+                    // only skip it when the round budget is fully spent.
+                    let budget = if left.is_zero() {
+                        Duration::ZERO
+                    } else {
+                        timing.per_voice.min(left.max(Duration::from_secs(1)))
+                    };
+                    if budget.is_zero() {
+                        send_discussion_canonical(
+                            workgraph_dir,
+                            &delivery_id,
+                            &voice.bot_id,
+                            chat_id,
+                            "",
+                            sink,
+                        )
+                        .await
+                    } else {
+                        let message = synthesis_message(topic, &takes);
+                        match compose_bounded(
+                            composer,
+                            workgraph_dir,
+                            &voice.session_ref,
+                            &voice.agent_id,
+                            &message,
+                            budget,
+                            family_roster,
+                        )
+                        .await
+                        {
+                            Some(text) => {
+                                send_discussion_canonical(
+                                    workgraph_dir,
+                                    &delivery_id,
+                                    &voice.bot_id,
+                                    chat_id,
+                                    &text,
+                                    sink,
+                                )
+                                .await
+                            }
+                            None => {
+                                send_discussion_canonical(
+                                    workgraph_dir,
+                                    &delivery_id,
+                                    &voice.bot_id,
+                                    chat_id,
+                                    "",
+                                    sink,
+                                )
+                                .await
+                            }
+                        }
                     }
                 }
-            }
+            };
+            synthesis = match resolution {
+                DiscussionPartResolution::Delivered(text) => Some(text),
+                DiscussionPartResolution::Skipped
+                | DiscussionPartResolution::Blocked => None,
+            };
         }
     }
 
@@ -397,7 +562,10 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tempfile::tempdir;
 
     /// A composer that returns a canned take per agent id, or errors for agents
     /// mapped to `None` (a "dead session").
@@ -471,6 +639,610 @@ mod tests {
             ["Nora", "Bruno", "Coach Mira", "Otto"],
             ["Household Member"],
         )
+    }
+
+    #[tokio::test]
+    async fn same_turn_refire_does_not_recompose() {
+        struct CountingComposer {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplyComposer for CountingComposer {
+            async fn compose(
+                &self,
+                _dir: &Path,
+                _session_ref: &str,
+                agent_id: &str,
+                message: &str,
+            ) -> Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if message.contains("close the discussion") {
+                    Ok("The shared direction is clear.".to_string())
+                } else {
+                    Ok(format!("A grounded take from {agent_id}."))
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let voices = vec![voice("voice-a"), voice("voice-b"), voice("voice-c")];
+        let family = FamilyVoiceRoster::from_names(
+            voices.iter().map(|voice| voice.display_name.as_str()),
+            ["Fixture Member"],
+        );
+        let composer = CountingComposer {
+            calls: AtomicUsize::new(0),
+        };
+        let sink = RecordingSink::default();
+
+        let first = run_discussion_round(
+            dir.path(),
+            "which option fits best?",
+            &voices,
+            "voice-c",
+            &composer,
+            &family,
+            &sink,
+            "-100-fixture",
+            "physical-discussion-refire",
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.takes.len(), 3);
+        assert!(first.synthesis.is_some());
+        assert_eq!(composer.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(sink.sent.lock().unwrap().len(), 4);
+
+        let replay = run_discussion_round(
+            dir.path(),
+            "which option fits best?",
+            &voices,
+            "voice-c",
+            &composer,
+            &family,
+            &sink,
+            "-100-fixture",
+            "physical-discussion-refire",
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            composer.calls.load(Ordering::SeqCst),
+            4,
+            "a confirmed physical-turn replay must not invoke any composer",
+        );
+        assert_eq!(
+            sink.sent.lock().unwrap().len(),
+            4,
+            "a confirmed physical-turn replay must stay transport-silent",
+        );
+        assert_eq!(
+            replay, first,
+            "the replay outcome must reuse the exact canonical delivered round",
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_send_reuses_canonical_take_bytes() {
+        struct ChangingComposer {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplyComposer for ChangingComposer {
+            async fn compose(
+                &self,
+                _dir: &Path,
+                _session_ref: &str,
+                _agent_id: &str,
+                _message: &str,
+            ) -> Result<String> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(if call == 0 {
+                    "**First canonical take.**".to_string()
+                } else {
+                    "A different recomposed take.".to_string()
+                })
+            }
+        }
+
+        struct FailFirstSink {
+            attempts: AtomicUsize,
+            texts: Mutex<Vec<String>>,
+            canonical_path: PathBuf,
+            canonical_seen_before_transport: AtomicBool,
+        }
+        #[async_trait]
+        impl ReplySink for FailFirstSink {
+            async fn send(
+                &self,
+                _bot_id: &str,
+                _chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                let canonical = std::fs::read_to_string(&self.canonical_path)
+                    .expect("canonical bytes must be durable before transport");
+                assert_eq!(
+                    canonical, text,
+                    "transport must receive the exact persisted canonical bytes",
+                );
+                self.canonical_seen_before_transport
+                    .store(true, Ordering::SeqCst);
+                self.texts.lock().unwrap().push(text.to_string());
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    anyhow::bail!("stub discussion transport failure");
+                }
+                Ok(Some("confirmed-take".to_string()))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let voices = vec![voice("voice-retry")];
+        let family = FamilyVoiceRoster::from_names(
+            voices.iter().map(|voice| voice.display_name.as_str()),
+            ["Fixture Member"],
+        );
+        let composer = ChangingComposer {
+            calls: AtomicUsize::new(0),
+        };
+        let physical_turn_key = "physical-discussion-send-retry";
+        let chat_id = "-100-fixture";
+        let delivery_id =
+            discussion_delivery_id(physical_turn_key, "take", "voice-retry");
+        let digest = super::super::telegram_conversation::durable_telegram_digest_v1(
+            "telegram-delivery-claim",
+            &[&delivery_id, "voice-retry", chat_id],
+        );
+        let sink = FailFirstSink {
+            attempts: AtomicUsize::new(0),
+            texts: Mutex::new(Vec::new()),
+            canonical_path: dir
+                .path()
+                .join("telegram-deliveries")
+                .join(format!("{digest}.canonical")),
+            canonical_seen_before_transport: AtomicBool::new(false),
+        };
+
+        let first = run_discussion_round(
+            dir.path(),
+            "what should we choose?",
+            &voices,
+            "missing-synthesizer",
+            &composer,
+            &family,
+            &sink,
+            chat_id,
+            physical_turn_key,
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+        assert!(first.takes.is_empty());
+        assert_eq!(first.skipped, vec!["voice-retry".to_string()]);
+        assert!(
+            sink.canonical_seen_before_transport
+                .load(Ordering::SeqCst),
+            "the failed transport must observe canonical guarded bytes already on disk",
+        );
+
+        let retry = run_discussion_round(
+            dir.path(),
+            "what should we choose?",
+            &voices,
+            "missing-synthesizer",
+            &composer,
+            &family,
+            &sink,
+            chat_id,
+            physical_turn_key,
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+        let replay = run_discussion_round(
+            dir.path(),
+            "what should we choose?",
+            &voices,
+            "missing-synthesizer",
+            &composer,
+            &family,
+            &sink,
+            chat_id,
+            physical_turn_key,
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            composer.calls.load(Ordering::SeqCst),
+            1,
+            "retry and confirmed refire must not recompose canonical bytes",
+        );
+        let texts = sink.texts.lock().unwrap().clone();
+        assert_eq!(texts, vec!["First canonical take.", "First canonical take."]);
+        assert_eq!(retry.takes[0].text, "First canonical take.");
+        assert_eq!(replay.takes, retry.takes);
+    }
+
+    #[tokio::test]
+    async fn partial_retry_context_contains_only_delivered_canonical_takes() {
+        #[derive(Default)]
+        struct ContextComposer {
+            calls: Mutex<HashMap<String, usize>>,
+            prompts: Mutex<Vec<(String, String)>>,
+        }
+        #[async_trait]
+        impl ReplyComposer for ContextComposer {
+            async fn compose(
+                &self,
+                _dir: &Path,
+                _session_ref: &str,
+                agent_id: &str,
+                message: &str,
+            ) -> Result<String> {
+                self.prompts
+                    .lock()
+                    .unwrap()
+                    .push((agent_id.to_string(), message.to_string()));
+                let call = {
+                    let mut calls = self.calls.lock().unwrap();
+                    let entry = calls.entry(agent_id.to_string()).or_default();
+                    let call = *entry;
+                    *entry += 1;
+                    call
+                };
+                match (agent_id, call) {
+                    ("voice-alpha", 0) => Ok("Alpha-original.".to_string()),
+                    ("voice-alpha", _) => Ok("Alpha-recomposed.".to_string()),
+                    ("voice-delta", 0) => Ok("Delta-original.".to_string()),
+                    ("voice-delta", _) => Ok("Delta-recomposed.".to_string()),
+                    ("voice-beta", 0) => Ok("Beta-original.".to_string()),
+                    ("voice-beta", _) => Ok("Beta-recomposed.".to_string()),
+                    ("voice-gamma", _) => {
+                        if message.contains("Alpha-original.")
+                            && message.contains("Delta-original.")
+                            && message.contains("Beta-original.")
+                            && !message.contains("recomposed")
+                        {
+                            if message.contains("close the discussion") {
+                                Ok(
+                                    "Alpha-original, Delta-original, Beta-original, and \
+                                     Gamma-original are the visible takes."
+                                        .to_string(),
+                                )
+                            } else {
+                                Ok(
+                                    "Gamma-original builds on Alpha-original, Delta-original, \
+                                     and Beta-original."
+                                        .to_string(),
+                                )
+                            }
+                        } else {
+                            Ok("I reacted to recomposed or unsent words.".to_string())
+                        }
+                    }
+                    _ => anyhow::bail!("unexpected discussion voice {agent_id}"),
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct FailBetaOnceSink {
+            failed_beta: AtomicBool,
+            attempts: Mutex<Vec<(String, String)>>,
+            delivered: Mutex<Vec<(String, String)>>,
+        }
+        #[async_trait]
+        impl ReplySink for FailBetaOnceSink {
+            async fn send(
+                &self,
+                bot_id: &str,
+                _chat_id: &str,
+                text: &str,
+            ) -> Result<Option<String>> {
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .push((bot_id.to_string(), text.to_string()));
+                if bot_id == "voice-beta"
+                    && !self.failed_beta.swap(true, Ordering::SeqCst)
+                {
+                    anyhow::bail!("stub beta transport failure");
+                }
+                self.delivered
+                    .lock()
+                    .unwrap()
+                    .push((bot_id.to_string(), text.to_string()));
+                Ok(Some(format!("confirmed-{bot_id}")))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let voices = vec![
+            voice("voice-alpha"),
+            voice("voice-delta"),
+            voice("voice-beta"),
+            voice("voice-gamma"),
+        ];
+        let family = FamilyVoiceRoster::from_names(
+            voices.iter().map(|voice| voice.display_name.as_str()),
+            ["Fixture Member"],
+        );
+        let composer = ContextComposer::default();
+        let sink = FailBetaOnceSink::default();
+
+        let first = run_discussion_round(
+            dir.path(),
+            "how should we combine these ideas?",
+            &voices,
+            "voice-gamma",
+            &composer,
+            &family,
+            &sink,
+            "-100-fixture",
+            "physical-discussion-partial-retry",
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first
+                .takes
+                .iter()
+                .map(|take| take.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha-original.", "Delta-original."],
+        );
+        assert_eq!(
+            first.skipped,
+            vec!["voice-beta".to_string(), "voice-gamma".to_string()],
+        );
+        assert_eq!(
+            composer
+                .calls
+                .lock()
+                .unwrap()
+                .get("voice-gamma")
+                .copied(),
+            None,
+            "a failed middle transport must stop the round before a later composer runs",
+        );
+        let delivered_before_retry = sink.delivered.lock().unwrap().len();
+
+        let retry = run_discussion_round(
+            dir.path(),
+            "how should we combine these ideas?",
+            &voices,
+            "voice-gamma",
+            &composer,
+            &family,
+            &sink,
+            "-100-fixture",
+            "physical-discussion-partial-retry",
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+
+        let calls = composer.calls.lock().unwrap().clone();
+        assert_eq!(calls.get("voice-alpha"), Some(&1));
+        assert_eq!(calls.get("voice-delta"), Some(&1));
+        assert_eq!(calls.get("voice-beta"), Some(&1));
+        assert_eq!(calls.get("voice-gamma"), Some(&2));
+        let gamma_retry_prompt = composer
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(agent, prompt)| {
+                agent == "voice-gamma" && !prompt.contains("close the discussion")
+            })
+            .map(|(_, prompt)| prompt.clone())
+            .unwrap();
+        assert!(gamma_retry_prompt.contains("Alpha-original."));
+        assert!(gamma_retry_prompt.contains("Delta-original."));
+        assert!(gamma_retry_prompt.contains("Beta-original."));
+        assert!(!gamma_retry_prompt.contains("recomposed"));
+
+        let delivered = sink.delivered.lock().unwrap().clone();
+        assert_eq!(
+            &delivered[delivered_before_retry..],
+            &[
+                ("voice-beta".to_string(), "Beta-original.".to_string()),
+                (
+                    "voice-gamma".to_string(),
+                    "Gamma-original builds on Alpha-original, Delta-original, and \
+                     Beta-original."
+                        .to_string(),
+                ),
+                (
+                    "voice-gamma".to_string(),
+                    "Alpha-original, Delta-original, Beta-original, and Gamma-original \
+                     are the visible takes."
+                        .to_string(),
+                ),
+            ],
+            "retry may deliver only canonical bytes and replies grounded in takes already confirmed",
+        );
+        assert_eq!(
+            retry
+                .takes
+                .iter()
+                .map(|take| take.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Alpha-original.",
+                "Delta-original.",
+                "Beta-original.",
+                "Gamma-original builds on Alpha-original, Delta-original, and Beta-original.",
+            ],
+        );
+        assert_eq!(
+            retry.synthesis.as_deref(),
+            Some(
+                "Alpha-original, Delta-original, Beta-original, and Gamma-original \
+                 are the visible takes.",
+            ),
+        );
+
+        let sends_before_replay = sink.attempts.lock().unwrap().len();
+        let replay = run_discussion_round(
+            dir.path(),
+            "how should we combine these ideas?",
+            &voices,
+            "voice-gamma",
+            &composer,
+            &family,
+            &sink,
+            "-100-fixture",
+            "physical-discussion-partial-retry",
+            generous_timing(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            composer.calls.lock().unwrap().clone(),
+            calls,
+            "a confirmed replay must stay composer-silent",
+        );
+        assert_eq!(
+            sink.attempts.lock().unwrap().len(),
+            sends_before_replay,
+            "a confirmed replay must stay transport-silent",
+        );
+        assert_eq!(replay, retry);
+    }
+
+    #[tokio::test]
+    async fn same_turn_compose_and_timeout_skips_are_durable_without_blocking_later_voices() {
+        #[derive(Default)]
+        struct SkipThenChangeComposer {
+            calls: Mutex<HashMap<String, usize>>,
+        }
+        #[async_trait]
+        impl ReplyComposer for SkipThenChangeComposer {
+            async fn compose(
+                &self,
+                _dir: &Path,
+                _session_ref: &str,
+                agent_id: &str,
+                _message: &str,
+            ) -> Result<String> {
+                let call = {
+                    let mut calls = self.calls.lock().unwrap();
+                    let entry = calls.entry(agent_id.to_string()).or_default();
+                    let call = *entry;
+                    *entry += 1;
+                    call
+                };
+                match (agent_id, call) {
+                    ("voice-skipped", 0) => {
+                        anyhow::bail!("stub first compose failure")
+                    }
+                    ("voice-skipped", _) => {
+                        Ok("A resurrected take must never land.".to_string())
+                    }
+                    ("voice-timeout", 0) => {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        Ok("A timed-out take must never land.".to_string())
+                    }
+                    ("voice-timeout", _) => {
+                        Ok("A resurrected timeout must never land.".to_string())
+                    }
+                    ("voice-later", _) => Ok("The later take can still land.".to_string()),
+                    _ => anyhow::bail!("unexpected discussion voice {agent_id}"),
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let voices = vec![
+            voice("voice-skipped"),
+            voice("voice-timeout"),
+            voice("voice-later"),
+        ];
+        let family = FamilyVoiceRoster::from_names(
+            voices.iter().map(|voice| voice.display_name.as_str()),
+            ["Fixture Member"],
+        );
+        let composer = SkipThenChangeComposer::default();
+        let sink = RecordingSink::default();
+
+        let first = run_discussion_round(
+            dir.path(),
+            "which option should we take?",
+            &voices,
+            "missing-synthesizer",
+            &composer,
+            &family,
+            &sink,
+            "-100-fixture",
+            "physical-discussion-durable-skip",
+            DiscussionTiming {
+                per_voice: Duration::from_millis(5),
+                overall: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first.skipped,
+            vec!["voice-skipped".to_string(), "voice-timeout".to_string()],
+        );
+        assert_eq!(
+            first
+                .takes
+                .iter()
+                .map(|take| take.bot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["voice-later"],
+        );
+        let sends_after_first = sink.sent.lock().unwrap().len();
+
+        let replay = run_discussion_round(
+            dir.path(),
+            "which option should we take?",
+            &voices,
+            "missing-synthesizer",
+            &composer,
+            &family,
+            &sink,
+            "-100-fixture",
+            "physical-discussion-durable-skip",
+            DiscussionTiming {
+                per_voice: Duration::from_millis(5),
+                overall: Duration::from_secs(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            composer
+                .calls
+                .lock()
+                .unwrap()
+                .get("voice-skipped")
+                .copied(),
+            Some(1),
+            "a durable skip must never re-invoke a changing composer",
+        );
+        assert_eq!(
+            composer
+                .calls
+                .lock()
+                .unwrap()
+                .get("voice-timeout")
+                .copied(),
+            Some(1),
+            "a durable timeout must never re-invoke a changing composer",
+        );
+        assert_eq!(sink.sent.lock().unwrap().len(), sends_after_first);
+        assert_eq!(replay, first);
     }
 
     #[tokio::test]

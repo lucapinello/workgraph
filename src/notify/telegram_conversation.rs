@@ -45,6 +45,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -577,6 +578,29 @@ pub fn durable_telegram_digest_v1(domain: &str, fields: &[&str]) -> String {
     )
 }
 
+fn delivery_claim_path(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+) -> Option<PathBuf> {
+    if delivery_id.trim().is_empty() {
+        return None;
+    }
+    // The filename itself starts with `b3-v1-`, making its encoding version
+    // explicit on disk. Hash all routing fields with a length-delimited
+    // canonical encoding so the ledger exposes no household or bot ids.
+    let digest = durable_telegram_digest_v1(
+        "telegram-delivery-claim",
+        &[delivery_id, bot_id, chat_id],
+    );
+    Some(
+        workgraph_dir
+            .join("telegram-deliveries")
+            .join(format!("{digest}.sent")),
+    )
+}
+
 /// Local state for one logical family-visible reply.
 ///
 /// The filesystem claim is the cross-process authority. This state only keeps
@@ -612,23 +636,8 @@ impl<'a> TurnDeliverySink<'a> {
         chat_id: &str,
         inner: &'a dyn ReplySink,
     ) -> Self {
-        let claim_path = if delivery_id.trim().is_empty() {
-            None
-        } else {
-            // The filename itself starts with `b3-v1-`, making its encoding
-            // version explicit on disk. Hash all routing fields with a
-            // length-delimited canonical encoding so the ledger exposes no
-            // household ids, bot ids, or message text.
-            let digest = durable_telegram_digest_v1(
-                "telegram-delivery-claim",
-                &[delivery_id, bot_id, chat_id],
-            );
-            Some(
-                workgraph_dir
-                    .join("telegram-deliveries")
-                    .join(format!("{digest}.sent")),
-            )
-        };
+        let claim_path =
+            delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id);
         let retry_path = claim_path.as_ref().map(|path| path.with_extension("retry"));
         Self {
             inner,
@@ -884,6 +893,339 @@ pub async fn send_reply_once(
 ) -> Result<Option<String>> {
     let guarded = TurnDeliverySink::new(workgraph_dir, delivery_id, bot_id, chat_id, sink);
     guarded.send(bot_id, chat_id, text).await
+}
+
+/// Durable state for a family-visible reply whose exact guarded bytes are
+/// persisted alongside the physical-turn delivery claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalDeliveryState {
+    /// No canonical bytes and no transport state exist; composition may run.
+    Missing,
+    /// An empty canonical marker records a first-writer compose/timeout skip.
+    /// It is never sent, but prevents a same-turn replay from resurrecting the
+    /// skipped logical reply with newly composed words.
+    Skipped,
+    /// Canonical bytes exist but have not been confirmed by transport yet.
+    Ready(String),
+    /// Canonical bytes and a confirmed transport claim both exist.
+    Confirmed(String),
+    /// A process owns a pending record-before-transport claim. The bytes must
+    /// not enter downstream discussion context until confirmation is durable.
+    Pending,
+    /// A transport claim/retry exists without canonical bytes (legacy or
+    /// corrupt state). Fail closed: do not recompose or expose unknown words.
+    Unavailable,
+}
+
+fn read_optional_canonical(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to read canonical Telegram delivery {}",
+                path.display(),
+            )
+        }),
+    }
+}
+
+/// Read canonical bytes and their transport state without claiming or sending.
+///
+/// Callers use this before composition: [`CanonicalDeliveryState::Confirmed`]
+/// and [`CanonicalDeliveryState::Ready`] both carry the first writer's exact
+/// guarded bytes, while only `Missing` permits a fresh draft.
+pub fn canonical_delivery_state(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+) -> Result<CanonicalDeliveryState> {
+    let Some(claim_path) =
+        delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id)
+    else {
+        return Ok(CanonicalDeliveryState::Missing);
+    };
+    let canonical_path = claim_path.with_extension("canonical");
+    let retry_path = claim_path.with_extension("retry");
+    let canonical = read_optional_canonical(&canonical_path)?;
+    let claim = match std::fs::read_to_string(&claim_path) {
+        Ok(body) => Some(
+            !body.trim().is_empty() && body.trim() != "pending",
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to read Telegram delivery claim {}",
+                    claim_path.display(),
+                )
+            });
+        }
+    };
+    let retry_exists = retry_path.try_exists().with_context(|| {
+        format!(
+            "Failed to inspect Telegram delivery retry {}",
+            retry_path.display(),
+        )
+    })?;
+
+    Ok(match (canonical, claim, retry_exists) {
+        (Some(text), None, false) if text.is_empty() => {
+            CanonicalDeliveryState::Skipped
+        }
+        (Some(text), Some(true), _) if !text.is_empty() => {
+            CanonicalDeliveryState::Confirmed(text)
+        }
+        (Some(text), Some(false), _) if !text.is_empty() => {
+            CanonicalDeliveryState::Pending
+        }
+        (Some(text), None, _) if !text.is_empty() => {
+            CanonicalDeliveryState::Ready(text)
+        }
+        (None, None, false) => CanonicalDeliveryState::Missing,
+        _ => CanonicalDeliveryState::Unavailable,
+    })
+}
+
+static NEXT_CANONICAL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn create_canonical_temp_file(
+    parent: &Path,
+    file_name: &str,
+    process_id: u32,
+    next_id: &AtomicU64,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+    loop {
+        let sequence = next_id.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp.{process_id}.{sequence}",
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            // A process can crash after staging but before cleanup, and a later
+            // process may eventually reuse its pid. Never delete or trust that
+            // orphan; advance to a fresh no-clobber candidate.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Atomically publish the first canonical byte sequence for a delivery.
+///
+/// A fully written and synced same-directory temp file is hard-linked into the
+/// canonical path. `hard_link` is the no-clobber commit point: concurrent
+/// composers may race, but every caller reads and sends the same winning bytes,
+/// and readers can never observe a partial file.
+fn persist_canonical_reply_once(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+) -> Result<String> {
+    let Some(claim_path) =
+        delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id)
+    else {
+        return Ok(text.to_string());
+    };
+    let canonical_path = claim_path.with_extension("canonical");
+    if let Some(existing) = read_optional_canonical(&canonical_path)? {
+        return Ok(existing);
+    }
+
+    let parent = canonical_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("canonical delivery path has no parent"))?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create Telegram delivery ledger {}",
+            parent.display(),
+        )
+    })?;
+    let file_name = canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("canonical");
+    let (temp_path, mut file) = create_canonical_temp_file(
+        parent,
+        file_name,
+        std::process::id(),
+        &NEXT_CANONICAL_TEMP_ID,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to stage canonical Telegram delivery {}",
+            canonical_path.display(),
+        )
+    })?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to stage canonical Telegram delivery {}",
+                canonical_path.display(),
+            )
+        });
+    }
+
+    let published = match std::fs::hard_link(&temp_path, &canonical_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            false
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to publish canonical Telegram delivery {}",
+                    canonical_path.display(),
+                )
+            });
+        }
+    };
+    let _ = std::fs::remove_file(&temp_path);
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+
+    if published {
+        Ok(text.to_string())
+    } else {
+        read_optional_canonical(&canonical_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "canonical Telegram delivery disappeared after concurrent publish: {}",
+                canonical_path.display(),
+            )
+        })
+    }
+}
+
+/// Persist guarded reply bytes before transport and deliver the winning
+/// canonical sequence at most once.
+///
+/// A returned transport error keeps the canonical file and re-arms the existing
+/// retry marker, so the next invocation sends byte-for-byte the original draft.
+/// `Pending` is conservative: another process may still be sending, and callers
+/// must not use those words as delivered discussion context yet.
+pub async fn send_canonical_reply_once(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+    sink: &dyn ReplySink,
+) -> Result<CanonicalDeliveryState> {
+    if delivery_id.trim().is_empty() {
+        if text.is_empty() {
+            return Ok(CanonicalDeliveryState::Skipped);
+        }
+        send_reply_once(
+            workgraph_dir,
+            delivery_id,
+            bot_id,
+            chat_id,
+            text,
+            sink,
+        )
+        .await?;
+        return Ok(CanonicalDeliveryState::Confirmed(text.to_string()));
+    }
+
+    // Inspect legacy/transport state before publishing anything. In particular,
+    // a claim or retry without canonical bytes represents words this process
+    // cannot know; attaching a newly composed draft would falsely bless those
+    // bytes as already delivered.
+    match canonical_delivery_state(
+        workgraph_dir,
+        delivery_id,
+        bot_id,
+        chat_id,
+    )? {
+        CanonicalDeliveryState::Confirmed(text) => {
+            return Ok(CanonicalDeliveryState::Confirmed(text));
+        }
+        CanonicalDeliveryState::Skipped => {
+            return Ok(CanonicalDeliveryState::Skipped);
+        }
+        CanonicalDeliveryState::Pending => {
+            return Ok(CanonicalDeliveryState::Pending);
+        }
+        CanonicalDeliveryState::Unavailable => {
+            return Ok(CanonicalDeliveryState::Unavailable);
+        }
+        CanonicalDeliveryState::Missing => {
+            persist_canonical_reply_once(
+                workgraph_dir,
+                delivery_id,
+                bot_id,
+                chat_id,
+                text,
+            )?;
+        }
+        CanonicalDeliveryState::Ready(_) => {}
+    }
+
+    let canonical = match canonical_delivery_state(
+        workgraph_dir,
+        delivery_id,
+        bot_id,
+        chat_id,
+    )? {
+        CanonicalDeliveryState::Confirmed(text) => {
+            return Ok(CanonicalDeliveryState::Confirmed(text));
+        }
+        CanonicalDeliveryState::Skipped => {
+            return Ok(CanonicalDeliveryState::Skipped);
+        }
+        CanonicalDeliveryState::Pending => {
+            return Ok(CanonicalDeliveryState::Pending);
+        }
+        CanonicalDeliveryState::Unavailable
+        | CanonicalDeliveryState::Missing => {
+            return Ok(CanonicalDeliveryState::Unavailable);
+        }
+        CanonicalDeliveryState::Ready(text) => text,
+    };
+
+    send_reply_once(
+        workgraph_dir,
+        delivery_id,
+        bot_id,
+        chat_id,
+        &canonical,
+        sink,
+    )
+    .await?;
+    Ok(match canonical_delivery_state(
+        workgraph_dir,
+        delivery_id,
+        bot_id,
+        chat_id,
+    )? {
+        CanonicalDeliveryState::Confirmed(text) => {
+            CanonicalDeliveryState::Confirmed(text)
+        }
+        CanonicalDeliveryState::Pending => CanonicalDeliveryState::Pending,
+        CanonicalDeliveryState::Skipped
+        | CanonicalDeliveryState::Missing
+        | CanonicalDeliveryState::Ready(_)
+        | CanonicalDeliveryState::Unavailable => {
+            CanonicalDeliveryState::Unavailable
+        }
+    })
 }
 
 /// Production sink: resolves `bot_id` against the config and sends via that
@@ -2772,6 +3114,85 @@ mod tests {
         fn edits(&self) -> Vec<(String, String, String, String)> {
             self.edited.lock().unwrap().clone()
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_claim_or_retry_without_canonical_never_publishes_new_bytes() {
+        for (case, extension, body) in [
+            ("confirmed", "sent", "message-1\n"),
+            ("pending", "sent", "pending\n"),
+            ("retry", "retry", "send\n"),
+        ] {
+            let dir = tempdir().unwrap();
+            let delivery_id = format!("legacy-{case}");
+            let claim_path = delivery_claim_path(
+                dir.path(),
+                &delivery_id,
+                "voice-fixture",
+                "-100-fixture",
+            )
+            .unwrap();
+            std::fs::create_dir_all(claim_path.parent().unwrap()).unwrap();
+            std::fs::write(claim_path.with_extension(extension), body).unwrap();
+            let canonical_path = claim_path.with_extension("canonical");
+            let sink = RecSink::default();
+
+            let state = send_canonical_reply_once(
+                dir.path(),
+                &delivery_id,
+                "voice-fixture",
+                "-100-fixture",
+                "A newly composed draft.",
+                &sink,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                state,
+                CanonicalDeliveryState::Unavailable,
+                "{case} legacy state must fail closed",
+            );
+            assert!(
+                !canonical_path.exists(),
+                "{case} legacy state must never acquire newly composed canonical bytes",
+            );
+            assert!(
+                sink.calls().is_empty(),
+                "{case} legacy state must never reach transport",
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_temp_creation_skips_a_crash_orphan_candidate() {
+        let dir = tempdir().unwrap();
+        let sequence = AtomicU64::new(7);
+        let process_id = 4242;
+        let file_name = "fixture.canonical";
+        let orphan = dir
+            .path()
+            .join(format!(".{file_name}.tmp.{process_id}.7"));
+        std::fs::write(&orphan, b"orphaned partial bytes").unwrap();
+
+        let (path, file) = create_canonical_temp_file(
+            dir.path(),
+            file_name,
+            process_id,
+            &sequence,
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(format!(".{file_name}.tmp.{process_id}.8").as_str()),
+        );
+        assert_eq!(
+            std::fs::read(&orphan).unwrap(),
+            b"orphaned partial bytes",
+            "the orphan is left intact for diagnosis; a fresh candidate is used",
+        );
     }
 
     /// Fake composer for the round-trip / failure / slow tests — no live model.
