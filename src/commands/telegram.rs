@@ -21,9 +21,9 @@ use worksgood::notify::telegram_voice;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::ownership;
 use worksgood::notify::telegram_group::{
-    CONCIERGE_BOT, Election, NaturalRoute, elect_group_inbound_with_owner_map,
-    elect_responders_with_owner_map, election_decision_summary, is_discussion_ask,
-    parse_at_mention_tokens, resolve_mentioned_bot, route_natural,
+    Election, NaturalRoute, elect_group_inbound_with_owner_map, elect_responders_with_owner_map,
+    election_decision_summary, is_discussion_ask, parse_at_mention_tokens, resolve_mentioned_bot,
+    route_natural_with_owner_map,
 };
 
 /// Whether an inbound listener message may fire a FAMILY command and/or the
@@ -516,13 +516,24 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     let all_bots = config.all_bots();
     worksgood::notify::telegram::warn_on_dm_chat_ids(&all_bots);
 
-    // Replies go out via one bot: the concierge (otto) when present, else the
-    // first configured bot. This matches the pre-existing single-channel reply
-    // behaviour — the poll fan-out below is the only change in scope here.
-    let reply_idx = channels
-        .iter()
-        .position(|c| c.bot_id() == CONCIERGE_BOT)
-        .unwrap_or(0);
+    // Generic replies go out through the project-local coordination owner.
+    // A single legacy bot is unambiguous; a multi-bot household with no
+    // configured coordination owner fails loudly rather than speaking as an
+    // arbitrary first HashMap entry.
+    let owner_map = ownership::OwnerMap::load(&project_root(dir));
+    let coordination_bot = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .and_then(|owner| resolve_mentioned_bot(owner, &config));
+    let reply_idx = match coordination_bot
+        .as_ref()
+        .and_then(|bot| channels.iter().position(|c| c.bot_id() == bot.bot_id))
+    {
+        Some(idx) => idx,
+        None if channels.len() == 1 => 0,
+        None => anyhow::bail!(
+            "household.toml must assign the coordination domain to one configured Telegram bot"
+        ),
+    };
 
     println!("Press Ctrl+C to stop\n");
 
@@ -1510,13 +1521,21 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             &route_body,
                             chrono::Local::now().naive_local(),
                         ) {
-                            let bot_id = convo::bot_id_for_channel(&route_config, &route_channel)
-                                .unwrap_or_else(|| {
+                            let owner_map =
+                                ownership::OwnerMap::load(&project_root(&workgraph_dir));
+                            let coordination_owner = owner_map
+                                .owner_for_domain(ownership::Domain::Coordination);
+                            let bot_id = convo::bot_id_for_channel_with_default(
+                                &route_config,
+                                &route_channel,
+                                coordination_owner,
+                            )
+                            .unwrap_or_else(|| {
                                     route_channel
                                         .strip_prefix("telegram:")
                                         .unwrap_or(&route_channel)
                                         .to_string()
-                                });
+                            });
                             if let Some((_, bot)) = route_config
                                 .all_bots()
                                 .into_iter()
@@ -2247,6 +2266,7 @@ fn clarify_target(target: &str, config: &TelegramConfig) -> String {
 /// concierge), and flags a `/standup` that the listener would intercept for the
 /// whole roster.
 pub fn run_route(
+    workgraph_dir: &Path,
     message: &str,
     reply_to_bot: Option<&str>,
     chat_type: &str,
@@ -2257,14 +2277,16 @@ pub fn run_route(
 
     // Approximate the listener's mention extraction: any @handle token.
     let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
 
-    let route = route_natural(
+    let route = route_natural_with_owner_map(
         Some(chat_type),
         Some(chat_id),
         message,
         &mention_usernames,
         reply_to_bot,
         &config,
+        &owner_map,
     );
 
     // The listener intercepts `/standup` (for the whole roster) on the routed
@@ -2507,6 +2529,10 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
         .into_iter()
         .map(|m| m.bot_id)
         .collect();
+    let synthesizer_bot = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .and_then(|owner| resolve_mentioned_bot(owner, &config))
+        .map(|bot| bot.bot_id);
 
     // (category, plan) — plan is Some only for a discussion round.
     let (category, plan): (&str, Option<discussion::DiscussionPlan>) = match &election {
@@ -2515,7 +2541,13 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
         Election::One { .. } => ("single-voice", None),
         Election::All { .. } => {
             if is_discussion {
-                ("discussion-round", Some(discussion::plan_round(&roster_ids)))
+                (
+                    "discussion-round",
+                    Some(discussion::plan_round(
+                        &roster_ids,
+                        synthesizer_bot.as_deref(),
+                    )),
+                )
             } else {
                 ("collective-greeting", None)
             }
@@ -2582,16 +2614,20 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
 pub fn run_compose_prompt(
     workgraph_dir: &Path,
     message: &str,
-    agent: &str,
+    agent: Option<&str>,
     session: Option<&str>,
     json: bool,
 ) -> Result<()> {
     use worksgood::notify::telegram_conversation;
 
-    let agent_id = agent.trim();
-    if agent_id.is_empty() {
-        anyhow::bail!("--agent must not be empty");
-    }
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let agent_id = agent
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or_else(|| owner_map.owner_for_domain(ownership::Domain::Coordination))
+        .context(
+            "--agent is required when household.toml has no configured coordination owner",
+        )?;
     // Default the session ref to the persona id: a bound agent name resolves to
     // its session, and an unknown ref simply yields no summary/history (the
     // fresh-session prompt) rather than an error — so a scratch project works.
@@ -3231,13 +3267,18 @@ pub async fn run_group_discussion(
         .await;
     }
 
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let synthesizer_bot = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .and_then(|owner| resolve_mentioned_bot(owner, config))
+        .map(|bot| bot.bot_id);
     let timing = discussion::DiscussionTiming::from_env();
     println!(
         "[{}] discussion round -> {} ({} voice(s), synthesizer {})",
         chrono::Utc::now().format("%H:%M:%S"),
         target,
         voices.len(),
-        CONCIERGE_BOT,
+        synthesizer_bot.as_deref().unwrap_or("none"),
     );
 
     // Same composer + feed-mirroring sink as the collective path: each take is
@@ -3272,7 +3313,7 @@ pub async fn run_group_discussion(
         workgraph_dir,
         human_message,
         &voices,
-        CONCIERGE_BOT,
+        synthesizer_bot.as_deref().unwrap_or(""),
         composer_ref,
         &family_roster,
         &sink,
@@ -5666,7 +5707,12 @@ pub fn run_conversation_dryrun(
     // `converse` and the turn has somewhere to land — needed for the fixture
     // round-trip AND both compose modes.
     if session_reply.is_some() || composed_reply.is_some() || compose || compose_error {
-        if let Some(agent_id) = convo::agent_for_channel(&config, channel) {
+        let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+        let coordination_owner =
+            owner_map.owner_for_domain(ownership::Domain::Coordination);
+        if let Some(agent_id) =
+            convo::agent_for_channel_with_default(&config, channel, coordination_owner)
+        {
             let uuid = worksgood::chat_sessions::create_session(
                 workgraph_dir,
                 worksgood::chat_sessions::SessionKind::Interactive,

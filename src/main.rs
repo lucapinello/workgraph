@@ -3852,6 +3852,7 @@ fn main() -> Result<()> {
                 chat_type,
                 chat_id,
             } => commands::telegram::run_route(
+                &workgraph_dir,
                 &message,
                 reply_to_bot.as_deref(),
                 &chat_type,
@@ -4021,7 +4022,7 @@ fn main() -> Result<()> {
             } => commands::telegram::run_compose_prompt(
                 &workgraph_dir,
                 &message,
-                &agent,
+                agent.as_deref(),
                 session.as_deref(),
                 cli.json,
             ),

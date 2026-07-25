@@ -313,11 +313,6 @@ pub fn route_group_message(
     GroupRoute::Unaddressed { reply_chat }
 }
 
-/// The persona the group's concierge fallback routes to when a message names
-/// no one. Otto is the Family Assistant — the "keeps the trains running" voice
-/// (docs/01 §2.4) — so unaddressed group chatter lands with him.
-pub const CONCIERGE_BOT: &str = "otto";
-
 /// How a natural-routed group message picked its target agent. Carried on
 /// [`NaturalRoute::ToBot`] purely for logging and tests — it never changes what
 /// the downstream 1:1 router does with the message.
@@ -330,14 +325,14 @@ pub enum AddressedBy {
     Name,
     /// A reply to a message that bot itself posted in the group.
     ReplyChain,
-    /// Nobody was named — routed to the concierge ([`CONCIERGE_BOT`]).
+    /// Nobody was named — routed to the configured coordination owner.
     Concierge,
     /// Nobody was named, but the ask's CONTENT clearly falls in a household
     /// [`Domain`] whose owner is not the concierge — so the DOMAIN OWNER answers
     /// as the voice (meals → Nora/Bruno, workouts → Mira), the same classifier
     /// that decides task ownership. Carries the domain so `wg telegram elect` can
     /// show the reasoning. Calendar/shopping/coordination and genuinely ambiguous
-    /// asks stay [`Concierge`](AddressedBy::Concierge) (Otto).
+    /// asks stay [`Concierge`](AddressedBy::Concierge).
     Domain(crate::notify::ownership::Domain),
 }
 
@@ -360,7 +355,7 @@ impl std::fmt::Display for AddressedBy {
 /// even for a bot?"*, [`route_natural`] answers *"which of our family voices
 /// should this land on?"* — resolving, in order: an explicit `@mention`, the
 /// first family name in the text, the bot a reply is threaded onto, and finally
-/// the concierge ([`CONCIERGE_BOT`]) when no one is named. It assumes the
+/// the configured coordination owner when no one is named. It assumes the
 /// receiving bot is the concierge running with Telegram privacy mode **off**
 /// (so plain chatter actually reaches the listener); see docs/09 §natural-group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,20 +411,21 @@ pub fn first_named_bot(text: &str, config: &TelegramConfig) -> Option<ResolvedBo
 /// 3. **Reply-chain** — `reply_to_bot` is the `@username` of the bot whose own
 ///    message this is a reply to (Telegram delivers replies-to-a-bot even under
 ///    privacy mode), so a threaded "yes that works" lands on that bot.
-/// 4. **Concierge** — nobody was named, so it goes to [`CONCIERGE_BOT`] (otto),
-///    who fronts the group. This only fires for messages the listener actually
-///    received, i.e. the concierge bot's privacy mode is off.
+/// 4. **Concierge** — nobody was named, so it goes to the configured
+///    coordination owner. This only fires for messages the listener actually
+///    received, i.e. that bot's privacy mode is off.
 ///
 /// Non-group chats yield [`NaturalRoute::Private`]. A group message with no chat
 /// id — or one that names no one when the concierge bot is not configured —
 /// yields [`NaturalRoute::Drop`].
-pub fn route_natural(
+pub fn route_natural_with_owner_map(
     chat_type: Option<&str>,
     chat_id: Option<&str>,
     text: &str,
     mention_usernames: &[String],
     reply_to_bot: Option<&str>,
     config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
 ) -> NaturalRoute {
     let is_group = matches!(chat_type, Some("group") | Some("supergroup"));
     if !is_group {
@@ -477,8 +473,8 @@ pub fn route_natural(
         }
     }
 
-    // 4. Concierge fallback — otto.
-    if let Some(bot) = resolve_mentioned_bot(CONCIERGE_BOT, config) {
+    // 4. Concierge fallback — the project-local coordination owner.
+    if let Some(bot) = concierge_bot(config, owner_map) {
         return NaturalRoute::ToBot {
             bot,
             reply_chat,
@@ -488,6 +484,29 @@ pub fn route_natural(
     }
 
     NaturalRoute::Drop
+}
+
+/// Natural routing without a project-local owner map.
+///
+/// Explicit mentions, names, and reply chains still resolve; an unaddressed
+/// message is dropped rather than attributed to a compiled household persona.
+pub fn route_natural(
+    chat_type: Option<&str>,
+    chat_id: Option<&str>,
+    text: &str,
+    mention_usernames: &[String],
+    reply_to_bot: Option<&str>,
+    config: &TelegramConfig,
+) -> NaturalRoute {
+    route_natural_with_owner_map(
+        chat_type,
+        chat_id,
+        text,
+        mention_usernames,
+        reply_to_bot,
+        config,
+        &crate::notify::ownership::OwnerMap::default(),
+    )
 }
 
 // ===========================================================================
@@ -799,7 +818,7 @@ impl std::fmt::Display for SilenceReason {
 /// ```
 ///
 /// * `rule` — which election rule fired, one of `mention` / `name` / `reply` /
-///   `otto-concierge` / `collective` / `silence:<reason>` / `private`.
+///   `concierge` / `collective` / `silence:<reason>` / `private`.
 /// * `target` — the elected agent id (or `<bot_id>(unbound)` when the bot fronts
 ///   no agent), `roster` for a collective address, `silence` when no one
 ///   answers, or `passthrough` for a private 1:1 chat.
@@ -822,7 +841,7 @@ pub fn election_decision_summary(
                 AddressedBy::Mention => "mention".to_string(),
                 AddressedBy::Name => "name".to_string(),
                 AddressedBy::ReplyChain => "reply".to_string(),
-                AddressedBy::Concierge => "otto-concierge".to_string(),
+                AddressedBy::Concierge => "concierge".to_string(),
                 // Show WHY a non-concierge voice was elected for an unaddressed
                 // ask: the domain the classifier read the content into.
                 AddressedBy::Domain(d) => format!("domain-{}", d.slug()),
@@ -1381,13 +1400,29 @@ fn domain_voice(
     use crate::notify::ownership::classify_domain;
     let domain = classify_domain(text);
     let owner = owner_map.owner_for_domain(domain)?;
-    // An Otto-owned domain (calendar / shopping / coordination) or ambiguous ask
-    // keeps the concierge rule — only a more-specific in-domain voice refines it.
-    if owner.eq_ignore_ascii_case(CONCIERGE_BOT) {
+    // A concierge-owned domain keeps the concierge rule — only a more-specific
+    // in-domain voice refines it.
+    if owner_map
+        .owner_for_domain(crate::notify::ownership::Domain::Coordination)
+        .is_some_and(|concierge| owner.eq_ignore_ascii_case(concierge))
+    {
         return None;
     }
     let bot = resolve_mentioned_bot(owner, config)?;
     Some((bot, domain))
+}
+
+/// Resolve the project's coordination owner to a configured Telegram bot.
+///
+/// Missing/malformed household configuration yields `None`; it never invents a
+/// persona id or silently chooses a different configured voice.
+fn concierge_bot(
+    config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
+) -> Option<ResolvedBot> {
+    let owner =
+        owner_map.owner_for_domain(crate::notify::ownership::Domain::Coordination)?;
+    resolve_mentioned_bot(owner, config)
 }
 
 pub fn elect_responders_with_owner_map(
@@ -1511,7 +1546,7 @@ pub fn elect_responders_with_owner_map(
                 addressed_by: AddressedBy::Domain(domain),
             };
         }
-        return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
+        return match concierge_bot(config, owner_map) {
             Some(bot) => Election::One {
                 bot,
                 reply_chat,
@@ -1580,7 +1615,7 @@ pub fn elect_responders_with_owner_map(
                 addressed_by: AddressedBy::Domain(domain),
             };
         }
-        return match resolve_mentioned_bot(CONCIERGE_BOT, config) {
+        return match concierge_bot(config, owner_map) {
             Some(bot) => Election::One {
                 bot,
                 reply_chat,
@@ -2031,13 +2066,14 @@ mod tests {
     }
 
     fn route(text: &str, reply_to_bot: Option<&str>) -> NaturalRoute {
-        route_natural(
+        route_natural_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             text,
             &[],
             reply_to_bot,
             &casa_config(),
+            &crate::notify::ownership::OwnerMap::casa_default(),
         )
     }
 
@@ -2195,7 +2231,15 @@ mod tests {
         // The three forms Telegram delivers `/standup` in a group.
         for text in ["/standup", "/standup@otto_casapinello_bot", "wg standup"] {
             let body =
-                match route_natural(Some("supergroup"), Some("-100999"), text, &[], None, &cfg) {
+                match route_natural_with_owner_map(
+                    Some("supergroup"),
+                    Some("-100999"),
+                    text,
+                    &[],
+                    None,
+                    &cfg,
+                    &crate::notify::ownership::OwnerMap::casa_default(),
+                ) {
                     NaturalRoute::ToBot { body, .. } => body,
                     other => panic!("expected ToBot for {text:?}, got {other:?}"),
                 };
@@ -2552,7 +2596,7 @@ id = "quartz"
 domains = ["cooking", "recipes"]
 
 [[agent]]
-id = "otto"
+id = "harbor"
 domains = ["coordination", "calendar"]
 "#,
         )
@@ -2560,7 +2604,7 @@ domains = ["coordination", "calendar"]
         let map = crate::notify::ownership::OwnerMap::load(root.path());
         let cfg = cfg_with_bots(&[
             ("quartz", "-100999", Some("quartz"), Some("quartz_bot")),
-            ("otto", "-100999", Some("otto"), Some("otto_bot")),
+            ("harbor", "-100999", Some("harbor"), Some("harbor_bot")),
         ]);
 
         let configured = elect_responders_with_owner_map(
@@ -2592,14 +2636,45 @@ domains = ["coordination", "calendar"]
         );
         assert_eq!(
             no_project_roster,
-            Election::One {
-                bot: resolve_mentioned_bot("otto", &cfg).expect("configured concierge"),
-                reply_chat: "-100999".to_string(),
-                body: "pizza on friday".to_string(),
-                addressed_by: AddressedBy::Concierge,
-            },
-            "without household.toml-derived ownership, election must not invent a domain owner"
+            Election::Silence(SilenceReason::NoVoicesConfigured),
+            "without household.toml-derived ownership, election must not invent any owner"
         );
+    }
+
+    #[test]
+    fn opaque_concierge_id_routes_unaddressed_turns() {
+        let owner_map = crate::notify::ownership::OwnerMap::from_pairs([
+            ("quartz", vec!["cooking"]),
+            ("harbor", vec!["coordination", "calendar"]),
+        ]);
+        let cfg = cfg_with_bots(&[
+            ("quartz", "-100999", Some("quartz"), Some("quartz_bot")),
+            ("harbor", "-100999", Some("harbor"), Some("harbor_bot")),
+        ]);
+
+        let election = elect_responders_with_owner_map(
+            Some("supergroup"),
+            Some("-100999"),
+            "can someone help with the schedule?",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+            &owner_map,
+        );
+        assert_one(&election, "harbor", AddressedBy::Concierge);
+
+        let route = route_natural_with_owner_map(
+            Some("supergroup"),
+            Some("-100999"),
+            "hello there",
+            &[],
+            None,
+            &cfg,
+            &owner_map,
+        );
+        assert_routed(&route, "harbor", AddressedBy::Concierge);
     }
 
     /// PRECEDENCE (morning-taco-bugs): a message that OPENS with a greeting word
@@ -3636,10 +3711,10 @@ domains = ["coordination", "calendar"]
     }
 
     #[test]
-    fn decision_line_for_otto_concierge() {
+    fn decision_line_for_configured_concierge() {
         // Unaddressed coordination ask with otto present → otto coordinates.
         let line = decision("can someone sort out the logistics?", &[], None);
-        assert_eq!(line, "msg=42 chat=supergroup rule=otto-concierge target=otto");
+        assert_eq!(line, "msg=42 chat=supergroup rule=concierge target=otto");
     }
 
     #[test]
@@ -3716,8 +3791,12 @@ domains = ["coordination", "calendar"]
     fn decision_line_targets_bot_id_when_agent_unbound() {
         // A bot fronting no agent falls back to "<bot_id>(unbound)" — the target
         // is never blank, so the log always names a landing point.
-        let cfg = cfg_with_bots(&[("otto", "-100999", None, Some("otto_bot"))]);
-        let election = elect_responders(
+        let cfg = cfg_with_bots(&[("harbor", "-100999", None, Some("harbor_bot"))]);
+        let owner_map = crate::notify::ownership::OwnerMap::from_pairs([(
+            "harbor",
+            vec!["coordination"],
+        )]);
+        let election = elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             "can someone help?",
@@ -3726,11 +3805,12 @@ domains = ["coordination", "calendar"]
             false,
             2,
             &cfg,
+            &owner_map,
         );
         let line = election_decision_summary(Some("3"), Some("supergroup"), &election);
         assert_eq!(
             line,
-            "msg=3 chat=supergroup rule=otto-concierge target=otto(unbound)"
+            "msg=3 chat=supergroup rule=concierge target=harbor(unbound)"
         );
     }
 

@@ -7165,9 +7165,9 @@ pub enum TelegramCommands {
         message: String,
 
         /// The persona whose voice the prompt is assembled for. Defaults to the
-        /// household concierge.
-        #[arg(long, default_value = "otto")]
-        agent: String,
+        /// project-local coordination owner from household.toml.
+        #[arg(long)]
+        agent: Option<String>,
 
         /// The bound chat session to read voice + recent turns from (a session
         /// uuid or a bound agent name). Defaults to `--agent`; an unknown ref

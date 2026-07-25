@@ -58,7 +58,6 @@ use crate::notify::parity;
 
 use super::NotificationChannel;
 use super::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
-use super::telegram_group::CONCIERGE_BOT;
 
 /// Which entry point produced a conversational message. Carried for logging so
 /// every handled inbound records *how* it was addressed.
@@ -262,10 +261,14 @@ pub fn glitch_line() -> String {
 /// Resolve the bot id that should answer, from an elected/receiving
 /// `channel_type` ("telegram" or "telegram:<bot_id>").
 ///
-/// The bare/`default`/legacy channel maps to the concierge ([`CONCIERGE_BOT`])
-/// when configured, else the first bot. A named channel maps to that bot,
-/// falling back to the first configured bot so a reply always has a sender.
-pub fn bot_id_for_channel(config: &TelegramConfig, channel_type: &str) -> Option<String> {
+/// The bare/`default`/legacy channel maps to `default_bot` when configured. A
+/// named channel maps only to that bot. Ambiguous or unknown routing fails
+/// closed rather than selecting an arbitrary HashMap entry.
+pub fn bot_id_for_channel_with_default(
+    config: &TelegramConfig,
+    channel_type: &str,
+    default_bot: Option<&str>,
+) -> Option<String> {
     let stripped = channel_type
         .strip_prefix("telegram:")
         .unwrap_or(channel_type);
@@ -274,19 +277,28 @@ pub fn bot_id_for_channel(config: &TelegramConfig, channel_type: &str) -> Option
         return None;
     }
     if stripped.is_empty() || stripped == "telegram" || stripped == "default" {
-        return bots
-            .iter()
-            .find(|(id, _)| id == CONCIERGE_BOT)
-            .or_else(|| bots.first())
-            .map(|(id, _)| id.clone());
+        if let Some(want) = default_bot {
+            return bots
+                .iter()
+                .find(|(id, bot)| {
+                    id.eq_ignore_ascii_case(want)
+                        || bot
+                            .agent_id
+                            .as_deref()
+                            .is_some_and(|agent| agent.eq_ignore_ascii_case(want))
+                })
+                .map(|(id, _)| id.clone());
+        }
+        return (bots.len() == 1).then(|| bots[0].0.clone());
     }
-    Some(
-        bots.iter()
-            .find(|(id, _)| id == stripped)
-            .or_else(|| bots.first())
-            .map(|(id, _)| id.clone())
-            .unwrap(),
-    )
+    bots.iter()
+        .find(|(id, _)| id == stripped)
+        .map(|(id, _)| id.clone())
+}
+
+/// Resolve a channel with no project-local default owner available.
+pub fn bot_id_for_channel(config: &TelegramConfig, channel_type: &str) -> Option<String> {
+    bot_id_for_channel_with_default(config, channel_type, None)
 }
 
 /// The agency agent a bot fronts (its `agent_id`), falling back to the bot id
@@ -306,6 +318,16 @@ pub fn agent_for_bot(config: &TelegramConfig, bot_id: &str) -> String {
 /// conversation` dry-run, which pre-binds a fixture session to this agent.
 pub fn agent_for_channel(config: &TelegramConfig, channel_type: &str) -> Option<String> {
     let bot_id = bot_id_for_channel(config, channel_type)?;
+    Some(agent_for_bot(config, &bot_id))
+}
+
+/// Resolve the addressed agent with a caller-supplied project-local default.
+pub fn agent_for_channel_with_default(
+    config: &TelegramConfig,
+    channel_type: &str,
+    default_bot: Option<&str>,
+) -> Option<String> {
+    let bot_id = bot_id_for_channel_with_default(config, channel_type, default_bot)?;
     Some(agent_for_bot(config, &bot_id))
 }
 
@@ -389,7 +411,16 @@ pub fn plan_conversation(
     sender: &str,
     entry: Entry,
 ) -> ConversationPlan {
-    let bot_id = bot_id_for_channel(config, route_channel).unwrap_or_else(|| {
+    let root = project_root_of(workgraph_dir);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let coordination_owner =
+        owner_map.owner_for_domain(ownership::Domain::Coordination);
+    let bot_id = bot_id_for_channel_with_default(
+        config,
+        route_channel,
+        coordination_owner,
+    )
+    .unwrap_or_else(|| {
         route_channel
             .strip_prefix("telegram:")
             .unwrap_or(route_channel)
@@ -2334,11 +2365,12 @@ domains = ["calendar", "coordination", "shopping"]
             bot_id_for_channel(&cfg, "telegram:bruno").as_deref(),
             Some("bruno")
         );
-        // Bare/legacy channel prefers the concierge.
+        // Bare/legacy channel uses the caller's configured coordination owner.
         assert_eq!(
-            bot_id_for_channel(&cfg, "telegram").as_deref(),
+            bot_id_for_channel_with_default(&cfg, "telegram", Some("otto")).as_deref(),
             Some("otto")
         );
+        assert_eq!(bot_id_for_channel(&cfg, "telegram"), None);
     }
 
     #[test]

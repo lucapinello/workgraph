@@ -10,8 +10,9 @@
 //! 1. Each bound-session persona contributes ONE short in-character take, in
 //!    roster order, **sequenced** so later voices can react to earlier ones (each
 //!    take's prompt embeds the takes so far). Each take is sent via ITS OWN bot.
-//! 2. Otto closes with a 1–3 sentence synthesis ("so the consensus seems to be…")
-//!    — but ONLY when at least two *other* voices actually contributed.
+//! 2. The configured coordination owner closes with a 1–3 sentence synthesis
+//!    ("so the consensus seems to be…") — but ONLY when at least two *other*
+//!    voices actually contributed.
 //! 3. It stays tight: a per-voice compose budget, an overall round deadline
 //!    (~90s), and a length cap. A voice whose session errors or does not answer
 //!    in time is **skipped silently** — never a glitch line, never jargon in the
@@ -29,7 +30,6 @@ use anyhow::Result;
 
 use super::grounding::{self, FamilyVoiceRoster};
 use super::telegram_conversation::{ReplyComposer, ReplySink};
-use super::telegram_group::CONCIERGE_BOT;
 
 /// Hard character cap for a single voice's take, applied after compose as a
 /// safety net (the prompt already asks for one or two sentences). Cut on a word
@@ -226,12 +226,12 @@ fn remaining(overall: Duration, started: Instant) -> Duration {
     overall.checked_sub(started.elapsed()).unwrap_or_default()
 }
 
-/// Run a discussion round: sequenced in-voice takes then an optional Otto
-/// synthesis, sending via `sink`.
+/// Run a discussion round: sequenced in-voice takes then an optional synthesis,
+/// sending via `sink`.
 ///
 /// `voices` is the roster order the takes are contributed in (each must have a
 /// bound session). `synthesizer_bot` is the persona that closes the discussion
-/// (Otto / [`CONCIERGE_BOT`]) — the synthesis fires only when at least two
+/// from project configuration. The synthesis fires only when at least two
 /// *other* voices contributed a take. `timing` bounds each voice and the round
 /// as a whole; a voice that errors or does not answer within its budget is
 /// skipped, never blocking the round and never leaking an error to the group.
@@ -329,8 +329,8 @@ pub async fn run_discussion_round(
 
 /// The planned shape of a discussion round for a given roster — the pure core of
 /// the `wg telegram discuss --dry-run` diagnostic. `take_voices` is the roster
-/// order the takes are contributed in; `synthesizer` is the persona that closes
-/// (Otto), present when configured. This does NOT decide *whether* a round runs
+/// order the takes are contributed in; `synthesizer` is the configured persona
+/// that closes, when present. This does NOT decide *whether* a round runs
 /// (that is [`is_discussion_ask`](super::telegram_group::is_discussion_ask) over
 /// a collective election) — only what the round would look like once it does.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,13 +339,19 @@ pub struct DiscussionPlan {
     pub synthesizer: Option<String>,
 }
 
-/// Plan a round over `roster_bot_ids` (roster order). The synthesizer is the
-/// concierge ([`CONCIERGE_BOT`]) when present in the roster.
-pub fn plan_round(roster_bot_ids: &[String]) -> DiscussionPlan {
-    let synthesizer = roster_bot_ids
-        .iter()
-        .find(|id| id.eq_ignore_ascii_case(CONCIERGE_BOT))
-        .cloned();
+/// Plan a round over `roster_bot_ids` (roster order). `synthesizer_bot` comes
+/// from the project-local coordination owner; an absent or unconfigured owner
+/// yields no synthesis rather than inventing a persona.
+pub fn plan_round(
+    roster_bot_ids: &[String],
+    synthesizer_bot: Option<&str>,
+) -> DiscussionPlan {
+    let synthesizer = synthesizer_bot.and_then(|want| {
+        roster_bot_ids
+            .iter()
+            .find(|id| id.eq_ignore_ascii_case(want))
+            .cloned()
+    });
     DiscussionPlan {
         take_voices: roster_bot_ids.to_vec(),
         synthesizer,
@@ -687,18 +693,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_round_puts_otto_as_synthesizer() {
+    fn opaque_synthesizer_id_is_configured() {
         let plan = plan_round(&[
-            "nora".to_string(),
-            "bruno".to_string(),
-            "mira".to_string(),
-            "otto".to_string(),
-        ]);
-        assert_eq!(plan.take_voices.len(), 4);
-        assert_eq!(plan.synthesizer.as_deref(), Some("otto"));
+            "ember".to_string(),
+            "quartz".to_string(),
+            "harbor".to_string(),
+        ], Some("harbor"));
+        assert_eq!(plan.take_voices.len(), 3);
+        assert_eq!(plan.synthesizer.as_deref(), Some("harbor"));
 
-        // No otto in the roster → no synthesizer.
-        let plan = plan_round(&["nora".to_string(), "bruno".to_string()]);
+        // No configured coordination owner → no synthesizer.
+        let plan = plan_round(&["ember".to_string(), "quartz".to_string()], None);
         assert_eq!(plan.synthesizer, None);
     }
 }
