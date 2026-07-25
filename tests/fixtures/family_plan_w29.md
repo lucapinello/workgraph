@@ -11,7 +11,7 @@
 
 ---
 
-## 1. Meal plan (Nora → Bruno)
+## 1. Dinners (Nora → Bruno)
 
 Nora's dinner skeleton for the week holds the household ratio — **3 fish · 2 vegetarian · 1 red meat · 1 leftover/flex** across the seven dinners — and stays **iron-forward** this week, carrying over last week's follow-up (`nora-followup-iron-deficit`: Nadin's iron trended below target, so vegetarian nights lean on lentils/chickpeas/spinach and pair with vitamin-C sources).
 

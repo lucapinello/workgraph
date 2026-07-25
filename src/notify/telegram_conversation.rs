@@ -3707,7 +3707,7 @@ mod tests {
 **Week of Monday 2026-07-13 to Sunday 2026-07-19**
 **Status:** DRAFT
 
-## 1. Meals
+## 1. Dinners (planner → cook)
 
 | Day | Slot | Dinner | Prep |
 |-----|------|--------|------|

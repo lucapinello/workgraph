@@ -10,7 +10,8 @@
 //!
 //! * the week's date range (`**Week of Monday 2026-07-13 → Sunday 2026-07-19**`)
 //!   and its publish `Status`,
-//! * the **meal plan** table (`## 1. Meal plan`) as one [`Meal`] per day,
+//! * the **dinners** table (`## 1. Dinners (…)`) as one [`Meal`] per day
+//!   (`## 1. Meals` remains a supported legacy alias),
 //! * the **shopping list** (`## 4. Shopping list`) as [`ShoppingSection`]s
 //!   (one per `###` store heading) with their bullet items,
 //! * the **workouts** (`## 2. Workouts`) as [`WorkoutDay`]s per person.
@@ -159,7 +160,7 @@ impl PlanDoc {
             // --- Section headings ---------------------------------------------
             if let Some(h2) = line.strip_prefix("## ") {
                 let low = h2.to_ascii_lowercase();
-                section = if low.contains("meal") {
+                section = if low.contains("meal") || low.contains("dinner") {
                     Section::Meals
                 } else if low.contains("shopping") {
                     Section::Shopping
@@ -483,14 +484,29 @@ mod tests {
     }
 
     #[test]
-    fn parses_seven_meals_in_day_order() {
+    fn parses_live_dinners_heading_in_day_order() {
+        assert!(
+            W29.contains("## 1. Dinners ("),
+            "canonical fixture must keep the live numbered Dinners heading"
+        );
         let doc = PlanDoc::parse("2026-W29", W29);
         assert_eq!(doc.meals.len(), 7, "one dinner per day");
         assert_eq!(doc.meals[0].weekday, "Mon");
         assert_eq!(doc.meals[0].date, Some(date(2026, 7, 13)));
         assert_eq!(doc.meals[0].dish, "Chickpea & spinach curry, brown rice");
         assert_eq!(doc.meals[0].prep, "~35 min");
-        assert_eq!(doc.meals[1].dish, "Baked salmon, roasted potatoes, green beans");
+        assert_eq!(
+            doc.meals[1].dish,
+            "Baked salmon, roasted potatoes, green beans"
+        );
+    }
+
+    #[test]
+    fn legacy_meals_heading_remains_supported() {
+        let legacy = W29.replacen("## 1. Dinners (Nora → Bruno)", "## 1. Meals", 1);
+        let doc = PlanDoc::parse("2026-W29", &legacy);
+        assert_eq!(doc.meals.len(), 7, "legacy Meals alias lost dinner rows");
+        assert_eq!(doc.meals[0].dish, "Chickpea & spinach curry, brown rice");
     }
 
     #[test]
