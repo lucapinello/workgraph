@@ -4586,7 +4586,7 @@ pub fn run_owner(
     let domain = ownership::classify_domain(ask);
     let map = match root {
         Some(r) => OwnerMap::load(r),
-        None => OwnerMap::casa_default(),
+        None => OwnerMap::default(),
     };
     let owner = map.owner_for_ask(ask).map(str::to_string);
     let decision = persona.map(|p| map.decide_owner(p, ask));

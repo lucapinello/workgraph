@@ -2262,6 +2262,31 @@ mod tests {
         }
     }
 
+    fn write_owner_fixture(wg: &Path) {
+        let root = project_root_of(wg);
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "nora"
+domains = ["meals", "nutrition"]
+
+[[agent]]
+id = "bruno"
+domains = ["meals", "cooking", "recipes"]
+
+[[agent]]
+id = "mira"
+domains = ["workouts"]
+
+[[agent]]
+id = "otto"
+domains = ["calendar", "coordination", "shopping"]
+"#,
+        )
+        .unwrap();
+    }
+
     fn confirm_human(wg: &Path, sender: &str, agent_id: &str, bot_id: &str) {
         let agency_dir = wg.join("agency");
         let mut map = TelegramBindingMap::load(&agency_dir).unwrap();
@@ -2862,6 +2887,7 @@ mod tests {
     /// `GroupElected` plan for that voice resolves to `Converse`. Returns the
     /// four-bot config the collective tests share.
     fn setup_collective(wg: &Path) -> TelegramConfig {
+        write_owner_fixture(wg);
         let cfg = cfg_with_bots(&[
             ("nora", Some("nora")),
             ("bruno", Some("bruno")),
@@ -2981,6 +3007,7 @@ mod tests {
     fn choke_point_restamps_off_domain_meal_task_to_owner_nora() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
+        write_owner_fixture(&wg);
         let origin = crate::graph::TaskOrigin::new(
             crate::graph::OriginChannel::TelegramGroup,
             "-100555",
@@ -3142,6 +3169,63 @@ mod tests {
             stamped[0].origin.as_ref().unwrap().persona,
             "otto",
             "an on-domain (coordination) task stays with its owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_household_never_invents_an_owner_handoff() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        confirm_human(&wg, "member-1", "human-member", "hearth");
+
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:hearth",
+            "-100404",
+            "member-1",
+            Entry::GroupElected,
+        );
+        let composer = FakeComposer::ok(
+            "Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup",
+        );
+        let sink = RecSink::default();
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Thursday dinner to soup",
+            "req-no-household-owner",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let delivered = sink
+            .edits()
+            .last()
+            .map(|edit| edit.3.clone())
+            .or_else(|| sink.calls().last().map(|call| call.2.clone()))
+            .unwrap_or_default();
+        assert_eq!(delivered, "Thursday soup is noted.");
+        assert!(
+            !delivered.contains("got this one"),
+            "no project roster means no named owner handoff: {delivered:?}",
+        );
+
+        let graph = crate::parser::load_graph(wg.join("graph.jsonl")).unwrap();
+        let created = graph
+            .tasks()
+            .find(|task| task.origin.is_some())
+            .expect("the real ask still creates one task");
+        assert_eq!(
+            created.origin.as_ref().unwrap().persona,
+            "hearth",
+            "missing ownership config fails open to the speaking persona",
         );
     }
 

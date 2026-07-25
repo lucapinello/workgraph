@@ -407,7 +407,7 @@ pub fn classify_domain(ask: &str) -> Domain {
 /// Maps household domains to the persona that OWNS them, derived from
 /// `household.toml` `[[agent]]` `domains`. Preserves author order so ties (two
 /// personas both listing `meals`) resolve deterministically to the first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnerMap {
     /// `(persona_id, domain_tags)` in `household.toml` author order.
     entries: Vec<(String, Vec<String>)>,
@@ -426,10 +426,9 @@ pub enum OwnerDecision {
 }
 
 impl OwnerMap {
-    /// The shipped Casa Pinello roster, mirroring `household.toml`:
-    /// Nora = meals & nutrition, Bruno = the kitchen (cooking/recipes), Coach
-    /// Mira = workouts, Otto = calendar / coordination / shopping. Used as the
-    /// fallback when no `household.toml` is found.
+    /// The legacy four-persona map retained for the group-election caller and
+    /// focused classifier tests. It is never a fallback for [`load`](Self::load):
+    /// task ownership and family-visible handoffs require project-local config.
     pub fn casa_default() -> Self {
         let entry = |id: &str, tags: &[&str]| {
             (
@@ -474,8 +473,7 @@ impl OwnerMap {
     }
 
     /// Parse `<root>/household.toml`'s `[[agent]]` blocks (id + domains). Returns
-    /// `None` when the file is absent or has no usable agents, so the caller can
-    /// fall back to [`casa_default`](Self::casa_default).
+    /// `None` when the file is absent, malformed, or has no usable agents.
     pub fn from_household_toml(root: &Path) -> Option<Self> {
         let body = std::fs::read_to_string(root.join("household.toml")).ok()?;
         let value: toml::Value = body.parse().ok()?;
@@ -502,10 +500,11 @@ impl OwnerMap {
         Some(Self::from_pairs(pairs))
     }
 
-    /// Load the owner map for a project root: `household.toml` if present, else
-    /// the Casa default. Never fails — routing always has a map.
+    /// Load the owner map for a project root. With no valid project roster the
+    /// map is empty, so [`decide_owner`](Self::decide_owner) fails open to the
+    /// speaking persona instead of naming or re-routing to a compiled household.
     pub fn load(root: &Path) -> Self {
-        Self::from_household_toml(root).unwrap_or_else(Self::casa_default)
+        Self::from_household_toml(root).unwrap_or_default()
     }
 
     /// The persona id that owns `domain`, by trying the domain's ordered
@@ -1227,6 +1226,27 @@ mod tests {
         assert_eq!(m.decide_owner("NORA", "swap dinner to tofu"), OwnerDecision::Owner);
         // Empty persona → fail open (do not drop a real ask).
         assert_eq!(m.decide_owner("", "swap dinner to tofu"), OwnerDecision::Owner);
+    }
+
+    #[test]
+    fn missing_or_malformed_household_never_uses_a_compiled_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = OwnerMap::load(dir.path());
+        assert_eq!(missing.owner_for_ask("swap Thursday dinner to soup"), None);
+        assert_eq!(
+            missing.decide_owner("hearth", "swap Thursday dinner to soup"),
+            OwnerDecision::Owner,
+            "without project-local ownership, the speaking persona keeps the ask",
+        );
+
+        std::fs::write(dir.path().join("household.toml"), "not = [valid").unwrap();
+        let malformed = OwnerMap::load(dir.path());
+        assert_eq!(malformed.owner_for_ask("swap Thursday dinner to soup"), None);
+        assert_eq!(
+            malformed.decide_owner("hearth", "swap Thursday dinner to soup"),
+            OwnerDecision::Owner,
+            "malformed project config must not resurrect another household's owner",
+        );
     }
 
     #[test]
