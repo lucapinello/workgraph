@@ -5098,46 +5098,29 @@ async fn deliver_lifecycle_fire(
 
 /// The owner's DM chat for a dead-end escalation, and the bot that speaks it.
 ///
-/// Prefers the project-configured coordination owner. If that owner has no
-/// usable bot, falls back to the legacy top-level operator chat and then to any
-/// configured bot. `None` means the caller must retain only its loud stderr
-/// record; no compiled persona is guessed.
+/// Uses only the explicit positive legacy top-level operator chat.
+///
+/// A helper bot's `chat_id` identifies a conversation, not who owns that
+/// conversation. Even when the helper is assigned the coordination domain, a
+/// positive id proves only that the target is a DM; it does not prove that the
+/// DM belongs to the household operator. Owner-facing alerts contain task
+/// details, so every per-helper target fails closed to the loud stderr record.
+/// Group/negative/empty legacy targets fail closed too. `None` means there is no
+/// proven private operator target; no persona or recipient is guessed.
 fn operator_alert_route(
     config: &TelegramConfig,
-    coordination_owner: Option<&str>,
+    _coordination_owner: Option<&str>,
 ) -> Option<(String, String)> {
-    let usable = |id: &String, bot: &worksgood::notify::telegram::TelegramBotConfig| {
-        (!bot.bot_token.trim().is_empty() && !bot.chat_id.trim().is_empty())
-            .then(|| (id.clone(), bot.chat_id.clone()))
-    };
-    if let Some(owner) = coordination_owner
-        .map(str::trim)
-        .filter(|owner| !owner.is_empty())
+    // Legacy single-bot operator chat, only when it is explicitly a private id.
+    if !config.bot_token.trim().is_empty()
+        && worksgood::notify::telegram::is_dm_chat_id(&config.chat_id)
     {
-        if let Some(hit) = config
-            .bots
-            .iter()
-            .find(|(id, bot)| {
-                id.eq_ignore_ascii_case(owner)
-                    || bot
-                        .agent_id
-                        .as_deref()
-                        .is_some_and(|agent| agent.eq_ignore_ascii_case(owner))
-            })
-            .and_then(|(id, bot)| usable(id, bot))
-        {
-            return Some(hit);
-        }
-    }
-    // Legacy single-bot operator chat.
-    if !config.bot_token.trim().is_empty() && !config.chat_id.trim().is_empty() {
         return Some((String::new(), config.chat_id.clone()));
     }
-    // Any bot at all beats silence for a dead-end ask.
-    config
-        .bots
-        .iter()
-        .find_map(|(id, bot)| usable(id, bot))
+    // A positive id proves only that a chat is private, not that its member is
+    // the coordination owner. Without an owner-bound or legacy operator target,
+    // deliberately fall through to the log-only path.
+    None
 }
 
 /// Deliver ONE dead-end operator alert — a family-origin task that failed with
@@ -5145,7 +5128,7 @@ fn operator_alert_route(
 /// line; this is the flag being raised, so the ask is never a dead end.
 ///
 /// Loud on stderr FIRST (that record survives a missing/broken bot config),
-/// then best-effort DM'd through the configured coordination owner. Errors are
+/// then best-effort DM'd through the explicit legacy operator target. Errors are
 /// reported, never propagated: a failed escalation must not abort the remaining
 /// report-backs.
 async fn deliver_operator_alert(
@@ -7928,7 +7911,7 @@ domains = ["cooking"]
     }
 
     #[test]
-    fn operator_alert_route_uses_the_configured_owner_in_any_map_order() {
+    fn operator_alert_route_refuses_unproven_coordination_dm() {
         use worksgood::notify::lifecycle::OperatorAlert;
 
         fn config_with_order(reverse: bool) -> TelegramConfig {
@@ -7973,21 +7956,15 @@ domains = ["cooking"]
         };
         for reverse in [false, true] {
             let config = config_with_order(reverse);
-            let route = operator_alert_route(&config, Some("night-orbit")).unwrap();
             assert_eq!(
-                route,
-                ("coordination-wire".to_string(), "7002".to_string()),
-                "the authored coordination owner must beat map order",
+                operator_alert_route(&config, Some("night-orbit")),
+                None,
+                "coordination ownership does not prove who owns a helper bot's private chat",
             );
-            let line =
-                worksgood::notify::lifecycle::dry_run_alert_line(&alert, Some(&route.0));
+            let line = worksgood::notify::lifecycle::dry_run_alert_line(&alert, None);
             assert!(
-                line.contains("bot 'coordination-wire'"),
-                "dry-run must report the bot actually selected: {line}",
-            );
-            assert!(
-                !line.contains("night-orbit"),
-                "dry-run names the resolved bot key, not an inferred route: {line}",
+                line.contains("logged only"),
+                "dry-run must expose the fail-closed route: {line}",
             );
         }
     }
@@ -8031,8 +8008,8 @@ domains = ["cooking"]
         };
         assert_eq!(
             operator_alert_route(&one_bot, None),
-            Some(("only-configured-wire".to_string(), "7004".to_string())),
-            "one explicit configured bot remains the final delivery fallback",
+            None,
+            "an arbitrary private member chat is not an owner-alert fallback",
         );
 
         assert_eq!(operator_alert_route(&TelegramConfig::default(), None), None);
@@ -8046,6 +8023,89 @@ domains = ["cooking"]
         assert!(
             line.contains("no configured bot") && line.contains("logged only"),
             "an unavailable route must be visible in dry-run output: {line}",
+        );
+    }
+
+    #[test]
+    fn operator_alert_route_refuses_group_chat_ids() {
+        use worksgood::notify::lifecycle::OperatorAlert;
+
+        let mut bots = HashMap::new();
+        bots.insert(
+            "coordination-wire".to_string(),
+            TelegramBotConfig {
+                bot_token: "200:BBB".to_string(),
+                chat_id: "-1007002".to_string(),
+                agent_id: Some("configured-owner".to_string()),
+                username: None,
+            },
+        );
+        bots.insert(
+            "fallback-wire".to_string(),
+            TelegramBotConfig {
+                bot_token: "100:AAA".to_string(),
+                chat_id: "-1007001".to_string(),
+                agent_id: Some("other-member".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: "300:CCC".to_string(),
+            chat_id: "-1007003".to_string(),
+            bots,
+        };
+
+        assert_eq!(
+            operator_alert_route(&config, Some("configured-owner")),
+            None,
+            "normal negative family-group ids must never masquerade as an owner DM",
+        );
+
+        let alert = OperatorAlert {
+            task_id: "stalled-porch-light".to_string(),
+            requester: "Household Member".to_string(),
+            text: "The porch-light request needs a look.".to_string(),
+            notification_id: "alert-stalled-porch-light".to_string(),
+        };
+        let sink = RecordingSink::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(
+            !rt.block_on(deliver_operator_alert(
+                &sink,
+                &config,
+                Some("configured-owner"),
+                &alert,
+            )),
+            "group-only configuration must retain the alert as a loud log record",
+        );
+        assert!(
+            sink.sends.lock().unwrap().is_empty(),
+            "owner-facing task details must never be sent into a family group",
+        );
+
+        let unrelated_private = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots: HashMap::from([(
+                "unrelated-wire".to_string(),
+                TelegramBotConfig {
+                    bot_token: "400:DDD".to_string(),
+                    chat_id: "7004".to_string(),
+                    agent_id: Some("other-member".to_string()),
+                    username: None,
+                },
+            )]),
+        };
+        assert_eq!(
+            operator_alert_route(&unrelated_private, Some("configured-owner")),
+            None,
+            "a positive private id is not proof that the chat belongs to the owner",
+        );
+
+        let line = worksgood::notify::lifecycle::dry_run_alert_line(&alert, None);
+        assert!(
+            line.contains("logged only"),
+            "the dry-run must report the fail-closed route honestly: {line}",
         );
     }
 
