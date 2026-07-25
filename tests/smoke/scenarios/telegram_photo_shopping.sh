@@ -6,6 +6,12 @@
 # `wg telegram photo-plan` (the scripted-test seam, sibling of `wg telegram
 # decide` / `elect`):
 #
+#   0. ENGINE BINDING    — the binary exercised is the one the caller REQUESTED
+#                          ($WG_BIN, honoured strictly, absolute path), proven
+#                          by poisoning PATH with a `wg` that refuses to run:
+#                          every assertion below is therefore about the build
+#                          under review, not about whatever `wg` PATH holds.
+#
 #   1. PHOTO ROUTING     — a captioned fridge photo ("bruno what do we still
 #                          need?") decodes as a photo and ELECTS Bruno by name,
 #                          exactly like a text message with the same caption.
@@ -26,10 +32,57 @@
 # pure decision, so no live bot, no real tokens, no gateway.
 
 set -euo pipefail
+# Remember where we were invoked from BEFORE the cd, so a relative WG_BIN
+# ("WG_BIN=target/debug/wg bash tests/smoke/...") still names the binary the
+# caller meant and not something under tests/smoke/scenarios/.
+smoke_cwd="$PWD"
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./_helpers.sh
 
-require_wg
+# ── The engine under test ───────────────────────────────────────────
+# This scenario drives the REAL binary, so WHICH binary runs is part of the
+# assertion. It used to call bare `wg`, i.e. whatever PATH happened to hold:
+#
+#   * with WG_BIN set but no `wg` on PATH (`env PATH=/usr/bin:/bin WG_BIN=…`,
+#     the shape task validation uses), `require_wg` emitted a loud SKIP —
+#     exit 77, which does NOT block the gate. The build under review was
+#     never exercised and the scenario could not go red: a false green.
+#   * with a STALE `wg` on PATH (installed weeks ago, before `telegram
+#     photo-plan` existed), the run exercised that stale binary instead and
+#     died with an opaque non-zero — a false failure blamed on this change.
+#
+# So resolve the requested executable ONCE, explicitly, and invoke it by
+# absolute path. WG_BIN wins and is honoured strictly: if it is set and not
+# usable we FAIL loudly rather than quietly substituting another binary,
+# because a silent substitution is precisely the bug above.
+WG=""
+if [ -n "${WG_BIN:-}" ]; then
+    case "$WG_BIN" in
+        /*) WG="$WG_BIN" ;;
+        *)  WG="$smoke_cwd/$WG_BIN" ;;
+    esac
+    [ -x "$WG" ] || loud_fail "WG_BIN=$WG_BIN resolves to '$WG', which is not an executable engine — refusing to fall back to PATH, because a silent fallback is how a stale binary stands in for the build under test"
+else
+    # No explicit request: prefer the installed engine (what the smoke gate
+    # has always exercised), then this repo's own build so a fresh clone that
+    # ran `cargo build` but not `cargo install` still runs instead of skipping.
+    repo_root="$(cd ../../.. && pwd)"
+    for cand in \
+        "$(command -v wg 2>/dev/null || true)" \
+        "$repo_root/target/debug/wg" \
+        "$repo_root/target/release/wg"
+    do
+        if [ -n "$cand" ] && [ -x "$cand" ]; then WG="$cand"; break; fi
+    done
+    [ -n "$WG" ] || loud_skip "MISSING WG BINARY" "no wg engine found: nothing on PATH and no target/{debug,release}/wg — run 'cargo build --bin wg' or set WG_BIN to the binary under test"
+fi
+echo "engine under test: $WG"
+
+# A binary that predates task photo-to-shopping has no `telegram photo-plan`
+# at all. Say so in one line instead of letting every assertion below fail on
+# a usage error, which is how "stale binary" masqueraded as "broken pipeline".
+"$WG" telegram photo-plan --help >/dev/null 2>&1 \
+    || loud_fail "engine at $WG has no 'telegram photo-plan' subcommand — this build predates task photo-to-shopping; rebuild it (cargo build --bin wg) or point WG_BIN at a current engine"
 
 fixtures="../fixtures"
 img="$fixtures/fridge_photo.png"
@@ -83,7 +136,8 @@ cat >"$scratch/list.json" <<'JSON'
 {"ok":true,"groups":[{"store":"Market","items":[{"key":"p:market|chickpeas","text":"Chickpeas","checked":false},{"key":"p:market|lemons","text":"Lemons","checked":false}]}]}
 JSON
 
-plan() { (cd "$scratch" && WG_DIR= wg telegram photo-plan "$@" 2>&1); }
+# Absolute path, never `wg` — see the engine-resolution block above.
+plan() { (cd "$scratch" && WG_DIR= "$WG" telegram photo-plan "$@" 2>&1); }
 
 expect_grep() {
     local desc="$1" out="$2" needle="$3"
@@ -91,6 +145,31 @@ expect_grep() {
     echo "$out" | grep -q "$needle" \
         || loud_fail "$desc: expected '$needle', got: $out"
 }
+
+echo "0. engine binding — the routing proof below runs on the REQUESTED binary:"
+# Poison PATH with a `wg` that refuses to work. Every engine call in this
+# scenario goes through "$WG" by absolute path, so the poison must never run.
+# If it ever does, the routing/album/mutation assertions were about some other
+# binary — the exact false-green/false-failure this scenario now pins.
+mkdir -p "$scratch/poison"
+cat >"$scratch/poison/wg" <<'SH'
+#!/bin/sh
+echo "PATH-RESOLVED-WG: the scenario must not resolve the engine from PATH" >&2
+exit 66
+SH
+chmod +x "$scratch/poison/wg"
+PATH="$scratch/poison:$PATH"
+export PATH
+[ "$(command -v wg 2>/dev/null || true)" = "$scratch/poison/wg" ] \
+    || loud_fail "could not poison PATH — 'command -v wg' is '$(command -v wg 2>/dev/null || true)', so this differential would not prove anything"
+# Identity-free on purpose: this step proves WHICH binary answers, not who is
+# elected. PATH stays poisoned for the rest of the script, so every routing,
+# album and mutation assertion below is likewise proven to run on "$WG".
+bind_out="$(plan @update.json)"
+expect_grep "PATH wg is poisoned yet the engine still answers" "$bind_out" "^photo — "
+if echo "$bind_out" | grep -q "PATH-RESOLVED-WG"; then
+    loud_fail "the scenario resolved the engine from PATH instead of '$WG': $bind_out"
+fi
 
 echo "1. photo routing — captioned fridge photo elects Bruno:"
 out="$(plan @update.json)"
