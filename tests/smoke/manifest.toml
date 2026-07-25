@@ -2281,6 +2281,15 @@ description = "Pins task photo-to-shopping (snap the fridge, the configured cook
 timeout_seconds = 30
 
 [[scenario]]
+name = "telegram_photo_turn_replay"
+script = "scenarios/telegram_photo_turn_replay.sh"
+owners = [
+    "p1-engine-photo-turn-replay",
+]
+description = "Pins photo-shopping restart safety through four fresh invocations of the real wg binary against an opaque scratch household, a production-shaped multi-bot notify TOML, confirmed-human binding, live Bot API album updates, a real PNG, and the live GET /shopping.json response shape. The hidden seam runs production decode, configured election, the complete photo-turn orchestrator (download → vision reply → shopping gateway mutations), family-voice guard, shared occurrence journal, and delivery ledger while replacing those three I/O seams and Telegram sends with scratch-only fixtures/JSONL artifacts. The first album frame mutates once and its stubbed send fails; restart on a later captionless frame from the same media_group_id must deliver only the stored canonical reply, a completed refire must stay silent, and a different later album with identical words must mutate and deliver once. Also requires versioned digest-only journal filenames and no bot-token leakage. No network, live plan, bot, token, chat, or runtime state is touched."
+timeout_seconds = 30
+
+[[scenario]]
 name = "telegram_group_reply_tuning"
 script = "scenarios/telegram_group_reply_tuning.sh"
 owners = [

@@ -7206,6 +7206,37 @@ pub enum TelegramCommands {
         #[arg(long)]
         list: Option<String>,
     },
+
+    /// Scratch-only replay harness for the durable photo mutation boundary
+    #[command(hide = true)]
+    PhotoReplay {
+        /// Raw Telegram update JSON, inline or `@path`.
+        update: String,
+
+        /// Fixture vision reply, including any `SHOPPING_UPDATE:` tail.
+        #[arg(long)]
+        reply: String,
+
+        /// Fixture `GET /shopping.json` body, inline or `@path`.
+        #[arg(long)]
+        list: String,
+
+        /// Local image copied by the stub downloader for each Telegram file id.
+        #[arg(long)]
+        mock_image: PathBuf,
+
+        /// JSONL artifact receiving one row per stubbed mutation turn.
+        #[arg(long)]
+        mock_mutation_log: PathBuf,
+
+        /// JSONL artifact receiving each successful stubbed send.
+        #[arg(long)]
+        mock_send_log: PathBuf,
+
+        /// Make this invocation's stub transport fail before recording a send.
+        #[arg(long)]
+        fail_send: bool,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking
