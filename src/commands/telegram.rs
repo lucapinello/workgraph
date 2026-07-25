@@ -21,9 +21,9 @@ use worksgood::notify::telegram_voice;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::ownership;
 use worksgood::notify::telegram_group::{
-    CONCIERGE_BOT, Election, NaturalRoute, elect_group_inbound, elect_responders,
-    election_decision_summary, is_discussion_ask, parse_at_mention_tokens, resolve_mentioned_bot,
-    route_natural,
+    CONCIERGE_BOT, Election, NaturalRoute, elect_group_inbound_with_owner_map,
+    elect_responders_with_owner_map, election_decision_summary, is_discussion_ask,
+    parse_at_mention_tokens, resolve_mentioned_bot, route_natural,
 };
 
 /// Whether an inbound listener message may fire a FAMILY command and/or the
@@ -1200,7 +1200,8 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // the group back to the conservative silence rule without a restart.
             let human_count = human_agent_id_set(&workgraph_dir).len();
 
-            let election = elect_responders(
+            let owner_map = ownership::OwnerMap::load(&project_root(&workgraph_dir));
+            let election = elect_responders_with_owner_map(
                 msg.chat_type.as_deref(),
                 msg.chat_id.as_deref(),
                 &msg.body,
@@ -1211,6 +1212,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 msg.sender_is_bot,
                 human_count,
                 &route_config,
+                &owner_map,
             );
 
             // Observability: exactly ONE decision line per consumed message —
@@ -2384,7 +2386,8 @@ pub fn run_elect(
     let human_count =
         human_count_override.unwrap_or_else(|| human_agent_id_set(workgraph_dir).len());
 
-    let election = elect_responders(
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let election = elect_responders_with_owner_map(
         Some(chat_type),
         Some(chat_id),
         message,
@@ -2395,6 +2398,7 @@ pub fn run_elect(
         false,
         human_count,
         &config,
+        &owner_map,
     );
 
     // (kind, who, addressed_by, body) — `who` is the elected agent for the
@@ -2484,7 +2488,8 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
     let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
     let human_count = human_agent_id_set(workgraph_dir).len();
 
-    let election = elect_responders(
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let election = elect_responders_with_owner_map(
         Some("supergroup"),
         Some("-1000000000001"),
         message,
@@ -2494,6 +2499,7 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
         false,
         human_count,
         &config,
+        &owner_map,
     );
 
     let is_discussion = is_discussion_ask(message);
@@ -2696,7 +2702,8 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
     // Membership-aware silence: mirror the listener by counting onboarded humans
     // so the diagnostic's election matches the live decision.
     let human_count = human_agent_id_set(workgraph_dir).len();
-    let election = elect_responders(
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let election = elect_responders_with_owner_map(
         msg.chat_type.as_deref(),
         msg.chat_id.as_deref(),
         &msg.body,
@@ -2705,6 +2712,7 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
         msg.sender_is_bot,
         human_count,
         &config,
+        &owner_map,
     );
     let (elected, addressed_by): (Option<String>, Option<String>) = match &election {
         Election::One { bot, addressed_by, .. } => (
@@ -2789,7 +2797,8 @@ pub fn run_photo_plan(
         Some(turn) => {
             let mention_usernames = parse_at_mention_tokens(&turn.caption);
             let human_count = human_agent_id_set(workgraph_dir).len();
-            let election = elect_responders(
+            let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+            let election = elect_responders_with_owner_map(
                 turn.chat_type.as_deref(),
                 turn.chat_id.as_deref(),
                 &turn.caption,
@@ -2798,6 +2807,7 @@ pub fn run_photo_plan(
                 false,
                 human_count,
                 &config,
+                &owner_map,
             );
             let who = match &election {
                 Election::One { bot, .. } => {
@@ -3565,8 +3575,15 @@ pub fn run_web_inbound(
     // the listener runs, via the shared `elect_group_inbound` seam (supergroup,
     // no reply-chain, never bot-sent). The path-parity test locks this to the
     // listener's decision.
-    let mut election =
-        elect_group_inbound(&target, message, &mention_usernames, human_count, &config);
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let mut election = elect_group_inbound_with_owner_map(
+        &target,
+        message,
+        &mention_usernames,
+        human_count,
+        &config,
+        &owner_map,
+    );
 
     // ── CLARIFICATION CONTINUATION ────────────────────────────────────────
     // A bare "yes"/"ok"/"si" from the same human within the clarify window is not

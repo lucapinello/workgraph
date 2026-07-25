@@ -426,9 +426,10 @@ pub enum OwnerDecision {
 }
 
 impl OwnerMap {
-    /// The legacy four-persona map retained for the group-election caller and
-    /// focused classifier tests. It is never a fallback for [`load`](Self::load):
-    /// task ownership and family-visible handoffs require project-local config.
+    /// Legacy four-persona fixture retained only for focused unit tests.
+    /// Production ownership and family-visible handoffs require project-local
+    /// configuration loaded through [`load`](Self::load).
+    #[cfg(test)]
     pub fn casa_default() -> Self {
         let entry = |id: &str, tags: &[&str]| {
             (

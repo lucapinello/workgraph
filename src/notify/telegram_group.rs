@@ -1372,21 +1372,15 @@ pub fn is_team_directed_ask(text: &str) -> bool {
 /// never configured is never elected. Explicit addressing (mention / name / reply)
 /// is resolved BEFORE this in [`elect_responders`], so a named voice always wins.
 ///
-/// The owner map is the shipped Casa roster ([`OwnerMap::casa_default`]); a
-/// household that reassigns domains still gets authoritative ownership at the
-/// creation choke point (which reads `household.toml`), and its election voice
-/// follows the default roster.
-///
 /// [`ownership::classify_domain`]: crate::notify::ownership::classify_domain
-/// [`OwnerMap::casa_default`]: crate::notify::ownership::OwnerMap::casa_default
 fn domain_voice(
     text: &str,
     config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
 ) -> Option<(ResolvedBot, crate::notify::ownership::Domain)> {
-    use crate::notify::ownership::{classify_domain, OwnerMap};
+    use crate::notify::ownership::classify_domain;
     let domain = classify_domain(text);
-    let map = OwnerMap::casa_default();
-    let owner = map.owner_for_domain(domain)?;
+    let owner = owner_map.owner_for_domain(domain)?;
     // An Otto-owned domain (calendar / shopping / coordination) or ambiguous ask
     // keeps the concierge rule — only a more-specific in-domain voice refines it.
     if owner.eq_ignore_ascii_case(CONCIERGE_BOT) {
@@ -1396,7 +1390,7 @@ fn domain_voice(
     Some((bot, domain))
 }
 
-pub fn elect_responders(
+pub fn elect_responders_with_owner_map(
     chat_type: Option<&str>,
     chat_id: Option<&str>,
     text: &str,
@@ -1405,6 +1399,7 @@ pub fn elect_responders(
     sender_is_bot: bool,
     human_count: usize,
     config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
 ) -> Election {
     // Fix #0 — the bot-loop guard. UNCONDITIONAL and first: a message sent by a
     // bot (ANY bot, including our own four seen on a sibling bot's poller) is
@@ -1508,7 +1503,7 @@ pub fn elect_responders(
         // whose owner is not the concierge (food → Bruno/Nora, workouts → Mira),
         // that owner ANSWERS as the voice. Otherwise the unaddressed ask is the
         // concierge's (Otto), exactly as before.
-        if let Some((bot, domain)) = domain_voice(text, config) {
+        if let Some((bot, domain)) = domain_voice(text, config, owner_map) {
             return Election::One {
                 bot,
                 reply_chat,
@@ -1540,7 +1535,7 @@ pub fn elect_responders(
     // yields, falling through to the domain routing below.
     if is_collective_address(text) {
         let explicit_broadcast = has_collective_trigger(text) || is_greeting_collective(text);
-        if explicit_broadcast || domain_voice(text, config).is_none() {
+        if explicit_broadcast || domain_voice(text, config, owner_map).is_none() {
             return Election::All {
                 reply_chat,
                 body: text.to_string(),
@@ -1567,7 +1562,7 @@ pub fn elect_responders(
         // NOT classifiable into a non-concierge domain (a bare "hey", "goodnight",
         // "hey guys are you around?") does the greeting shape earn a collective
         // whole-roster greeting.
-        let domain = domain_voice(text, config);
+        let domain = domain_voice(text, config, owner_map);
         if domain.is_none() && is_greeting_shaped(text) {
             return Election::All {
                 reply_chat,
@@ -1600,6 +1595,36 @@ pub fn elect_responders(
     Election::Silence(SilenceReason::SmallTalk)
 }
 
+/// Elect responders without a configured domain-owner map.
+///
+/// Explicit addressing, collective asks, concierge routing, and silence rules
+/// still work. Domain-specific routing requires callers to use
+/// [`elect_responders_with_owner_map`] with the current project's
+/// `household.toml`-derived map; this compatibility entry deliberately carries
+/// no compiled household identities.
+pub fn elect_responders(
+    chat_type: Option<&str>,
+    chat_id: Option<&str>,
+    text: &str,
+    mention_usernames: &[String],
+    reply_to_bot: Option<&str>,
+    sender_is_bot: bool,
+    human_count: usize,
+    config: &TelegramConfig,
+) -> Election {
+    elect_responders_with_owner_map(
+        chat_type,
+        chat_id,
+        text,
+        mention_usernames,
+        reply_to_bot,
+        sender_is_bot,
+        human_count,
+        config,
+        &crate::notify::ownership::OwnerMap::default(),
+    )
+}
+
 /// Elect responders for a WEB-ORIGIN (kiosk conversation-pane) inbound message,
 /// as a first-class supergroup group turn.
 ///
@@ -1619,7 +1644,26 @@ pub fn elect_group_inbound(
     human_count: usize,
     config: &TelegramConfig,
 ) -> Election {
-    elect_responders(
+    elect_group_inbound_with_owner_map(
+        chat_id,
+        text,
+        mention_usernames,
+        human_count,
+        config,
+        &crate::notify::ownership::OwnerMap::default(),
+    )
+}
+
+/// Web-origin election using the current project's configured owner map.
+pub fn elect_group_inbound_with_owner_map(
+    chat_id: &str,
+    text: &str,
+    mention_usernames: &[String],
+    human_count: usize,
+    config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
+) -> Election {
+    elect_responders_with_owner_map(
         Some("supergroup"),
         Some(chat_id),
         text,
@@ -1628,6 +1672,7 @@ pub fn elect_group_inbound(
         false, // a human typed it; never bot-sent
         human_count,
         config,
+        owner_map,
     )
 }
 
@@ -2231,7 +2276,7 @@ mod tests {
         human_count: usize,
     ) -> Election {
         let mentions: Vec<String> = mentions.iter().map(|s| s.to_string()).collect();
-        elect_responders(
+        elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             text,
@@ -2240,6 +2285,7 @@ mod tests {
             false, // human sender in the a–f election tests
             human_count,
             &casa_config(),
+            &crate::notify::ownership::OwnerMap::casa_default(),
         )
     }
 
@@ -2458,10 +2504,11 @@ mod tests {
     #[test]
     fn elect_unaddressed_ask_routes_to_domain_owner_voice() {
         let cfg = casa_config();
+        let owner_map = crate::notify::ownership::OwnerMap::casa_default();
         // (text, expected voice agent, expected addressed_by). human_count = 1
         // (the Casa single-human group), so an unaddressed ask is answered.
         let expect_one = |text: &str, agent: &str, by: AddressedBy| {
-            let e = elect_responders(
+            let e = elect_responders_with_owner_map(
                 Some("supergroup"),
                 Some("-100999"),
                 text,
@@ -2470,6 +2517,7 @@ mod tests {
                 false,
                 1,
                 &cfg,
+                &owner_map,
             );
             match &e {
                 Election::One { bot, addressed_by, .. } => {
@@ -2491,6 +2539,67 @@ mod tests {
         // Calendar/logistics and genuinely ambiguous asks stay with the concierge.
         expect_one("when is the dentist?", "otto", AddressedBy::Concierge);
         expect_one("can you help me?", "otto", AddressedBy::Concierge);
+    }
+
+    #[test]
+    fn domain_voice_uses_project_owner_map_and_never_compiled_roster() {
+        let root = tempfile::tempdir().expect("temp project");
+        std::fs::write(
+            root.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "quartz"
+domains = ["cooking", "recipes"]
+
+[[agent]]
+id = "otto"
+domains = ["coordination", "calendar"]
+"#,
+        )
+        .expect("write household fixture");
+        let map = crate::notify::ownership::OwnerMap::load(root.path());
+        let cfg = cfg_with_bots(&[
+            ("quartz", "-100999", Some("quartz"), Some("quartz_bot")),
+            ("otto", "-100999", Some("otto"), Some("otto_bot")),
+        ]);
+
+        let configured = elect_responders_with_owner_map(
+            Some("supergroup"),
+            Some("-100999"),
+            "pizza on friday",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+            &map,
+        );
+        assert_one(
+            &configured,
+            "quartz",
+            AddressedBy::Domain(crate::notify::ownership::Domain::Cooking),
+        );
+
+        let no_project_roster = elect_responders(
+            Some("supergroup"),
+            Some("-100999"),
+            "pizza on friday",
+            &[],
+            None,
+            false,
+            1,
+            &cfg,
+        );
+        assert_eq!(
+            no_project_roster,
+            Election::One {
+                bot: resolve_mentioned_bot("otto", &cfg).expect("configured concierge"),
+                reply_chat: "-100999".to_string(),
+                body: "pizza on friday".to_string(),
+                addressed_by: AddressedBy::Concierge,
+            },
+            "without household.toml-derived ownership, election must not invent a domain owner"
+        );
     }
 
     /// PRECEDENCE (morning-taco-bugs): a message that OPENS with a greeting word
@@ -2555,7 +2664,7 @@ mod tests {
     /// only ever applies to UNADDRESSED asks.
     #[test]
     fn elect_explicit_name_beats_domain_voice() {
-        let e = elect_responders(
+        let e = elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             "otto, sort out pizza for friday",
@@ -2564,6 +2673,7 @@ mod tests {
             false,
             1,
             &casa_config(),
+            &crate::notify::ownership::OwnerMap::casa_default(),
         );
         match &e {
             Election::One { bot, addressed_by, .. } => {
@@ -2579,7 +2689,7 @@ mod tests {
     /// see WHY the chef (not Otto) answered.
     #[test]
     fn election_summary_shows_domain_reasoning() {
-        let e = elect_responders(
+        let e = elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
             "pizza on friday",
@@ -2588,6 +2698,7 @@ mod tests {
             false,
             1,
             &casa_config(),
+            &crate::notify::ownership::OwnerMap::casa_default(),
         );
         let summary = election_decision_summary(Some("m1"), Some("supergroup"), &e);
         assert!(
@@ -2606,7 +2717,7 @@ mod tests {
     fn single_meal_ask_elects_exactly_one_owner_not_the_roster() {
         let ask = "hey plan for branzino for tomorrow night";
         let elect = |humans: usize| {
-            elect_responders(
+            elect_responders_with_owner_map(
                 Some("supergroup"),
                 Some("-100999"),
                 ask,
@@ -2615,6 +2726,7 @@ mod tests {
                 false,
                 humans,
                 &casa_config(),
+                &crate::notify::ownership::OwnerMap::casa_default(),
             )
         };
 
@@ -2657,9 +2769,10 @@ mod tests {
         // the mention rung. Order asserted: mention > name > reply > collective >
         // ask(otto) > silence.
         let cfg = casa_config_no_usernames();
+        let owner_map = crate::notify::ownership::OwnerMap::casa_default();
         let elect = |text: &str, mentions: &[&str], reply: Option<&str>| {
             let m: Vec<String> = mentions.iter().map(|s| s.to_string()).collect();
-            elect_responders(
+            elect_responders_with_owner_map(
                 Some("supergroup"),
                 Some("-100999"),
                 text,
@@ -2668,6 +2781,7 @@ mod tests {
                 false,
                 2,
                 &cfg,
+                &owner_map,
             )
         };
         let agent_of = |e: &Election| match e {
@@ -3691,12 +3805,13 @@ mod tests {
     fn fennel_web_inbound_elects_nora_not_otto() {
         use crate::notify::ownership::Domain;
         let cfg = casa_config();
-        let election = elect_group_inbound(
+        let election = elect_group_inbound_with_owner_map(
             "-100999",
             "hey can you swap tacod for grilled fennel",
             &[],
             1,
             &cfg,
+            &crate::notify::ownership::OwnerMap::casa_default(),
         );
         match &election {
             Election::One { bot, addressed_by, .. } => {
