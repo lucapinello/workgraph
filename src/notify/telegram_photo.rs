@@ -39,8 +39,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-use super::grounding::{self, FamilyVoiceRoster};
 use super::IncomingMessage;
+use super::grounding::{self, FamilyVoiceRoster};
 
 // ---------------------------------------------------------------------------
 // Photo parsing
@@ -413,7 +413,11 @@ pub enum ShoppingAction {
 /// whitespace, drop a trailing plural `s` on the last word so "lemons" matches
 /// "lemon". Mirrors the gateway's own `norm` intent without importing it.
 fn norm_item(s: &str) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let collapsed = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     // Singularize the final token only (avoid butchering "chickpeas" mid-word).
     if let Some((head, last)) = collapsed.rsplit_once(' ') {
         format!("{head} {}", singular(last))
@@ -456,7 +460,10 @@ fn names_match(name: &str, item_text: &str) -> bool {
 /// wins (we keep what we still need on the list) — so a model that lists an
 /// item on both sides never leaves it wrongly crossed off. Duplicate actions on
 /// the same key are de-duplicated.
-pub fn plan_shopping_actions(verdict: &VisionVerdict, list: &[ShoppingItem]) -> Vec<ShoppingAction> {
+pub fn plan_shopping_actions(
+    verdict: &VisionVerdict,
+    list: &[ShoppingItem],
+) -> Vec<ShoppingAction> {
     use std::collections::HashSet;
     let mut actions: Vec<ShoppingAction> = Vec::new();
     let mut crossed_keys: HashSet<String> = HashSet::new();
@@ -690,8 +697,7 @@ impl TelegramPhotoDownloader {
 impl PhotoDownloader for TelegramPhotoDownloader {
     async fn download(&self, file_id: &str, dest: &Path) -> Result<()> {
         // 1. Resolve the file path via getFile.
-        let get_file_url =
-            format!("https://api.telegram.org/bot{}/getFile", self.bot_token);
+        let get_file_url = format!("https://api.telegram.org/bot{}/getFile", self.bot_token);
         let resp = self
             .client
             .post(&get_file_url)
@@ -837,18 +843,17 @@ pub async fn run_photo_shopping_turn(
     // the family-safe text that may be delivered.
     let reply_text = grounding::enforce_family_voice(&reply_text, family_roster);
 
-    Ok(PhotoTurnResult { reply_text, actions })
+    Ok(PhotoTurnResult {
+        reply_text,
+        actions,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn photo_msg(
-        file_id: &str,
-        caption: &str,
-        media_group_id: Option<&str>,
-    ) -> IncomingMessage {
+    fn photo_msg(file_id: &str, caption: &str, media_group_id: Option<&str>) -> IncomingMessage {
         IncomingMessage {
             channel: "telegram".to_string(),
             sender: "luca".to_string(),
@@ -946,10 +951,7 @@ mod tests {
 
     #[test]
     fn photo_lone_photos_are_separate_turns() {
-        let msgs = vec![
-            photo_msg("f1", "one", None),
-            photo_msg("f2", "two", None),
-        ];
+        let msgs = vec![photo_msg("f1", "one", None), photo_msg("f2", "two", None)];
         let turns = coalesce_album(&msgs);
         assert_eq!(turns.len(), 2);
     }
@@ -1052,10 +1054,14 @@ mod tests {
             text: "Chickpeas".into()
         }));
         // "lemons" already on list uncrossed → no action; "chard" missing → add.
-        assert!(actions.contains(&ShoppingAction::Add { text: "chard".into() }));
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, ShoppingAction::CrossOff { text, .. } if text == "Lemons")));
+        assert!(actions.contains(&ShoppingAction::Add {
+            text: "chard".into()
+        }));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ShoppingAction::CrossOff { text, .. } if text == "Lemons"))
+        );
     }
 
     #[test]
@@ -1086,9 +1092,11 @@ mod tests {
             need: vec!["eggs".into()],
         };
         let actions = plan_shopping_actions(&verdict, &list);
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, ShoppingAction::CrossOff { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ShoppingAction::CrossOff { .. }))
+        );
     }
 
     #[test]
@@ -1230,7 +1238,10 @@ mod tests {
         assert_eq!(composer.seen_images.lock().unwrap().as_slice(), &[2]);
         let prompt = composer.seen_prompt.lock().unwrap().clone();
         assert!(prompt.contains("Chickpeas"), "list is in the prompt");
-        assert!(prompt.contains("bruno what do we still need?"), "caption in prompt");
+        assert!(
+            prompt.contains("bruno what do we still need?"),
+            "caption in prompt"
+        );
         assert!(prompt.contains("@"), "image reference in prompt");
 
         // Reply is family-voice with the marker stripped.
@@ -1239,7 +1250,10 @@ mod tests {
 
         // Mutations went through the endpoints: cross off chickpeas, add chard.
         let calls = gateway.calls.lock().unwrap().clone();
-        assert!(calls.contains(&"toggle p:s|chickpeas true".to_string()), "calls={calls:?}");
+        assert!(
+            calls.contains(&"toggle p:s|chickpeas true".to_string()),
+            "calls={calls:?}"
+        );
         assert!(calls.contains(&"add chard".to_string()), "calls={calls:?}");
 
         // Temp files cleaned up.

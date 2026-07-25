@@ -401,9 +401,15 @@ mod tests {
         setup_graph(&dir, &graph);
 
         let err = run(&dir, "daily-digest", Some("cleanup"), &[], false);
-        assert!(err.is_err(), "protected task must refuse abandon without --force");
+        assert!(
+            err.is_err(),
+            "protected task must refuse abandon without --force"
+        );
         let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("PROTECTED"), "error must name the protection: {msg}");
+        assert!(
+            msg.contains("PROTECTED"),
+            "error must name the protection: {msg}"
+        );
 
         // Status is unchanged — the sweep did NOT kill the cron.
         let task = load_graph(graph_path(&dir))
@@ -411,7 +417,11 @@ mod tests {
             .get_task("daily-digest")
             .unwrap()
             .clone();
-        assert_eq!(task.status, Status::Open, "refused abandon must leave it Open");
+        assert_eq!(
+            task.status,
+            Status::Open,
+            "refused abandon must leave it Open"
+        );
     }
 
     #[test]

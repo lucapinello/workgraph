@@ -194,12 +194,7 @@ impl PlanDoc {
                     }),
                     Section::Workouts => {
                         // "Luca — strength focus (…)" → person = "Luca".
-                        let person = h3
-                            .split(['—', '-'])
-                            .next()
-                            .unwrap_or(h3)
-                            .trim()
-                            .to_string();
+                        let person = h3.split(['—', '-']).next().unwrap_or(h3).trim().to_string();
                         workout_person = Some(person);
                     }
                     _ => {}
@@ -253,8 +248,7 @@ impl PlanDoc {
                     }
                 }
                 Section::Workouts => {
-                    if let (Some(person), Some(cells)) =
-                        (workout_person.as_ref(), table_row(line))
+                    if let (Some(person), Some(cells)) = (workout_person.as_ref(), table_row(line))
                     {
                         // Columns: Day | Session | Structure
                         if cells.len() >= 2 && !is_header_or_rule(&cells) {
@@ -418,7 +412,9 @@ fn is_header_or_rule(cells: &[String]) -> bool {
     cells
         .iter()
         .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '))
-        || cells.iter().any(|c| c.chars().all(|ch| ch == '-') && !c.is_empty())
+        || cells
+            .iter()
+            .any(|c| c.chars().all(|ch| ch == '-') && !c.is_empty())
 }
 
 /// Parse a day cell like `"Mon 07-13"` into (`"Mon"`, date). The date is

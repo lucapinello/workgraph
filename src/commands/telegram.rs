@@ -15,17 +15,17 @@ use worksgood::notify::casa_feed;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
 use worksgood::notify::fast_lane;
+use worksgood::notify::ownership;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
 use worksgood::notify::telegram_conversation::durable_telegram_digest_v1;
-use worksgood::notify::telegram_family_commands as family_commands;
-use worksgood::notify::telegram_voice;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
-use worksgood::notify::ownership;
+use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_group::{
     Election, NaturalRoute, elect_group_inbound_with_owner_map, elect_responders_with_owner_map,
     election_decision_summary, is_discussion_ask, parse_at_mention_tokens, resolve_mentioned_bot,
     route_natural_with_owner_map,
 };
+use worksgood::notify::telegram_voice;
 
 /// Whether an inbound listener message may fire a FAMILY command and/or the
 /// OPERATOR command reference.
@@ -241,8 +241,11 @@ impl WebLoginOutcome {
                 "I don't recognise you yet — ask someone already in the household to add you."
                     .to_string()
             }
-            WebLoginOutcome::EmptyRoster | WebLoginOutcome::LinkExpired | WebLoginOutcome::NoSession => {
-                "That sign-in link expired — reopen the Casa page and tap the fresh link.".to_string()
+            WebLoginOutcome::EmptyRoster
+            | WebLoginOutcome::LinkExpired
+            | WebLoginOutcome::NoSession => {
+                "That sign-in link expired — reopen the Casa page and tap the fresh link."
+                    .to_string()
             }
         }
     }
@@ -314,11 +317,7 @@ fn parse_login_nonce(body: &str) -> Option<&str> {
         .split_whitespace()
         .next()
         .unwrap_or("");
-    if nonce.is_empty() {
-        None
-    } else {
-        Some(nonce)
-    }
+    if nonce.is_empty() { None } else { Some(nonce) }
 }
 
 /// Handle a 1:1 `/start login_<nonce>` web-identity deep link: POST the sender's
@@ -348,7 +347,14 @@ async fn confirm_web_login_outcome(
         },
         Some(c) if c.reason.as_deref() == Some("empty-roster") => WebLoginOutcome::EmptyRoster,
         Some(c) if c.reason.as_deref() == Some("unknown-user") => WebLoginOutcome::UnknownUser,
-        Some(c) if matches!(c.reason.as_deref(), Some("unknown-nonce") | Some("expired") | Some("used")) => WebLoginOutcome::LinkExpired,
+        Some(c)
+            if matches!(
+                c.reason.as_deref(),
+                Some("unknown-nonce") | Some("expired") | Some("used")
+            ) =>
+        {
+            WebLoginOutcome::LinkExpired
+        }
         _ => WebLoginOutcome::NoSession,
     }
 }
@@ -356,11 +362,7 @@ async fn confirm_web_login_outcome(
 /// Backward-compatible thin wrapper returning the family-voice reply string for
 /// the non-founding outcomes (used by the existing unit tests + the plain
 /// signed-in / unknown-user / no-session paths).
-async fn confirm_web_login(
-    client: &reqwest::Client,
-    nonce: &str,
-    telegram_id: &str,
-) -> String {
+async fn confirm_web_login(client: &reqwest::Client, nonce: &str, telegram_id: &str) -> String {
     confirm_web_login_outcome(client, nonce, telegram_id)
         .await
         .reply()
@@ -407,8 +409,14 @@ async fn redeem_invite(client: &reqwest::Client, nonce: &str, telegram_id: &str)
     };
     match redeemed {
         Some(r) if r.ok => {
-            let who = r.name.as_deref().filter(|s| !s.is_empty()).unwrap_or("friend");
-            format!("Welcome to the household, {who}! You're all set — sign in on any device. \u{1f3e0}")
+            let who = r
+                .name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("friend");
+            format!(
+                "Welcome to the household, {who}! You're all set — sign in on any device. \u{1f3e0}"
+            )
         }
         Some(r) if r.reason.as_deref() == Some("used") => {
             "That invite was already used — ask for a fresh one from Manage household.".to_string()
@@ -456,7 +464,8 @@ async fn found_household(
                  You're signed in on {label}; invite the rest of the family from Manage household."
             )
         }
-        _ => "I couldn't finish setting up — tap the sign-in link for a fresh one and try again.".to_string(),
+        _ => "I couldn't finish setting up — tap the sign-in link for a fresh one and try again."
+            .to_string(),
     }
 }
 
@@ -501,11 +510,9 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     // Start this run from a clean slate so a previous run's failure streak
     // cannot make a freshly started listener look deaf.
     let bot_ids: Vec<String> = channels.iter().map(|c| c.bot_id().to_string()).collect();
-    if let Err(e) = worksgood::notify::listener_health::reset_for_new_run(
-        dir,
-        &bot_ids,
-        chrono::Utc::now(),
-    ) {
+    if let Err(e) =
+        worksgood::notify::listener_health::reset_for_new_run(dir, &bot_ids, chrono::Utc::now())
+    {
         eprintln!("warning: could not initialize listener health state: {e:#}");
     }
 
@@ -556,32 +563,33 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     const LIFECYCLE_TICK_SECS: u64 = 15;
     {
         let lifecycle_dir = dir.to_path_buf();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(LIFECYCLE_TICK_SECS));
-            let graph_path = crate::commands::graph_path(&lifecycle_dir);
-            let graph = match worksgood::parser::load_graph(&graph_path) {
-                Ok(g) => g,
-                Err(_) => continue, // no graph yet — nothing to report
-            };
-            let root = project_root(&lifecycle_dir);
-            let log_path = worksgood::notify::reminder::FiredLog::path(&root);
-            let fired = worksgood::notify::reminder::FiredLog::load(&log_path);
-            let pending = worksgood::notify::lifecycle::pending_fires(
-                graph.tasks(),
-                |id| fired.contains(id),
-            );
-            if pending.is_empty() && !lifecycle_reconciliation_needs_tick(&log_path) {
-                continue; // no unreported transition — stay quiet
-            }
-            // Something transitioned: deliver every pending report-back (same code
-            // path as `wg telegram lifecycle`, real send). Exactly-once + pacing
-            // are enforced inside via the persisted FiredLog.
-            if let Err(e) = run_lifecycle(&lifecycle_dir, None, false, None, false, false) {
-                eprintln!(
-                    "[{}] lifecycle report-back tick failed: {}",
-                    chrono::Utc::now().format("%H:%M:%S"),
-                    worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
-                );
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(LIFECYCLE_TICK_SECS));
+                let graph_path = crate::commands::graph_path(&lifecycle_dir);
+                let graph = match worksgood::parser::load_graph(&graph_path) {
+                    Ok(g) => g,
+                    Err(_) => continue, // no graph yet — nothing to report
+                };
+                let root = project_root(&lifecycle_dir);
+                let log_path = worksgood::notify::reminder::FiredLog::path(&root);
+                let fired = worksgood::notify::reminder::FiredLog::load(&log_path);
+                let pending = worksgood::notify::lifecycle::pending_fires(graph.tasks(), |id| {
+                    fired.contains(id)
+                });
+                if pending.is_empty() && !lifecycle_reconciliation_needs_tick(&log_path) {
+                    continue; // no unreported transition — stay quiet
+                }
+                // Something transitioned: deliver every pending report-back (same code
+                // path as `wg telegram lifecycle`, real send). Exactly-once + pacing
+                // are enforced inside via the persisted FiredLog.
+                if let Err(e) = run_lifecycle(&lifecycle_dir, None, false, None, false, false) {
+                    eprintln!(
+                        "[{}] lifecycle report-back tick failed: {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
+                    );
+                }
             }
         });
     }
@@ -1837,7 +1845,13 @@ fn try_confirm_binding(workgraph_dir: &Path, sender: &str, body: &str) -> Option
     // `sender` is the already-resolved binding key (numeric id or @handle).
     // Passing it as both id and username satisfies Erik's `matches_sender`
     // contract for either key kind (numeric matches on id, handle on username).
-    let name = apply_confirmation(&mut bindings, sender, Some(sender), body, chrono::Utc::now())?;
+    let name = apply_confirmation(
+        &mut bindings,
+        sender,
+        Some(sender),
+        body,
+        chrono::Utc::now(),
+    )?;
     if let Err(e) = bindings.save(&agency_dir) {
         eprintln!("Failed to persist Telegram binding confirmation: {e}");
         return None;
@@ -2004,11 +2018,14 @@ async fn handle_photo_shopping_turn(
     route_config: &TelegramConfig,
     wg_config: Option<&worksgood::config::Config>,
 ) -> Result<()> {
-    use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::grounding;
+    use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_photo as photo;
 
-    let turn = match photo::coalesce_album(std::slice::from_ref(msg)).into_iter().next() {
+    let turn = match photo::coalesce_album(std::slice::from_ref(msg))
+        .into_iter()
+        .next()
+    {
         Some(t) => t,
         None => return Ok(()), // not a photo (shouldn't happen — caller gated)
     };
@@ -2448,7 +2465,10 @@ fn resolve_send_bot(
 /// map is now the norm and the legacy top-level `chat_id` is often empty, so a
 /// caller that reads only `config.chat_id` bails on a perfectly-valid bots-map
 /// config (task `urgent-web-inbound` — the kiosk web-inbound regression).
-fn resolve_group_chat_id(config: &TelegramConfig, chat_id_override: Option<&str>) -> Option<String> {
+fn resolve_group_chat_id(
+    config: &TelegramConfig,
+    chat_id_override: Option<&str>,
+) -> Option<String> {
     if let Some(o) = chat_id_override {
         let o = o.trim();
         if !o.is_empty() {
@@ -2624,7 +2644,10 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        println!("{}", telegram_sender::resolve_inbound_summary(&value, &bindings));
+        println!(
+            "{}",
+            telegram_sender::resolve_inbound_summary(&value, &bindings)
+        );
     }
     Ok(())
 }
@@ -2678,7 +2701,12 @@ pub fn run_elect(
     let (kind, who, addressed_by, body): (&str, Option<String>, Option<String>, String) =
         match &election {
             Election::Private => ("private", None, None, message.to_string()),
-            Election::Silence(reason) => ("silence", None, Some(reason.to_string()), message.to_string()),
+            Election::Silence(reason) => (
+                "silence",
+                None,
+                Some(reason.to_string()),
+                message.to_string(),
+            ),
             Election::All { body, .. } => {
                 let roster = worksgood::notify::telegram_standup::load_project_roster(
                     &project_root(workgraph_dir),
@@ -2778,9 +2806,9 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
     let is_discussion = is_discussion_ask(message);
     let roster_ids: Vec<String> =
         standup::load_project_roster(&project_root(workgraph_dir), &config)?
-        .into_iter()
-        .map(|m| m.bot_id)
-        .collect();
+            .into_iter()
+            .map(|m| m.bot_id)
+            .collect();
     let synthesizer_bot = owner_map
         .owner_for_domain(ownership::Domain::Coordination)
         .and_then(|owner| resolve_mentioned_bot(owner, &config))
@@ -2829,9 +2857,9 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
                 },
             );
             match plan.synthesizer {
-                Some(s) => println!(
-                    "then {s} closes with a synthesis (only if ≥2 other voices weigh in)"
-                ),
+                Some(s) => {
+                    println!("then {s} closes with a synthesis (only if ≥2 other voices weigh in)")
+                }
                 None => println!("no synthesizer configured — no closing wrap-up"),
             }
         }
@@ -2877,9 +2905,7 @@ pub fn run_compose_prompt(
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .or_else(|| owner_map.owner_for_domain(ownership::Domain::Coordination))
-        .context(
-            "--agent is required when household.toml has no configured coordination owner",
-        )?;
+        .context("--agent is required when household.toml has no configured coordination owner")?;
     // Default the session ref to the persona id: a bound agent name resolves to
     // its session, and an unknown ref simply yields no summary/history (the
     // fresh-session prompt) rather than an error — so a scratch project works.
@@ -2888,8 +2914,12 @@ pub fn run_compose_prompt(
         .filter(|s| !s.is_empty())
         .unwrap_or(agent_id);
 
-    let prompt =
-        telegram_conversation::compose_prompt_preview(workgraph_dir, session_ref, agent_id, message);
+    let prompt = telegram_conversation::compose_prompt_preview(
+        workgraph_dir,
+        session_ref,
+        agent_id,
+        message,
+    );
 
     if json {
         // Which forwarded blocks are present in the ASSEMBLED prompt (not merely
@@ -3003,7 +3033,9 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
         &owner_map,
     );
     let (elected, addressed_by): (Option<String>, Option<String>) = match &election {
-        Election::One { bot, addressed_by, .. } => (
+        Election::One {
+            bot, addressed_by, ..
+        } => (
             bot.agent_id.clone().or_else(|| Some(bot.bot_id.clone())),
             Some(addressed_by.to_string()),
         ),
@@ -3173,7 +3205,14 @@ pub fn run_photo_plan(
             .map(|g| format!(", album group {g}"))
             .unwrap_or_default(),
     );
-    println!("  caption: {}", if turn.caption.is_empty() { "(none)" } else { &turn.caption });
+    println!(
+        "  caption: {}",
+        if turn.caption.is_empty() {
+            "(none)"
+        } else {
+            &turn.caption
+        }
+    );
     println!(
         "  routes to: {}",
         elected.as_deref().unwrap_or("(silence — no one answers)")
@@ -3339,8 +3378,7 @@ pub fn run_photo_replay(
 
     let read_arg = |arg: &str| -> Result<String> {
         if let Some(path) = arg.strip_prefix('@') {
-            std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read fixture {path}"))
+            std::fs::read_to_string(path).with_context(|| format!("failed to read fixture {path}"))
         } else {
             Ok(arg.to_string())
         }
@@ -3676,9 +3714,7 @@ pub async fn run_group_collective(
                 GuardPolicy::AlreadyGuarded,
             );
             let request_id = collective_request_id(target, &member.bot_id, physical_turn_key);
-            let composer = wg_config
-                .clone()
-                .map(convo::OneshotComposer::from_config);
+            let composer = wg_config.clone().map(convo::OneshotComposer::from_config);
             let composer_ref = composer.as_ref().map(|c| c as &dyn convo::ReplyComposer);
             match convo::run_conversation_turn(
                 workgraph_dir,
@@ -3766,9 +3802,9 @@ pub async fn run_group_discussion(
     sender: &str,
     physical_turn_key: &str,
 ) -> Result<()> {
+    use worksgood::notify::grounding;
     use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_discussion as discussion;
-    use worksgood::notify::grounding;
     use worksgood::notify::telegram_standup as standup;
 
     let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
@@ -3957,12 +3993,7 @@ impl FamilyReplyDelivery {
         }
     }
 
-    fn wrap<S>(
-        &self,
-        inner: S,
-        scope: ReplyScope,
-        guard: GuardPolicy,
-    ) -> ScopedFamilyReplySink<S> {
+    fn wrap<S>(&self, inner: S, scope: ReplyScope, guard: GuardPolicy) -> ScopedFamilyReplySink<S> {
         ScopedFamilyReplySink {
             inner,
             delivery: self.clone(),
@@ -4128,7 +4159,10 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
     }
     // 2. Web identity is a display name / humanId — match the binding's `name`
     //    or its `human-`-prefixed agent id, then hand back the stored key.
-    let want = sender.trim().trim_start_matches("human-").to_ascii_lowercase();
+    let want = sender
+        .trim()
+        .trim_start_matches("human-")
+        .to_ascii_lowercase();
     if let Some(b) = map.bindings.iter().find(|b| {
         b.name.eq_ignore_ascii_case(sender)
             || b.agent_id
@@ -4188,11 +4222,7 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 /// The gateway supplies the physical-turn key once per accepted occurrence.
 /// Hashing that opaque key preserves a real dispatcher refire while allowing a
 /// household member to repeat identical words later and receive another answer.
-fn web_inbound_request_id(
-    reply_chat: &str,
-    bot_id: &str,
-    physical_turn_key: &str,
-) -> String {
+fn web_inbound_request_id(reply_chat: &str, bot_id: &str, physical_turn_key: &str) -> String {
     format!(
         "web-request-{}",
         durable_telegram_digest_v1(
@@ -4280,10 +4310,7 @@ fn web_physical_turn_key(reply_chat: &str, body: &str, turn_id: Option<&str>) ->
         .unwrap_or_else(|| ("body", body.trim()));
     format!(
         "web-turn-{}",
-        durable_telegram_digest_v1(
-            "web-physical-turn",
-            &[reply_chat, kind, occurrence],
-        ),
+        durable_telegram_digest_v1("web-physical-turn", &[reply_chat, kind, occurrence],),
     )
 }
 
@@ -4312,7 +4339,10 @@ fn fast_lane_reply_target(
     config: &TelegramConfig,
     target: &str,
 ) -> (String, String) {
-    if let Election::One { bot, reply_chat, .. } = election {
+    if let Election::One {
+        bot, reply_chat, ..
+    } = election
+    {
         return (bot.bot_id.clone(), reply_chat.clone());
     }
     let bot_id = config
@@ -4416,12 +4446,8 @@ async fn run_web_fast_lane_occurrence(
 
     let (outcome, resumed_delivery) = match state {
         OccurrenceState::New => {
-            match fast_lane::run_fast_lane_with_calendar_owner(
-                root,
-                message,
-                today,
-                calendar_owner,
-            ) {
+            match fast_lane::run_fast_lane_with_calendar_owner(root, message, today, calendar_owner)
+            {
                 FastLaneResult::Fallback { .. } => {
                     // This closed-set classifier did not ultimately own the turn
                     // (for example, no current plan could be edited). Persist that
@@ -4430,10 +4456,8 @@ async fn run_web_fast_lane_occurrence(
                     return Ok(WebFastLaneDispatch::PassedThrough);
                 }
                 FastLaneResult::Applied { report, op, .. } => {
-                    let guarded = worksgood::notify::grounding::enforce_family_voice(
-                        &report,
-                        family_roster,
-                    );
+                    let guarded =
+                        worksgood::notify::grounding::enforce_family_voice(&report, family_roster);
                     if guarded != report {
                         eprintln!(
                             "[{}] family-voice guard: cleaned a web fast-lane reply before journaling",
@@ -4909,10 +4933,7 @@ pub fn run_web_inbound(
                 // itself a continuation so a confirmed exchange can't loop. Best
                 // effort — a ledger write failure never blocks the reply.
                 if clarify_continued_body.is_none() {
-                    let voice = bot
-                        .agent_id
-                        .clone()
-                        .unwrap_or_else(|| bot.bot_id.clone());
+                    let voice = bot.agent_id.clone().unwrap_or_else(|| bot.bot_id.clone());
                     if let Err(e) = ownership::ClarifyLedger::open(
                         &clarify_root,
                         &clarify_chat,
@@ -5118,9 +5139,7 @@ pub async fn run_family_command(
             })?
         }
     };
-    let chosen = bots
-        .iter()
-        .find(|(id, _)| id == &resolved.bot_id);
+    let chosen = bots.iter().find(|(id, _)| id == &resolved.bot_id);
     let bot_id = match chosen {
         Some((id, _)) => id.clone(),
         None => anyhow::bail!(
@@ -5347,9 +5366,7 @@ pub fn run_remind(
     json: bool,
 ) -> Result<()> {
     use worksgood::agency::TelegramBindingMap;
-    use worksgood::notify::reminder::{
-        self, AdHocStore, FiredLog, FirePolicy, Reminder,
-    };
+    use worksgood::notify::reminder::{self, AdHocStore, FirePolicy, FiredLog, Reminder};
 
     let root = project_root(workgraph_dir);
     let owner_map = ownership::OwnerMap::load(&root);
@@ -5380,7 +5397,10 @@ pub fn run_remind(
             None => {
                 let msg = "That didn't look like a reminder — try \"remind me Thursday to …\".";
                 if json {
-                    println!("{}", serde_json::json!({ "registered": false, "reason": msg }));
+                    println!(
+                        "{}",
+                        serde_json::json!({ "registered": false, "reason": msg })
+                    );
                 } else {
                     println!("{msg}");
                 }
@@ -5401,9 +5421,9 @@ pub fn run_remind(
         let path = AdHocStore::path(&root);
         let mut store = AdHocStore::load(&path);
         let added = store.add(rem.clone());
-        store.save(&path).with_context(|| {
-            format!("failed to persist ad-hoc reminder to {}", path.display())
-        })?;
+        store
+            .save(&path)
+            .with_context(|| format!("failed to persist ad-hoc reminder to {}", path.display()))?;
         if json {
             println!(
                 "{}",
@@ -5517,7 +5537,12 @@ pub fn run_remind(
                 } else {
                     f.reminder.recipient.clone()
                 };
-                println!("WOULD SEND to {} via {}: {}", who, f.reminder.bot, f.message());
+                println!(
+                    "WOULD SEND to {} via {}: {}",
+                    who,
+                    f.reminder.bot,
+                    f.message()
+                );
             }
             for r in &result.dropped {
                 println!("WOULD DROP (too late): ⏰ {}", r.text);
@@ -5646,12 +5671,7 @@ fn resolve_reminder_target(
 /// reply already carries a `TASK_CREATE:` tail, and whether there is a MISMATCH
 /// a live turn would repair (a one-off action promised with no artifact). No
 /// side effects — nothing is sent, no task is created.
-pub fn run_parity(
-    reply_text: &str,
-    human: Option<&str>,
-    _dry_run: bool,
-    json: bool,
-) -> Result<()> {
+pub fn run_parity(reply_text: &str, human: Option<&str>, _dry_run: bool, json: bool) -> Result<()> {
     use worksgood::notify::lifecycle;
     use worksgood::notify::parity::{self, PromiseKind};
 
@@ -5769,7 +5789,9 @@ pub fn run_owner(
             println!("verdict: {p} OWNS this ask → it creates the task");
         }
         (Some(p), Some(OwnerDecision::Defer { owner })) => {
-            println!("verdict: {p} is OFF-DOMAIN → defers to {owner} (re-routed, never its own copy)");
+            println!(
+                "verdict: {p} is OFF-DOMAIN → defers to {owner} (re-routed, never its own copy)"
+            );
         }
         _ => {}
     }
@@ -5936,7 +5958,11 @@ async fn deliver_operator_alert(
                 chrono::Utc::now().format("%H:%M:%S"),
                 alert.task_id,
                 chat_id,
-                if bot_id.is_empty() { "legacy bot" } else { &bot_id },
+                if bot_id.is_empty() {
+                    "legacy bot"
+                } else {
+                    &bot_id
+                },
             );
             true
         }
@@ -6338,8 +6364,7 @@ pub fn run_lifecycle(
         // Compute against throwaway copies so a dry run records nothing.
         let mut dry_log = log.clone();
         let mut dry_store = store.clone();
-        let result =
-            lifecycle::lifecycle_tick(&inputs, &mut dry_log, &mut dry_store, now, &policy);
+        let result = lifecycle::lifecycle_tick(&inputs, &mut dry_log, &mut dry_store, now, &policy);
         if json {
             let rows: Vec<_> = result
                 .fired
@@ -6381,23 +6406,25 @@ pub fn run_lifecycle(
             && result.capped.is_empty()
             && result.operator_alerts.is_empty()
         {
-            println!("Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).", now.format("%Y-%m-%d %H:%M"));
+            println!(
+                "Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).",
+                now.format("%Y-%m-%d %H:%M")
+            );
         } else {
             for f in &result.fired {
                 println!("{}", lifecycle::dry_run_line(f));
             }
             for f in &result.capped {
-                println!("[dry-run] (capped → folds into digest) {}", lifecycle::dry_run_line(f));
+                println!(
+                    "[dry-run] (capped → folds into digest) {}",
+                    lifecycle::dry_run_line(f)
+                );
             }
             for a in &result.operator_alerts {
-                let route =
-                    operator_alert_route(&config, coordination_owner.as_deref());
+                let route = operator_alert_route(&config, coordination_owner.as_deref());
                 println!(
                     "{}",
-                    lifecycle::dry_run_alert_line(
-                        a,
-                        route.as_ref().map(|(bot, _)| bot.as_str()),
-                    )
+                    lifecycle::dry_run_alert_line(a, route.as_ref().map(|(bot, _)| bot.as_str()),)
                 );
             }
         }
@@ -6449,7 +6476,10 @@ pub fn run_lifecycle(
         && result.capped.is_empty()
         && result.operator_alerts.is_empty()
     {
-        println!("Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).", now.format("%Y-%m-%d %H:%M"));
+        println!(
+            "Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).",
+            now.format("%Y-%m-%d %H:%M")
+        );
     }
     Ok(())
 }
@@ -6561,12 +6591,7 @@ pub fn run_digest(
                 // coordination owner. Without one, only the recipient's explicit
                 // bot binding may send; roster/map order is never a fallback.
                 let (target, bot_id, _bot) =
-                    match resolve_dm_target(
-                        &config,
-                        &bindings,
-                        member,
-                        &coordination_owner,
-                    ) {
+                    match resolve_dm_target(&config, &bindings, member, &coordination_owner) {
                         Some(t) => t,
                         None => {
                             eprintln!(
@@ -6577,14 +6602,8 @@ pub fn run_digest(
                             continue;
                         }
                     };
-                match deliver_digest_fire(
-                    sink.as_ref(),
-                    &family_delivery,
-                    &bot_id,
-                    &target,
-                    text,
-                )
-                .await
+                match deliver_digest_fire(sink.as_ref(), &family_delivery, &bot_id, &target, text)
+                    .await
                 {
                     Ok(()) => {
                         // Confirmed delivery: NOW mark today's digest sent and
@@ -6708,10 +6727,12 @@ fn resolve_dm_target(
     if !bot.trim().is_empty() {
         return bots
             .iter()
-            .find(|(id, b)| id.eq_ignore_ascii_case(bot) || {
-                b.agent_id
-                    .as_deref()
-                    .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case(bot))
+            .find(|(id, b)| {
+                id.eq_ignore_ascii_case(bot) || {
+                    b.agent_id
+                        .as_deref()
+                        .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case(bot))
+                }
             })
             .map(|(id, b)| (target, id.clone(), b.clone()));
     }
@@ -6758,7 +6779,7 @@ fn fire_errands(
 ) -> Result<usize> {
     use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, Offer};
     use worksgood::notify::errand::{self, ShoppingModel};
-    use worksgood::notify::reminder::{FiredLog, FirePolicy};
+    use worksgood::notify::reminder::{FirePolicy, FiredLog};
 
     let plan = match current {
         Some(p) => p,
@@ -6800,7 +6821,14 @@ fn fire_errands(
 
     if dry_run {
         for f in &firings {
-            let body = errand::route_errand_nudge(f, &shopping, &mut DigestStore::default(), now, &DigestPolicy::new()).0;
+            let body = errand::route_errand_nudge(
+                f,
+                &shopping,
+                &mut DigestStore::default(),
+                now,
+                &DigestPolicy::new(),
+            )
+            .0;
             let who = if f.errand.recipient.is_empty() {
                 "(group)".to_string()
             } else {
@@ -6832,18 +6860,22 @@ fn fire_errands(
             let (_, offer) = errand::route_errand_nudge(f, &shopping, &mut digest, now, &policy);
             match offer {
                 Offer::SendNow(text) => {
-                    let (target, bot_id, _bot) =
-                        match resolve_dm_target(config, bindings, &f.errand.recipient, &f.errand.bot) {
-                            Some(t) => t,
-                            None => {
-                                eprintln!(
-                                    "[{}] no bound bot/chat for errand recipient '{}' — skipping DM",
-                                    chrono::Utc::now().format("%H:%M:%S"),
-                                    f.errand.recipient,
-                                );
-                                continue;
-                            }
-                        };
+                    let (target, bot_id, _bot) = match resolve_dm_target(
+                        config,
+                        bindings,
+                        &f.errand.recipient,
+                        &f.errand.bot,
+                    ) {
+                        Some(t) => t,
+                        None => {
+                            eprintln!(
+                                "[{}] no bound bot/chat for errand recipient '{}' — skipping DM",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                                f.errand.recipient,
+                            );
+                            continue;
+                        }
+                    };
                     match family_delivery
                         .send(ReplyScope::Private, &bot_id, &target, &text)
                         .await
@@ -7094,8 +7126,7 @@ pub fn run_conversation_dryrun(
     // round-trip AND both compose modes.
     if session_reply.is_some() || composed_reply.is_some() || compose || compose_error {
         let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-        let coordination_owner =
-            owner_map.owner_for_domain(ownership::Domain::Coordination);
+        let coordination_owner = owner_map.owner_for_domain(ownership::Domain::Coordination);
         if let Some(agent_id) =
             convo::agent_for_channel_with_default(&config, channel, coordination_owner)
         {
@@ -7171,13 +7202,7 @@ pub fn run_conversation_dryrun(
     struct FailingComposer;
     #[async_trait::async_trait]
     impl convo::ReplyComposer for FailingComposer {
-        async fn compose(
-            &self,
-            _wg: &Path,
-            _s: &str,
-            _a: &str,
-            _m: &str,
-        ) -> Result<String> {
+        async fn compose(&self, _wg: &Path, _s: &str, _a: &str, _m: &str) -> Result<String> {
             anyhow::bail!("induced compose failure (--compose-error)")
         }
     }
@@ -7193,15 +7218,16 @@ pub fn run_conversation_dryrun(
     };
     let fixture_composer = composed_reply.map(|reply| FixtureComposer(reply.to_string()));
     let failing_composer = FailingComposer;
-    let composer_ref: Option<&dyn convo::ReplyComposer> = if let Some(fixture) =
-        fixture_composer.as_ref()
-    {
-        Some(fixture)
-    } else if compose_error {
-        Some(&failing_composer)
-    } else {
-        real_composer.as_ref().map(|c| c as &dyn convo::ReplyComposer)
-    };
+    let composer_ref: Option<&dyn convo::ReplyComposer> =
+        if let Some(fixture) = fixture_composer.as_ref() {
+            Some(fixture)
+        } else if compose_error {
+            Some(&failing_composer)
+        } else {
+            real_composer
+                .as_ref()
+                .map(|c| c as &dyn convo::ReplyComposer)
+        };
 
     let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
     let outcome = rt.block_on(async {
@@ -7216,8 +7242,8 @@ pub fn run_conversation_dryrun(
                 let reply = reply.to_string();
                 tokio::spawn(async move {
                     for _ in 0..200 {
-                        let inbox = worksgood::chat::read_inbox_ref(&dir, &session_ref)
-                            .unwrap_or_default();
+                        let inbox =
+                            worksgood::chat::read_inbox_ref(&dir, &session_ref).unwrap_or_default();
                         if let Some(m) = inbox.iter().find(|m| m.role == "user") {
                             let _ = worksgood::chat::append_outbox_ref(
                                 &dir,
@@ -7270,9 +7296,7 @@ pub fn run_conversation_dryrun(
     if json {
         let sends_json: Vec<_> = sends
             .iter()
-            .map(|(bot, chat, text)| {
-                serde_json::json!({ "bot": bot, "chat": chat, "text": text })
-            })
+            .map(|(bot, chat, text)| serde_json::json!({ "bot": bot, "chat": chat, "text": text }))
             .collect();
         println!(
             "{}",
@@ -7781,8 +7805,7 @@ async fn poll_once(
                 .map(|id| id.to_string());
 
             if chat_id.as_deref() == Some(target_chat_id) {
-                let identity =
-                    worksgood::notify::telegram_sender::identity_from_message(message);
+                let identity = worksgood::notify::telegram_sender::identity_from_message(message);
                 let sender = identity.display();
 
                 let body = message
@@ -7900,7 +7923,13 @@ fn bot_offset_state_path(bot_id: &str) -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().context("could not determine home directory")?;
     let safe: String = bot_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Ok(home
         .join(".config")
@@ -7989,7 +8018,10 @@ mod tests {
         let g = command_gate(&gate_msg("supergroup", false));
         assert!(!g.family && !g.operator, "no slash entity → no command");
         let g = command_gate(&gate_msg("private", false));
-        assert!(!g.family && !g.operator, "no slash entity → no command in DM either");
+        assert!(
+            !g.family && !g.operator,
+            "no slash entity → no command in DM either"
+        );
     }
 
     #[test]
@@ -7997,8 +8029,14 @@ mod tests {
         // Even a genuine slash command in a family GROUP must NOT open the
         // operator claim/done path — that content is coordinator-only.
         let g = command_gate(&gate_msg("supergroup", true));
-        assert!(g.family, "a real /command still runs the family set in a group");
-        assert!(!g.operator, "the operator WG reference must never surface in a group");
+        assert!(
+            g.family,
+            "a real /command still runs the family set in a group"
+        );
+        assert!(
+            !g.operator,
+            "the operator WG reference must never surface in a group"
+        );
     }
 
     #[test]
@@ -8006,7 +8044,10 @@ mod tests {
         // A 1:1 operator DM with a real slash command is the only place the
         // operator reference may run.
         let g = command_gate(&gate_msg("private", true));
-        assert!(g.operator, "operator reference is allowed in a 1:1 slash command");
+        assert!(
+            g.operator,
+            "operator reference is allowed in a 1:1 slash command"
+        );
     }
 
     #[test]
@@ -8057,14 +8098,19 @@ mod tests {
     fn auth_confirm_url_defaults_to_loopback() {
         // Default (no override) is the loopback gateway. We do not mutate the
         // process env here (tests run concurrently); just assert the constant.
-        assert_eq!(AUTH_CONFIRM_URL_DEFAULT, "http://127.0.0.1:7788/auth/confirm");
+        assert_eq!(
+            AUTH_CONFIRM_URL_DEFAULT,
+            "http://127.0.0.1:7788/auth/confirm"
+        );
     }
 
     /// Spin a one-shot loopback HTTP stub standing in for the gateway
     /// `POST /auth/confirm`. It captures the request body (so the test can assert
     /// exactly `{nonce, telegram_id}` crossed the wire) and answers with
     /// `response_json`. Drives the REAL `confirm_web_login` POST path end to end.
-    fn spawn_confirm_stub(response_json: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    fn spawn_confirm_stub(
+        response_json: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8120,7 +8166,9 @@ mod tests {
     /// over the channel, so a test can assert on the request HEADERS — used to
     /// prove the listener attaches (or omits) the `x-casa-auth-secret` header
     /// (task urgent-auth-phantom).
-    fn spawn_confirm_stub_raw(response_json: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    fn spawn_confirm_stub_raw(
+        response_json: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8213,7 +8261,10 @@ mod tests {
             std::env::remove_var("CASA_AUTH_CONFIRM_SECRET");
             // Point the file lookup at a path that cannot exist so the default
             // `.casa/auth-confirm.secret` (which may exist in a live CWD) is skipped.
-            std::env::set_var("CASA_AUTH_CONFIRM_SECRET_FILE", "/nonexistent/casa/auth-confirm.secret");
+            std::env::set_var(
+                "CASA_AUTH_CONFIRM_SECRET_FILE",
+                "/nonexistent/casa/auth-confirm.secret",
+            );
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = reqwest::Client::new();
@@ -8310,7 +8361,13 @@ mod tests {
     /// across the device families the gateway maps a User-Agent to.
     #[test]
     fn signed_in_reply_names_the_real_device_not_kitchen_tablet() {
-        for label in ["your iPhone", "your iPad", "a Mac", "a Windows PC", "an Android phone"] {
+        for label in [
+            "your iPhone",
+            "your iPad",
+            "a Mac",
+            "a Windows PC",
+            "an Android phone",
+        ] {
             let reply = WebLoginOutcome::SignedIn {
                 device: label.to_string(),
                 tablet: false,
@@ -8343,7 +8400,10 @@ mod tests {
             tablet: true,
         }
         .reply();
-        assert!(marker_beats_label.contains("kitchen tablet"), "reply: {marker_beats_label}");
+        assert!(
+            marker_beats_label.contains("kitchen tablet"),
+            "reply: {marker_beats_label}"
+        );
     }
 
     /// An older gateway that carries no device descriptor → a neutral fallback
@@ -8380,7 +8440,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn confirm_web_login_marked_tablet_says_kitchen_tablet() {
-        let (url, _rx) = spawn_confirm_stub(r#"{"ok":true,"device":"the kitchen tablet","tablet":true}"#);
+        let (url, _rx) =
+            spawn_confirm_stub(r#"{"ok":true,"device":"the kitchen tablet","tablet":true}"#);
         unsafe { std::env::set_var("CASA_AUTH_CONFIRM_URL", &url) };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = reqwest::Client::new();
@@ -8828,8 +8889,7 @@ mod tests {
 
         // A pinned turn the engine would have stayed silent on is still forced
         // to answer in the pinned voice with the raw message as the body.
-        let silent =
-            Election::Silence(worksgood::notify::telegram_group::SilenceReason::SmallTalk);
+        let silent = Election::Silence(worksgood::notify::telegram_group::SilenceReason::SmallTalk);
         let forced = apply_owner_pin(
             silent,
             Some("cedar"),
@@ -9040,13 +9100,8 @@ domains = ["calendar"]
                 bots,
             };
             assert!(
-                resolve_dm_target(
-                    &config,
-                    &bindings,
-                    "Household Member",
-                    "unresolved-source",
-                )
-                .is_none(),
+                resolve_dm_target(&config, &bindings, "Household Member", "unresolved-source",)
+                    .is_none(),
                 "an unresolved non-empty Source must never fall through to map order",
             );
         }
@@ -9334,8 +9389,7 @@ domains = ["calendar"]
         );
 
         // Web collective callers share the explicit occurrence id across voices.
-        let web_first =
-            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-a"));
+        let web_first = web_physical_turn_key("-100700", "hello household", Some("turn-fixture-a"));
         assert_eq!(
             web_first,
             web_physical_turn_key(
@@ -9347,11 +9401,7 @@ domains = ["calendar"]
         );
         assert_ne!(
             web_first,
-            web_physical_turn_key(
-                "-100700",
-                "hello household",
-                Some("turn-fixture-b"),
-            ),
+            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-b"),),
             "a later web occurrence gets a fresh collective key even with identical words",
         );
     }
@@ -9373,8 +9423,7 @@ domains = ["calendar"]
             "telegram-turn-b3-v1-5c81580a6d5538a35b1233961550e48f16c2f8633615ecb2501491deb9673a83",
         );
 
-        let web_turn =
-            web_physical_turn_key("-100700", "hello household", Some("opaque-turn-a7"));
+        let web_turn = web_physical_turn_key("-100700", "hello household", Some("opaque-turn-a7"));
         assert_eq!(
             web_turn,
             "web-turn-b3-v1-62753b68ec0fbd6e844d7728ecd3ce10560f707a7ef63f394b400dc60eeaa930",
@@ -9588,11 +9637,7 @@ domains = ["calendar"]
                 chat_id: &str,
                 text: &str,
             ) -> Result<Option<String>> {
-                let row = (
-                    bot_id.to_string(),
-                    chat_id.to_string(),
-                    text.to_string(),
-                );
+                let row = (bot_id.to_string(), chat_id.to_string(), text.to_string());
                 self.attempts.lock().unwrap().push(row.clone());
                 if self
                     .fail_next
@@ -9834,12 +9879,8 @@ domains = ["calendar"]
             request_id: String,
         ) {
             for _ in 0..200 {
-                let inbox =
-                    chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap_or_default();
-                if inbox
-                    .iter()
-                    .any(|message| message.request_id == request_id)
-                {
+                let inbox = chat::read_inbox_ref(&workgraph_dir, &session_ref).unwrap_or_default();
+                if inbox.iter().any(|message| message.request_id == request_id) {
                     chat::append_outbox_ref(
                         &workgraph_dir,
                         &session_ref,
@@ -9943,8 +9984,7 @@ domains = ["calendar"]
             requester: "member-4".to_string(),
             channel: OriginChannel::TelegramGroup,
         };
-        let first_legacy_id =
-            collective_request_id(chat_id, "wire-legacy", &first_key);
+        let first_legacy_id = collective_request_id(chat_id, "wire-legacy", &first_key);
         let first_responder = tokio::spawn(append_legacy_reply(
             workgraph_dir.clone(),
             legacy_session.clone(),
@@ -9973,8 +10013,7 @@ domains = ["calendar"]
         )
         .await
         .unwrap();
-        let later_legacy_id =
-            collective_request_id(chat_id, "wire-legacy", &later_key);
+        let later_legacy_id = collective_request_id(chat_id, "wire-legacy", &later_key);
         let later_responder = tokio::spawn(append_legacy_reply(
             workgraph_dir.clone(),
             legacy_session,
@@ -10118,14 +10157,8 @@ domains = ["calendar"]
             fallback,
             web_physical_turn_key(chat, "a different legacy message", None),
         );
-        assert_ne!(
-            first,
-            web_inbound_request_id("-100888", voice, &first_key),
-        );
-        assert_ne!(
-            first,
-            web_inbound_request_id(chat, "voice-8", &first_key),
-        );
+        assert_ne!(first, web_inbound_request_id("-100888", voice, &first_key),);
+        assert_ne!(first, web_inbound_request_id(chat, "voice-8", &first_key),);
         assert!(
             first.starts_with("web-request-b3-v1-"),
             "unexpected id shape: {first}",
@@ -10232,7 +10265,10 @@ domains = ["calendar"]
         let (bot_id, bot, chat) = resolve_send_bot(&config, None, None).unwrap();
         assert_eq!(bot_id, "nora");
         assert_eq!(bot.bot_token, "111:AAA", "must not slice an empty token");
-        assert!(!bot.bot_token.is_empty(), "empty token would yield a 404 URL");
+        assert!(
+            !bot.bot_token.is_empty(),
+            "empty token would yield a 404 URL"
+        );
         assert_eq!(chat, "1001", "defaults to the resolved bot's own chat");
     }
 
@@ -10307,7 +10343,9 @@ domains = ["calendar"]
             chat_id: String::new(),
             bots: HashMap::new(),
         };
-        let err = resolve_send_bot(&config, None, None).unwrap_err().to_string();
+        let err = resolve_send_bot(&config, None, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("No Telegram bots configured"), "got: {err}");
     }
 
@@ -10413,7 +10451,10 @@ domains = ["calendar"]
             "a persona-named send with no matching bot must hard-fail, not fall back to bruno"
         );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("otto"), "error must name the missing persona: {err}");
+        assert!(
+            err.contains("otto"),
+            "error must name the missing persona: {err}"
+        );
         assert!(
             !err.contains("BRUNO"),
             "error must never leak/return bruno's token as a fallback: {err}"
@@ -10670,7 +10711,13 @@ domains = ["calendar"]
         // benign NotParkedReply — NOT a security Rejected — carrying the persona
         // DISPLAY NAME ("Otto"), never the raw agent id/hash. That name is what
         // the listener logs, so tailing the log never reads as a refusal.
-        match route_inbound_reply(dir, "telegram:otto", "luca-1", Some("luca-1"), "otto, are you there?") {
+        match route_inbound_reply(
+            dir,
+            "telegram:otto",
+            "luca-1",
+            Some("luca-1"),
+            "otto, are you there?",
+        ) {
             InboundReplyOutcome::NotParkedReply { persona } => {
                 assert_eq!(persona, "Otto", "logs the persona display name, not a hash");
                 let line = fallthrough_log_line(&persona);
@@ -10707,12 +10754,7 @@ domains = ["calendar"]
 
     #[async_trait::async_trait]
     impl worksgood::notify::telegram_conversation::ReplySink for ExactReplySink {
-        async fn send(
-            &self,
-            bot_id: &str,
-            chat_id: &str,
-            text: &str,
-        ) -> Result<Option<String>> {
+        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
             self.sends.lock().unwrap().push((
                 bot_id.to_string(),
                 chat_id.to_string(),
@@ -10774,11 +10816,7 @@ domains = ["calendar"]
         let feed = casa_feed::feed_path_for(dir.path());
         let delivery = opaque_delivery(&feed);
         let group_transport = ExactReplySink::default();
-        let group = delivery.wrap(
-            group_transport,
-            ReplyScope::Group,
-            GuardPolicy::Enforce,
-        );
+        let group = delivery.wrap(group_transport, ReplyScope::Group, GuardPolicy::Enforce);
         let raw = "**Harbor Voice** 💬 **Dinner is ready.** \
                    That lives over in the pipeline. **Service:** dispatcher healthy — 2 agents.";
 
@@ -10788,9 +10826,16 @@ domains = ["calendar"]
 
         let sent = group.inner.sends.lock().unwrap();
         assert_eq!(sent.len(), 1, "one confirmed group send");
-        assert_eq!(sent[0].2, "Dinner is ready.", "the engine guard owns final bytes");
+        assert_eq!(
+            sent[0].2, "Dinner is ready.",
+            "the engine guard owns final bytes"
+        );
         let lines = feed_lines(&feed);
-        assert_eq!(lines.len(), 1, "one confirmed group send produces one feed line");
+        assert_eq!(
+            lines.len(),
+            1,
+            "one confirmed group send produces one feed line"
+        );
         let entry: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(
             entry["text"].as_str().unwrap(),
@@ -10802,11 +10847,7 @@ domains = ["calendar"]
         drop(sent);
 
         let private_transport = ExactReplySink::default();
-        let private = delivery.wrap(
-            private_transport,
-            ReplyScope::Private,
-            GuardPolicy::Enforce,
-        );
+        let private = delivery.wrap(private_transport, ReplyScope::Private, GuardPolicy::Enforce);
         rt.block_on(private.send("harbor", "private-chat", "A private answer."))
             .unwrap();
         assert_eq!(private.inner.sends.lock().unwrap().len(), 1);
@@ -10838,13 +10879,8 @@ domains = ["calendar"]
             !feed.exists() || feed_lines(&feed).is_empty(),
             "the transient acknowledgement is never a feed line"
         );
-        rt.block_on(sink.edit(
-            "harbor",
-            "group-chat",
-            "message-1",
-            "Dinner is ready.",
-        ))
-        .unwrap();
+        rt.block_on(sink.edit("harbor", "group-chat", "message-1", "Dinner is ready."))
+            .unwrap();
 
         assert_eq!(sink.inner.sends.lock().unwrap().len(), 1);
         assert_eq!(sink.inner.edits.lock().unwrap().len(), 1);
@@ -10932,7 +10968,7 @@ domains = ["calendar"]
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
-        .unwrap();
+            .unwrap();
 
         // Telegram: exactly one send.
         assert_eq!(
@@ -10968,7 +11004,7 @@ domains = ["calendar"]
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             sink.sends.lock().unwrap().len(),
@@ -10995,7 +11031,7 @@ domains = ["calendar"]
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             sink.attempts.lock().unwrap().len(),

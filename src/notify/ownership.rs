@@ -133,7 +133,11 @@ fn has_any(words: &[String], needles: &[&str]) -> bool {
 fn edit_distance_le_1(a: &str, b: &str) -> bool {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let (longer, shorter) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let (longer, shorter) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     let ldiff = longer.len() - shorter.len();
     if ldiff > 1 {
         return false;
@@ -194,28 +198,84 @@ fn tokens(text: &str) -> Vec<String> {
 }
 
 const WORKOUT_WORDS: &[&str] = &[
-    "workout", "workouts", "exercise", "exercises", "gym", "training", "train",
-    "run", "running", "jog", "jogging", "yoga", "stretch", "cardio", "lift",
-    "lifting", "weights", "fitness", "pilates", "reps", "hike",
+    "workout",
+    "workouts",
+    "exercise",
+    "exercises",
+    "gym",
+    "training",
+    "train",
+    "run",
+    "running",
+    "jog",
+    "jogging",
+    "yoga",
+    "stretch",
+    "cardio",
+    "lift",
+    "lifting",
+    "weights",
+    "fitness",
+    "pilates",
+    "reps",
+    "hike",
 ];
 
 const CALENDAR_WORDS: &[&str] = &[
-    "calendar", "appointment", "appointments", "schedule", "scheduling",
-    "reschedule", "book", "booking", "reminder", "reminders", "remind",
-    "meeting", "event", "rsvp", "reservation",
+    "calendar",
+    "appointment",
+    "appointments",
+    "schedule",
+    "scheduling",
+    "reschedule",
+    "book",
+    "booking",
+    "reminder",
+    "reminders",
+    "remind",
+    "meeting",
+    "event",
+    "rsvp",
+    "reservation",
 ];
 
 const SHOPPING_WORDS: &[&str] = &[
-    "shopping", "grocery", "groceries", "buy", "errand", "errands", "store",
-    "supermarket", "pickup", "pantry", "restock",
+    "shopping",
+    "grocery",
+    "groceries",
+    "buy",
+    "errand",
+    "errands",
+    "store",
+    "supermarket",
+    "pickup",
+    "pantry",
+    "restock",
 ];
 
 /// Nouns that mark an ask as being about *food / a meal*. Presence of one makes
 /// the ask a meals domain (split into planning vs cooking below).
 const MEAL_WORDS: &[&str] = &[
-    "dinner", "dinners", "lunch", "lunches", "breakfast", "breakfasts", "meal",
-    "meals", "menu", "menus", "dish", "dishes", "supper", "snack", "snacks",
-    "food", "recipe", "recipes", "eat", "eating",
+    "dinner",
+    "dinners",
+    "lunch",
+    "lunches",
+    "breakfast",
+    "breakfasts",
+    "meal",
+    "meals",
+    "menu",
+    "menus",
+    "dish",
+    "dishes",
+    "supper",
+    "snack",
+    "snacks",
+    "food",
+    "recipe",
+    "recipes",
+    "eat",
+    "eating",
 ];
 
 /// Signals that a *meal* ask is about the KITCHEN — a recipe, a technique, "how
@@ -224,16 +284,34 @@ const MEAL_WORDS: &[&str] = &[
 /// dish name ("grilled tofu") is NOT one of these, so a plan change like "swap
 /// dinner to grilled tofu" stays with the planner.
 const COOKING_WORDS: &[&str] = &[
-    "recipe", "recipes", "cook", "cooking", "bake", "baking", "roast",
-    "roasting", "marinate", "marinade", "technique", "saute", "simmer", "knead",
-    "prep", "chop",
+    "recipe",
+    "recipes",
+    "cook",
+    "cooking",
+    "bake",
+    "baking",
+    "roast",
+    "roasting",
+    "marinate",
+    "marinade",
+    "technique",
+    "saute",
+    "simmer",
+    "knead",
+    "prep",
+    "chop",
 ];
 
 /// Phrases that clinch a recipe / how-to-cook ask even if the individual words
 /// are ambiguous.
 const COOKING_PHRASES: &[&str] = &[
-    "how do i cook", "how to cook", "how do i make", "how to make",
-    "recipe for", "how do you cook", "how do you make",
+    "how do i cook",
+    "how to cook",
+    "how do i make",
+    "how to make",
+    "recipe for",
+    "how do you cook",
+    "how do you make",
 ];
 
 /// Specific, prepared DISH names (not raw ingredients). A bare dish mention with
@@ -243,10 +321,32 @@ const COOKING_PHRASES: &[&str] = &[
 /// belong on the shopping list, and is checked LAST (after shopping) so
 /// "add pizza to the shopping list" still routes to shopping, not the kitchen.
 const DISH_WORDS: &[&str] = &[
-    "pizza", "pasta", "carbonara", "lasagna", "lasagne", "risotto", "ravioli",
-    "gnocchi", "sushi", "ramen", "taco", "tacos", "burrito", "burritos",
-    "burger", "burgers", "curry", "paella", "pesto", "omelette", "omelet",
-    "pancakes", "waffles", "quesadilla", "enchiladas", "stirfry",
+    "pizza",
+    "pasta",
+    "carbonara",
+    "lasagna",
+    "lasagne",
+    "risotto",
+    "ravioli",
+    "gnocchi",
+    "sushi",
+    "ramen",
+    "taco",
+    "tacos",
+    "burrito",
+    "burritos",
+    "burger",
+    "burgers",
+    "curry",
+    "paella",
+    "pesto",
+    "omelette",
+    "omelet",
+    "pancakes",
+    "waffles",
+    "quesadilla",
+    "enchiladas",
+    "stirfry",
 ];
 
 /// Raw edible ingredients (not prepared dishes, not the generic meal nouns). A
@@ -256,21 +356,78 @@ const DISH_WORDS: &[&str] = &[
 /// from [`DISH_WORDS`] so the swap-shape rule can treat both as edible while the
 /// bare-dish rule stays limited to prepared dishes.
 const INGREDIENT_WORDS: &[&str] = &[
-    "fennel", "tofu", "tempeh", "seitan", "trout", "salmon", "tuna", "cod",
-    "chicken", "beef", "pork", "lamb", "turkey", "sausage", "bacon", "shrimp",
-    "prawns", "artichoke", "artichokes", "broccoli", "spinach", "kale",
-    "mushroom", "mushrooms", "eggplant", "aubergine", "zucchini", "courgette",
-    "cauliflower", "asparagus", "lentils", "chickpeas", "beans", "quinoa",
-    "couscous", "polenta", "risotto", "gnocchi", "halloumi", "feta", "avocado",
-    "aubergines", "peppers", "squash",
+    "fennel",
+    "tofu",
+    "tempeh",
+    "seitan",
+    "trout",
+    "salmon",
+    "tuna",
+    "cod",
+    "chicken",
+    "beef",
+    "pork",
+    "lamb",
+    "turkey",
+    "sausage",
+    "bacon",
+    "shrimp",
+    "prawns",
+    "artichoke",
+    "artichokes",
+    "broccoli",
+    "spinach",
+    "kale",
+    "mushroom",
+    "mushrooms",
+    "eggplant",
+    "aubergine",
+    "zucchini",
+    "courgette",
+    "cauliflower",
+    "asparagus",
+    "lentils",
+    "chickpeas",
+    "beans",
+    "quinoa",
+    "couscous",
+    "polenta",
+    "risotto",
+    "gnocchi",
+    "halloumi",
+    "feta",
+    "avocado",
+    "aubergines",
+    "peppers",
+    "squash",
     // Fish & other proteins the family plans meals around. "branzino" is the
     // exact miss from Luca's 2026-07-17 transcript ("plan for branzino for
     // tomorrow night"): unknown to the classifier, it dropped to Coordination →
     // Otto and the whole roster answered. Kept typo-tolerant via `is_edible`.
-    "branzino", "seabass", "bass", "halibut", "haddock", "tilapia", "sardines",
-    "anchovies", "mackerel", "swordfish", "snapper", "sole", "flounder",
-    "mussels", "clams", "scallops", "squid", "calamari", "octopus", "lobster",
-    "crab", "duck", "venison", "veal",
+    "branzino",
+    "seabass",
+    "bass",
+    "halibut",
+    "haddock",
+    "tilapia",
+    "sardines",
+    "anchovies",
+    "mackerel",
+    "swordfish",
+    "snapper",
+    "sole",
+    "flounder",
+    "mussels",
+    "clams",
+    "scallops",
+    "squid",
+    "calamari",
+    "octopus",
+    "lobster",
+    "crab",
+    "duck",
+    "venison",
+    "veal",
 ];
 
 /// Verbs that mark a "replace A with B" SWAP shape. When one of these appears
@@ -352,8 +509,8 @@ pub fn classify_domain(ask: &str) -> Domain {
         return Domain::Calendar;
     }
 
-    let cooking_flavored = has_any(&words, COOKING_WORDS)
-        || COOKING_PHRASES.iter().any(|p| lower.contains(p));
+    let cooking_flavored =
+        has_any(&words, COOKING_WORDS) || COOKING_PHRASES.iter().any(|p| lower.contains(p));
 
     if has_any(&words, MEAL_WORDS) {
         // A meal ask: the kitchen owns a recipe/technique ask; the planner owns
@@ -531,9 +688,11 @@ impl OwnerMap {
     /// one. `None` only if no persona lists any of the tags.
     pub fn owner_for_domain(&self, domain: Domain) -> Option<&str> {
         for tag in domain.household_tags() {
-            if let Some((id, _)) = self.entries.iter().find(|(_, tags)| {
-                tags.iter().any(|t| t == tag)
-            }) {
+            if let Some((id, _)) = self
+                .entries
+                .iter()
+                .find(|(_, tags)| tags.iter().any(|t| t == tag))
+            {
                 return Some(id.as_str());
             }
         }
@@ -751,8 +910,21 @@ pub enum CreateDecision {
 /// Single words that mark a message as a CORRECTION of something just said,
 /// rather than a fresh request. Matched as whole tokens.
 const CORRECTION_WORDS: &[&str] = &[
-    "actually", "sorry", "just", "instead", "rather", "no", "not", "nope",
-    "correction", "nevermind", "scratch", "meant", "oops", "wait", "also",
+    "actually",
+    "sorry",
+    "just",
+    "instead",
+    "rather",
+    "no",
+    "not",
+    "nope",
+    "correction",
+    "nevermind",
+    "scratch",
+    "meant",
+    "oops",
+    "wait",
+    "also",
 ];
 
 /// Multi-word correction cues, matched as substrings of the normalized text.
@@ -847,8 +1019,7 @@ pub fn decide_creation(
     )
     .into_iter()
     .filter(|r| {
-        Domain::from_slug(&r.domain)
-            .is_some_and(|prev| amendable_subject(prev, domain, ask))
+        Domain::from_slug(&r.domain).is_some_and(|prev| amendable_subject(prev, domain, ask))
     })
     .filter(|r| is_open(&r.task_id))
     .next_back();
@@ -872,12 +1043,7 @@ impl IntentLedger {
     /// `window_secs` of `now_epoch`), or `None` if this ask is new to the chat.
     /// A duplicate means the caller must REFUSE creation and reuse the returned
     /// task id.
-    pub fn find_recent(
-        root: &Path,
-        fp: &str,
-        now_epoch: i64,
-        window_secs: i64,
-    ) -> Option<String> {
+    pub fn find_recent(root: &Path, fp: &str, now_epoch: i64, window_secs: i64) -> Option<String> {
         let path = Self::path(root);
         let body = std::fs::read_to_string(&path).ok()?;
         body.lines()
@@ -996,10 +1162,34 @@ pub const DEFAULT_CLARIFY_WINDOW_SECS: i64 = 180;
 /// "yes" continues but "yes but make it pasta" (which carries new content) falls
 /// through to a fresh election. English + the Italian the family uses.
 const CONFIRMATION_PHRASES: &[&str] = &[
-    "yes", "yep", "yeah", "yup", "y", "ok", "okay", "k", "sure", "sounds good",
-    "yes please", "please do", "do it", "go ahead", "go for it", "perfect",
-    "great", "confirmed", "correct", "that works", "works for me", "si", "sì",
-    "certo", "va bene", "vabene", "fallo", "perfetto",
+    "yes",
+    "yep",
+    "yeah",
+    "yup",
+    "y",
+    "ok",
+    "okay",
+    "k",
+    "sure",
+    "sounds good",
+    "yes please",
+    "please do",
+    "do it",
+    "go ahead",
+    "go for it",
+    "perfect",
+    "great",
+    "confirmed",
+    "correct",
+    "that works",
+    "works for me",
+    "si",
+    "sì",
+    "certo",
+    "va bene",
+    "vabene",
+    "fallo",
+    "perfetto",
 ];
 
 /// True when `text`, once normalized to space-joined lower-case alphanumeric
@@ -1202,12 +1392,18 @@ mod tests {
         );
         // A raw grocery is NOT a dish — it stays coordination/shopping, never the
         // kitchen (guards the "add rice to the list" owner test).
-        assert_eq!(classify_domain("add rice to the list"), Domain::Coordination);
+        assert_eq!(
+            classify_domain("add rice to the list"),
+            Domain::Coordination
+        );
     }
 
     #[test]
     fn workout_calendar_shopping_classify() {
-        assert_eq!(classify_domain("can we move my gym session?"), Domain::Workouts);
+        assert_eq!(
+            classify_domain("can we move my gym session?"),
+            Domain::Workouts
+        );
         assert_eq!(
             classify_domain("book a dentist appointment next week"),
             Domain::Calendar
@@ -1216,7 +1412,10 @@ mod tests {
             classify_domain("add oat milk to the shopping list"),
             Domain::Shopping
         );
-        assert_eq!(classify_domain("who is picking up the kids?"), Domain::Coordination);
+        assert_eq!(
+            classify_domain("who is picking up the kids?"),
+            Domain::Coordination
+        );
     }
 
     // ---- owner resolution ------------------------------------------------
@@ -1224,7 +1423,10 @@ mod tests {
     #[test]
     fn casa_owners_resolve_per_domain() {
         let m = OwnerMap::casa_default();
-        assert_eq!(m.owner_for_ask("swap Thursday dinner to grilled tofu"), Some("nora"));
+        assert_eq!(
+            m.owner_for_ask("swap Thursday dinner to grilled tofu"),
+            Some("nora")
+        );
         assert_eq!(m.owner_for_ask("how do I cook the tofu"), Some("bruno"));
         assert_eq!(m.owner_for_ask("reschedule my workout"), Some("mira"));
         assert_eq!(m.owner_for_ask("book a table for Friday"), Some("otto"));
@@ -1241,15 +1443,21 @@ mod tests {
         // Mira (workouts) must NEVER own a cooking/meals task.
         assert_eq!(
             m.decide_owner("mira", ask),
-            OwnerDecision::Defer { owner: "nora".into() }
+            OwnerDecision::Defer {
+                owner: "nora".into()
+            }
         );
         assert_eq!(
             m.decide_owner("bruno", ask),
-            OwnerDecision::Defer { owner: "nora".into() }
+            OwnerDecision::Defer {
+                owner: "nora".into()
+            }
         );
         assert_eq!(
             m.decide_owner("otto", ask),
-            OwnerDecision::Defer { owner: "nora".into() }
+            OwnerDecision::Defer {
+                owner: "nora".into()
+            }
         );
     }
 
@@ -1271,7 +1479,9 @@ mod tests {
         // A genuinely off-domain voice (Coach Mira) still defers to Bruno.
         assert_eq!(
             m.decide_owner("mira", ask),
-            OwnerDecision::Defer { owner: "bruno".into() }
+            OwnerDecision::Defer {
+                owner: "bruno".into()
+            }
         );
     }
 
@@ -1281,16 +1491,24 @@ mod tests {
         let m = OwnerMap::casa_default();
         assert_eq!(
             m.decide_owner("otto", "can you plan my run for tomorrow"),
-            OwnerDecision::Defer { owner: "mira".into() }
+            OwnerDecision::Defer {
+                owner: "mira".into()
+            }
         );
     }
 
     #[test]
     fn decide_owner_is_case_insensitive_and_fails_open() {
         let m = OwnerMap::casa_default();
-        assert_eq!(m.decide_owner("NORA", "swap dinner to tofu"), OwnerDecision::Owner);
+        assert_eq!(
+            m.decide_owner("NORA", "swap dinner to tofu"),
+            OwnerDecision::Owner
+        );
         // Empty persona → fail open (do not drop a real ask).
-        assert_eq!(m.decide_owner("", "swap dinner to tofu"), OwnerDecision::Owner);
+        assert_eq!(
+            m.decide_owner("", "swap dinner to tofu"),
+            OwnerDecision::Owner
+        );
     }
 
     #[test]
@@ -1306,7 +1524,10 @@ mod tests {
 
         std::fs::write(dir.path().join("household.toml"), "not = [valid").unwrap();
         let malformed = OwnerMap::load(dir.path());
-        assert_eq!(malformed.owner_for_ask("swap Thursday dinner to soup"), None);
+        assert_eq!(
+            malformed.owner_for_ask("swap Thursday dinner to soup"),
+            None
+        );
         assert_eq!(
             malformed.decide_owner("hearth", "swap Thursday dinner to soup"),
             OwnerDecision::Owner,
@@ -1325,10 +1546,7 @@ mod tests {
         // nutrition tag wins for a plan change regardless of author order.
         assert_eq!(m.owner_for_domain(Domain::MealPlanning), Some("nora"));
         // A raw "meals"-only tie falls to author order (bruno first here).
-        let m2 = OwnerMap::from_pairs(vec![
-            ("bruno", vec!["meals"]),
-            ("nora", vec!["meals"]),
-        ]);
+        let m2 = OwnerMap::from_pairs(vec![("bruno", vec!["meals"]), ("nora", vec!["meals"])]);
         assert_eq!(m2.owner_for_domain(Domain::MealPlanning), Some("bruno"));
     }
 
@@ -1491,12 +1709,26 @@ mod tests {
         );
         // A different CHAT is a separate conversation.
         assert_eq!(
-            decide_creation(root, "just mozzarella", "other-chat", "Luca", 1060, always_open),
+            decide_creation(
+                root,
+                "just mozzarella",
+                "other-chat",
+                "Luca",
+                1060,
+                always_open
+            ),
             CreateDecision::Create
         );
         // Past the window (3 min) it is a genuinely new ask.
         assert_eq!(
-            decide_creation(root, "just mozzarella", chat, "Luca", 1000 + 400, always_open),
+            decide_creation(
+                root,
+                "just mozzarella",
+                chat,
+                "Luca",
+                1000 + 400,
+                always_open
+            ),
             CreateDecision::Create
         );
         // An unnamed requester can never amend — no sender to key on.
@@ -1529,7 +1761,11 @@ mod tests {
             );
         }
         // …while the corrective fragments are folded in.
-        for correction in ["just mozzarella", "actually no onions", "sorry, make it thin crust"] {
+        for correction in [
+            "just mozzarella",
+            "actually no onions",
+            "sorry, make it thin crust",
+        ] {
             assert!(
                 is_corrective_follow_up(correction),
                 "'{correction}' reads as a correction"
@@ -1570,7 +1806,14 @@ mod tests {
         let root = dir.path();
         let chat = "8905220378";
         let ask = "can we do pizza tomorrow night";
-        record_ask(root, ask, chat, "Luca", "update-saturday-dinner-plan-to", 1000);
+        record_ask(
+            root,
+            ask,
+            chat,
+            "Luca",
+            "update-saturday-dinner-plan-to",
+            1000,
+        );
         assert_eq!(
             decide_creation(root, ask, chat, "Luca", 1030, |_| true),
             CreateDecision::Duplicate {
@@ -1603,7 +1846,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            decide_creation(root, "just mozzarella", "8905220378", "Luca", 1060, |_| true),
+            decide_creation(root, "just mozzarella", "8905220378", "Luca", 1060, |_| {
+                true
+            }),
             CreateDecision::Create
         );
     }
@@ -1649,37 +1894,70 @@ mod tests {
             "a meal-plan ask must NOT fall to the concierge (otto)"
         );
         // The plan verb is required — a bare ingredient mention is still neutral.
-        assert_eq!(classify_domain("we're out of branzino"), Domain::Coordination);
+        assert_eq!(
+            classify_domain("we're out of branzino"),
+            Domain::Coordination
+        );
         // Other proteins + typo tolerance behave the same.
-        assert_eq!(classify_domain("plan salmon for saturday"), Domain::MealPlanning);
-        assert_eq!(classify_domain("can you plan branzin for friday"), Domain::MealPlanning);
+        assert_eq!(
+            classify_domain("plan salmon for saturday"),
+            Domain::MealPlanning
+        );
+        assert_eq!(
+            classify_domain("can you plan branzin for friday"),
+            Domain::MealPlanning
+        );
     }
 
     #[test]
     fn misspelled_dish_swaps_still_route_to_food() {
         // Typo tolerance mirrors the roster-name matcher: a one-letter slip in the
         // dish/ingredient still classifies as a food plan change.
-        assert_eq!(classify_domain("swap tacod for burgers"), Domain::MealPlanning);
-        assert_eq!(classify_domain("replace the chiken with trout"), Domain::MealPlanning);
-        assert_eq!(classify_domain("switch fridays pizzza for pasta"), Domain::MealPlanning);
+        assert_eq!(
+            classify_domain("swap tacod for burgers"),
+            Domain::MealPlanning
+        );
+        assert_eq!(
+            classify_domain("replace the chiken with trout"),
+            Domain::MealPlanning
+        );
+        assert_eq!(
+            classify_domain("switch fridays pizzza for pasta"),
+            Domain::MealPlanning
+        );
         // Correctly-spelled ingredient swap with no meal noun, too.
-        assert_eq!(classify_domain("swap chicken for tofu"), Domain::MealPlanning);
+        assert_eq!(
+            classify_domain("swap chicken for tofu"),
+            Domain::MealPlanning
+        );
     }
 
     #[test]
     fn swap_shape_does_not_hijack_non_food_or_recipe_asks() {
         // A recipe ask sitting next to a swap-ish verb stays with the kitchen —
         // "change" + "lentils" must NOT become a plan swap.
-        assert_eq!(classify_domain("how do I cook the lentils"), Domain::Cooking);
-        assert_eq!(classify_domain("change how you roast the chicken"), Domain::Cooking);
+        assert_eq!(
+            classify_domain("how do I cook the lentils"),
+            Domain::Cooking
+        );
+        assert_eq!(
+            classify_domain("change how you roast the chicken"),
+            Domain::Cooking
+        );
         // A workout / calendar swap is still owned by workouts / calendar, not food.
-        assert_eq!(classify_domain("swap my gym session to friday"), Domain::Workouts);
+        assert_eq!(
+            classify_domain("swap my gym session to friday"),
+            Domain::Workouts
+        );
         assert_eq!(
             classify_domain("reschedule the dentist appointment"),
             Domain::Calendar
         );
         // A swap with NOTHING edible is not a food swap.
-        assert_eq!(classify_domain("swap my seat with yours"), Domain::Coordination);
+        assert_eq!(
+            classify_domain("swap my seat with yours"),
+            Domain::Coordination
+        );
         // A bare craving with an incidental "changed" but NO connector is a dish
         // for the chef, not a plan swap (morning-taco-bugs must stay green).
         assert_eq!(
@@ -1696,9 +1974,18 @@ mod tests {
             Domain::MealPlanning
         );
         assert_eq!(classify_domain("pizza on friday"), Domain::Cooking);
-        assert_eq!(classify_domain("add pizza to the shopping list"), Domain::Shopping);
-        assert_eq!(classify_domain("add rice to the list"), Domain::Coordination);
-        assert_eq!(classify_domain("who is picking up the kids?"), Domain::Coordination);
+        assert_eq!(
+            classify_domain("add pizza to the shopping list"),
+            Domain::Shopping
+        );
+        assert_eq!(
+            classify_domain("add rice to the list"),
+            Domain::Coordination
+        );
+        assert_eq!(
+            classify_domain("who is picking up the kids?"),
+            Domain::Coordination
+        );
     }
 
     #[test]
@@ -1718,11 +2005,33 @@ mod tests {
 
     #[test]
     fn bare_confirmations_recognised_but_content_replies_are_not() {
-        for yes in ["yes", "Yes", "  ok  ", "yep", "sure", "si", "sì", "do it", "sounds good"] {
-            assert!(is_bare_confirmation(yes), "{yes:?} should be a confirmation");
+        for yes in [
+            "yes",
+            "Yes",
+            "  ok  ",
+            "yep",
+            "sure",
+            "si",
+            "sì",
+            "do it",
+            "sounds good",
+        ] {
+            assert!(
+                is_bare_confirmation(yes),
+                "{yes:?} should be a confirmation"
+            );
         }
-        for no in ["yes but make it pasta", "no", "actually pizza", "maybe later", ""] {
-            assert!(!is_bare_confirmation(no), "{no:?} should NOT be a confirmation");
+        for no in [
+            "yes but make it pasta",
+            "no",
+            "actually pizza",
+            "maybe later",
+            "",
+        ] {
+            assert!(
+                !is_bare_confirmation(no),
+                "{no:?} should NOT be a confirmation"
+            );
         }
     }
 
@@ -1737,7 +2046,10 @@ mod tests {
         let human = "luca";
         let ask = "hey can you swap tacod for grilled fennel";
         // No exchange yet → a "yes" is not a continuation.
-        assert_eq!(clarify_continuation(root, chat, human, "yes", 1000, 180), None);
+        assert_eq!(
+            clarify_continuation(root, chat, human, "yes", 1000, 180),
+            None
+        );
         // Nora asks a clarifying question → window opens.
         ClarifyLedger::open(root, chat, human, "nora", ask, 1000).unwrap();
         let ex = clarify_continuation(root, chat, human, "yes", 1030, 180)
@@ -1755,9 +2067,15 @@ mod tests {
         let chat = "grp";
         ClarifyLedger::open(root, chat, "luca", "nora", "swap x for y", 1000).unwrap();
         // Outside the window → not a continuation.
-        assert_eq!(clarify_continuation(root, chat, "luca", "yes", 1400, 180), None);
+        assert_eq!(
+            clarify_continuation(root, chat, "luca", "yes", 1400, 180),
+            None
+        );
         // A DIFFERENT human's "yes" does not continue Luca's exchange.
-        assert_eq!(clarify_continuation(root, chat, "mara", "yes", 1030, 180), None);
+        assert_eq!(
+            clarify_continuation(root, chat, "mara", "yes", 1030, 180),
+            None
+        );
         // A content-bearing reply is a fresh ask, not a continuation.
         assert_eq!(
             clarify_continuation(root, chat, "luca", "make it pasta instead", 1030, 180),

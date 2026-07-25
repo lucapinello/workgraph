@@ -4010,12 +4010,17 @@ fn sort_tasks_by_priority_with_features<'a>(
     });
 
     // Idle gate: only include idle (priority 0) tasks when no higher-priority tasks are in the set
-    let has_normal_or_higher = task_priorities.iter().any(|(_, p, _)| *p >= PRIORITY_NORMAL);
+    let has_normal_or_higher = task_priorities
+        .iter()
+        .any(|(_, p, _)| *p >= PRIORITY_NORMAL);
     if has_normal_or_higher {
         task_priorities.retain(|(_, p, _)| *p != PRIORITY_IDLE);
     }
 
-    let sorted_tasks: Vec<_> = task_priorities.into_iter().map(|(task, _, _)| task).collect();
+    let sorted_tasks: Vec<_> = task_priorities
+        .into_iter()
+        .map(|(task, _, _)| task)
+        .collect();
 
     // Log priority decisions if we have tasks
     if !sorted_tasks.is_empty() {
@@ -4371,10 +4376,9 @@ fn self_cancel_orphaned_eval_satellites(graph: &mut worksgood::graph::WorkGraph)
         .filter(|t| t.id.starts_with(".flip-") || t.id.starts_with(".evaluate-"))
         .filter(|t| !t.status.is_terminal())
         .filter_map(|t| {
-            let source_id = t
-                .id
-                .strip_prefix(".flip-")
-                .or_else(|| t.id.strip_prefix(".evaluate-"))?;
+            let source_id =
+                t.id.strip_prefix(".flip-")
+                    .or_else(|| t.id.strip_prefix(".evaluate-"))?;
             let source = graph.get_task(source_id)?;
             source
                 .status
@@ -5443,14 +5447,16 @@ pub fn coordinator_tick(
         // AND drops the now-stale edge from every dependent of the completed run,
         // so the recurring cron satisfies — never re-blocks — its fanout children.
         {
-            let (reset_ids, satisfied) =
-                worksgood::cron::reset_due_legacy_crons(graph, Utc::now());
+            let (reset_ids, satisfied) = worksgood::cron::reset_due_legacy_crons(graph, Utc::now());
             for task_id in &reset_ids {
                 let next = graph
                     .get_task(task_id)
                     .and_then(|t| t.next_cron_fire.clone())
                     .unwrap_or_else(|| "unknown".to_string());
-                eprintln!("[dispatcher] Cron reset: '{}' → Open (next fire: {})", task_id, next);
+                eprintln!(
+                    "[dispatcher] Cron reset: '{}' → Open (next fire: {})",
+                    task_id, next
+                );
                 modified = true;
             }
             if !satisfied.is_empty() {
@@ -7843,8 +7849,10 @@ mod tests {
         assert!(t.paused, "quarantined task is paused (parked)");
         assert!(t.assigned.is_none());
         assert!(
-            t.log.iter().any(|e| e.actor.as_deref() == Some("spawn-quarantine")
-                && e.message.contains("QUARANTINED")),
+            t.log
+                .iter()
+                .any(|e| e.actor.as_deref() == Some("spawn-quarantine")
+                    && e.message.contains("QUARANTINED")),
             "a loud quarantine log entry is recorded"
         );
         // Parked → no longer ready, so it can't be re-selected or be the probe.
@@ -7892,7 +7900,13 @@ mod tests {
         }
         // 3rd failure hits the quarantine threshold → poison + parked + excluded.
         let poison = record_spawn_failure_and_quarantine(
-            &gp, "poison", "err 3", "claude", Some("shell"), 5, 3,
+            &gp,
+            "poison",
+            "err 3",
+            "claude",
+            Some("shell"),
+            5,
+            3,
         );
         assert!(poison, "3rd failure crosses the quarantine threshold");
         assert!(
@@ -7981,10 +7995,15 @@ mod tests {
                 Status::Abandoned,
                 "orphaned satellite is marked Abandoned (source {source_status})"
             );
-            assert!(t.assigned.is_none(), "self-cancel clears any stale assignee");
             assert!(
-                t.log.iter().any(|e| e.actor.as_deref() == Some("eval-lifecycle-orphan")
-                    && e.message.contains("SELF-CANCELLED")),
+                t.assigned.is_none(),
+                "self-cancel clears any stale assignee"
+            );
+            assert!(
+                t.log
+                    .iter()
+                    .any(|e| e.actor.as_deref() == Some("eval-lifecycle-orphan")
+                        && e.message.contains("SELF-CANCELLED")),
                 "a loud self-cancel log entry is recorded"
             );
 

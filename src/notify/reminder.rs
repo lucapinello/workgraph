@@ -135,11 +135,7 @@ impl Reminder {
 }
 
 /// Collect every reminder-shaped row in a parsed plan into [`Reminder`]s.
-pub fn reminders_from_plan(
-    plan: &PlanDoc,
-    members: &[String],
-    owners: &OwnerMap,
-) -> Vec<Reminder> {
+pub fn reminders_from_plan(plan: &PlanDoc, members: &[String], owners: &OwnerMap) -> Vec<Reminder> {
     plan.calendar
         .iter()
         .filter_map(|ev| Reminder::from_calendar_event(&plan.week_code, ev, members, owners))
@@ -353,7 +349,11 @@ pub fn tick(
         match decide(r.due, now, policy) {
             FireDecision::Pending => {}
             FireDecision::Fire { late } => {
-                log.record(&r.id, now, if late { Outcome::Late } else { Outcome::OnTime });
+                log.record(
+                    &r.id,
+                    now,
+                    if late { Outcome::Late } else { Outcome::OnTime },
+                );
                 result.fired.push(Firing {
                     reminder: r.clone(),
                     late,
@@ -523,11 +523,7 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
 }
 
 /// Turn a parsed intent into a stored [`Reminder`] with a stable ad-hoc id.
-pub fn intent_to_reminder(
-    intent: &AdHocIntent,
-    recipient: &str,
-    bot: &str,
-) -> Reminder {
+pub fn intent_to_reminder(intent: &AdHocIntent, recipient: &str, bot: &str) -> Reminder {
     let id = format!(
         "adhoc:{}:{:016x}",
         intent.due.format("%Y%m%dT%H%M"),
@@ -603,7 +599,11 @@ fn long_weekday_name(wd: Weekday) -> &'static str {
 /// Falls back to a part-of-day default, else 9am. `had` is true when the text
 /// carried an explicit clock or part-of-day word (used to require a time signal
 /// when there is no day word).
-fn resolve_time(low: &str, _now: NaiveDateTime, _date: NaiveDate) -> (NaiveTime, Option<String>, bool) {
+fn resolve_time(
+    low: &str,
+    _now: NaiveDateTime,
+    _date: NaiveDate,
+) -> (NaiveTime, Option<String>, bool) {
     if let Some((t, label)) = parse_explicit_time(low) {
         return (t, Some(label), true);
     }
@@ -739,13 +739,26 @@ fn extract_body(text: &str) -> String {
 fn strip_trailing_time(body: &str) -> String {
     let mut words: Vec<&str> = body.split_whitespace().collect();
     let is_timeword = |w: &str| {
-        let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_ascii_lowercase();
+        let w = w
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_ascii_lowercase();
         matches!(
             w.as_str(),
-            "today" | "tonight" | "tomorrow" | "morning" | "afternoon" | "evening"
-                | "night" | "noon" | "at" | "on"
-        ) || WEEKDAYS.iter().any(|(names, _)| names.contains(&w.as_str()))
-            || parse_time_token(&w).is_some_and(|_| w.contains(':') || w.ends_with("am") || w.ends_with("pm"))
+            "today"
+                | "tonight"
+                | "tomorrow"
+                | "morning"
+                | "afternoon"
+                | "evening"
+                | "night"
+                | "noon"
+                | "at"
+                | "on"
+        ) || WEEKDAYS
+            .iter()
+            .any(|(names, _)| names.contains(&w.as_str()))
+            || parse_time_token(&w)
+                .is_some_and(|_| w.contains(':') || w.ends_with("am") || w.ends_with("pm"))
     };
     // Trim from both ends only (keep interior words intact).
     while words.first().is_some_and(|w| is_timeword(w)) {
@@ -842,10 +855,7 @@ mod tests {
     use crate::notify::family_plan::CalendarEvent;
 
     fn members() -> Vec<String> {
-        vec![
-            "Luca".to_string(),
-            "Nadin".to_string(),
-        ]
+        vec!["Luca".to_string(), "Nadin".to_string()]
     }
 
     fn owners() -> OwnerMap {
@@ -885,7 +895,10 @@ mod tests {
         assert_eq!(r.bot, "otto");
         assert_eq!(r.text, "Luca PT check-in (if unanswered)");
         assert_eq!(r.source, ReminderSource::Plan);
-        assert_eq!(r.message(false), "\u{23f0} Luca PT check-in (if unanswered)");
+        assert_eq!(
+            r.message(false),
+            "\u{23f0} Luca PT check-in (if unanswered)"
+        );
     }
 
     #[test]
@@ -897,9 +910,7 @@ mod tests {
             event: "Cook: chickpea & spinach curry".into(),
             source: "Bruno".into(),
         };
-        assert!(
-            Reminder::from_calendar_event("2026-W29", &ev, &members(), &owners()).is_none()
-        );
+        assert!(Reminder::from_calendar_event("2026-W29", &ev, &members(), &owners()).is_none());
     }
 
     #[test]
@@ -914,7 +925,10 @@ mod tests {
         let policy = FirePolicy::default();
         let due = dt(2026, 7, 14, 19, 30);
         // Exactly at due, and 1 min after: on time.
-        assert_eq!(decide(due, due, &policy), FireDecision::Fire { late: false });
+        assert_eq!(
+            decide(due, due, &policy),
+            FireDecision::Fire { late: false }
+        );
         assert_eq!(
             decide(due, dt(2026, 7, 14, 19, 31), &policy),
             FireDecision::Fire { late: false }
@@ -1033,11 +1047,8 @@ mod tests {
     fn adhoc_intent_weekday_and_to_body() {
         // Thursday morning default, body after "to".
         let now = dt(2026, 7, 12, 10, 0); // Sunday
-        let intent = parse_reminder_intent(
-            "Otto remind me Thursday to defrost the trout",
-            now,
-        )
-        .expect("reminder intent");
+        let intent = parse_reminder_intent("Otto remind me Thursday to defrost the trout", now)
+            .expect("reminder intent");
         assert_eq!(intent.due.weekday(), Weekday::Thu);
         assert_eq!(intent.due.time(), nt(9, 0), "morning default");
         assert_eq!(intent.text, "Defrost the trout");
@@ -1047,9 +1058,8 @@ mod tests {
     #[test]
     fn adhoc_intent_explicit_clock() {
         let now = dt(2026, 7, 12, 10, 0);
-        let intent =
-            parse_reminder_intent("remind me tomorrow at 7pm to call the plumber", now)
-                .expect("intent");
+        let intent = parse_reminder_intent("remind me tomorrow at 7pm to call the plumber", now)
+            .expect("intent");
         assert_eq!(intent.due, dt(2026, 7, 13, 19, 0));
         assert_eq!(intent.text, "Call the plumber");
     }
@@ -1067,8 +1077,7 @@ mod tests {
     fn adhoc_intent_becomes_stored_reminder() {
         let now = dt(2026, 7, 12, 10, 0);
         let intent =
-            parse_reminder_intent("remind me tomorrow morning to water the plants", now)
-                .unwrap();
+            parse_reminder_intent("remind me tomorrow morning to water the plants", now).unwrap();
         let r = intent_to_reminder(&intent, "Luca", "otto");
         assert_eq!(r.recipient, "Luca");
         assert_eq!(r.bot, "otto");
@@ -1083,8 +1092,7 @@ mod tests {
         let path = AdHocStore::path(dir.path());
         let now = dt(2026, 7, 12, 10, 0);
         let intent =
-            parse_reminder_intent("remind me tomorrow morning to water the plants", now)
-                .unwrap();
+            parse_reminder_intent("remind me tomorrow morning to water the plants", now).unwrap();
         let r = intent_to_reminder(&intent, "Luca", "otto");
 
         let mut store = AdHocStore::load(&path);
@@ -1134,7 +1142,9 @@ domains = ["meals"]
             "the fixture must exercise the production `## 1. Dinners (…)` shape",
         );
         let reminders = reminders_from_plan(&plan, &members(), &owners);
-        let reminder = reminders.first().expect("live-shaped reminder row resolves");
+        let reminder = reminders
+            .first()
+            .expect("live-shaped reminder row resolves");
         assert_eq!(
             reminder.bot, "coordination-anchor-7",
             "the complete authored display name must resolve to its stable id",

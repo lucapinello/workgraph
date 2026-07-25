@@ -223,20 +223,56 @@ pub fn parse_rating_reply(text: &str) -> Option<(Verdict, String)> {
     // Word signals (checked on a lowercased copy). Kept small and legible; this
     // is family chat, not sentiment analysis.
     let loved_words = [
-        "loved", "love it", "amazing", "delicious", "incredible", "best", "so good",
-        "fantastic", "yum", "yummy", "perfect", "obsessed", "10/10",
+        "loved",
+        "love it",
+        "amazing",
+        "delicious",
+        "incredible",
+        "best",
+        "so good",
+        "fantastic",
+        "yum",
+        "yummy",
+        "perfect",
+        "obsessed",
+        "10/10",
     ];
     let liked_words = [
-        "liked", "good", "nice", "tasty", "great", "yes", "yep", "thumbs up", "solid",
-        "enjoyed", "please again", "again please", "more of this",
+        "liked",
+        "good",
+        "nice",
+        "tasty",
+        "great",
+        "yes",
+        "yep",
+        "thumbs up",
+        "solid",
+        "enjoyed",
+        "please again",
+        "again please",
+        "more of this",
     ];
     let meh_words = [
         "meh", "ok", "okay", "fine", "average", "alright", "so-so", "so so", "not bad",
     ];
     let disliked_words = [
-        "no thanks", "not again", "hated", "gross", "bland", "too salty", "yuck", "awful",
-        "bad", "disgusting", "won't miss", "wont miss", "skip", "not for me", "dry",
-        "overcooked", "banned",
+        "no thanks",
+        "not again",
+        "hated",
+        "gross",
+        "bland",
+        "too salty",
+        "yuck",
+        "awful",
+        "bad",
+        "disgusting",
+        "won't miss",
+        "wont miss",
+        "skip",
+        "not for me",
+        "dry",
+        "overcooked",
+        "banned",
     ];
 
     let word_hit = |set: &[&str]| set.iter().any(|w| lower.contains(w));
@@ -308,7 +344,10 @@ pub fn append_rating(path: &Path, rating: &MealRating) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     file.write_all(rating.to_json_line().as_bytes())?;
     file.write_all(b"\n")?;
     Ok(())
@@ -360,7 +399,10 @@ impl AskRecord {
         Some(AskRecord {
             ts: v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0),
             dish: v.get("dish")?.as_str()?.to_string(),
-            responded: v.get("responded").and_then(|x| x.as_bool()).unwrap_or(false),
+            responded: v
+                .get("responded")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
         })
     }
 }
@@ -397,7 +439,10 @@ pub fn append_ask(path: &Path, ask: &AskRecord) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     file.write_all(ask.to_json_line().as_bytes())?;
     file.write_all(b"\n")?;
     Ok(())
@@ -546,7 +591,10 @@ pub fn summarize(ratings: &[MealRating]) -> Vec<DishVerdict> {
 
 /// The dishes worth repeating (net-positive score).
 pub fn winners(ratings: &[MealRating]) -> Vec<DishVerdict> {
-    summarize(ratings).into_iter().filter(|d| d.score > 0).collect()
+    summarize(ratings)
+        .into_iter()
+        .filter(|d| d.score > 0)
+        .collect()
 }
 
 /// The dishes worth dropping/reworking (net-negative score).
@@ -570,7 +618,9 @@ pub fn render_plan_briefing(ratings: &[MealRating]) -> String {
         return String::new();
     }
     let mut out = String::new();
-    out.push_str("Last week's dinner ratings from the family — repeat the wins, retire the flops:\n");
+    out.push_str(
+        "Last week's dinner ratings from the family — repeat the wins, retire the flops:\n",
+    );
     for d in &wins {
         out.push_str(&format!(
             "- {} {} — a hit ({}). Bring it back.\n",
@@ -675,7 +725,10 @@ mod tests {
     fn feedback_ask_is_family_voice_and_names_the_dish() {
         let line = compose_ask("Salmon");
         assert!(line.contains("salmon"), "should name the dish: {line}");
-        assert!(line.contains("👍") && line.contains("👎"), "offers the quick path");
+        assert!(
+            line.contains("👍") && line.contains("👎"),
+            "offers the quick path"
+        );
         assert_eq!(
             line,
             "How was the salmon tonight? 👍 👎 or just tell me — I'll remember it for next week."
@@ -714,8 +767,14 @@ mod tests {
 
     #[test]
     fn feedback_routing_reads_words_and_keeps_the_note() {
-        assert_eq!(parse_rating_reply("loved it, best yet!").unwrap().0, Verdict::Loved);
-        assert_eq!(parse_rating_reply("it was fine, meh").unwrap().0, Verdict::Meh);
+        assert_eq!(
+            parse_rating_reply("loved it, best yet!").unwrap().0,
+            Verdict::Loved
+        );
+        assert_eq!(
+            parse_rating_reply("it was fine, meh").unwrap().0,
+            Verdict::Meh
+        );
         let (v, note) = parse_rating_reply("no thanks, too bland").unwrap();
         assert_eq!(v, Verdict::Disliked);
         assert_eq!(note, "no thanks, too bland");
@@ -747,9 +806,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = feedback_path_for(dir.path());
         assert_eq!(path.file_name().unwrap(), "feedback.jsonl");
-        append_rating(&path, &rating("Beef stir-fry", "nadin", Verdict::Loved, "more please", 10))
-            .unwrap();
-        append_rating(&path, &rating("Beet salad", "luca", Verdict::Disliked, "", 20)).unwrap();
+        append_rating(
+            &path,
+            &rating("Beef stir-fry", "nadin", Verdict::Loved, "more please", 10),
+        )
+        .unwrap();
+        append_rating(
+            &path,
+            &rating("Beet salad", "luca", Verdict::Disliked, "", 20),
+        )
+        .unwrap();
         let back = load_ratings(&path);
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].dish, "Beef stir-fry");
@@ -786,7 +852,11 @@ mod tests {
 
     #[test]
     fn feedback_gate_blocks_second_ask_same_day() {
-        let asks = vec![AskRecord { ts: 5 * DAY + 1000, dish: "Salmon".into(), responded: true }];
+        let asks = vec![AskRecord {
+            ts: 5 * DAY + 1000,
+            dish: "Salmon".into(),
+            responded: true,
+        }];
         let d = gate(&asks, 5 * DAY + 9_000_000);
         assert!(!d.should_send());
         assert!(d.reason().contains("today"));
@@ -798,8 +868,16 @@ mod tests {
     fn feedback_gate_backs_off_after_two_silent_asks() {
         // Two prior asks, both unanswered, on earlier days.
         let asks = vec![
-            AskRecord { ts: 3 * DAY, dish: "Tofu".into(), responded: false },
-            AskRecord { ts: 4 * DAY, dish: "Cod".into(), responded: false },
+            AskRecord {
+                ts: 3 * DAY,
+                dish: "Tofu".into(),
+                responded: false,
+            },
+            AskRecord {
+                ts: 4 * DAY,
+                dish: "Cod".into(),
+                responded: false,
+            },
         ];
         let d = gate(&asks, 5 * DAY);
         assert!(!d.should_send(), "should back off, not nag");
@@ -810,8 +888,16 @@ mod tests {
     fn feedback_gate_resumes_when_family_answered_recently() {
         // One silence then one answer: the two most recent are not both silent.
         let asks = vec![
-            AskRecord { ts: 3 * DAY, dish: "Tofu".into(), responded: false },
-            AskRecord { ts: 4 * DAY, dish: "Cod".into(), responded: true },
+            AskRecord {
+                ts: 3 * DAY,
+                dish: "Tofu".into(),
+                responded: false,
+            },
+            AskRecord {
+                ts: 4 * DAY,
+                dish: "Cod".into(),
+                responded: true,
+            },
         ];
         assert!(gate(&asks, 5 * DAY).should_send());
     }
@@ -820,10 +906,24 @@ mod tests {
     fn feedback_gate_ask_log_round_trips_and_marks_answered() {
         let dir = tempdir().unwrap();
         let path = ask_log_path_for(dir.path());
-        append_ask(&path, &AskRecord { ts: 3 * DAY, dish: "Tofu".into(), responded: false })
-            .unwrap();
-        append_ask(&path, &AskRecord { ts: 4 * DAY, dish: "Cod".into(), responded: false })
-            .unwrap();
+        append_ask(
+            &path,
+            &AskRecord {
+                ts: 3 * DAY,
+                dish: "Tofu".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        append_ask(
+            &path,
+            &AskRecord {
+                ts: 4 * DAY,
+                dish: "Cod".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
         // Before answering: gate backs off.
         assert!(!gate(&load_asks(&path), 5 * DAY).should_send());
         // A rating arrives -> mark the latest ask answered.
@@ -876,7 +976,10 @@ mod tests {
             briefing.to_lowercase().contains("drop") || briefing.to_lowercase().contains("rework"),
             "tells the drafter to retire it"
         );
-        assert!(briefing.contains("more please"), "carries the family's own words");
+        assert!(
+            briefing.contains("more please"),
+            "carries the family's own words"
+        );
         // No ratings -> empty briefing (prompt guards on this).
         assert!(render_plan_briefing(&[]).is_empty());
     }

@@ -98,14 +98,15 @@ pub fn ingest_disposable_into_spawner(
     }
     updated.push_str(&block);
 
-    crate::executor::native::resume::store_session_summary(&summary_path, &updated)
-        .with_context(|| {
+    crate::executor::native::resume::store_session_summary(&summary_path, &updated).with_context(
+        || {
             format!(
                 "failed to ingest disposable '{}' into spawner session summary {}",
                 task.id,
                 summary_path.display()
             )
-        })?;
+        },
+    )?;
 
     Ok(Some(IngestReport {
         summary_path,
@@ -151,7 +152,7 @@ fn render_ingest_block(task: &Task, marker: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_sessions::{bind_agent, create_session, SessionKind};
+    use crate::chat_sessions::{SessionKind, bind_agent, create_session};
     use crate::graph::{LogEntry, Task};
     use tempfile::tempdir;
 
@@ -162,10 +163,7 @@ mod tests {
         let mut task = Task {
             id: id.to_string(),
             title: "Scrape 3 chicken recipes".to_string(),
-            tags: vec![
-                "disposable".to_string(),
-                format!("spawned-by:{}", spawner),
-            ],
+            tags: vec!["disposable".to_string(), format!("spawned-by:{}", spawner)],
             artifacts: vec!["docs/artifacts/chicken-recipes.md".to_string()],
             ..Task::default()
         };
@@ -193,7 +191,11 @@ mod tests {
         bind_agent(wg, "bruno-agent", "bruno").unwrap();
         // Seed a prior-week decision so we prove we *append*, not clobber.
         let summary_path = chat_dir_for_uuid(wg, &uuid).join("session-summary.md");
-        std::fs::write(&summary_path, "## Prior work\nWe chose a 50-50 pasta split.\n").unwrap();
+        std::fs::write(
+            &summary_path,
+            "## Prior work\nWe chose a 50-50 pasta split.\n",
+        )
+        .unwrap();
 
         let task = disposable_spawned_by("scrape-recipes", "bruno-agent");
 
@@ -273,10 +275,18 @@ mod tests {
         // No spawned-by tag → nothing to ingest into.
         let mut orphan = disposable_spawned_by("orphan", "bruno-agent");
         orphan.tags.retain(|t| !t.starts_with("spawned-by:"));
-        assert!(ingest_disposable_into_spawner(wg, &orphan).unwrap().is_none());
+        assert!(
+            ingest_disposable_into_spawner(wg, &orphan)
+                .unwrap()
+                .is_none()
+        );
 
         // Spawner named but not bound to any session → benign no-op.
         let unbound = disposable_spawned_by("unbound", "nobody-agent");
-        assert!(ingest_disposable_into_spawner(wg, &unbound).unwrap().is_none());
+        assert!(
+            ingest_disposable_into_spawner(wg, &unbound)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -173,9 +173,7 @@ impl TranscribeFailure {
             TranscribeFailure::Silence => {
                 "That recording came through with nothing I could hear — mind trying again, or just typing it?"
             }
-            TranscribeFailure::Unclear => {
-                "I couldn't make out that recording — mind typing it?"
-            }
+            TranscribeFailure::Unclear => "I couldn't make out that recording — mind typing it?",
         }
     }
 }
@@ -494,9 +492,11 @@ mod tests {
 
     #[test]
     fn failure_messages_are_in_persona_and_name_the_fix() {
-        assert!(TranscribeFailure::Unconfigured
-            .message()
-            .contains("casa voice-setup"));
+        assert!(
+            TranscribeFailure::Unconfigured
+                .message()
+                .contains("casa voice-setup")
+        );
         assert!(TranscribeFailure::Unclear.message().contains("typing"));
         assert!(!TranscribeFailure::Silence.message().is_empty());
     }
@@ -608,7 +608,9 @@ mod tests {
         let meta = voice_meta(&msg).expect("voice note parses");
 
         // 2. transcribe: the gateway (stubbed — no live whisper) hears the add.
-        let dl = StubDownloader { bytes: vec![1, 2, 3] };
+        let dl = StubDownloader {
+            bytes: vec![1, 2, 3],
+        };
         let gw = StubGateway {
             response: serde_json::json!({
                 "ok": true,
@@ -650,8 +652,7 @@ mod tests {
             other => panic!("spoken add should fast-lane like a typed add, got {other:?}"),
         }
         // The plan on disk actually gained the spoken item.
-        let after =
-            std::fs::read_to_string(plans.join("2026-W29-family-plan.md")).unwrap();
+        let after = std::fs::read_to_string(plans.join("2026-W29-family-plan.md")).unwrap();
         assert!(
             after.to_lowercase().contains("olive oil"),
             "the spoken item reached the plan file"

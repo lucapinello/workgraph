@@ -437,9 +437,7 @@ impl DigestStore {
         let Some(state) = self.people.get_mut(&nudge.recipient) else {
             return false;
         };
-        if state.pending.iter().any(|item| item.id == nudge.id)
-            || state.standalone_sent == 0
-        {
+        if state.pending.iter().any(|item| item.id == nudge.id) || state.standalone_sent == 0 {
             return false;
         }
         let Some(seen_index) = state.seen.iter().position(|id| id == &nudge.id) else {
@@ -650,23 +648,42 @@ mod tests {
         let policy = DigestPolicy::new();
         // Three non-urgent items queued the evening before / overnight.
         let items = [
-            Nudge::bundled("r1", "Luca", NudgeKind::Reminder, dt(2026, 7, 13, 6, 0),
-                "PT check-in at 19:30"),
-            Nudge::bundled("f1", "Luca", NudgeKind::FeedbackAsk, dt(2026, 7, 13, 6, 0),
-                "how was last night's salmon?"),
-            Nudge::bundled("e1", "Luca", NudgeKind::ErrandNudge, dt(2026, 7, 13, 6, 0),
-                "market run at 9 — list attached"),
+            Nudge::bundled(
+                "r1",
+                "Luca",
+                NudgeKind::Reminder,
+                dt(2026, 7, 13, 6, 0),
+                "PT check-in at 19:30",
+            ),
+            Nudge::bundled(
+                "f1",
+                "Luca",
+                NudgeKind::FeedbackAsk,
+                dt(2026, 7, 13, 6, 0),
+                "how was last night's salmon?",
+            ),
+            Nudge::bundled(
+                "e1",
+                "Luca",
+                NudgeKind::ErrandNudge,
+                dt(2026, 7, 13, 6, 0),
+                "market run at 9 — list attached",
+            ),
         ];
         for n in &items {
             // Offered at 06:30 (inside quiet hours) — all held, none sent.
-            assert_eq!(store.offer(n, dt(2026, 7, 13, 6, 30), &policy),
-                       Offer::Queued { overflow: false });
+            assert_eq!(
+                store.offer(n, dt(2026, 7, 13, 6, 30), &policy),
+                Offer::Queued { overflow: false }
+            );
         }
         assert_eq!(store.state("Luca").unwrap().pending().len(), 3);
         assert!(!store.state("Luca").unwrap().digest_sent());
 
         // At 08:00 the single digest lands, bundling all three.
-        let msg = store.emit_digest("Luca", dt(2026, 7, 13, 8, 0), &policy).unwrap();
+        let msg = store
+            .emit_digest("Luca", dt(2026, 7, 13, 8, 0), &policy)
+            .unwrap();
         assert_eq!(
             msg,
             "Today: PT check-in at 19:30 \u{b7} how was last night's salmon? \
@@ -681,15 +698,39 @@ mod tests {
         let mut store = DigestStore::default();
         let policy = DigestPolicy::new();
         store.offer(
-            &Nudge::bundled("f1", "Nadin", NudgeKind::FeedbackAsk, dt(2026, 7, 13, 6, 0), "how was dinner?"),
-            dt(2026, 7, 13, 6, 0), &policy);
+            &Nudge::bundled(
+                "f1",
+                "Nadin",
+                NudgeKind::FeedbackAsk,
+                dt(2026, 7, 13, 6, 0),
+                "how was dinner?",
+            ),
+            dt(2026, 7, 13, 6, 0),
+            &policy,
+        );
         // First emit at 08:00 delivers.
-        assert!(store.emit_digest("Nadin", dt(2026, 7, 13, 8, 0), &policy).is_some());
+        assert!(
+            store
+                .emit_digest("Nadin", dt(2026, 7, 13, 8, 0), &policy)
+                .is_some()
+        );
         // A later item the same day queues but does NOT trigger a second digest.
         store.offer(
-            &Nudge::bundled("f2", "Nadin", NudgeKind::FeedbackAsk, dt(2026, 7, 13, 12, 0), "how was lunch?"),
-            dt(2026, 7, 13, 12, 0), &policy);
-        assert!(store.emit_digest("Nadin", dt(2026, 7, 13, 12, 5), &policy).is_none());
+            &Nudge::bundled(
+                "f2",
+                "Nadin",
+                NudgeKind::FeedbackAsk,
+                dt(2026, 7, 13, 12, 0),
+                "how was lunch?",
+            ),
+            dt(2026, 7, 13, 12, 0),
+            &policy,
+        );
+        assert!(
+            store
+                .emit_digest("Nadin", dt(2026, 7, 13, 12, 5), &policy)
+                .is_none()
+        );
         assert_eq!(store.state("Nadin").unwrap().pending().len(), 1);
     }
 
@@ -699,13 +740,29 @@ mod tests {
         let policy = DigestPolicy::new();
         // Empty queue → nothing to send even at 09:00.
         store.state_mut("Luca");
-        assert!(store.emit_digest("Luca", dt(2026, 7, 13, 9, 0), &policy).is_none());
+        assert!(
+            store
+                .emit_digest("Luca", dt(2026, 7, 13, 9, 0), &policy)
+                .is_none()
+        );
         // Queued but before the 08:00 digest hour → not yet.
         store.offer(
-            &Nudge::bundled("f1", "Luca", NudgeKind::FeedbackAsk, dt(2026, 7, 13, 6, 0), "how was dinner?"),
-            dt(2026, 7, 13, 6, 0), &policy);
+            &Nudge::bundled(
+                "f1",
+                "Luca",
+                NudgeKind::FeedbackAsk,
+                dt(2026, 7, 13, 6, 0),
+                "how was dinner?",
+            ),
+            dt(2026, 7, 13, 6, 0),
+            &policy,
+        );
         assert!(!store.digest_due("Luca", dt(2026, 7, 13, 7, 45), &policy));
-        assert!(store.emit_digest("Luca", dt(2026, 7, 13, 7, 45), &policy).is_none());
+        assert!(
+            store
+                .emit_digest("Luca", dt(2026, 7, 13, 7, 45), &policy)
+                .is_none()
+        );
     }
 
     // --- time-critical passthrough & cap -----------------------------------
@@ -715,8 +772,13 @@ mod tests {
         let mut store = DigestStore::default();
         let policy = DigestPolicy::new();
         // An explicitly-timed errand nudge due at 06:15 (inside quiet hours).
-        let n = Nudge::time_critical("e-depart", "Luca", NudgeKind::ErrandNudge,
-            dt(2026, 7, 13, 6, 15), "leave now for the 6:40 train");
+        let n = Nudge::time_critical(
+            "e-depart",
+            "Luca",
+            NudgeKind::ErrandNudge,
+            dt(2026, 7, 13, 6, 15),
+            "leave now for the 6:40 train",
+        );
         assert_eq!(
             store.offer(&n, dt(2026, 7, 13, 6, 15), &policy),
             Offer::SendNow("leave now for the 6:40 train".to_string())
@@ -728,12 +790,21 @@ mod tests {
     fn standalone_cap_then_overflow_folds_into_digest() {
         let mut store = DigestStore::default();
         let policy = DigestPolicy::new(); // cap = 3
-        let day = |h, mi, s: &str| Nudge::time_critical(
-            format!("tc-{h}{mi}"), "Luca", NudgeKind::Reminder, dt(2026, 7, 13, h, mi), s);
+        let day = |h, mi, s: &str| {
+            Nudge::time_critical(
+                format!("tc-{h}{mi}"),
+                "Luca",
+                NudgeKind::Reminder,
+                dt(2026, 7, 13, h, mi),
+                s,
+            )
+        };
         // First three fire standalone.
         for (h, mi, s) in [(9, 0, "a"), (10, 0, "b"), (11, 0, "c")] {
-            assert!(matches!(store.offer(&day(h, mi, s), dt(2026, 7, 13, h, mi), &policy),
-                             Offer::SendNow(_)));
+            assert!(matches!(
+                store.offer(&day(h, mi, s), dt(2026, 7, 13, h, mi), &policy),
+                Offer::SendNow(_)
+            ));
         }
         assert_eq!(store.state("Luca").unwrap().standalone_sent(), 3);
         // The fourth overflows into the digest with an honest line.
@@ -741,7 +812,11 @@ mod tests {
             store.offer(&day(12, 0, "d — held"), dt(2026, 7, 13, 12, 0), &policy),
             Offer::Queued { overflow: true }
         );
-        assert_eq!(store.state("Luca").unwrap().standalone_sent(), 3, "cap not exceeded");
+        assert_eq!(
+            store.state("Luca").unwrap().standalone_sent(),
+            3,
+            "cap not exceeded"
+        );
         assert_eq!(store.state("Luca").unwrap().pending().len(), 1);
     }
 
@@ -756,14 +831,31 @@ mod tests {
         // Spend the whole proactive cap with reminders.
         for (h, s) in [(9, "a"), (10, "b"), (11, "c")] {
             let n = Nudge::time_critical(
-                format!("tc-{h}"), "Luca", NudgeKind::Reminder, dt(2026, 7, 13, h, 0), s);
-            assert!(matches!(store.offer(&n, dt(2026, 7, 13, h, 0), &policy), Offer::SendNow(_)));
+                format!("tc-{h}"),
+                "Luca",
+                NudgeKind::Reminder,
+                dt(2026, 7, 13, h, 0),
+                s,
+            );
+            assert!(matches!(
+                store.offer(&n, dt(2026, 7, 13, h, 0), &policy),
+                Offer::SendNow(_)
+            ));
         }
-        assert_eq!(store.state("Luca").unwrap().standalone_sent(), 3, "cap spent");
+        assert_eq!(
+            store.state("Luca").unwrap().standalone_sent(),
+            3,
+            "cap spent"
+        );
 
         // A further reminder overflows (control) …
         let more = Nudge::time_critical(
-            "tc-more", "Luca", NudgeKind::Reminder, dt(2026, 7, 13, 12, 0), "held");
+            "tc-more",
+            "Luca",
+            NudgeKind::Reminder,
+            dt(2026, 7, 13, 12, 0),
+            "held",
+        );
         assert_eq!(
             store.offer(&more, dt(2026, 7, 13, 12, 0), &policy),
             Offer::Queued { overflow: true }
@@ -772,14 +864,19 @@ mod tests {
         // … but a lifecycle report-back for the SAME person at the SAME time
         // still sends standalone, and does not touch the proactive counter.
         let reply = Nudge::time_critical(
-            "lifecycle:pesto:done", "Luca", NudgeKind::Lifecycle,
-            dt(2026, 7, 13, 12, 0), "Done — Wednesday is now pesto ✅");
+            "lifecycle:pesto:done",
+            "Luca",
+            NudgeKind::Lifecycle,
+            dt(2026, 7, 13, 12, 0),
+            "Done — Wednesday is now pesto ✅",
+        );
         assert_eq!(
             store.offer(&reply, dt(2026, 7, 13, 12, 0), &policy),
             Offer::SendNow("Done — Wednesday is now pesto ✅".to_string())
         );
         assert_eq!(
-            store.state("Luca").unwrap().standalone_sent(), 3,
+            store.state("Luca").unwrap().standalone_sent(),
+            3,
             "lifecycle reply does not consume the proactive budget"
         );
         // Exactly-once still holds: re-offering the same reply is a no-op.
@@ -792,10 +889,18 @@ mod tests {
     #[test]
     fn digest_shows_honest_overflow_line() {
         let items = vec![
-            DigestItem { id: "b1".into(), text: "how was dinner?".into(),
-                         kind: NudgeKind::FeedbackAsk, overflow: false },
-            DigestItem { id: "o1".into(), text: "pharmacy pickup was due at 4".into(),
-                         kind: NudgeKind::ErrandNudge, overflow: true },
+            DigestItem {
+                id: "b1".into(),
+                text: "how was dinner?".into(),
+                kind: NudgeKind::FeedbackAsk,
+                overflow: false,
+            },
+            DigestItem {
+                id: "o1".into(),
+                text: "pharmacy pickup was due at 4".into(),
+                kind: NudgeKind::ErrandNudge,
+                overflow: true,
+            },
         ];
         let msg = compose_digest(&items);
         assert_eq!(
@@ -809,8 +914,10 @@ mod tests {
     #[test]
     fn overflow_only_digest_has_no_today_line() {
         let items = vec![DigestItem {
-            id: "o1".into(), text: "pharmacy pickup".into(),
-            kind: NudgeKind::ErrandNudge, overflow: true,
+            id: "o1".into(),
+            text: "pharmacy pickup".into(),
+            kind: NudgeKind::ErrandNudge,
+            overflow: true,
         }];
         let msg = compose_digest(&items);
         assert!(!msg.contains("Today:"));
@@ -825,8 +932,13 @@ mod tests {
         let policy = DigestPolicy::new();
         // Spend the cap and queue one overflow on day 1.
         for (h, s) in [(9, "a"), (10, "b"), (11, "c"), (12, "d")] {
-            let n = Nudge::time_critical(format!("d1-{h}"), "Luca", NudgeKind::Reminder,
-                dt(2026, 7, 13, h, 0), s);
+            let n = Nudge::time_critical(
+                format!("d1-{h}"),
+                "Luca",
+                NudgeKind::Reminder,
+                dt(2026, 7, 13, h, 0),
+                s,
+            );
             store.offer(&n, dt(2026, 7, 13, h, 0), &policy);
         }
         // Deliver day-1 digest so pending clears.
@@ -835,9 +947,17 @@ mod tests {
         assert!(store.state("Luca").unwrap().digest_sent());
 
         // Day 2: a fresh time-critical offer resets the counter and fires again.
-        let n = Nudge::time_critical("d2-1", "Luca", NudgeKind::Reminder,
-            dt(2026, 7, 14, 9, 0), "new day ping");
-        assert!(matches!(store.offer(&n, dt(2026, 7, 14, 9, 0), &policy), Offer::SendNow(_)));
+        let n = Nudge::time_critical(
+            "d2-1",
+            "Luca",
+            NudgeKind::Reminder,
+            dt(2026, 7, 14, 9, 0),
+            "new day ping",
+        );
+        assert!(matches!(
+            store.offer(&n, dt(2026, 7, 14, 9, 0), &policy),
+            Offer::SendNow(_)
+        ));
         assert_eq!(store.state("Luca").unwrap().standalone_sent(), 1);
         assert!(!store.state("Luca").unwrap().digest_sent());
     }
@@ -846,11 +966,26 @@ mod tests {
     fn same_id_offered_twice_is_deduped() {
         let mut store = DigestStore::default();
         let policy = DigestPolicy::new();
-        let n = Nudge::time_critical("once", "Luca", NudgeKind::Reminder,
-            dt(2026, 7, 13, 9, 0), "ping");
-        assert!(matches!(store.offer(&n, dt(2026, 7, 13, 9, 0), &policy), Offer::SendNow(_)));
-        assert_eq!(store.offer(&n, dt(2026, 7, 13, 9, 1), &policy), Offer::Duplicate);
-        assert_eq!(store.state("Luca").unwrap().standalone_sent(), 1, "no double count");
+        let n = Nudge::time_critical(
+            "once",
+            "Luca",
+            NudgeKind::Reminder,
+            dt(2026, 7, 13, 9, 0),
+            "ping",
+        );
+        assert!(matches!(
+            store.offer(&n, dt(2026, 7, 13, 9, 0), &policy),
+            Offer::SendNow(_)
+        ));
+        assert_eq!(
+            store.offer(&n, dt(2026, 7, 13, 9, 1), &policy),
+            Offer::Duplicate
+        );
+        assert_eq!(
+            store.state("Luca").unwrap().standalone_sent(),
+            1,
+            "no double count"
+        );
     }
 
     #[test]
@@ -966,9 +1101,17 @@ mod tests {
     fn not_yet_due_is_pending_and_records_nothing() {
         let mut store = DigestStore::default();
         let policy = DigestPolicy::new();
-        let n = Nudge::bundled("later", "Luca", NudgeKind::FeedbackAsk,
-            dt(2026, 7, 13, 18, 0), "how was dinner?");
-        assert_eq!(store.offer(&n, dt(2026, 7, 13, 12, 0), &policy), Offer::Pending);
+        let n = Nudge::bundled(
+            "later",
+            "Luca",
+            NudgeKind::FeedbackAsk,
+            dt(2026, 7, 13, 18, 0),
+            "how was dinner?",
+        );
+        assert_eq!(
+            store.offer(&n, dt(2026, 7, 13, 12, 0), &policy),
+            Offer::Pending
+        );
         assert!(store.state("Luca").is_none() || store.state("Luca").unwrap().pending().is_empty());
     }
 
@@ -998,9 +1141,21 @@ mod tests {
         // Teo's tighter cap: the 2nd time-critical overflows.
         let mut store = DigestStore::default();
         let a = Nudge::time_critical("t1", "Teo", NudgeKind::Reminder, dt(2026, 7, 13, 9, 0), "a");
-        let b = Nudge::time_critical("t2", "Teo", NudgeKind::Reminder, dt(2026, 7, 13, 10, 0), "b");
-        assert!(matches!(store.offer(&a, dt(2026, 7, 13, 9, 0), &policy), Offer::SendNow(_)));
-        assert_eq!(store.offer(&b, dt(2026, 7, 13, 10, 0), &policy), Offer::Queued { overflow: true });
+        let b = Nudge::time_critical(
+            "t2",
+            "Teo",
+            NudgeKind::Reminder,
+            dt(2026, 7, 13, 10, 0),
+            "b",
+        );
+        assert!(matches!(
+            store.offer(&a, dt(2026, 7, 13, 9, 0), &policy),
+            Offer::SendNow(_)
+        ));
+        assert_eq!(
+            store.offer(&b, dt(2026, 7, 13, 10, 0), &policy),
+            Offer::Queued { overflow: true }
+        );
     }
 
     #[test]
@@ -1009,12 +1164,23 @@ mod tests {
         // must wait until quiet hours end, never landing mid-quiet.
         let policy = DigestPolicy::new().with_override(
             "Owl",
-            PersonOverride { digest_time: Some(t(6, 0)), ..Default::default() },
+            PersonOverride {
+                digest_time: Some(t(6, 0)),
+                ..Default::default()
+            },
         );
         let mut store = DigestStore::default();
         store.offer(
-            &Nudge::bundled("f1", "Owl", NudgeKind::FeedbackAsk, dt(2026, 7, 13, 5, 0), "how was dinner?"),
-            dt(2026, 7, 13, 5, 0), &policy);
+            &Nudge::bundled(
+                "f1",
+                "Owl",
+                NudgeKind::FeedbackAsk,
+                dt(2026, 7, 13, 5, 0),
+                "how was dinner?",
+            ),
+            dt(2026, 7, 13, 5, 0),
+            &policy,
+        );
         // 06:30 is past the digest hour but still inside default quiet (< 07:30).
         assert!(!store.digest_due("Owl", dt(2026, 7, 13, 6, 30), &policy));
         // 07:30 quiet ends → digest may land.
@@ -1028,11 +1194,27 @@ mod tests {
         let mut store = DigestStore::default();
         let policy = DigestPolicy::new();
         store.offer(
-            &Nudge::time_critical("tc", "Luca", NudgeKind::Reminder, dt(2026, 7, 13, 9, 0), "ping"),
-            dt(2026, 7, 13, 9, 0), &policy);
+            &Nudge::time_critical(
+                "tc",
+                "Luca",
+                NudgeKind::Reminder,
+                dt(2026, 7, 13, 9, 0),
+                "ping",
+            ),
+            dt(2026, 7, 13, 9, 0),
+            &policy,
+        );
         store.offer(
-            &Nudge::bundled("b", "Luca", NudgeKind::FeedbackAsk, dt(2026, 7, 13, 9, 0), "how was dinner?"),
-            dt(2026, 7, 13, 9, 0), &policy);
+            &Nudge::bundled(
+                "b",
+                "Luca",
+                NudgeKind::FeedbackAsk,
+                dt(2026, 7, 13, 9, 0),
+                "how was dinner?",
+            ),
+            dt(2026, 7, 13, 9, 0),
+            &policy,
+        );
         let json = serde_json::to_string(&store).unwrap();
         let back: DigestStore = serde_json::from_str(&json).unwrap();
         let st = back.state("Luca").unwrap();
@@ -1040,7 +1222,16 @@ mod tests {
         assert_eq!(st.pending().len(), 1);
         // The de-dupe set survived, so re-offering the fired id is still a no-op.
         let mut back = back;
-        let n = Nudge::time_critical("tc", "Luca", NudgeKind::Reminder, dt(2026, 7, 13, 9, 30), "ping");
-        assert_eq!(back.offer(&n, dt(2026, 7, 13, 9, 30), &policy), Offer::Duplicate);
+        let n = Nudge::time_critical(
+            "tc",
+            "Luca",
+            NudgeKind::Reminder,
+            dt(2026, 7, 13, 9, 30),
+            "ping",
+        );
+        assert_eq!(
+            back.offer(&n, dt(2026, 7, 13, 9, 30), &policy),
+            Offer::Duplicate
+        );
     }
 }

@@ -143,9 +143,7 @@ pub fn discussion_take_message(topic: &str, prior: &[Take]) -> String {
     m.push_str(topic.trim());
     m.push_str("\".\n\n");
     if prior.is_empty() {
-        m.push_str(
-            "You're first to weigh in — kick it off with your honest take. ",
-        );
+        m.push_str("You're first to weigh in — kick it off with your honest take. ");
     } else {
         m.push_str("Here's what the family have said so far:\n");
         for t in prior {
@@ -211,9 +209,10 @@ async fn compose_bounded(
         // Discussion turns do not pass through telegram_conversation's finalizer.
         // Guard the clamped draft here, before it enters either the Telegram sink
         // or the mirrored Casa feed.
-        Ok(Ok(text)) if !text.trim().is_empty() => {
-            Some(grounding::enforce_family_voice(&clamp_take(&text), family_roster))
-        }
+        Ok(Ok(text)) if !text.trim().is_empty() => Some(grounding::enforce_family_voice(
+            &clamp_take(&text),
+            family_roster,
+        )),
         _ => None,
     }
 }
@@ -245,22 +244,9 @@ async fn send_discussion_canonical(
     text: &str,
     sink: &dyn ReplySink,
 ) -> DiscussionPartResolution {
-    match send_canonical_reply_once(
-        workgraph_dir,
-        delivery_id,
-        bot_id,
-        chat_id,
-        text,
-        sink,
-    )
-    .await
-    {
-        Ok(CanonicalDeliveryState::Confirmed(text)) => {
-            DiscussionPartResolution::Delivered(text)
-        }
-        Ok(CanonicalDeliveryState::Skipped) => {
-            DiscussionPartResolution::Skipped
-        }
+    match send_canonical_reply_once(workgraph_dir, delivery_id, bot_id, chat_id, text, sink).await {
+        Ok(CanonicalDeliveryState::Confirmed(text)) => DiscussionPartResolution::Delivered(text),
+        Ok(CanonicalDeliveryState::Skipped) => DiscussionPartResolution::Skipped,
         // A transport error, in-flight claim, or legacy/corrupt state is not a
         // family-visible take. Keep it out of subsequent compose context.
         Ok(
@@ -310,21 +296,11 @@ pub async fn run_discussion_round(
             skipped.push(voice.bot_id.clone());
             continue;
         }
-        let delivery_id =
-            discussion_delivery_id(physical_turn_key, "take", &voice.bot_id);
-        let state = canonical_delivery_state(
-            workgraph_dir,
-            &delivery_id,
-            &voice.bot_id,
-            chat_id,
-        )?;
+        let delivery_id = discussion_delivery_id(physical_turn_key, "take", &voice.bot_id);
+        let state = canonical_delivery_state(workgraph_dir, &delivery_id, &voice.bot_id, chat_id)?;
         let resolution = match state {
-            CanonicalDeliveryState::Confirmed(text) => {
-                DiscussionPartResolution::Delivered(text)
-            }
-            CanonicalDeliveryState::Skipped => {
-                DiscussionPartResolution::Skipped
-            }
+            CanonicalDeliveryState::Confirmed(text) => DiscussionPartResolution::Delivered(text),
+            CanonicalDeliveryState::Skipped => DiscussionPartResolution::Skipped,
             CanonicalDeliveryState::Ready(text) => {
                 send_discussion_canonical(
                     workgraph_dir,
@@ -336,8 +312,7 @@ pub async fn run_discussion_round(
                 )
                 .await
             }
-            CanonicalDeliveryState::Pending
-            | CanonicalDeliveryState::Unavailable => {
+            CanonicalDeliveryState::Pending | CanonicalDeliveryState::Unavailable => {
                 DiscussionPartResolution::Blocked
             }
             CanonicalDeliveryState::Missing => {
@@ -422,21 +397,14 @@ pub async fn run_discussion_round(
     let mut synthesis = None;
     if !delivery_barrier && non_synth_takes >= 2 {
         if let Some(voice) = voices.iter().find(|v| v.bot_id == synthesizer_bot) {
-            let delivery_id =
-                discussion_delivery_id(physical_turn_key, "synthesis", &voice.bot_id);
-            let state = canonical_delivery_state(
-                workgraph_dir,
-                &delivery_id,
-                &voice.bot_id,
-                chat_id,
-            )?;
+            let delivery_id = discussion_delivery_id(physical_turn_key, "synthesis", &voice.bot_id);
+            let state =
+                canonical_delivery_state(workgraph_dir, &delivery_id, &voice.bot_id, chat_id)?;
             let resolution = match state {
                 CanonicalDeliveryState::Confirmed(text) => {
                     DiscussionPartResolution::Delivered(text)
                 }
-                CanonicalDeliveryState::Skipped => {
-                    DiscussionPartResolution::Skipped
-                }
+                CanonicalDeliveryState::Skipped => DiscussionPartResolution::Skipped,
                 CanonicalDeliveryState::Ready(text) => {
                     send_discussion_canonical(
                         workgraph_dir,
@@ -448,8 +416,7 @@ pub async fn run_discussion_round(
                     )
                     .await
                 }
-                CanonicalDeliveryState::Pending
-                | CanonicalDeliveryState::Unavailable => {
+                CanonicalDeliveryState::Pending | CanonicalDeliveryState::Unavailable => {
                     DiscussionPartResolution::Blocked
                 }
                 CanonicalDeliveryState::Missing => {
@@ -513,8 +480,7 @@ pub async fn run_discussion_round(
             };
             synthesis = match resolution {
                 DiscussionPartResolution::Delivered(text) => Some(text),
-                DiscussionPartResolution::Skipped
-                | DiscussionPartResolution::Blocked => None,
+                DiscussionPartResolution::Skipped | DiscussionPartResolution::Blocked => None,
             };
         }
     }
@@ -541,10 +507,7 @@ pub struct DiscussionPlan {
 /// Plan a round over `roster_bot_ids` (roster order). `synthesizer_bot` comes
 /// from the project-local coordination owner; an absent or unconfigured owner
 /// yields no synthesis rather than inventing a persona.
-pub fn plan_round(
-    roster_bot_ids: &[String],
-    synthesizer_bot: Option<&str>,
-) -> DiscussionPlan {
+pub fn plan_round(roster_bot_ids: &[String], synthesizer_bot: Option<&str>) -> DiscussionPlan {
     let synthesizer = synthesizer_bot.and_then(|want| {
         roster_bot_ids
             .iter()
@@ -598,12 +561,7 @@ mod tests {
 
     #[async_trait]
     impl ReplySink for RecordingSink {
-        async fn send(
-            &self,
-            bot_id: &str,
-            _chat_id: &str,
-            text: &str,
-        ) -> Result<Option<String>> {
+        async fn send(&self, bot_id: &str, _chat_id: &str, text: &str) -> Result<Option<String>> {
             self.sent
                 .lock()
                 .unwrap()
@@ -790,8 +748,7 @@ mod tests {
         };
         let physical_turn_key = "physical-discussion-send-retry";
         let chat_id = "-100-fixture";
-        let delivery_id =
-            discussion_delivery_id(physical_turn_key, "take", "voice-retry");
+        let delivery_id = discussion_delivery_id(physical_turn_key, "take", "voice-retry");
         let digest = super::super::telegram_conversation::durable_telegram_digest_v1(
             "telegram-delivery-claim",
             &[&delivery_id, "voice-retry", chat_id],
@@ -823,8 +780,7 @@ mod tests {
         assert!(first.takes.is_empty());
         assert_eq!(first.skipped, vec!["voice-retry".to_string()]);
         assert!(
-            sink.canonical_seen_before_transport
-                .load(Ordering::SeqCst),
+            sink.canonical_seen_before_transport.load(Ordering::SeqCst),
             "the failed transport must observe canonical guarded bytes already on disk",
         );
 
@@ -863,7 +819,10 @@ mod tests {
             "retry and confirmed refire must not recompose canonical bytes",
         );
         let texts = sink.texts.lock().unwrap().clone();
-        assert_eq!(texts, vec!["First canonical take.", "First canonical take."]);
+        assert_eq!(
+            texts,
+            vec!["First canonical take.", "First canonical take."]
+        );
         assert_eq!(retry.takes[0].text, "First canonical take.");
         assert_eq!(replay.takes, retry.takes);
     }
@@ -909,17 +868,13 @@ mod tests {
                             && !message.contains("recomposed")
                         {
                             if message.contains("close the discussion") {
-                                Ok(
-                                    "Alpha-original, Delta-original, Beta-original, and \
+                                Ok("Alpha-original, Delta-original, Beta-original, and \
                                      Gamma-original are the visible takes."
-                                        .to_string(),
-                                )
+                                    .to_string())
                             } else {
-                                Ok(
-                                    "Gamma-original builds on Alpha-original, Delta-original, \
+                                Ok("Gamma-original builds on Alpha-original, Delta-original, \
                                      and Beta-original."
-                                        .to_string(),
-                                )
+                                    .to_string())
                             }
                         } else {
                             Ok("I reacted to recomposed or unsent words.".to_string())
@@ -948,9 +903,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((bot_id.to_string(), text.to_string()));
-                if bot_id == "voice-beta"
-                    && !self.failed_beta.swap(true, Ordering::SeqCst)
-                {
+                if bot_id == "voice-beta" && !self.failed_beta.swap(true, Ordering::SeqCst) {
                     anyhow::bail!("stub beta transport failure");
                 }
                 self.delivered
@@ -1002,12 +955,7 @@ mod tests {
             vec!["voice-beta".to_string(), "voice-gamma".to_string()],
         );
         assert_eq!(
-            composer
-                .calls
-                .lock()
-                .unwrap()
-                .get("voice-gamma")
-                .copied(),
+            composer.calls.lock().unwrap().get("voice-gamma").copied(),
             None,
             "a failed middle transport must stop the round before a later composer runs",
         );
@@ -1144,9 +1092,7 @@ mod tests {
                     ("voice-skipped", 0) => {
                         anyhow::bail!("stub first compose failure")
                     }
-                    ("voice-skipped", _) => {
-                        Ok("A resurrected take must never land.".to_string())
-                    }
+                    ("voice-skipped", _) => Ok("A resurrected take must never land.".to_string()),
                     ("voice-timeout", 0) => {
                         tokio::time::sleep(Duration::from_millis(80)).await;
                         Ok("A timed-out take must never land.".to_string())
@@ -1222,22 +1168,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            composer
-                .calls
-                .lock()
-                .unwrap()
-                .get("voice-skipped")
-                .copied(),
+            composer.calls.lock().unwrap().get("voice-skipped").copied(),
             Some(1),
             "a durable skip must never re-invoke a changing composer",
         );
         assert_eq!(
-            composer
-                .calls
-                .lock()
-                .unwrap()
-                .get("voice-timeout")
-                .copied(),
+            composer.calls.lock().unwrap().get("voice-timeout").copied(),
             Some(1),
             "a durable timeout must never re-invoke a changing composer",
         );
@@ -1387,7 +1323,10 @@ mod tests {
 
         // Only one non-otto take (nora) → NO synthesis.
         assert!(outcome.synthesis.is_none());
-        assert_eq!(outcome.skipped, vec!["bruno".to_string(), "mira".to_string()]);
+        assert_eq!(
+            outcome.skipped,
+            vec!["bruno".to_string(), "mira".to_string()]
+        );
         // Otto spoke exactly once (his peer take), never a wrap-up.
         let sent = sink.sent.lock().unwrap();
         assert_eq!(sent.iter().filter(|(bot, _)| bot == "otto").count(), 1);
@@ -1469,11 +1408,24 @@ mod tests {
         .unwrap();
 
         let sent = sink.sent.lock().unwrap();
-        assert_eq!(sent.len(), 5, "four takes and the synthesis should still land");
+        assert_eq!(
+            sent.len(),
+            5,
+            "four takes and the synthesis should still land"
+        );
         for (_, text) in sent.iter() {
-            assert!(!text.contains("Nora 💬"), "self-attribution leaked: {text:?}");
-            assert!(!text.contains("Zephyra"), "off-roster claim leaked: {text:?}");
-            assert!(!text.contains("got this one"), "persona handoff leaked: {text:?}");
+            assert!(
+                !text.contains("Nora 💬"),
+                "self-attribution leaked: {text:?}"
+            );
+            assert!(
+                !text.contains("Zephyra"),
+                "off-roster claim leaked: {text:?}"
+            );
+            assert!(
+                !text.contains("got this one"),
+                "persona handoff leaked: {text:?}"
+            );
             assert!(
                 !["system", "gateway", "pipeline"]
                     .iter()
@@ -1483,8 +1435,16 @@ mod tests {
             assert!(!text.contains("W29"), "machine shorthand leaked: {text:?}");
             assert!(!text.contains("**"), "markdown leaked: {text:?}");
         }
-        assert_eq!(sent[1].1, "Pasta sounds great.", "safe copy must stay unchanged");
-        assert!(outcome.takes.iter().all(|take| !take.text.contains("Zephyra")));
+        assert_eq!(
+            sent[1].1, "Pasta sounds great.",
+            "safe copy must stay unchanged"
+        );
+        assert!(
+            outcome
+                .takes
+                .iter()
+                .all(|take| !take.text.contains("Zephyra"))
+        );
         assert!(
             !outcome
                 .synthesis
@@ -1508,11 +1468,14 @@ mod tests {
 
     #[test]
     fn opaque_synthesizer_id_is_configured() {
-        let plan = plan_round(&[
-            "ember".to_string(),
-            "quartz".to_string(),
-            "harbor".to_string(),
-        ], Some("harbor"));
+        let plan = plan_round(
+            &[
+                "ember".to_string(),
+                "quartz".to_string(),
+                "harbor".to_string(),
+            ],
+            Some("harbor"),
+        );
         assert_eq!(plan.take_voices.len(), 3);
         assert_eq!(plan.synthesizer.as_deref(), Some("harbor"));
 

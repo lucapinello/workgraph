@@ -586,15 +586,30 @@ pub const COLLECTIVE_TRIGGERS: &[&str] = &[
 /// tokens of 4+ chars (so "helo"/"ciap" still open), exact for the short ones
 /// ("hey"/"hi"/"yo") to avoid firing on unrelated 2–3 letter words. Tunable.
 pub const GREETING_TOKENS: &[&str] = &[
-    "hey", "hi", "hello", "hiya", "heya", "yo", "sup", "howdy", "ciao", "hola",
+    "hey",
+    "hi",
+    "hello",
+    "hiya",
+    "heya",
+    "yo",
+    "sup",
+    "howdy",
+    "ciao",
+    "hola",
     "hallo",
     // Time-of-day greetings, written as one word ("goodnight", "goodmorning").
     // The two-word forms ("good night", "good morning") are handled by
     // [`is_greeting_shaped`], which pairs a leading "good"/"g" with the
     // time-of-day word so bare "morning"/"night" don't count as greetings.
-    "goodnight", "goodmorning", "goodevening", "goodafternoon",
+    "goodnight",
+    "goodmorning",
+    "goodevening",
+    "goodafternoon",
     // Italian
-    "buongiorno", "buonasera", "buonanotte", "salve",
+    "buongiorno",
+    "buonasera",
+    "buonanotte",
+    "salve",
 ];
 
 /// Time-of-day words that turn a leading "good"/"g" into a greeting
@@ -610,8 +625,17 @@ pub const TIME_OF_DAY_WORDS: &[&str] = &["morning", "evening", "afternoon", "nig
 /// (see [`is_greeting_collective`]), so it can safely include the looser "guys"
 /// / "folks" / "all" that would over-fire on their own.
 pub const BROAD_ADDRESS_TOKENS: &[&str] = &[
-    "guys", "folks", "all", "y'all", "yall", "everyone", "everybody", "team",
-    "ragazzi", "ragazza", "tutti",
+    "guys",
+    "folks",
+    "all",
+    "y'all",
+    "yall",
+    "everyone",
+    "everybody",
+    "team",
+    "ragazzi",
+    "ragazza",
+    "tutti",
 ];
 
 /// Plural-you follower words: when one *immediately follows* "you"/"u" it turns
@@ -620,15 +644,38 @@ pub const BROAD_ADDRESS_TOKENS: &[&str] = &[
 /// a third-person "the guys"/"those guys" (no leading "you"), which stays
 /// concierge. Fuzzy-matched for 4+ chars. See [`is_plural_you_address`].
 pub const PLURAL_YOU_FOLLOWERS: &[&str] = &[
-    "guys", "all", "folks", "both", "two", "lot", "everyone", "everybody",
-    "team", "crew", "gang", "people", "ragazzi", "tutti", "yous",
+    "guys",
+    "all",
+    "folks",
+    "both",
+    "two",
+    "lot",
+    "everyone",
+    "everybody",
+    "team",
+    "crew",
+    "gang",
+    "people",
+    "ragazzi",
+    "tutti",
+    "yous",
 ];
 
 /// Nouns that, following "the whole …", name the family as one body — "the whole
 /// team/family/crew". Fuzzy-matched for 4+ chars. See [`is_plural_you_address`].
 pub const WHOLE_GROUP_NOUNS: &[&str] = &[
-    "team", "family", "crew", "gang", "group", "household", "fam", "bunch", "lot",
-    "squad", "gruppo", "famiglia",
+    "team",
+    "family",
+    "crew",
+    "gang",
+    "group",
+    "household",
+    "fam",
+    "bunch",
+    "lot",
+    "squad",
+    "gruppo",
+    "famiglia",
 ];
 
 /// Opening gratitude tokens ("thanks", "thank", "thx", "grazie", "cheers"). A
@@ -636,8 +683,8 @@ pub const WHOLE_GROUP_NOUNS: &[&str] = &[
 /// even when it names the family ("thanks everyone", "thank you all"). Fuzzy for
 /// 4+ chars. See [`is_gratitude_opener`].
 pub const GRATITUDE_OPENERS: &[&str] = &[
-    "thanks", "thank", "thankyou", "thanx", "thx", "ty", "tysm", "grazie",
-    "cheers", "gracias", "merci",
+    "thanks", "thank", "thankyou", "thanx", "thx", "ty", "tysm", "grazie", "cheers", "gracias",
+    "merci",
 ];
 
 /// Endearment verbs ("love you all", "miss you guys"). When one *opens* the
@@ -645,15 +692,26 @@ pub const GRATITUDE_OPENERS: &[&str] = &[
 /// is the object of affection — small-talk the bots stay out of — not an address
 /// asking the family to weigh in. Fuzzy for 4+ chars. See [`is_plural_you_address`].
 pub const ENDEARMENT_VERBS: &[&str] = &[
-    "love", "loved", "loves", "loving", "miss", "missed", "adore", "adored",
-    "appreciate", "bless", "cherish", "hug", "hugs",
+    "love",
+    "loved",
+    "loves",
+    "loving",
+    "miss",
+    "missed",
+    "adore",
+    "adored",
+    "appreciate",
+    "bless",
+    "cherish",
+    "hug",
+    "hugs",
 ];
 
 /// Interjections/verbs that, immediately before a family name, mark it as an
 /// *address* rather than narrative mention ("tell bruno", "hey nora"). Tunable.
 pub const ADDRESSING_CUES: &[&str] = &[
-    "tell", "ask", "hey", "hi", "hello", "get", "ping", "summon", "call", "tag",
-    "notify", "remind", "yo", "ciao",
+    "tell", "ask", "hey", "hi", "hello", "get", "ping", "summon", "call", "tag", "notify",
+    "remind", "yo", "ciao",
 ];
 
 /// Words that, immediately AFTER a leading family name, signal it is a vocative
@@ -663,9 +721,9 @@ pub const ADDRESSING_CUES: &[&str] = &[
 /// ("nora **from** work said hi") does NOT — the cheap fix for the
 /// name-about-a-human false positive. Tunable.
 pub const ADDRESS_FOLLOWERS: &[&str] = &[
-    "can", "could", "would", "will", "please", "pls", "plz", "what", "what's",
-    "whats", "when", "where", "why", "how", "do", "does", "did", "are", "is",
-    "you", "u", "help", "we", "let's", "lets", "i'm", "im", "i",
+    "can", "could", "would", "will", "please", "pls", "plz", "what", "what's", "whats", "when",
+    "where", "why", "how", "do", "does", "did", "are", "is", "you", "u", "help", "we", "let's",
+    "lets", "i'm", "im", "i",
 ];
 
 /// Indefinite-agent words that ask "someone in the group" rather than a named
@@ -676,22 +734,77 @@ pub const INDEFINITE_AGENTS: &[&str] = &["someone", "somebody", "anyone", "anybo
 /// these is plausibly *for the team* (the concierge) rather than idle chatter.
 /// Tunable — this is the heart of the e-vs-f (ask-vs-small-talk) boundary.
 pub const DOMAIN_KEYWORDS: &[&str] = &[
-    "dinner", "lunch", "breakfast", "meal", "meals", "menu", "food", "cook",
-    "cooking", "recipe",
-    "recipes", "grocery", "groceries", "shopping", "shop", "fridge", "pantry",
-    "plan", "planning", "schedule", "scheduling", "calendar", "remind", "reminder",
-    "reminders", "book", "booking", "appointment", "appointments", "week",
-    "weekend", "workout", "workouts", "exercise", "gym", "training", "chore",
-    "chores", "clean", "cleaning", "budget", "todo", "task", "tasks", "errand",
-    "errands", "dishes", "laundry",
+    "dinner",
+    "lunch",
+    "breakfast",
+    "meal",
+    "meals",
+    "menu",
+    "food",
+    "cook",
+    "cooking",
+    "recipe",
+    "recipes",
+    "grocery",
+    "groceries",
+    "shopping",
+    "shop",
+    "fridge",
+    "pantry",
+    "plan",
+    "planning",
+    "schedule",
+    "scheduling",
+    "calendar",
+    "remind",
+    "reminder",
+    "reminders",
+    "book",
+    "booking",
+    "appointment",
+    "appointments",
+    "week",
+    "weekend",
+    "workout",
+    "workouts",
+    "exercise",
+    "gym",
+    "training",
+    "chore",
+    "chores",
+    "clean",
+    "cleaning",
+    "budget",
+    "todo",
+    "task",
+    "tasks",
+    "errand",
+    "errands",
+    "dishes",
+    "laundry",
 ];
 
 /// Sentence-lead phrases that mark a request aimed at the group ("can we …",
 /// "let's …", "who can …") rather than a specific person.
 pub const REQUEST_LEADS: &[&str] = &[
-    "can we", "could we", "should we", "shall we", "let's", "lets ", "we need",
-    "we should", "who can", "who could", "who wants", "can someone", "can somebody",
-    "could someone", "could somebody", "can anyone", "does anyone", "is anyone",
+    "can we",
+    "could we",
+    "should we",
+    "shall we",
+    "let's",
+    "lets ",
+    "we need",
+    "we should",
+    "who can",
+    "who could",
+    "who wants",
+    "can someone",
+    "can somebody",
+    "could someone",
+    "could somebody",
+    "can anyone",
+    "does anyone",
+    "is anyone",
 ];
 
 /// Multi-word discussion/opinion phrases. A COLLECTIVELY-elected message that
@@ -728,10 +841,22 @@ pub const DISCUSSION_TRIGGERS: &[&[&str]] = &[
 /// Kept to words that a plain group *greeting* never contains, so gating a round
 /// on them can never turn "hey guys" into a deliberation. See [`is_discussion_ask`].
 pub const DISCUSSION_WORDS: &[&str] = &[
-    "discuss", "discussion", "debate", "consensus", "deliberate", "brainstorm",
-    "thoughts", "opinions", "opinion", "reckon", "disagree",
+    "discuss",
+    "discussion",
+    "debate",
+    "consensus",
+    "deliberate",
+    "brainstorm",
+    "thoughts",
+    "opinions",
+    "opinion",
+    "reckon",
+    "disagree",
     // Italian
-    "discutere", "consenso", "opinione", "opinioni",
+    "discutere",
+    "consenso",
+    "opinione",
+    "opinioni",
 ];
 
 /// Discussion *verbs* — the imperative/hortative core of a "let's talk this
@@ -740,16 +865,21 @@ pub const DISCUSSION_WORDS: &[&str] = &[
 /// ([`DISCUSSION_VERB_CUES`]), reads as a deliberation invitation even without a
 /// question mark. Fuzzy-matched for 4+ chars. See [`is_discussion_ask`].
 pub const DISCUSSION_VERBS: &[&str] = &[
-    "discuss", "debate", "deliberate", "brainstorm", "discutere", "dibattere",
+    "discuss",
+    "debate",
+    "deliberate",
+    "brainstorm",
+    "discutere",
+    "dibattere",
 ];
 
 /// Request/hortative cues that, immediately before a [`DISCUSSION_VERBS`] verb,
 /// mark it as an *ask to the group* ("let's **discuss**", "can you guys
 /// **debate**", "we should **brainstorm**"). Fuzzy-matched for 4+ chars.
 pub const DISCUSSION_VERB_CUES: &[&str] = &[
-    "let's", "lets", "let", "please", "pls", "plz", "can", "could", "would",
-    "will", "should", "you", "u", "guys", "we", "everyone", "all", "y'all",
-    "yall", "someone", "anyone", "gonna", "wanna",
+    "let's", "lets", "let", "please", "pls", "plz", "can", "could", "would", "will", "should",
+    "you", "u", "guys", "we", "everyone", "all", "y'all", "yall", "someone", "anyone", "gonna",
+    "wanna",
 ];
 
 /// Who should respond to a de-duplicated inbound group message.
@@ -893,7 +1023,11 @@ fn word_list(text: &str) -> Vec<String> {
 fn edit_distance_le_1(a: &str, b: &str) -> bool {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let (longer, shorter) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let (longer, shorter) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     let ldiff = longer.len() - shorter.len();
     if ldiff > 1 {
         return false;
@@ -983,7 +1117,10 @@ pub fn is_greeting_shaped(text: &str) -> bool {
         Some(f) => f.as_str(),
         None => return false,
     };
-    if GREETING_TOKENS.iter().any(|g| fuzzy_token_matches(first, g)) {
+    if GREETING_TOKENS
+        .iter()
+        .any(|g| fuzzy_token_matches(first, g))
+    {
         return true;
     }
     // "good <morning|night|…>" / "g'night" — a leading good-wish + time-of-day.
@@ -1289,9 +1426,8 @@ fn addressed_display_name_bot(
             }
 
             let end = start + name_words.len() - 1;
-            let last = raw_words[end].trim_start_matches(|c: char| {
-                !c.is_alphanumeric() && c != '_' && c != '@'
-            });
+            let last = raw_words[end]
+                .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '@');
             let last_word =
                 last.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'');
             let trailing = last.strip_prefix(last_word).unwrap_or_default();
@@ -1414,8 +1550,7 @@ pub fn is_team_directed_ask(text: &str) -> bool {
     let has_indefinite = INDEFINITE_AGENTS.iter().any(|w| words.contains(*w));
     let has_domain = DOMAIN_KEYWORDS.iter().any(|w| words.contains(*w));
     let request_lead = REQUEST_LEADS.iter().any(|p| lower.starts_with(p));
-    let human_directed =
-        words.contains("you") || words.contains("your") || words.contains("u");
+    let human_directed = words.contains("you") || words.contains("your") || words.contains("u");
 
     // Strongest signal: explicitly asking "someone/anyone" in the group.
     if has_indefinite && (is_question || has_domain || request_lead) {
@@ -1491,8 +1626,7 @@ fn concierge_bot(
     config: &TelegramConfig,
     owner_map: &crate::notify::ownership::OwnerMap,
 ) -> Option<ResolvedBot> {
-    let owner =
-        owner_map.owner_for_domain(crate::notify::ownership::Domain::Coordination)?;
+    let owner = owner_map.owner_for_domain(crate::notify::ownership::Domain::Coordination)?;
     resolve_mentioned_bot(owner, config)
 }
 
@@ -2324,19 +2458,18 @@ mod tests {
 
         // The three forms Telegram delivers `/standup` in a group.
         for text in ["/standup", "/standup@otto_casapinello_bot", "wg standup"] {
-            let body =
-                match route_natural_with_owner_map(
-                    Some("supergroup"),
-                    Some("-100999"),
-                    text,
-                    &[],
-                    None,
-                    &cfg,
-                    &crate::notify::ownership::OwnerMap::casa_default(),
-                ) {
-                    NaturalRoute::ToBot { body, .. } => body,
-                    other => panic!("expected ToBot for {text:?}, got {other:?}"),
-                };
+            let body = match route_natural_with_owner_map(
+                Some("supergroup"),
+                Some("-100999"),
+                text,
+                &[],
+                None,
+                &cfg,
+                &crate::notify::ownership::OwnerMap::casa_default(),
+            ) {
+                NaturalRoute::ToBot { body, .. } => body,
+                other => panic!("expected ToBot for {text:?}, got {other:?}"),
+            };
             assert!(
                 standup::is_standup_command(&body),
                 "listener must intercept {text:?} (routed body {body:?})"
@@ -2546,7 +2679,11 @@ mod tests {
         ] {
             let resolved = resolve_mentioned_bot(handle, &cfg)
                 .unwrap_or_else(|| panic!("{handle} must resolve without a configured username"));
-            assert_eq!(resolved.agent_id.as_deref(), Some(agent), "handle {handle:?}");
+            assert_eq!(
+                resolved.agent_id.as_deref(),
+                Some(agent),
+                "handle {handle:?}"
+            );
         }
     }
 
@@ -2596,7 +2733,10 @@ mod tests {
     fn parse_at_mention_tokens_strips_trailing_punctuation() {
         // `@bruno?` must yield the clean handle `bruno` (not `bruno?`), so the
         // mention resolves instead of silently degrading.
-        assert_eq!(parse_at_mention_tokens("@bruno?"), vec!["bruno".to_string()]);
+        assert_eq!(
+            parse_at_mention_tokens("@bruno?"),
+            vec!["bruno".to_string()]
+        );
         assert_eq!(
             parse_at_mention_tokens("@nora_casapinello_bot what about you?"),
             vec!["nora_casapinello_bot".to_string()]
@@ -2659,7 +2799,9 @@ mod tests {
                 &owner_map,
             );
             match &e {
-                Election::One { bot, addressed_by, .. } => {
+                Election::One {
+                    bot, addressed_by, ..
+                } => {
                     assert_eq!(bot.agent_id.as_deref(), Some(agent), "voice for {text:?}");
                     assert_eq!(*addressed_by, by, "addressed_by for {text:?}");
                 }
@@ -2668,7 +2810,11 @@ mod tests {
         };
         use crate::notify::ownership::Domain;
         // Food → the chef (Bruno), not Otto.
-        expect_one("pizza on friday", "bruno", AddressedBy::Domain(Domain::Cooking));
+        expect_one(
+            "pizza on friday",
+            "bruno",
+            AddressedBy::Domain(Domain::Cooking),
+        );
         // Workouts → Coach Mira.
         expect_one(
             "am I training tomorrow?",
@@ -2813,7 +2959,12 @@ domains = ["coordination", "calendar"]
         // BARE greetings — no domain ask — stay a warm whole-roster greeting, in
         // BOTH the single-human group and (for the explicit-broadcast forms) the
         // two-human group.
-        for t in ["hey", "hey guys are you around?", "morning everybody", "hello all"] {
+        for t in [
+            "hey",
+            "hey guys are you around?",
+            "morning everybody",
+            "hello all",
+        ] {
             assert!(
                 matches!(elect_solo(t, &[], None), Election::All { .. }),
                 "bare greeting {t:?} must stay collective, got {:?}",
@@ -2846,7 +2997,9 @@ domains = ["coordination", "calendar"]
             &crate::notify::ownership::OwnerMap::casa_default(),
         );
         match &e {
-            Election::One { bot, addressed_by, .. } => {
+            Election::One {
+                bot, addressed_by, ..
+            } => {
                 assert_eq!(bot.agent_id.as_deref(), Some("otto"));
                 assert_eq!(*addressed_by, AddressedBy::Name);
             }
@@ -2905,7 +3058,9 @@ domains = ["coordination", "calendar"]
         // roster (the four-bot bug), never the concierge (Otto).
         let single = elect(1);
         match &single {
-            Election::One { bot, addressed_by, .. } => {
+            Election::One {
+                bot, addressed_by, ..
+            } => {
                 assert_eq!(
                     bot.agent_id.as_deref(),
                     Some("nora"),
@@ -2955,9 +3110,9 @@ domains = ["coordination", "calendar"]
             )
         };
         let agent_of = |e: &Election| match e {
-            Election::One { bot, addressed_by, .. } => {
-                (bot.agent_id.clone(), Some(*addressed_by))
-            }
+            Election::One {
+                bot, addressed_by, ..
+            } => (bot.agent_id.clone(), Some(*addressed_by)),
             _ => (None, None),
         };
 
@@ -2981,7 +3136,10 @@ domains = ["coordination", "calendar"]
             (Some("otto".to_string()), Some(AddressedBy::ReplyChain))
         );
         // 4. collective greeting → the whole roster.
-        assert!(matches!(elect("hey everyone!", &[], None), Election::All { .. }));
+        assert!(matches!(
+            elect("hey everyone!", &[], None),
+            Election::All { .. }
+        ));
         // 5. unaddressed coordination ask → the concierge (otto). A food/workout
         //    ask instead reaches its domain owner (rung 5' below).
         assert_eq!(
@@ -2994,7 +3152,9 @@ domains = ["coordination", "calendar"]
             agent_of(&elect("what's for dinner tonight?", &[], None)),
             (
                 Some("nora".to_string()),
-                Some(AddressedBy::Domain(crate::notify::ownership::Domain::MealPlanning))
+                Some(AddressedBy::Domain(
+                    crate::notify::ownership::Domain::MealPlanning
+                ))
             )
         );
         // 6. pure small talk → silence.
@@ -3100,7 +3260,10 @@ domains = ["coordination", "calendar"]
         // Third-person "the guys" is NOT a second-person address — it stays a
         // single concierge answer, never a four-way broadcast.
         assert!(
-            !matches!(elect("tell the guys dinner is ready", &[], None), Election::All { .. }),
+            !matches!(
+                elect("tell the guys dinner is ready", &[], None),
+                Election::All { .. }
+            ),
             "third-person 'the guys' must not elect the roster"
         );
         assert!(
@@ -3155,7 +3318,10 @@ domains = ["coordination", "calendar"]
             "can you plan dinner?", // singular "you"
             "what's for dinner tonight?",
         ] {
-            assert!(!is_plural_you_address(t), "expected NOT plural-you for {t:?}");
+            assert!(
+                !is_plural_you_address(t),
+                "expected NOT plural-you for {t:?}"
+            );
         }
     }
 
@@ -3191,7 +3357,10 @@ domains = ["coordination", "calendar"]
             "hey folks what's for dinner tonight?", // a plain ask, not a debate
             "",
         ] {
-            assert!(!is_discussion_ask(t), "expected NOT discussion ask for {t:?}");
+            assert!(
+                !is_discussion_ask(t),
+                "expected NOT discussion ask for {t:?}"
+            );
         }
     }
 
@@ -3213,7 +3382,11 @@ domains = ["coordination", "calendar"]
             ("what do you all think?", true, true),
             // A discussion ask with NO second-person-plural address is promoted to
             // collective too (would otherwise be swallowed to the concierge).
-            ("let's discuss the weekend plan and find consensus", true, true),
+            (
+                "let's discuss the weekend plan and find consensus",
+                true,
+                true,
+            ),
             ("thoughts on the holiday plan everyone?", true, true),
             // Collective greeting → collective, but NOT a round.
             ("hey guys are you around?", true, false),
@@ -3349,8 +3522,16 @@ domains = ["coordination", "calendar"]
 
     #[test]
     fn elect_group_without_chat_id_is_silence_no_chat() {
-        let e =
-            elect_responders(Some("group"), None, "hey guys", &[], None, false, 2, &casa_config());
+        let e = elect_responders(
+            Some("group"),
+            None,
+            "hey guys",
+            &[],
+            None,
+            false,
+            2,
+            &casa_config(),
+        );
         assert_eq!(e, Election::Silence(SilenceReason::NoChatId));
     }
 
@@ -3506,7 +3687,10 @@ domains = ["coordination", "calendar"]
         // wrongly elected silence:small-talk. A human reads this as an
         // unambiguous group summon → the whole roster now answers.
         assert!(
-            matches!(elect("hey guyd are you aroind?", &[], None), Election::All { .. }),
+            matches!(
+                elect("hey guyd are you aroind?", &[], None),
+                Election::All { .. }
+            ),
             "Luca's typo'd greeting-question must elect the collective, not silence"
         );
     }
@@ -3527,8 +3711,14 @@ domains = ["coordination", "calendar"]
     fn elect_more_typo_summons_are_collective() {
         // Fuzzy trigger phrase ("hi guyz") and fuzzy greeting-question openers.
         assert!(matches!(elect("hi guyz!", &[], None), Election::All { .. }));
-        assert!(matches!(elect("hey are you all aroind?", &[], None), Election::All { .. }));
-        assert!(matches!(elect("helo everyone up yet?", &[], None), Election::All { .. }));
+        assert!(matches!(
+            elect("hey are you all aroind?", &[], None),
+            Election::All { .. }
+        ));
+        assert!(matches!(
+            elect("helo everyone up yet?", &[], None),
+            Election::All { .. }
+        ));
     }
 
     #[test]
@@ -3592,8 +3782,15 @@ domains = ["coordination", "calendar"]
         // Every greeting shape earns a brief roster greeting in a single-human
         // group, including typo'd and time-of-day forms.
         for t in [
-            "hi", "hey", "helo", "hey there", "goodnight", "goodmorning",
-            "good morning", "good night", "buongiorno",
+            "hi",
+            "hey",
+            "helo",
+            "hey there",
+            "goodnight",
+            "goodmorning",
+            "good morning",
+            "good night",
+            "buongiorno",
         ] {
             assert!(
                 matches!(elect_solo(t, &[], None), Election::All { .. }),
@@ -3624,7 +3821,11 @@ domains = ["coordination", "calendar"]
     fn elect_solo_still_honours_named_mention_and_ask_precedence() {
         // Membership only changes the d/e/f *fallback*. Explicit targets and
         // team-directed asks still win exactly as before, even in a solo group.
-        assert_one(&elect_solo("nora, hi", &[], None), "nora", AddressedBy::Name);
+        assert_one(
+            &elect_solo("nora, hi", &[], None),
+            "nora",
+            AddressedBy::Name,
+        );
         assert_one(
             &elect_solo("can someone sort out the logistics?", &[], None),
             "otto",
@@ -3764,11 +3965,17 @@ domains = ["coordination", "calendar"]
         assert!(addressed_name_bot("i saw bruno at the shop", &cfg).is_none());
         // But real addresses resolve:
         assert_eq!(
-            addressed_name_bot("nora, thanks", &cfg).unwrap().agent_id.as_deref(),
+            addressed_name_bot("nora, thanks", &cfg)
+                .unwrap()
+                .agent_id
+                .as_deref(),
             Some("nora")
         );
         assert_eq!(
-            addressed_name_bot("hey mira", &cfg).unwrap().agent_id.as_deref(),
+            addressed_name_bot("hey mira", &cfg)
+                .unwrap()
+                .agent_id
+                .as_deref(),
             Some("mira")
         );
     }
@@ -3791,8 +3998,7 @@ domains = ["cooking"]
 "#,
         )
         .unwrap();
-        let owners =
-            crate::notify::ownership::OwnerMap::from_household_toml(root.path()).unwrap();
+        let owners = crate::notify::ownership::OwnerMap::from_household_toml(root.path()).unwrap();
         let config = cfg_with_bots(&[
             ("unit-7", "-100999", Some("unit-7"), Some("opaque_one_bot")),
             ("unit-2", "-100999", Some("unit-2"), Some("opaque_two_bot")),
@@ -3891,8 +4097,16 @@ domains = ["cooking"]
 
     #[test]
     fn decision_line_for_silence_no_chat_id() {
-        let election =
-            elect_responders(Some("group"), None, "hey guys", &[], None, false, 2, &casa_config());
+        let election = elect_responders(
+            Some("group"),
+            None,
+            "hey guys",
+            &[],
+            None,
+            false,
+            2,
+            &casa_config(),
+        );
         let line = election_decision_summary(None, Some("group"), &election);
         // No transport message id → "none"; reason surfaced in the rule.
         assert_eq!(
@@ -3947,10 +4161,8 @@ domains = ["cooking"]
         // A bot fronting no agent falls back to "<bot_id>(unbound)" — the target
         // is never blank, so the log always names a landing point.
         let cfg = cfg_with_bots(&[("harbor", "-100999", None, Some("harbor_bot"))]);
-        let owner_map = crate::notify::ownership::OwnerMap::from_pairs([(
-            "harbor",
-            vec!["coordination"],
-        )]);
+        let owner_map =
+            crate::notify::ownership::OwnerMap::from_pairs([("harbor", vec!["coordination"])]);
         let election = elect_responders_with_owner_map(
             Some("supergroup"),
             Some("-100999"),
@@ -4049,7 +4261,9 @@ domains = ["cooking"]
             &crate::notify::ownership::OwnerMap::casa_default(),
         );
         match &election {
-            Election::One { bot, addressed_by, .. } => {
+            Election::One {
+                bot, addressed_by, ..
+            } => {
                 assert_eq!(
                     bot.agent_id.as_deref(),
                     Some("nora"),

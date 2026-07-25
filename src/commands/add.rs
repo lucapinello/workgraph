@@ -1595,7 +1595,8 @@ mod tests {
             None,
             None,
             None,
-            false)
+            false,
+        )
     }
 
     fn write_max_task_depth_config(dir: &Path, max_depth: u32) {

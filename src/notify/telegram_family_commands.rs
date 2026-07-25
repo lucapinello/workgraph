@@ -203,8 +203,17 @@ pub fn compose(cmd: &FamilyCommand, ctx: &CommandContext<'_>) -> String {
 /// whole-ish tokens so ordinary family words ("ready in ten minutes") don't trip
 /// it. See `fix-command-leaks`.
 const OPERATOR_VOCAB: &[&str] = &[
-    "claim ", "unclaim", "wg claim", "wg done", "workgraph", "task id", "task_id",
-    "coordinator", "`claim", "`done", "`status`",
+    "claim ",
+    "unclaim",
+    "wg claim",
+    "wg done",
+    "workgraph",
+    "task id",
+    "task_id",
+    "coordinator",
+    "`claim",
+    "`done",
+    "`status`",
 ];
 
 /// Whether `text` is safe to render into a FAMILY chat: no markdown code
@@ -361,9 +370,7 @@ fn compose_help(_ctx: &CommandContext<'_>) -> String {
     for cmd in FAMILY_COMMANDS {
         out.push_str(&format!("\n{} — {}", cmd.keyword, cmd.description));
     }
-    out.push_str(
-        "\n\nType any of these in the group, or message a bot directly — either works.",
-    );
+    out.push_str("\n\nType any of these in the group, or message a bot directly — either works.");
     out
 }
 
@@ -423,7 +430,14 @@ fn upcoming_scheduled(ctx: &CommandContext<'_>) -> Vec<String> {
             if fire < ctx.now {
                 return None;
             }
-            Some((fire, format!("{} — {}", bullet_title(&t.title), friendly_when(fire, ctx.now))))
+            Some((
+                fire,
+                format!(
+                    "{} — {}",
+                    bullet_title(&t.title),
+                    friendly_when(fire, ctx.now)
+                ),
+            ))
         })
         .collect();
     items.sort_by_key(|(when, _)| *when);
@@ -457,7 +471,10 @@ fn friendly_when(when: DateTime<Utc>, now: DateTime<Utc>) -> String {
 /// True when a task is assigned to one of the known human operators (checking
 /// both the resolved `agent` and the human-friendly `assigned` fields).
 fn task_is_human(task: &crate::graph::Task, humans: &HashSet<String>) -> bool {
-    task.agent.as_deref().map(|a| humans.contains(a)).unwrap_or(false)
+    task.agent
+        .as_deref()
+        .map(|a| humans.contains(a))
+        .unwrap_or(false)
         || task
             .assigned
             .as_deref()
@@ -567,10 +584,15 @@ mod tests {
             let kw = cmd.keyword;
             assert_eq!(match_command(kw).unwrap().keyword, kw);
             assert_eq!(
-                match_command(&format!("{kw}@bruno_chef_bot")).unwrap().keyword,
+                match_command(&format!("{kw}@bruno_chef_bot"))
+                    .unwrap()
+                    .keyword,
                 kw
             );
-            assert_eq!(match_command(&format!("  {kw} please ")).unwrap().keyword, kw);
+            assert_eq!(
+                match_command(&format!("  {kw} please ")).unwrap().keyword,
+                kw
+            );
             assert_eq!(
                 match_command(&format!("wg {}", kw.trim_start_matches('/')))
                     .unwrap()
@@ -674,7 +696,10 @@ mod tests {
         let out = compose_week(&c);
         assert!(out.contains("Monday"), "weekday name, not a date: {out}");
         assert!(!out.contains("07-13"), "no raw dates: {out}");
-        assert!(out.contains("Chickpea & spinach curry"), "meal grounded: {out}");
+        assert!(
+            out.contains("Chickpea & spinach curry"),
+            "meal grounded: {out}"
+        );
         assert!(out.contains("Workouts:"), "workouts line: {out}");
         assert!(out.contains("Luca"), "workout person: {out}");
     }
@@ -751,10 +776,7 @@ mod tests {
         let by = |kw: &str| FAMILY_COMMANDS.iter().find(|c| c.keyword == kw).unwrap();
         let owners = OwnerMap::from_pairs([
             ("quartz", vec!["cooking", "recipes"]),
-            (
-                "harbor",
-                vec!["shopping", "calendar", "coordination"],
-            ),
+            ("harbor", vec!["shopping", "calendar", "coordination"]),
         ]);
         assert_eq!(by("/dinner").owner(&owners), Some("quartz"));
         assert_eq!(by("/shopping").owner(&owners), Some("harbor"));

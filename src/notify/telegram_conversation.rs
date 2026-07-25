@@ -478,19 +478,14 @@ pub fn plan_conversation(
 ) -> ConversationPlan {
     let root = project_root_of(workgraph_dir);
     let owner_map = ownership::OwnerMap::load(&root);
-    let coordination_owner =
-        owner_map.owner_for_domain(ownership::Domain::Coordination);
-    let bot_id = bot_id_for_channel_with_default(
-        config,
-        route_channel,
-        coordination_owner,
-    )
-    .unwrap_or_else(|| {
-        route_channel
-            .strip_prefix("telegram:")
-            .unwrap_or(route_channel)
-            .to_string()
-    });
+    let coordination_owner = owner_map.owner_for_domain(ownership::Domain::Coordination);
+    let bot_id = bot_id_for_channel_with_default(config, route_channel, coordination_owner)
+        .unwrap_or_else(|| {
+            route_channel
+                .strip_prefix("telegram:")
+                .unwrap_or(route_channel)
+                .to_string()
+        });
     let route = ReplyRoute {
         bot_id: bot_id.clone(),
         chat_id: reply_chat.to_string(),
@@ -652,10 +647,8 @@ fn delivery_claim_path(
     // The filename itself starts with `b3-v1-`, making its encoding version
     // explicit on disk. Hash all routing fields with a length-delimited
     // canonical encoding so the ledger exposes no household or bot ids.
-    let digest = durable_telegram_digest_v1(
-        "telegram-delivery-claim",
-        &[delivery_id, bot_id, chat_id],
-    );
+    let digest =
+        durable_telegram_digest_v1("telegram-delivery-claim", &[delivery_id, bot_id, chat_id]);
     Some(
         workgraph_dir
             .join("telegram-deliveries")
@@ -698,8 +691,7 @@ impl<'a> TurnDeliverySink<'a> {
         chat_id: &str,
         inner: &'a dyn ReplySink,
     ) -> Self {
-        let claim_path =
-            delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id);
+        let claim_path = delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id);
         let retry_path = claim_path.as_ref().map(|path| path.with_extension("retry"));
         Self {
             inner,
@@ -754,10 +746,7 @@ impl<'a> TurnDeliverySink<'a> {
         }
         match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => {
-                if let Err(error) = file
-                    .write_all(b"pending\n")
-                    .and_then(|_| file.sync_all())
-                {
+                if let Err(error) = file.write_all(b"pending\n").and_then(|_| file.sync_all()) {
                     drop(file);
                     let _ = std::fs::remove_file(path);
                     return Err(error).with_context(|| {
@@ -814,10 +803,8 @@ impl<'a> TurnDeliverySink<'a> {
             );
         }
         if let Some(retry_path) = self.retry_path.as_ref()
-            && let Err(error) = crate::atomic_file::write_atomic(
-                retry_path,
-                format!("{retry_state}\n").as_bytes(),
-            )
+            && let Err(error) =
+                crate::atomic_file::write_atomic(retry_path, format!("{retry_state}\n").as_bytes())
         {
             eprintln!(
                 "[{}] Telegram delivery ledger could not mark failed delivery retryable: {error}",
@@ -889,13 +876,7 @@ impl ReplySink for TurnDeliverySink<'_> {
         }
     }
 
-    async fn edit(
-        &self,
-        bot_id: &str,
-        chat_id: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<()> {
+    async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
         let state = self.state.lock().unwrap().clone();
         match state {
             TurnDeliveryState::Duplicate(_) => Ok(()),
@@ -1003,18 +984,14 @@ pub fn canonical_delivery_state(
     bot_id: &str,
     chat_id: &str,
 ) -> Result<CanonicalDeliveryState> {
-    let Some(claim_path) =
-        delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id)
-    else {
+    let Some(claim_path) = delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id) else {
         return Ok(CanonicalDeliveryState::Missing);
     };
     let canonical_path = claim_path.with_extension("canonical");
     let retry_path = claim_path.with_extension("retry");
     let canonical = read_optional_canonical(&canonical_path)?;
     let claim = match std::fs::read_to_string(&claim_path) {
-        Ok(body) => Some(
-            !body.trim().is_empty() && body.trim() != "pending",
-        ),
+        Ok(body) => Some(!body.trim().is_empty() && body.trim() != "pending"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(error).with_context(|| {
@@ -1033,18 +1010,10 @@ pub fn canonical_delivery_state(
     })?;
 
     Ok(match (canonical, claim, retry_exists) {
-        (Some(text), None, false) if text.is_empty() => {
-            CanonicalDeliveryState::Skipped
-        }
-        (Some(text), Some(true), _) if !text.is_empty() => {
-            CanonicalDeliveryState::Confirmed(text)
-        }
-        (Some(text), Some(false), _) if !text.is_empty() => {
-            CanonicalDeliveryState::Pending
-        }
-        (Some(text), None, _) if !text.is_empty() => {
-            CanonicalDeliveryState::Ready(text)
-        }
+        (Some(text), None, false) if text.is_empty() => CanonicalDeliveryState::Skipped,
+        (Some(text), Some(true), _) if !text.is_empty() => CanonicalDeliveryState::Confirmed(text),
+        (Some(text), Some(false), _) if !text.is_empty() => CanonicalDeliveryState::Pending,
+        (Some(text), None, _) if !text.is_empty() => CanonicalDeliveryState::Ready(text),
         (None, None, false) => CanonicalDeliveryState::Missing,
         _ => CanonicalDeliveryState::Unavailable,
     })
@@ -1060,9 +1029,7 @@ fn create_canonical_temp_file(
 ) -> std::io::Result<(PathBuf, std::fs::File)> {
     loop {
         let sequence = next_id.fetch_add(1, Ordering::Relaxed);
-        let temp_path = parent.join(format!(
-            ".{file_name}.tmp.{process_id}.{sequence}",
-        ));
+        let temp_path = parent.join(format!(".{file_name}.tmp.{process_id}.{sequence}",));
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1093,9 +1060,7 @@ fn persist_canonical_reply_once(
     chat_id: &str,
     text: &str,
 ) -> Result<String> {
-    let Some(claim_path) =
-        delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id)
-    else {
+    let Some(claim_path) = delivery_claim_path(workgraph_dir, delivery_id, bot_id, chat_id) else {
         return Ok(text.to_string());
     };
     let canonical_path = claim_path.with_extension("canonical");
@@ -1145,9 +1110,7 @@ fn persist_canonical_reply_once(
 
     let published = match std::fs::hard_link(&temp_path, &canonical_path) {
         Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            false
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) => {
             let _ = std::fs::remove_file(&temp_path);
             return Err(error).with_context(|| {
@@ -1194,15 +1157,7 @@ pub async fn send_canonical_reply_once(
         if text.is_empty() {
             return Ok(CanonicalDeliveryState::Skipped);
         }
-        send_reply_once(
-            workgraph_dir,
-            delivery_id,
-            bot_id,
-            chat_id,
-            text,
-            sink,
-        )
-        .await?;
+        send_reply_once(workgraph_dir, delivery_id, bot_id, chat_id, text, sink).await?;
         return Ok(CanonicalDeliveryState::Confirmed(text.to_string()));
     }
 
@@ -1210,12 +1165,7 @@ pub async fn send_canonical_reply_once(
     // a claim or retry without canonical bytes represents words this process
     // cannot know; attaching a newly composed draft would falsely bless those
     // bytes as already delivered.
-    match canonical_delivery_state(
-        workgraph_dir,
-        delivery_id,
-        bot_id,
-        chat_id,
-    )? {
+    match canonical_delivery_state(workgraph_dir, delivery_id, bot_id, chat_id)? {
         CanonicalDeliveryState::Confirmed(text) => {
             return Ok(CanonicalDeliveryState::Confirmed(text));
         }
@@ -1229,23 +1179,12 @@ pub async fn send_canonical_reply_once(
             return Ok(CanonicalDeliveryState::Unavailable);
         }
         CanonicalDeliveryState::Missing => {
-            persist_canonical_reply_once(
-                workgraph_dir,
-                delivery_id,
-                bot_id,
-                chat_id,
-                text,
-            )?;
+            persist_canonical_reply_once(workgraph_dir, delivery_id, bot_id, chat_id, text)?;
         }
         CanonicalDeliveryState::Ready(_) => {}
     }
 
-    let canonical = match canonical_delivery_state(
-        workgraph_dir,
-        delivery_id,
-        bot_id,
-        chat_id,
-    )? {
+    let canonical = match canonical_delivery_state(workgraph_dir, delivery_id, bot_id, chat_id)? {
         CanonicalDeliveryState::Confirmed(text) => {
             return Ok(CanonicalDeliveryState::Confirmed(text));
         }
@@ -1255,8 +1194,7 @@ pub async fn send_canonical_reply_once(
         CanonicalDeliveryState::Pending => {
             return Ok(CanonicalDeliveryState::Pending);
         }
-        CanonicalDeliveryState::Unavailable
-        | CanonicalDeliveryState::Missing => {
+        CanonicalDeliveryState::Unavailable | CanonicalDeliveryState::Missing => {
             return Ok(CanonicalDeliveryState::Unavailable);
         }
         CanonicalDeliveryState::Ready(text) => text,
@@ -1271,23 +1209,16 @@ pub async fn send_canonical_reply_once(
         sink,
     )
     .await?;
-    Ok(match canonical_delivery_state(
-        workgraph_dir,
-        delivery_id,
-        bot_id,
-        chat_id,
-    )? {
-        CanonicalDeliveryState::Confirmed(text) => {
-            CanonicalDeliveryState::Confirmed(text)
-        }
-        CanonicalDeliveryState::Pending => CanonicalDeliveryState::Pending,
-        CanonicalDeliveryState::Skipped
-        | CanonicalDeliveryState::Missing
-        | CanonicalDeliveryState::Ready(_)
-        | CanonicalDeliveryState::Unavailable => {
-            CanonicalDeliveryState::Unavailable
-        }
-    })
+    Ok(
+        match canonical_delivery_state(workgraph_dir, delivery_id, bot_id, chat_id)? {
+            CanonicalDeliveryState::Confirmed(text) => CanonicalDeliveryState::Confirmed(text),
+            CanonicalDeliveryState::Pending => CanonicalDeliveryState::Pending,
+            CanonicalDeliveryState::Skipped
+            | CanonicalDeliveryState::Missing
+            | CanonicalDeliveryState::Ready(_)
+            | CanonicalDeliveryState::Unavailable => CanonicalDeliveryState::Unavailable,
+        },
+    )
 }
 
 /// Production sink: resolves `bot_id` against the config and sends via that
@@ -1753,8 +1684,7 @@ impl ReplyComposer for OneshotComposer {
         agent_id: &str,
         human_message: &str,
     ) -> Result<String> {
-        let prompt =
-            build_compose_prompt(workgraph_dir, session_ref, agent_id, human_message);
+        let prompt = build_compose_prompt(workgraph_dir, session_ref, agent_id, human_message);
         let config = self.config.clone();
         let model = self.model_spec.clone();
         let timeout = self.timeout_secs;
@@ -1927,16 +1857,9 @@ pub async fn run_conversation_turn(
         // rewrite may have failed before transport did. Reapply the context-free
         // family guard so a still-dirty row can never bypass it on retry.
         let reply_text = if composer.is_none() {
-            let family_roster = grounding::load_family_voice_roster(
-                &project_root_of(workgraph_dir),
-                workgraph_dir,
-            );
-            guard_legacy_reply_and_sync_outbox(
-                workgraph_dir,
-                session_ref,
-                &reply,
-                &family_roster,
-            )
+            let family_roster =
+                grounding::load_family_voice_roster(&project_root_of(workgraph_dir), workgraph_dir);
+            guard_legacy_reply_and_sync_outbox(workgraph_dir, session_ref, &reply, &family_roster)
         } else {
             reply.content.clone()
         };
@@ -2021,12 +1944,7 @@ pub async fn run_conversation_turn(
                 let baseline = retry_legacy_baseline
                     .unwrap_or_else(|| outbox_baseline(workgraph_dir, session_ref));
                 if !resuming_failed_attempt {
-                    chat::append_inbox_ref(
-                        workgraph_dir,
-                        session_ref,
-                        human_message,
-                        request_id,
-                    )?;
+                    chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id)?;
                 }
                 let outcome = await_session_reply(
                     workgraph_dir,
@@ -2062,9 +1980,7 @@ async fn deliver_persisted_reply(
     text: &str,
 ) -> Result<()> {
     match ack_mid {
-        Some(mid) if !mid.is_empty() => {
-            sink.edit(&route.bot_id, &route.chat_id, mid, text).await
-        }
+        Some(mid) if !mid.is_empty() => sink.edit(&route.bot_id, &route.chat_id, mid, text).await,
         _ => sink
             .send(&route.bot_id, &route.chat_id, text)
             .await
@@ -2089,9 +2005,7 @@ async fn deliver_reply(
     let guarded = grounding::enforce_family_voice_with(
         text,
         roster,
-        grounding::FamilyVoiceOptions {
-            authorized_handoff,
-        },
+        grounding::FamilyVoiceOptions { authorized_handoff },
     );
     if guarded != text {
         eprintln!(
@@ -2264,15 +2178,7 @@ async fn persist_and_deliver_glitch(
         sink.rearm_incomplete_ack();
         return Err(error);
     }
-    deliver_reply(
-        sink,
-        route,
-        ack_mid,
-        &reply,
-        family_roster,
-        None,
-    )
-    .await
+    deliver_reply(sink, route, ack_mid, &reply, family_roster, None).await
 }
 
 /// Drive a bounded compose turn: race the composer against the ack/timeout
@@ -2299,10 +2205,8 @@ async fn run_composed_turn(
     // Load the authoritative project-local roster once for every dynamic send
     // this turn. The delivery choke point reuses it for graph answers, compose
     // failures/timeouts, and the finalized answer.
-    let family_roster = grounding::load_family_voice_roster(
-        &project_root_of(workgraph_dir),
-        workgraph_dir,
-    );
+    let family_roster =
+        grounding::load_family_voice_roster(&project_root_of(workgraph_dir), workgraph_dir);
 
     // "Are they done yet?" — a status question from someone with recent
     // origin-stamped tasks is answered from LIVE graph state, not a generic chat
@@ -2325,17 +2229,10 @@ async fn run_composed_turn(
     // ("Nadin is not logged so ignore this"), persist it BEFORE we compose so
     // the very reply to this turn honours it (`build_compose_prompt` replays
     // every recorded correction), and so does every future turn. Best-effort.
-    if !retrying_delivery
-        && let Some(correction) = grounding::detect_correction(human_message)
-    {
+    if !retrying_delivery && let Some(correction) = grounding::detect_correction(human_message) {
         let root = project_root_of(workgraph_dir);
         let stored = format!("{}{}", grounding::CORRECTION_PREFIX, correction);
-        match parity::PreferenceStore::record(
-            &root,
-            &stored,
-            &origin.requester,
-            &origin.persona,
-        ) {
+        match parity::PreferenceStore::record(&root, &stored, &origin.requester, &origin.persona) {
             Ok(_) => println!(
                 "[{}] conversation recorded correction (chat {})",
                 chrono::Utc::now().format("%H:%M:%S"),
@@ -2690,7 +2587,11 @@ async fn finalize_composed_reply(
     // calendar is strict — any schedule claim is then a fabrication.
     {
         let now = chrono::Local::now().naive_local();
-        let sched = grounding::fetch_schedule_grounding(&project_root_of(workgraph_dir), now, human_message);
+        let sched = grounding::fetch_schedule_grounding(
+            &project_root_of(workgraph_dir),
+            now,
+            human_message,
+        );
         let unsourced = grounding::find_unsourced_schedule_claims(&reply_text, &sched);
         if !unsourced.is_empty() {
             eprintln!(
@@ -2719,7 +2620,10 @@ async fn finalize_composed_reply(
             eprintln!(
                 "[{}] never-claim-empty guard: {agent_id}'s draft claims planned day(s) {:?} are empty — rewriting to the honest dish",
                 chrono::Utc::now().format("%H:%M:%S"),
-                false_empty.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(),
+                false_empty
+                    .iter()
+                    .map(|(d, _)| d.as_str())
+                    .collect::<Vec<_>>(),
             );
             reply_text = grounding::week_grounding_rewrite(&false_empty);
         }
@@ -2815,7 +2719,11 @@ fn try_create_origin_task(
             eprintln!(
                 "[{}] creation choke-point off-domain guard: {} does not own a {} task — re-stamping ownership to {}",
                 chrono::Utc::now().format("%H:%M:%S"),
-                if origin.persona.is_empty() { "an unnamed voice" } else { origin.persona.as_str() },
+                if origin.persona.is_empty() {
+                    "an unnamed voice"
+                } else {
+                    origin.persona.as_str()
+                },
                 ownership::classify_domain(human_message).slug(),
                 owner,
             );
@@ -2941,10 +2849,7 @@ fn try_create_origin_task(
 /// guard to create a re-routed task under the domain owner while keeping the
 /// chat/requester the ask arrived with, so the lifecycle loop still reports back
 /// to the right conversation.
-fn origin_as_persona(
-    origin: &crate::graph::TaskOrigin,
-    persona: &str,
-) -> crate::graph::TaskOrigin {
+fn origin_as_persona(origin: &crate::graph::TaskOrigin, persona: &str) -> crate::graph::TaskOrigin {
     let mut owned = origin.clone();
     owned.persona = persona.trim().to_string();
     owned
@@ -2962,21 +2867,14 @@ fn speaker_is_owner(origin: &crate::graph::TaskOrigin, owner: &str) -> bool {
     }
     let matches_owner = |id: &str| {
         let id = id.trim().to_ascii_lowercase();
-        id == owner
-            || id.starts_with(&format!("{owner}_"))
-            || id.starts_with(&format!("{owner}-"))
+        id == owner || id.starts_with(&format!("{owner}_")) || id.starts_with(&format!("{owner}-"))
     };
-    matches_owner(&origin.persona)
-        || origin.bot_id.as_deref().map(matches_owner).unwrap_or(false)
+    matches_owner(&origin.persona) || origin.bot_id.as_deref().map(matches_owner).unwrap_or(false)
 }
 
 /// Persist a standing preference to the durable store under the project's
 /// `.casa/`, best-effort (a write failure must never block the reply).
-fn record_standing_preference(
-    workgraph_dir: &Path,
-    text: &str,
-    origin: &crate::graph::TaskOrigin,
-) {
+fn record_standing_preference(workgraph_dir: &Path, text: &str, origin: &crate::graph::TaskOrigin) {
     let root = project_root_of(workgraph_dir);
     match parity::PreferenceStore::record(&root, text, &origin.requester, &origin.persona) {
         Ok(_) => println!(
@@ -3017,10 +2915,8 @@ async fn await_session_reply(
     sink: &dyn ReplySink,
     initial_ack_message_id: Option<&str>,
 ) -> Result<TurnOutcome> {
-    let family_roster = grounding::load_family_voice_roster(
-        &project_root_of(workgraph_dir),
-        workgraph_dir,
-    );
+    let family_roster =
+        grounding::load_family_voice_roster(&project_root_of(workgraph_dir), workgraph_dir);
     let start = Instant::now();
     let mut acked = initial_ack_message_id.is_some();
     let mut ack_mid = initial_ack_message_id.map(str::to_string);
@@ -3101,19 +2997,13 @@ mod tests {
             "telegram-delivery-claim",
             &["physical-turn-42", "voice-7", "-100700"],
         );
-        let expected =
-            "b3-v1-4b104375ef8b7da0364f0eed5c0d3d89892964585c454af7859842b60ec24db9";
+        let expected = "b3-v1-4b104375ef8b7da0364f0eed5c0d3d89892964585c454af7859842b60ec24db9";
         assert_eq!(digest, expected);
 
         let dir = tempdir().unwrap();
         let inner = RecSink::default();
-        let sink = TurnDeliverySink::new(
-            dir.path(),
-            "physical-turn-42",
-            "voice-7",
-            "-100700",
-            &inner,
-        );
+        let sink =
+            TurnDeliverySink::new(dir.path(), "physical-turn-42", "voice-7", "-100700", &inner);
         assert_eq!(
             sink.claim_path
                 .as_deref()
@@ -3145,10 +3035,11 @@ mod tests {
     #[async_trait]
     impl ReplySink for RecSink {
         async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
-            self.sent
-                .lock()
-                .unwrap()
-                .push((bot_id.to_string(), chat_id.to_string(), text.to_string()));
+            self.sent.lock().unwrap().push((
+                bot_id.to_string(),
+                chat_id.to_string(),
+                text.to_string(),
+            ));
             let mut n = self.next_id.lock().unwrap();
             *n += 1;
             Ok(Some(n.to_string()))
@@ -3187,13 +3078,9 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             let delivery_id = format!("legacy-{case}");
-            let claim_path = delivery_claim_path(
-                dir.path(),
-                &delivery_id,
-                "voice-fixture",
-                "-100-fixture",
-            )
-            .unwrap();
+            let claim_path =
+                delivery_claim_path(dir.path(), &delivery_id, "voice-fixture", "-100-fixture")
+                    .unwrap();
             std::fs::create_dir_all(claim_path.parent().unwrap()).unwrap();
             std::fs::write(claim_path.with_extension(extension), body).unwrap();
             let canonical_path = claim_path.with_extension("canonical");
@@ -3232,18 +3119,11 @@ mod tests {
         let sequence = AtomicU64::new(7);
         let process_id = 4242;
         let file_name = "fixture.canonical";
-        let orphan = dir
-            .path()
-            .join(format!(".{file_name}.tmp.{process_id}.7"));
+        let orphan = dir.path().join(format!(".{file_name}.tmp.{process_id}.7"));
         std::fs::write(&orphan, b"orphaned partial bytes").unwrap();
 
-        let (path, file) = create_canonical_temp_file(
-            dir.path(),
-            file_name,
-            process_id,
-            &sequence,
-        )
-        .unwrap();
+        let (path, file) =
+            create_canonical_temp_file(dir.path(), file_name, process_id, &sequence).unwrap();
         drop(file);
 
         assert_eq!(
@@ -3510,10 +3390,7 @@ domains = ["calendar", "coordination", "shopping"]
             Some(canonical),
             "full id",
         );
-        assert_eq!(
-            canonical_agent_id(wg, "otto").as_deref(),
-            Some(canonical),
-        );
+        assert_eq!(canonical_agent_id(wg, "otto").as_deref(), Some(canonical),);
         assert_eq!(
             canonical_agent_id(wg, "OTTO").as_deref(),
             Some(canonical),
@@ -3546,23 +3423,15 @@ domains = ["calendar", "coordination", "shopping"]
         let dir = tempdir().unwrap();
         let wg = dir.path();
         let alias = "household-slot-a";
-        let canonical =
-            "a4f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500001";
-        let tempting_name_id =
-            "b5f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500002";
+        let canonical = "a4f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500001";
+        let tempting_name_id = "b5f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500002";
         write_agent(wg, canonical, "Unrelated Display Metadata");
         write_agent(wg, tempting_name_id, alias);
 
-        let expected_session = create_session(
-            wg,
-            SessionKind::Interactive,
-            &[alias.to_string()],
-            None,
-        )
-        .unwrap();
+        let expected_session =
+            create_session(wg, SessionKind::Interactive, &[alias.to_string()], None).unwrap();
         bind_agent(wg, canonical, &expected_session).unwrap();
-        let tempting_session =
-            create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+        let tempting_session = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
         bind_agent(wg, tempting_name_id, &tempting_session).unwrap();
 
         assert_eq!(
@@ -3593,10 +3462,7 @@ domains = ["calendar", "coordination", "shopping"]
         );
 
         write_agent(wg, canonical, "Renamed Display Metadata");
-        assert_eq!(
-            canonical_agent_id(wg, alias).as_deref(),
-            Some(canonical),
-        );
+        assert_eq!(canonical_agent_id(wg, alias).as_deref(), Some(canonical),);
         let renamed = plan_conversation(
             wg,
             &cfg,
@@ -3642,18 +3508,10 @@ domains = ["calendar", "coordination", "shopping"]
             let dir = tempdir().unwrap();
             let wg = dir.path();
             let alias = "household-slot-unbound";
-            let tempting =
-                "c6f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500003";
+            let tempting = "c6f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500003";
             write_agent(wg, tempting, alias);
-            create_session(
-                wg,
-                SessionKind::Interactive,
-                &[alias.to_string()],
-                None,
-            )
-            .unwrap();
-            let tempting_session =
-                create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            create_session(wg, SessionKind::Interactive, &[alias.to_string()], None).unwrap();
+            let tempting_session = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
             bind_agent(wg, tempting, &tempting_session).unwrap();
             assert_sessionless(wg, alias);
         }
@@ -3663,22 +3521,14 @@ domains = ["calendar", "coordination", "shopping"]
             let dir = tempdir().unwrap();
             let wg = dir.path();
             let alias = "household-slot-duplicate";
-            let first_id =
-                "d7f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500004";
-            let tempting =
-                "e8f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500005";
+            let first_id = "d7f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500004";
+            let tempting = "e8f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500005";
             write_agent(wg, first_id, "First Unrelated Display");
             write_agent(wg, tempting, alias);
-            let first = create_session(
-                wg,
-                SessionKind::Interactive,
-                &[alias.to_string()],
-                None,
-            )
-            .unwrap();
+            let first =
+                create_session(wg, SessionKind::Interactive, &[alias.to_string()], None).unwrap();
             bind_agent(wg, first_id, &first).unwrap();
-            let second =
-                create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            let second = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
             bind_agent(wg, tempting, &second).unwrap();
             let mut registry = crate::chat_sessions::load(wg).unwrap();
             registry
@@ -3697,24 +3547,16 @@ domains = ["calendar", "coordination", "shopping"]
             let dir = tempdir().unwrap();
             let wg = dir.path();
             let alias = "household-slot-ambiguous";
-            let target =
-                "f9f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500006";
-            let tempting =
-                "0af74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500007";
+            let target = "f9f74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500006";
+            let tempting = "0af74b35c0e564f0a35886f59b55e6546aa53c77cfde4c9a34d9fcb987500007";
             write_agent(wg, target, "Second Unrelated Display");
             write_agent(wg, tempting, alias);
-            let aliased = create_session(
-                wg,
-                SessionKind::Interactive,
-                &[alias.to_string()],
-                None,
-            )
-            .unwrap();
+            let aliased =
+                create_session(wg, SessionKind::Interactive, &[alias.to_string()], None).unwrap();
             bind_agent(wg, target, &aliased).unwrap();
             let duplicate_binding =
                 create_session(wg, SessionKind::Interactive, &[], None).unwrap();
-            let tempting_session =
-                create_session(wg, SessionKind::Interactive, &[], None).unwrap();
+            let tempting_session = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
             bind_agent(wg, tempting, &tempting_session).unwrap();
             let mut registry = crate::chat_sessions::load(wg).unwrap();
             registry
@@ -3836,8 +3678,14 @@ domains = ["calendar", "coordination", "shopping"]
         bind_agent(&wg, "bruno", &uuid).unwrap();
         confirm_human(&wg, "luca-1", "human-luca", "otto");
 
-        let plan =
-            plan_conversation(&wg, &cfg, "telegram:bruno", "-100777", "luca-1", Entry::GroupElected);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:bruno",
+            "-100777",
+            "luca-1",
+            Entry::GroupElected,
+        );
         let sink = RecSink::default();
 
         let wg2 = wg.clone();
@@ -3854,10 +3702,17 @@ domains = ["calendar", "coordination", "shopping"]
             }
         });
 
-        let outcome =
-            run_conversation_turn(&wg, &plan, "bruno what's for dinner?", "req-2", fast_timing(), None, &sink)
-                .await
-                .unwrap();
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "bruno what's for dinner?",
+            "req-2",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
         responder.await.unwrap();
 
         assert!(matches!(outcome, TurnOutcome::Replied { .. }));
@@ -3884,8 +3739,14 @@ domains = ["calendar", "coordination", "shopping"]
         bind_agent(&wg, "bruno", &uuid).unwrap();
         confirm_human(&wg, "luca-1", "human-luca", "otto");
 
-        let plan =
-            plan_conversation(&wg, &cfg, "telegram:bruno", "-100777", "luca-1", Entry::GroupElected);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:bruno",
+            "-100777",
+            "luca-1",
+            Entry::GroupElected,
+        );
         // Sanity: the plan itself routed to bruno.
         assert_eq!(plan.route().bot_id, "bruno");
 
@@ -3907,22 +3768,42 @@ domains = ["calendar", "coordination", "shopping"]
         assert!(matches!(outcome, TurnOutcome::Replied { acked: true }));
         // EVERY send (the ack) went out via bruno, in the group — never otto.
         for (bot, chat_id, _text) in sink.calls() {
-            assert_eq!(bot, "bruno", "composed group reply must send via the ELECTED bot");
-            assert_eq!(chat_id, "-100777", "composed group reply lands in the GROUP");
+            assert_eq!(
+                bot, "bruno",
+                "composed group reply must send via the ELECTED bot"
+            );
+            assert_eq!(
+                chat_id, "-100777",
+                "composed group reply lands in the GROUP"
+            );
         }
         // The final answer edits the ack in place — also via bruno.
         for (bot, chat_id, _mid, text) in sink.edits() {
-            assert_eq!(bot, "bruno", "the final answer edit must also use the ELECTED bot");
+            assert_eq!(
+                bot, "bruno",
+                "the final answer edit must also use the ELECTED bot"
+            );
             assert_eq!(chat_id, "-100777");
             assert_eq!(text, "Dinner's at seven.");
         }
         // The elected bot's token is distinct from the concierge's, so a wrong-bot
         // send would have surfaced a different token — pin the mapping explicitly.
-        let bruno_token = cfg.all_bots().into_iter().find(|(id, _)| id == "bruno").unwrap().1.bot_token;
+        let bruno_token = cfg
+            .all_bots()
+            .into_iter()
+            .find(|(id, _)| id == "bruno")
+            .unwrap()
+            .1
+            .bot_token;
         assert_eq!(bruno_token, "token-bruno");
         assert_ne!(
             bruno_token,
-            cfg.all_bots().into_iter().find(|(id, _)| id == "otto").unwrap().1.bot_token,
+            cfg.all_bots()
+                .into_iter()
+                .find(|(id, _)| id == "otto")
+                .unwrap()
+                .1
+                .bot_token,
             "bruno and otto must carry distinct tokens for this test to be meaningful"
         );
     }
@@ -4021,18 +3902,10 @@ domains = ["calendar", "coordination"]
 "#,
         )
         .unwrap();
-        let session_ref =
-            create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        let session_ref = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
         let request_id = "physical-turn-from-before-ledger";
-        let human_message =
-            "The red calendar is not correct; use the blue calendar and update it.";
-        chat::append_inbox_ref(
-            &wg,
-            &session_ref,
-            human_message,
-            request_id,
-        )
-        .unwrap();
+        let human_message = "The red calendar is not correct; use the blue calendar and update it.";
+        chat::append_inbox_ref(&wg, &session_ref, human_message, request_id).unwrap();
         chat::append_outbox_ref(
             &wg,
             &session_ref,
@@ -4145,8 +4018,7 @@ domains = ["calendar", "coordination"]
         }
 
         let dir = tempdir().unwrap();
-        let session_ref =
-            create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let session_ref = create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
         let plan = ConversationPlan::Converse {
             session_ref: session_ref.clone(),
             agent_id: "persona-9".to_string(),
@@ -4253,8 +4125,7 @@ domains = ["calendar", "coordination"]
         }
 
         let dir = tempdir().unwrap();
-        let session_ref =
-            create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let session_ref = create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
         let plan = ConversationPlan::Converse {
             session_ref: session_ref.clone(),
             agent_id: "persona-13".to_string(),
@@ -4378,8 +4249,7 @@ domains = ["calendar", "coordination"]
         }
 
         let dir = tempdir().unwrap();
-        let session_ref =
-            create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let session_ref = create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
         let plan = ConversationPlan::Converse {
             session_ref: session_ref.clone(),
             agent_id: "persona-14".to_string(),
@@ -4647,7 +4517,10 @@ domains = ["calendar", "coordination"]
             &sink,
         )
         .await;
-        assert!(first.is_err(), "the first latency acknowledgement must fail");
+        assert!(
+            first.is_err(),
+            "the first latency acknowledgement must fail"
+        );
 
         let responder_dir = workgraph_dir.clone();
         let responder_session = session_ref.clone();
@@ -4659,9 +4532,7 @@ domains = ["calendar", "coordination"]
                 chat::read_inbox_ref(&responder_dir, &responder_session).unwrap_or_default();
             let matching = inbox
                 .iter()
-                .filter(|message| {
-                    message.request_id == "physical-turn-legacy-ack-send-retry"
-                })
+                .filter(|message| message.request_id == "physical-turn-legacy-ack-send-retry")
                 .collect::<Vec<_>>();
             for (index, message) in matching.iter().enumerate() {
                 chat::append_outbox_ref(
@@ -4698,9 +4569,7 @@ domains = ["calendar", "coordination"]
         assert_eq!(
             inbox
                 .iter()
-                .filter(|message| {
-                    message.request_id == "physical-turn-legacy-ack-send-retry"
-                })
+                .filter(|message| { message.request_id == "physical-turn-legacy-ack-send-retry" })
                 .count(),
             1,
             "the failed ack already belongs to the original inbox turn",
@@ -4709,9 +4578,7 @@ domains = ["calendar", "coordination"]
         assert_eq!(
             outbox
                 .iter()
-                .filter(|message| {
-                    message.request_id == "physical-turn-legacy-ack-send-retry"
-                })
+                .filter(|message| { message.request_id == "physical-turn-legacy-ack-send-retry" })
                 .count(),
             1,
             "one physical turn must not leave an orphaned second session reply",
@@ -4881,8 +4748,7 @@ domains = ["calendar", "coordination"]
         }
 
         let dir = tempdir().unwrap();
-        let session_ref =
-            create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
+        let session_ref = create_session(dir.path(), SessionKind::Interactive, &[], None).unwrap();
         let plan = ConversationPlan::Converse {
             session_ref: session_ref.clone(),
             agent_id: "persona-11".to_string(),
@@ -4895,8 +4761,7 @@ domains = ["calendar", "coordination"]
             channel: crate::graph::OriginChannel::TelegramGroup,
         };
         let sink = FailFirstEditSink::default();
-        let composer =
-            FakeComposer::ok_after("The answer is ready.", Duration::from_millis(150));
+        let composer = FakeComposer::ok_after("The answer is ready.", Duration::from_millis(150));
 
         let first = run_conversation_turn(
             dir.path(),
@@ -5053,13 +4918,12 @@ domains = ["calendar", "coordination"]
         // The human sees the confirming reply, never the machine directive.
         let (_bot, _chat, text) = sink.calls().last().cloned().unwrap_or_default();
         // Delivery may edit the ack in place; check both channels for the reply.
-        let last = sink
-            .edits()
-            .last()
-            .map(|e| e.3.clone())
-            .unwrap_or(text);
+        let last = sink.edits().last().map(|e| e.3.clone()).unwrap_or(text);
         assert!(!last.contains("TASK_CREATE"), "directive leaked: {last}");
-        assert!(!last.to_lowercase().contains("snag"), "no correction expected: {last}");
+        assert!(
+            !last.to_lowercase().contains("snag"),
+            "no correction expected: {last}"
+        );
     }
 
     /// PARITY, fallback path: a stubborn composer promises action on BOTH the
@@ -5117,7 +4981,10 @@ domains = ["calendar", "coordination"]
             .map(|e| e.3.clone())
             .or_else(|| sink.calls().last().map(|c| c.2.clone()))
             .unwrap();
-        assert!(last.to_lowercase().contains("snag"), "expected correction: {last}");
+        assert!(
+            last.to_lowercase().contains("snag"),
+            "expected correction: {last}"
+        );
     }
 
     /// PARITY, no false positive: a purely non-committal reply (no promise)
@@ -5148,7 +5015,11 @@ domains = ["calendar", "coordination"]
         .unwrap();
 
         // No retry, no task.
-        assert_eq!(composer.call_count(), 1, "no retry for a non-committal reply");
+        assert_eq!(
+            composer.call_count(),
+            1,
+            "no retry for a non-committal reply"
+        );
         let graph = crate::parser::load_graph(wg.join("graph.jsonl")).ok();
         let any_task = graph.map(|g| g.tasks().next().is_some()).unwrap_or(false);
         assert!(!any_task, "no task should be created for small talk");
@@ -5215,13 +5086,7 @@ domains = ["calendar", "coordination", "shopping"]
             let uuid = create_session(wg, SessionKind::Interactive, &[], None).unwrap();
             bind_agent(wg, persona, &uuid).unwrap();
         }
-        add_binding_for_bot(
-            wg,
-            "member-1",
-            "Household Member",
-            true,
-            "coord-9",
-        );
+        add_binding_for_bot(wg, "member-1", "Household Member", true, "coord-9");
         (cfg, personas)
     }
 
@@ -5339,20 +5204,9 @@ domains = ["calendar", "coordination", "shopping"]
                 "That sounds good.\nTASK_CREATE: alternate meal update {}",
                 index + 1
             );
-            run_voice_as(
-                &wg,
-                &cfg,
-                persona,
-                chat,
-                "member-1",
-                ask,
-                &reply,
-                &sink,
-            )
-            .await;
+            run_voice_as(&wg, &cfg, persona, chat, "member-1", ask, &reply, &sink).await;
             if first_off_domain_delivery.is_none() {
-                first_off_domain_delivery =
-                    sink.calls().last().map(|call| call.2.clone());
+                first_off_domain_delivery = sink.calls().last().map(|call| call.2.clone());
             }
         }
 
@@ -5588,9 +5442,8 @@ domains = ["calendar", "coordination", "shopping"]
             "member-1",
             Entry::GroupElected,
         );
-        let composer = FakeComposer::ok(
-            "Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup",
-        );
+        let composer =
+            FakeComposer::ok("Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup");
         let sink = RecSink::default();
         run_conversation_turn(
             &wg,
@@ -5643,7 +5496,11 @@ domains = ["calendar", "coordination", "shopping"]
         let ask = "update Friday dinner to carbonara instead";
         let sink = RecSink::default();
         run_voice(
-            &wg, &cfg, "otto", chat, ask,
+            &wg,
+            &cfg,
+            "otto",
+            chat,
+            ask,
             "On it!\nTASK_CREATE: update Friday dinner to carbonara",
             &sink,
         )
@@ -5668,10 +5525,26 @@ domains = ["calendar", "coordination", "shopping"]
         // (ask, task title, expected owner). One Otto turn per row, separate chats
         // so the intent ledger never cross-dedupes distinct asks.
         let cases: &[(&str, &str, &str)] = &[
-            ("update Friday dinner to carbonara", "update Friday dinner", "nora"),
-            ("what's a good recipe for the tofu?", "share a tofu recipe", "bruno"),
-            ("can we move my gym session to Friday?", "reschedule gym to Friday", "mira"),
-            ("book a dentist appointment next week", "book the dentist", "otto"),
+            (
+                "update Friday dinner to carbonara",
+                "update Friday dinner",
+                "nora",
+            ),
+            (
+                "what's a good recipe for the tofu?",
+                "share a tofu recipe",
+                "bruno",
+            ),
+            (
+                "can we move my gym session to Friday?",
+                "reschedule gym to Friday",
+                "mira",
+            ),
+            (
+                "book a dentist appointment next week",
+                "book the dentist",
+                "otto",
+            ),
             ("add oat milk to the shopping list", "add oat milk", "otto"),
             ("who is picking up the kids?", "arrange kid pickup", "otto"),
         ];
@@ -5682,7 +5555,11 @@ domains = ["calendar", "coordination", "shopping"]
             let chat = format!("-1006{i:02}");
             let sink = RecSink::default();
             run_voice(
-                &wg, &cfg, "otto", &chat, ask,
+                &wg,
+                &cfg,
+                "otto",
+                &chat,
+                ask,
                 &format!("On it!\nTASK_CREATE: {title}"),
                 &sink,
             )
@@ -5712,9 +5589,15 @@ domains = ["calendar", "coordination", "shopping"]
         let ask = "can we all move my gym session to Friday?";
 
         for (persona, reply) in [
-            ("nora", "I'll flag it.\nTASK_CREATE: move the gym session to Friday"),
+            (
+                "nora",
+                "I'll flag it.\nTASK_CREATE: move the gym session to Friday",
+            ),
             ("bruno", "Sure.\nTASK_CREATE: shift gym to Friday"),
-            ("mira", "On it — Friday works 💪\nTASK_CREATE: reschedule gym session to Friday"),
+            (
+                "mira",
+                "On it — Friday works 💪\nTASK_CREATE: reschedule gym session to Friday",
+            ),
             ("otto", "Noted.\nTASK_CREATE: gym Friday"),
         ] {
             let sink = RecSink::default();
@@ -5829,8 +5712,14 @@ domains = ["calendar", "coordination", "shopping"]
         let (_bot, _chat, text) = sink.calls().last().unwrap().clone();
         assert!(text.contains("on it now"), "status answer, got: {text}");
         assert!(!text.contains("WRONG"), "must not use the model: {text}");
-        assert!(!text.contains("**"), "status markdown bypassed delivery: {text}");
-        assert!(text.contains("weekly refresh"), "status title was lost: {text}");
+        assert!(
+            !text.contains("**"),
+            "status markdown bypassed delivery: {text}"
+        );
+        assert!(
+            text.contains("weekly refresh"),
+            "status title was lost: {text}"
+        );
         let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
         assert_eq!(
             outbox.last().map(|message| message.content.as_str()),
@@ -5868,7 +5757,10 @@ domains = ["calendar", "coordination", "shopping"]
 
         let (_bot, _chat, text) = sink.calls().last().unwrap().clone();
         assert!(text.starts_with("Sure — I'll get it sorted."), "{text}");
-        assert!(text.contains(lifecycle::FOLLOW_ACK), "follow ack appended: {text}");
+        assert!(
+            text.contains(lifecycle::FOLLOW_ACK),
+            "follow ack appended: {text}"
+        );
     }
 
     #[test]
@@ -5922,10 +5814,17 @@ domains = ["calendar", "coordination", "shopping"]
             chat::append_outbox_ref(&wg2, &uuid2, "here at last", &m.request_id).unwrap();
         });
 
-        let outcome =
-            run_conversation_turn(&wg, &plan, "you there?", "req-3", fast_timing(), None, &sink)
-                .await
-                .unwrap();
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "you there?",
+            "req-3",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
         responder.await.unwrap();
 
         assert_eq!(outcome, TurnOutcome::Replied { acked: true });
@@ -5935,7 +5834,11 @@ domains = ["calendar", "coordination", "shopping"]
         assert_eq!(calls[0].1, "555");
         assert!(calls[0].2.contains("On it"));
         let edits = sink.edits();
-        assert_eq!(edits.len(), 1, "the final reply replaces the ack: {edits:?}");
+        assert_eq!(
+            edits.len(),
+            1,
+            "the final reply replaces the ack: {edits:?}"
+        );
         assert_eq!(edits[0].0, "otto");
         assert_eq!(edits[0].1, "555");
         assert_eq!(edits[0].3, "here at last");
@@ -6030,7 +5933,10 @@ domains = ["calendar", "coordination", "shopping"]
         // The composed reply is also persisted to the outbox for TUI/feed parity.
         if let ConversationPlan::Converse { session_ref, .. } = &plan {
             let out = chat::read_outbox_since_ref(&wg, session_ref, 0).unwrap();
-            assert_eq!(out.last().unwrap().content, "Yep — dinner's at seven, see you there!");
+            assert_eq!(
+                out.last().unwrap().content,
+                "Yep — dinner's at seven, see you there!"
+            );
         }
     }
 
@@ -6059,7 +5965,10 @@ domains = ["calendar", "coordination", "shopping"]
         .await
         .unwrap();
 
-        assert!(start.elapsed() < Duration::from_secs(1), "must fail fast, not hang");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must fail fast, not hang"
+        );
         assert_eq!(outcome, TurnOutcome::Glitched { acked: false });
         let calls = sink.calls();
         assert_eq!(calls.len(), 1);
@@ -6080,7 +5989,8 @@ domains = ["calendar", "coordination", "shopping"]
         let (_cfg, plan) = converse_fixture(&wg);
         let sink = RecSink::default();
         // fast_timing ack_after is 80ms; delay 200ms so the ack fires first.
-        let composer = FakeComposer::ok_after("Here at last — all sorted!", Duration::from_millis(200));
+        let composer =
+            FakeComposer::ok_after("Here at last — all sorted!", Duration::from_millis(200));
 
         let outcome = run_conversation_turn(
             &wg,
@@ -6136,7 +6046,11 @@ domains = ["calendar", "coordination", "shopping"]
         assert!(calls[0].2.contains("On it"));
         let edits = sink.edits();
         assert_eq!(edits.len(), 1);
-        assert!(edits[0].3.contains("glitched"), "ack edited into glitch: {:?}", edits[0].3);
+        assert!(
+            edits[0].3.contains("glitched"),
+            "ack edited into glitch: {:?}",
+            edits[0].3
+        );
     }
 
     /// DEFER DISCIPLINE (morning-taco-bugs): the owner never defers to itself. The
@@ -6160,7 +6074,10 @@ domains = ["calendar", "coordination", "shopping"]
         assert!(speaker_is_owner(&origin("bruno", None), "bruno"));
         assert!(speaker_is_owner(&origin("Bruno", None), "bruno"));
         // Persona fell back to the bot id (no configured agent_id).
-        assert!(speaker_is_owner(&origin("bruno_casapinello_bot", None), "bruno"));
+        assert!(speaker_is_owner(
+            &origin("bruno_casapinello_bot", None),
+            "bruno"
+        ));
         assert!(speaker_is_owner(&origin("bruno-bot", None), "bruno"));
         // Owner recognised via the bot_id channel even when persona is a bot id.
         assert!(speaker_is_owner(
@@ -6168,7 +6085,10 @@ domains = ["calendar", "coordination", "shopping"]
             "bruno"
         ));
         // A different voice is NOT the owner — it still defers.
-        assert!(!speaker_is_owner(&origin("mira", Some("mira_casapinello_bot")), "bruno"));
+        assert!(!speaker_is_owner(
+            &origin("mira", Some("mira_casapinello_bot")),
+            "bruno"
+        ));
         assert!(!speaker_is_owner(&origin("otto", None), "bruno"));
         // No owner resolved → never a self-owner.
         assert!(!speaker_is_owner(&origin("bruno", None), ""));
@@ -6229,27 +6149,57 @@ domains = ["calendar", "coordination", "shopping"]
             .unwrap()
             .and_hms_opt(12, 0, 0)
             .unwrap();
-        let grounded =
-            build_compose_prompt_at(&wg, &uuid, "otto", "Plans for tomorrow?", now, ForwardedContext::default());
+        let grounded = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "Plans for tomorrow?",
+            now,
+            ForwardedContext::default(),
+        );
         assert!(
             grounded.contains("Dentist"),
             "tomorrow's appointment missing from prompt:\n{grounded}"
         );
         assert!(grounded.contains("Thursday"));
         // The answer-first instruction header is present.
-        assert!(grounded.to_lowercase().contains("answer the question directly"));
+        assert!(
+            grounded
+                .to_lowercase()
+                .contains("answer the question directly")
+        );
         // Other days must NOT bleed into a scoped "tomorrow" ask.
-        assert!(!grounded.contains("Baked salmon"), "Tue meal leaked:\n{grounded}");
-        assert!(!grounded.contains("Chickpea"), "Mon meal leaked:\n{grounded}");
+        assert!(
+            !grounded.contains("Baked salmon"),
+            "Tue meal leaked:\n{grounded}"
+        );
+        assert!(
+            !grounded.contains("Chickpea"),
+            "Mon meal leaked:\n{grounded}"
+        );
 
         // A whole-week ask still surfaces the full week's meals.
-        let week = build_compose_prompt_at(&wg, &uuid, "otto", "how's the week?", now, ForwardedContext::default());
+        let week = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "how's the week?",
+            now,
+            ForwardedContext::default(),
+        );
         assert!(week.contains("Baked salmon"));
         assert!(week.contains("Luca PT check-in"));
         assert!(week.to_lowercase().contains("do not stall"));
 
         // Small talk carries no read-shaped WEEK block (no meal dump)...
-        let plain = build_compose_prompt_at(&wg, &uuid, "otto", "morning!", now, ForwardedContext::default());
+        let plain = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "morning!",
+            now,
+            ForwardedContext::default(),
+        );
         assert!(!plain.contains("Baked salmon"));
         // ...but it DOES now carry the always-on anti-fabrication calendar-truth
         // line (rule 5, §6.7). Wed 07-15 has no calendar events → the model is
@@ -6267,8 +6217,18 @@ domains = ["calendar", "coordination", "shopping"]
             .unwrap()
             .and_hms_opt(15, 0, 0)
             .unwrap();
-        let greet = build_compose_prompt_at(&wg, &uuid, "otto", "how's your day?", tue_noon, ForwardedContext::default());
-        assert!(greet.contains("PT check-in"), "real event missing from greeting prompt:\n{greet}");
+        let greet = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "how's your day?",
+            tue_noon,
+            ForwardedContext::default(),
+        );
+        assert!(
+            greet.contains("PT check-in"),
+            "real event missing from greeting prompt:\n{greet}"
+        );
         assert!(greet.to_lowercase().contains("do not invent"), "{greet}");
     }
 
@@ -6303,7 +6263,10 @@ domains = ["calendar", "coordination", "shopping"]
             "otto",
             "tell me the calories",
             now,
-            ForwardedContext { thread: Some(thread), ..Default::default() },
+            ForwardedContext {
+                thread: Some(thread),
+                ..Default::default()
+            },
         );
         assert!(
             followup.contains("pasta pomodoro"),
@@ -6311,15 +6274,27 @@ domains = ["calendar", "coordination", "shopping"]
         );
         assert!(
             followup.to_lowercase().contains("follow-up")
-                && followup.to_lowercase().contains("do not ask what they mean"),
+                && followup
+                    .to_lowercase()
+                    .contains("do not ask what they mean"),
             "compose-not-clarify instruction missing from the prompt:\n{followup}"
         );
 
         // WITHOUT thread context: the same ambiguous ask carries no referent and
         // no follow-up instruction — this is exactly the state that made the engine
         // clarify instead of answer.
-        let bare = build_compose_prompt_at(&wg, &uuid, "otto", "tell me the calories", now, ForwardedContext::default());
-        assert!(!bare.contains("pasta pomodoro"), "referent leaked without a thread:\n{bare}");
+        let bare = build_compose_prompt_at(
+            &wg,
+            &uuid,
+            "otto",
+            "tell me the calories",
+            now,
+            ForwardedContext::default(),
+        );
+        assert!(
+            !bare.contains("pasta pomodoro"),
+            "referent leaked without a thread:\n{bare}"
+        );
         assert!(
             !bare.to_lowercase().contains("do not ask what they mean"),
             "follow-up instruction present without a thread:\n{bare}"
@@ -6332,9 +6307,15 @@ domains = ["calendar", "coordination", "shopping"]
             "otto",
             "tell me the calories",
             now,
-            ForwardedContext { thread: Some("   "), ..Default::default() },
+            ForwardedContext {
+                thread: Some("   "),
+                ..Default::default()
+            },
         );
-        assert!(!blank.to_lowercase().contains("do not ask what they mean"), "{blank}");
+        assert!(
+            !blank.to_lowercase().contains("do not ask what they mean"),
+            "{blank}"
+        );
     }
 
     /// WEEK CONTEXT (task week-grounding-engine): the gateway forwards the parsed
@@ -6371,7 +6352,10 @@ domains = ["calendar", "coordination", "shopping"]
             "nora",
             "what's for dinner tomorrow?",
             now,
-            ForwardedContext { week: Some(week), ..Default::default() },
+            ForwardedContext {
+                week: Some(week),
+                ..Default::default()
+            },
         );
         assert!(
             grounded.contains("Baked white fish with tomato, olives & capers"),
@@ -6433,7 +6417,10 @@ domains = ["calendar", "coordination", "shopping"]
         // A family correction, which outranks distilled memory (docs/39 §5.2).
         parity::PreferenceStore::record(
             dir.path(),
-            &format!("{}Nadin is not logged so ignore this", grounding::CORRECTION_PREFIX),
+            &format!(
+                "{}Nadin is not logged so ignore this",
+                grounding::CORRECTION_PREFIX
+            ),
             "luca",
             "nora",
         )
@@ -6483,11 +6470,15 @@ domains = ["calendar", "coordination", "shopping"]
         let week_pos = prompt
             .find("THIS WEEK'S DINNERS")
             .expect("forwarded week block present");
-        let plan_pos = prompt.find("Chickpea").expect("read-shaped week grounding present");
+        let plan_pos = prompt
+            .find("Chickpea")
+            .expect("read-shaped week grounding present");
         let corr_pos = prompt
             .find("Nadin is not logged")
             .expect("corrections block present");
-        let msg_pos = prompt.find("Message: ").expect("the human message tail is present");
+        let msg_pos = prompt
+            .find("Message: ")
+            .expect("the human message tail is present");
         for (label, pos) in [
             ("the calendar-truth line", calendar_pos),
             ("the read-shaped week grounding", plan_pos),
@@ -6535,7 +6526,10 @@ domains = ["calendar", "coordination", "shopping"]
             "otto",
             "what's for dinner?",
             now,
-            ForwardedContext { memory: Some("  \n \n"), ..Default::default() },
+            ForwardedContext {
+                memory: Some("  \n \n"),
+                ..Default::default()
+            },
         );
         assert_eq!(
             none, blank,
@@ -6554,7 +6548,10 @@ domains = ["calendar", "coordination", "shopping"]
             "otto",
             "what's for dinner?",
             now,
-            ForwardedContext { memory: Some(sample_memory_block()), ..Default::default() },
+            ForwardedContext {
+                memory: Some(sample_memory_block()),
+                ..Default::default()
+            },
         );
         assert_ne!(with, none, "the memory block is not being injected at all");
         assert!(with.contains("FAMILY MEMORY"), "{with}");
@@ -6587,7 +6584,10 @@ domains = ["calendar", "coordination", "shopping"]
             "otto",
             "what's for dinner?",
             now,
-            ForwardedContext { memory: Some(&huge), ..Default::default() },
+            ForwardedContext {
+                memory: Some(&huge),
+                ..Default::default()
+            },
         );
         assert!(
             prompt.contains("Nina is allergic to peanuts"),
@@ -6635,7 +6635,10 @@ domains = ["calendar", "coordination", "shopping"]
             "nora",
             "tell me the calories",
             now,
-            ForwardedContext { thread: Some(thread), ..Default::default() },
+            ForwardedContext {
+                thread: Some(thread),
+                ..Default::default()
+            },
         );
 
         // The recency instruction is present: lead with the most recent, close
@@ -6652,8 +6655,13 @@ domains = ["calendar", "coordination", "shopping"]
         // The instruction must land AFTER the raw thread block (the model reads
         // the discipline after seeing the turns it applies to).
         let thread_pos = followup.find("duck breast").expect("thread block present");
-        let recency_pos = followup.find("the LAST message in that list").expect("recency instr present");
-        assert!(recency_pos > thread_pos, "recency instruction placed before the thread block:\n{followup}");
+        let recency_pos = followup
+            .find("the LAST message in that list")
+            .expect("recency instr present");
+        assert!(
+            recency_pos > thread_pos,
+            "recency instruction placed before the thread block:\n{followup}"
+        );
     }
 
     /// RULE 3 (corrections stick): "Nadin is not logged so ignore this" is
@@ -6688,10 +6696,10 @@ domains = ["calendar", "coordination", "shopping"]
         let root = dir.path();
         let prefs = parity::PreferenceStore::all(root);
         assert!(
-            prefs.iter().any(|p| p
-                .text
-                .starts_with(grounding::CORRECTION_PREFIX)
-                && p.text.contains("Nadin")),
+            prefs
+                .iter()
+                .any(|p| p.text.starts_with(grounding::CORRECTION_PREFIX)
+                    && p.text.contains("Nadin")),
             "correction not persisted: {prefs:?}"
         );
 
@@ -6721,23 +6729,48 @@ domains = ["calendar", "coordination", "shopping"]
         let sink1 = RecSink::default();
         let c1 = FakeComposer::ok(stall);
         run_conversation_turn(
-            &wg, &plan, "Plans for tomorrow?", "req-1", fast_timing(), Some(&c1), &sink1,
+            &wg,
+            &plan,
+            "Plans for tomorrow?",
+            "req-1",
+            fast_timing(),
+            Some(&c1),
+            &sink1,
         )
         .await
         .unwrap();
-        assert!(sink1.calls().last().unwrap().2.contains("waiting on confirmations"));
+        assert!(
+            sink1
+                .calls()
+                .last()
+                .unwrap()
+                .2
+                .contains("waiting on confirmations")
+        );
 
         // Turn 2: the SAME stall is drafted again → guard answers honestly.
         let sink2 = RecSink::default();
         let c2 = FakeComposer::ok(stall);
         run_conversation_turn(
-            &wg, &plan, "walk me through it", "req-2", fast_timing(), Some(&c2), &sink2,
+            &wg,
+            &plan,
+            "walk me through it",
+            "req-2",
+            fast_timing(),
+            Some(&c2),
+            &sink2,
         )
         .await
         .unwrap();
         let last = sink2.calls().last().unwrap().2.clone();
-        assert!(!last.contains("waiting on confirmations"), "stall repeated: {last}");
-        assert!(last.to_lowercase().contains("read"), "not the honest fallback: {last}");
+        assert!(
+            !last.contains("waiting on confirmations"),
+            "stall repeated: {last}"
+        );
+        assert!(
+            last.to_lowercase().contains("read"),
+            "not the honest fallback: {last}"
+        );
     }
 
     /// RULE 5 (§6.7 anti-fabrication): a composed reply that INVENTS a schedule
@@ -6766,7 +6799,13 @@ domains = ["calendar", "coordination", "shopping"]
         let sink = RecSink::default();
         let c = FakeComposer::ok(fabricated);
         run_conversation_turn(
-            &wg, &plan, "how's your day?", "req-fab", fast_timing(), Some(&c), &sink,
+            &wg,
+            &plan,
+            "how's your day?",
+            "req-fab",
+            fast_timing(),
+            Some(&c),
+            &sink,
         )
         .await
         .unwrap();
@@ -6823,8 +6862,14 @@ domains = ["calendar"]
             true,
             "coordination-lantern",
         );
-        let plan =
-            plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:hearth",
+            "555",
+            "member-1",
+            Entry::Direct,
+        );
 
         let raw = "**The Hearth** 💬 **Dinner is ready.** Check with **Zephyra** before serving. \
                    That lives over in the pipeline. **Service:** dispatcher healthy — 2 agents. \
@@ -6880,8 +6925,14 @@ domains = ["calendar"]
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
         bind_agent(&wg, "hearth", &uuid).unwrap();
         add_binding(&wg, "member-1", "Household Member", true);
-        let plan =
-            plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:hearth",
+            "555",
+            "member-1",
+            Entry::Direct,
+        );
 
         let sink = RecSink::default();
         let composer = FakeComposer::ok("The Wayfinder's got this one.");
@@ -6938,8 +6989,14 @@ name = "The Wayfinder"
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
         bind_agent(&wg, "hearth", &uuid).unwrap();
         add_binding(&wg, "member-1", "Household Member", true);
-        let plan =
-            plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:hearth",
+            "555",
+            "member-1",
+            Entry::Direct,
+        );
 
         let raw = "**The Hearth** 💬 **Dinner is ready.** We're waiting on you and \
                    **Quillon Vale** to confirm. 🧭 The Wayfinder's got this one.";
@@ -7052,13 +7109,11 @@ name = "Fixture Voice"
         // `edit_outbox_message_ref` writes this sibling path before renaming it.
         // A directory at that exact path deterministically forces the rewrite
         // to fail while leaving the original outbox readable for retry.
-        let rewrite_blocker =
-            chat::outbox_path_ref(&wg, &session_ref).with_extension("jsonl.tmp");
+        let rewrite_blocker = chat::outbox_path_ref(&wg, &session_ref).with_extension("jsonl.tmp");
         std::fs::create_dir_all(&rewrite_blocker).unwrap();
 
         let raw = "**Fixture Voice** says dinner is ready for **Fixture Member**.";
-        let family_roster =
-            grounding::load_family_voice_roster(&project_root_of(&wg), &wg);
+        let family_roster = grounding::load_family_voice_roster(&project_root_of(&wg), &wg);
         let expected = grounding::enforce_family_voice(raw, &family_roster);
         assert_ne!(
             expected, raw,
@@ -7212,9 +7267,8 @@ domains = ["meals"]
         );
 
         let sink = FailFirstHandoffSink::default();
-        let composer = FakeComposer::ok(
-            "Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup",
-        );
+        let composer =
+            FakeComposer::ok("Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup");
         let first = run_conversation_turn(
             &wg,
             &plan,
@@ -7340,8 +7394,7 @@ domains = ["meals"]
 
         let delivered = sink.calls().last().unwrap().2.clone();
         assert_eq!(
-            delivered,
-            "Saturday stew is noted.\n\nThis one's for the right person 🥗",
+            delivered, "Saturday stew is noted.\n\nThis one's for the right person 🥗",
             "a missing authored name gets grounded name-free copy",
         );
         assert!(
@@ -7374,13 +7427,7 @@ domains = ["meals"]
         map.save(&agency_dir).unwrap();
     }
 
-    fn add_binding_for_bot(
-        wg: &Path,
-        sender: &str,
-        name: &str,
-        confirmed: bool,
-        bot_id: &str,
-    ) {
+    fn add_binding_for_bot(wg: &Path, sender: &str, name: &str, confirmed: bool, bot_id: &str) {
         let agency_dir = wg.join("agency");
         let mut map = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
         let mut b = crate::agency::TelegramBinding::new(

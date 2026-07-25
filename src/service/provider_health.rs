@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 /// Plain-language operator alert emitted when the provider pause trips. Mirrors
 /// the spawn breaker's alert voice: no jargon, says what happened and that it
 /// will recover on its own.
-pub const PROVIDER_PAUSED_ALERT_TEXT: &str =
-    "⚠️ The family team can't reach its AI right now — usually a login issue. \
+pub const PROVIDER_PAUSED_ALERT_TEXT: &str = "⚠️ The family team can't reach its AI right now — usually a login issue. \
 The task runner has paused and will keep checking; it resumes on its own once the connection is back.";
 
 /// Plain-language operator alert emitted when the provider pause auto-resumes.
@@ -604,9 +603,7 @@ impl ProviderHealth {
         match self.last_probe_at.as_deref() {
             None => true,
             Some(stamp) => match chrono::DateTime::parse_from_rfc3339(stamp) {
-                Ok(last) => {
-                    now.signed_duration_since(last).num_seconds() >= interval_secs as i64
-                }
+                Ok(last) => now.signed_duration_since(last).num_seconds() >= interval_secs as i64,
                 // Unparseable stamp → don't get stuck; probe now.
                 Err(_) => true,
             },
@@ -959,8 +956,7 @@ mod tests {
     /// not a provider failure — the agent ran fine, the graph declined it.
     #[test]
     fn test_wg_done_blocked_refusal_is_task_logic_not_provider() {
-        let refusal =
-            "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
+        let refusal = "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
              parent-y (failed_pending_eval)";
         assert_eq!(
             classify_error(Some(1), refusal),
@@ -1059,8 +1055,7 @@ mod tests {
     fn test_done_refused_for_blocked_parent_never_pauses_provider() {
         let mut health = ProviderHealth::default();
         let provider_id = "claude";
-        let refusal =
-            "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
+        let refusal = "Cannot mark 'satellite-x' as done: blocked by 1 unresolved task(s):\n  \
              parent-y (failed_pending_eval)";
 
         // The satellite's agent ran fine but was done-refused, five times — well
@@ -1077,7 +1072,10 @@ mod tests {
             provider.consecutive_failures, 0,
             "wg-done refusals for a blocked parent must not touch the provider counter"
         );
-        assert!(!provider.should_pause(3), "the provider must not be near pausing");
+        assert!(
+            !provider.should_pause(3),
+            "the provider must not be near pausing"
+        );
 
         let paused = health.check_and_apply_pauses(3, "pause");
         assert!(
@@ -1147,7 +1145,10 @@ mod tests {
         // A second triage pass while STILL paused must not re-arm the alert.
         health.record_failure("claude", ProviderErrorKind::FatalProvider, "auth".into());
         let paused2 = health.check_and_apply_pauses(3, "pause");
-        assert!(paused2.is_empty(), "already-paused provider does not re-pause");
+        assert!(
+            paused2.is_empty(),
+            "already-paused provider does not re-pause"
+        );
         assert_eq!(health.take_pause_alert(), None);
         assert_eq!(health.pause_generation, 1);
     }
@@ -1218,11 +1219,9 @@ mod tests {
         health.check_and_apply_pauses(3, "pause");
         assert_eq!(health.paused_provider_ids(), vec!["claude".to_string()]);
 
-        let paused_at = chrono::DateTime::parse_from_rfc3339(
-            health.paused_at.as_deref().unwrap(),
-        )
-        .unwrap()
-        .with_timezone(&Utc);
+        let paused_at = chrono::DateTime::parse_from_rfc3339(health.paused_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
         let later = paused_at + chrono::Duration::seconds(90);
         assert_eq!(health.pause_duration_secs(later), Some(90));
     }

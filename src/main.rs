@@ -410,9 +410,9 @@ mod resolver_tests {
     #[test]
     fn parse_task_choices_skips_blanks_and_dedups_keys() {
         let raw = vec![
-            "  ".to_string(),              // blank label -> skipped
+            "  ".to_string(), // blank label -> skipped
             "dup=First".to_string(),
-            "dup=Second".to_string(),      // duplicate key -> first wins
+            "dup=Second".to_string(), // duplicate key -> first wins
         ];
         let choices = super::parse_task_choices(&raw, false);
         assert_eq!(choices.len(), 1);
@@ -1084,7 +1084,10 @@ fn main() -> Result<()> {
             // task's agent. The link is stored as a `spawned-by:<agent>` tag so
             // no Task field / construction site changes are needed.
             let mut tag = tag;
-            if !tag.iter().any(|t| t.starts_with(worksgood::graph::SPAWNED_BY_TAG_PREFIX)) {
+            if !tag
+                .iter()
+                .any(|t| t.starts_with(worksgood::graph::SPAWNED_BY_TAG_PREFIX))
+            {
                 let is_disposable = tag.iter().any(|t| t == worksgood::graph::DISPOSABLE_TAG);
                 let resolved_spawner = spawned_by.clone().or_else(|| {
                     if !is_disposable {
@@ -1405,7 +1408,13 @@ fn main() -> Result<()> {
             reason,
             superseded_by,
             force,
-        } => commands::abandon::run(&workgraph_dir, &id, reason.as_deref(), &superseded_by, force),
+        } => commands::abandon::run(
+            &workgraph_dir,
+            &id,
+            reason.as_deref(),
+            &superseded_by,
+            force,
+        ),
         Commands::Retry {
             id,
             preserve_session,
@@ -3965,12 +3974,7 @@ fn main() -> Result<()> {
                 reply_text,
                 human,
                 dry_run,
-            } => commands::telegram::run_parity(
-                &reply_text,
-                human.as_deref(),
-                dry_run,
-                cli.json,
-            ),
+            } => commands::telegram::run_parity(&reply_text, human.as_deref(), dry_run, cli.json),
             TelegramCommands::Owner {
                 ask,
                 persona,

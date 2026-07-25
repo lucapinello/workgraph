@@ -424,7 +424,10 @@ fn check_pi_output_guard() -> Check {
 /// directory. Mirrors the expansion `AuthConfig::resolve_configured_oauth_token`
 /// performs, so the doctor checks the same file the handler will actually read.
 fn expand_home(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("$HOME/")) {
+    if let Some(rest) = path
+        .strip_prefix("~/")
+        .or_else(|| path.strip_prefix("$HOME/"))
+    {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }

@@ -1768,7 +1768,9 @@ fn record_tick_events(
 /// lives), so the project root is its parent.
 fn project_root_for(dir: &Path) -> PathBuf {
     if dir.file_name().and_then(|n| n.to_str()) == Some(".wg") {
-        dir.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.to_path_buf())
+        dir.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dir.to_path_buf())
     } else {
         dir.to_path_buf()
     }
@@ -2133,30 +2135,31 @@ fn maybe_probe_and_resume_provider_with_alert_sender<P, F>(
 fn run_provider_probe(provider_id: &str, logger: &DaemonLogger) -> bool {
     use std::process::Stdio;
 
-    let (program, args): (String, Vec<String>) =
-        if let Ok(cmd) = std::env::var("WG_PROVIDER_PROBE_CMD") {
-            let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
-            if parts.is_empty() {
-                logger.warn("[provider-health] WG_PROVIDER_PROBE_CMD is empty — skipping probe");
-                return false;
-            }
-            let program = parts.remove(0);
-            (program, parts)
-        } else if provider_id == "claude"
-            || provider_id.contains("claude")
-            || provider_id.contains("anthropic")
-        {
-            (
-                "claude".to_string(),
-                vec!["-p".to_string(), "ping".to_string()],
-            )
-        } else {
-            logger.info(&format!(
+    let (program, args): (String, Vec<String>) = if let Ok(cmd) =
+        std::env::var("WG_PROVIDER_PROBE_CMD")
+    {
+        let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
+        if parts.is_empty() {
+            logger.warn("[provider-health] WG_PROVIDER_PROBE_CMD is empty — skipping probe");
+            return false;
+        }
+        let program = parts.remove(0);
+        (program, parts)
+    } else if provider_id == "claude"
+        || provider_id.contains("claude")
+        || provider_id.contains("anthropic")
+    {
+        (
+            "claude".to_string(),
+            vec!["-p".to_string(), "ping".to_string()],
+        )
+    } else {
+        logger.info(&format!(
                 "[provider-health] no auto-probe available for provider '{}' — staying paused until manual resume",
                 provider_id
             ));
-            return false;
-        };
+        return false;
+    };
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3689,11 +3692,12 @@ pub fn run_daemon(
                         let breaker_cfg = spawn_breaker::SpawnBreakerConfig::from_config(
                             &worksgood::config::Config::load_or_default(&dir),
                         );
-                        coord_state.spawn_breaker = Some(spawn_breaker::SpawnBreakerSnapshot::capture(
-                            &breaker,
-                            chrono::Utc::now(),
-                            &breaker_cfg,
-                        ));
+                        coord_state.spawn_breaker =
+                            Some(spawn_breaker::SpawnBreakerSnapshot::capture(
+                                &breaker,
+                                chrono::Utc::now(),
+                                &breaker_cfg,
+                            ));
                         coord_state.save(&dir);
                     }
 
@@ -4202,9 +4206,11 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
     // fix: status printed "closed (healthy)" while the daemon held the breaker
     // OPEN because it re-loaded/re-derived from a separate, drifting source.
     let breaker_now = chrono::Utc::now();
-    let breaker = spawn_breaker::SpawnBreakerState::load(&spawn_breaker::SpawnBreakerState::path(dir));
-    let breaker_cfg =
-        spawn_breaker::SpawnBreakerConfig::from_config(&worksgood::config::Config::load_or_default(dir));
+    let breaker =
+        spawn_breaker::SpawnBreakerState::load(&spawn_breaker::SpawnBreakerState::path(dir));
+    let breaker_cfg = spawn_breaker::SpawnBreakerConfig::from_config(
+        &worksgood::config::Config::load_or_default(dir),
+    );
     let live_breaker = coord.spawn_breaker.clone().unwrap_or_else(|| {
         spawn_breaker::SpawnBreakerSnapshot::capture(&breaker, breaker_now, &breaker_cfg)
     });
@@ -4213,13 +4219,11 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
     // Provider-health pause readout — prominent so a service frozen because it
     // can't reach its AI is obvious at a glance (previously only a daemon.log
     // grep surfaced it).
-    let provider_health =
-        worksgood::service::ProviderHealth::load(dir).unwrap_or_default();
+    let provider_health = worksgood::service::ProviderHealth::load(dir).unwrap_or_default();
     let provider_paused = provider_health.service_paused;
     let provider_pause_reason = provider_health.pause_reason.clone();
     let provider_pause_secs = provider_health.pause_duration_secs(breaker_now);
-    let provider_pause_human =
-        provider_pause_secs.map(|s| worksgood::format_duration(s, false));
+    let provider_pause_human = provider_pause_secs.map(|s| worksgood::format_duration(s, false));
     let provider_last_probe = provider_health.last_probe_at.clone();
 
     // Inbound-listener health — a DEAF listener (process alive, every
@@ -5688,9 +5692,7 @@ chat_id = "{chat_id}"
         assert!(!after.service_paused, "a successful probe must auto-resume");
         assert!(after.pause_reason.is_none());
         assert_eq!(
-            after
-                .get_or_create_provider("claude")
-                .consecutive_failures,
+            after.get_or_create_provider("claude").consecutive_failures,
             0,
             "resume must reset the failure counter"
         );

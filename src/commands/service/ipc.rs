@@ -422,10 +422,7 @@ fn is_benign_disconnect(err: &std::io::Error) -> bool {
     {
         if matches!(
             err.raw_os_error(),
-            Some(libc::EINVAL)
-                | Some(libc::EPIPE)
-                | Some(libc::ECONNRESET)
-                | Some(libc::ENOTCONN)
+            Some(libc::EINVAL) | Some(libc::EPIPE) | Some(libc::ECONNRESET) | Some(libc::ENOTCONN)
         ) {
             return true;
         }

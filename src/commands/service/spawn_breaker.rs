@@ -53,8 +53,7 @@ impl SpawnBreakerConfig {
         let cap = config
             .coordinator
             .spawn_breaker_max_cooldown_secs
-            .max(config.coordinator.spawn_breaker_cooldown_secs.max(1))
-            as i64;
+            .max(config.coordinator.spawn_breaker_cooldown_secs.max(1)) as i64;
         Self {
             threshold: config.coordinator.spawn_breaker_threshold,
             base_cooldown_secs: base,
@@ -344,7 +343,11 @@ pub struct SpawnBreakerSnapshot {
 
 impl SpawnBreakerSnapshot {
     /// Build a resolved snapshot from live breaker state + config at `now`.
-    pub fn capture(state: &SpawnBreakerState, now: DateTime<Utc>, cfg: &SpawnBreakerConfig) -> Self {
+    pub fn capture(
+        state: &SpawnBreakerState,
+        now: DateTime<Utc>,
+        cfg: &SpawnBreakerConfig,
+    ) -> Self {
         let phase = if !cfg.enabled() {
             "disabled".to_string()
         } else {
@@ -371,13 +374,11 @@ impl SpawnBreakerSnapshot {
 }
 
 /// The plain-language operator alert body for a tripped/re-tripped breaker.
-pub const OPERATOR_ALERT_TEXT: &str =
-    "⚠️ The family team's task runner is stuck — it will retry itself shortly. \
+pub const OPERATOR_ALERT_TEXT: &str = "⚠️ The family team's task runner is stuck — it will retry itself shortly. \
 If this keeps happening, check the server.";
 
 /// The plain-language operator alert body for a wedged dispatcher (watchdog).
-pub const WATCHDOG_ALERT_TEXT: &str =
-    "⚠️ The family team's task runner looks stuck — there is work waiting but nothing is \
+pub const WATCHDOG_ALERT_TEXT: &str = "⚠️ The family team's task runner looks stuck — there is work waiting but nothing is \
 running. It will keep trying; if this doesn't clear on its own, check the server.";
 
 /// Build a time-critical operator nudge so the alert routes through the digest
@@ -539,7 +540,10 @@ mod tests {
             s.record_failure(at(i), &c);
         }
         assert!(s.take_alert());
-        assert!(!s.take_alert(), "alert consumed exactly once per open episode");
+        assert!(
+            !s.take_alert(),
+            "alert consumed exactly once per open episode"
+        );
     }
 
     #[test]
@@ -649,7 +653,10 @@ mod tests {
         let now = alert_now();
         let n0 = operator_alert_nudge("operator", "gen0", now, OPERATOR_ALERT_TEXT);
         let n1 = operator_alert_nudge("operator", "gen1", now, OPERATOR_ALERT_TEXT);
-        assert_ne!(n0.id, n1.id, "re-open must not be deduped against first open");
+        assert_ne!(
+            n0.id, n1.id,
+            "re-open must not be deduped against first open"
+        );
 
         let mut store = DigestStore::default();
         let policy = DigestPolicy::new();

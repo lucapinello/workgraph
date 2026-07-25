@@ -210,7 +210,7 @@ const RETRY_EXHAUSTED_MARKERS: &[&str] = &[
     "retry exhausted",
     "retries exhausted",
     "no retries remaining",
-    "verdict",  // "evaluation verdict X rejected: score=…" — the eval declined to rescue
+    "verdict", // "evaluation verdict X rejected: score=…" — the eval declined to rescue
     "giving up",
     "quarantine",
 ];
@@ -453,7 +453,8 @@ pub const FAILED_RETRY_LINE: &str =
 /// The honest line for a failure with NO retry behind it: no promise, but the
 /// ask is not silently dropped either — it is flagged to the operator (see
 /// [`OperatorAlert`]).
-pub const FAILED_FINAL_LINE: &str = "That didn't work out — I've flagged it so it isn't forgotten 🙏";
+pub const FAILED_FINAL_LINE: &str =
+    "That didn't work out — I've flagged it so it isn't forgotten 🙏";
 
 /// The honest line for genuinely dropped work (a non-duplicate abandon): no
 /// retry claim, and the family is told how to get it back.
@@ -1002,7 +1003,11 @@ pub fn operator_alert_text(task_id: &str, what: &str, requester: &str) -> String
     let who = requester.trim();
     let who = if who.is_empty() { "someone" } else { who };
     let what = what.trim();
-    let what = if what.is_empty() { "a chat request" } else { what };
+    let what = if what.is_empty() {
+        "a chat request"
+    } else {
+        what
+    };
     format!(
         "⚠️ {who} asked for something that didn't get done and won't retry on its own: \
          \"{what}\". I told them it's flagged, not fixed. Task `{task_id}` — worth a look."
@@ -1057,11 +1062,7 @@ pub fn lifecycle_tick(
                 result.operator_alerts.push(OperatorAlert {
                     task_id: input.task_id.clone(),
                     requester: input.origin.requester.clone(),
-                    text: operator_alert_text(
-                        &input.task_id,
-                        &input.what,
-                        &input.origin.requester,
-                    ),
+                    text: operator_alert_text(&input.task_id, &input.what, &input.origin.requester),
                     notification_id: alert_id,
                 });
             }
@@ -1102,7 +1103,11 @@ pub fn lifecycle_tick(
 /// Format a single lifecycle notification for the `wg telegram lifecycle
 /// --dry-run <task>` seam: what would be sent, where, and as whom.
 pub fn dry_run_line(fire: &LifecycleFire) -> String {
-    let bot = fire.origin.bot_id.as_deref().unwrap_or(&fire.origin.persona);
+    let bot = fire
+        .origin
+        .bot_id
+        .as_deref()
+        .unwrap_or(&fire.origin.persona);
     format!(
         "[dry-run] {} → chat {} via bot '{}' as '{}': {}",
         fire.event.slug(),
@@ -1175,7 +1180,10 @@ mod tests {
         let mut t = task_with("x", Status::Open);
         t.origin = None;
         let json = serde_json::to_string(&t).unwrap();
-        assert!(!json.contains("origin"), "no origin key when unstamped: {json}");
+        assert!(
+            !json.contains("origin"),
+            "no origin key when unstamped: {json}"
+        );
     }
 
     // -- event derivation from status -----------------------------------------
@@ -1194,7 +1202,10 @@ mod tests {
             "soft-done must not fire a premature 'done'"
         );
         assert_eq!(event_for_status(Status::Done), Some(LifecycleEvent::Done));
-        assert_eq!(event_for_status(Status::Failed), Some(LifecycleEvent::Failed));
+        assert_eq!(
+            event_for_status(Status::Failed),
+            Some(LifecycleEvent::Failed)
+        );
         assert_eq!(
             event_for_status(Status::Abandoned),
             Some(LifecycleEvent::Failed)
@@ -1367,9 +1378,17 @@ mod tests {
     #[test]
     fn lifecycle_done_carries_what_changed() {
         let o = origin();
-        let summary = "Carbonara Wednesday, eggs Tuesday, and fish for Saturday lunch — the week's updated.";
+        let summary =
+            "Carbonara Wednesday, eggs Tuesday, and fish for Saturday lunch — the week's updated.";
         assert_eq!(
-            render_line(&o, LifecycleEvent::Done, &[], Some(summary), FailureShape::Final).unwrap(),
+            render_line(
+                &o,
+                LifecycleEvent::Done,
+                &[],
+                Some(summary),
+                FailureShape::Final
+            )
+            .unwrap(),
             "Done! Carbonara Wednesday, eggs Tuesday, and fish for Saturday lunch — the week's updated ✅"
         );
         assert_eq!(
@@ -1418,7 +1437,11 @@ mod tests {
         ] {
             assert!(is_status_question(q), "should detect: {q}");
         }
-        for not in ["dinner's done, come eat", "thanks!", "make carbonara wednesday"] {
+        for not in [
+            "dinner's done, come eat",
+            "thanks!",
+            "make carbonara wednesday",
+        ] {
             assert!(!is_status_question(not), "should NOT detect: {not}");
         }
     }
@@ -1536,8 +1559,15 @@ mod tests {
             input("d", LifecycleEvent::Done),
         ];
         let r = lifecycle_tick(&inputs, &mut log, &mut store, now(), &policy);
-        assert_eq!(r.fired.len(), 4, "every report-back reaches the human standalone");
-        assert!(r.capped.is_empty(), "a reply is never folded into the digest");
+        assert_eq!(
+            r.fired.len(),
+            4,
+            "every report-back reaches the human standalone"
+        );
+        assert!(
+            r.capped.is_empty(),
+            "a reply is never folded into the digest"
+        );
         // All four are recorded so a re-tick fires none of them again.
         let r2 = lifecycle_tick(&inputs, &mut log, &mut store, now(), &policy);
         assert!(r2.fired.is_empty() && r2.capped.is_empty());
@@ -1606,8 +1636,14 @@ mod tests {
             user: None,
             message: "LIFECYCLE_SUMMARY: Friday's dinner is now roast trout & potatoes".into(),
         });
-        let line = LifecycleInput::from_task(&t, vec![]).unwrap().render().unwrap();
-        assert_eq!(line, "Done! Friday's dinner is now roast trout & potatoes ✅");
+        let line = LifecycleInput::from_task(&t, vec![])
+            .unwrap()
+            .render()
+            .unwrap();
+        assert_eq!(
+            line,
+            "Done! Friday's dinner is now roast trout & potatoes ✅"
+        );
     }
 
     #[test]
@@ -1623,7 +1659,10 @@ mod tests {
             .unwrap()
             .render()
             .unwrap();
-        assert!(!line.contains("swap"), "failed line must not quote the title: {line}");
+        assert!(
+            !line.contains("swap"),
+            "failed line must not quote the title: {line}"
+        );
     }
 
     #[test]
@@ -1640,9 +1679,7 @@ mod tests {
         // "Done! " + capped body + " ✅" — body must respect SUMMARY_MAX_CHARS.
         assert!(line.ends_with('✅'));
         assert!(line.contains('…'), "over-long summary is elided: {line}");
-        let body = line
-            .trim_start_matches("Done! ")
-            .trim_end_matches(" ✅");
+        let body = line.trim_start_matches("Done! ").trim_end_matches(" ✅");
         assert!(
             body.chars().count() <= SUMMARY_MAX_CHARS,
             "capped body is {} chars: {body}",
@@ -1661,7 +1698,10 @@ mod tests {
         let p = pending_fires([running.clone()].iter(), never);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].event, LifecycleEvent::Started);
-        assert_eq!(p[0].notification_id, notification_id("t1", LifecycleEvent::Started));
+        assert_eq!(
+            p[0].notification_id,
+            notification_id("t1", LifecycleEvent::Started)
+        );
 
         // Already fired → silence (dedupe on retries).
         let fired_id = p[0].notification_id.clone();
@@ -1891,7 +1931,11 @@ mod tests {
         assert_eq!(alert.task_id, "swap-thursday-dinner");
         assert_eq!(alert.requester, "Luca");
         assert!(alert.text.contains("Luca"), "{}", alert.text);
-        assert!(alert.text.contains("swap-thursday-dinner"), "{}", alert.text);
+        assert!(
+            alert.text.contains("swap-thursday-dinner"),
+            "{}",
+            alert.text
+        );
         assert_eq!(
             alert.notification_id,
             alert_notification_id("swap-thursday-dinner")
@@ -1899,7 +1943,10 @@ mod tests {
 
         // Exactly once: a re-tick escalates nothing again.
         let r2 = lifecycle_tick(&[inp], &mut log, &mut store, now(), &policy);
-        assert!(r2.operator_alerts.is_empty(), "alert must fire exactly once");
+        assert!(
+            r2.operator_alerts.is_empty(),
+            "alert must fire exactly once"
+        );
         assert!(r2.fired.is_empty());
     }
 

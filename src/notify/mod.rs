@@ -17,11 +17,11 @@ pub mod fast_lane;
 pub mod grounding;
 pub mod lifecycle;
 pub mod listener_health;
+#[cfg(feature = "matrix-lite")]
+pub mod matrix;
 pub mod meal_feedback;
 pub mod ownership;
 pub mod parity;
-#[cfg(feature = "matrix-lite")]
-pub mod matrix;
 pub mod push;
 pub mod reminder;
 pub mod slack;

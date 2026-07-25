@@ -337,7 +337,8 @@ mod tests {
         // id and has no public @username. The old path saw sender "unknown" and
         // rejected him; find_by_identity resolves him from `from.id` alone.
         let mut map = TelegramBindingMap::default();
-        map.add(binding("8905220378", "human-luca", "Luca")).unwrap();
+        map.add(binding("8905220378", "human-luca", "Luca"))
+            .unwrap();
 
         let hit = map
             .find_by_identity(Some("8905220378"), None)
@@ -348,7 +349,8 @@ mod tests {
     #[test]
     fn find_by_identity_prefers_id_but_falls_back_to_username() {
         let mut map = TelegramBindingMap::default();
-        map.add(binding("8905220378", "human-luca", "Luca")).unwrap();
+        map.add(binding("8905220378", "human-luca", "Luca"))
+            .unwrap();
         map.add(binding("@nadin", "human-nadin", "Nadin")).unwrap();
 
         // id wins when present.
@@ -366,7 +368,10 @@ mod tests {
             "human-nadin"
         );
         // neither identifies anyone → None.
-        assert!(map.find_by_identity(Some("999999"), Some("ghost")).is_none());
+        assert!(
+            map.find_by_identity(Some("999999"), Some("ghost"))
+                .is_none()
+        );
         assert!(map.find_by_identity(None, None).is_none());
     }
 

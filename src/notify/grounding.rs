@@ -52,8 +52,8 @@ use std::sync::LazyLock;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use regex::{Captures, Regex};
 
-use crate::agency::TelegramBindingMap;
 use super::family_plan::{self, PlanDoc};
+use crate::agency::TelegramBindingMap;
 
 // ---------------------------------------------------------------------------
 // Rule 1 — grounding: classify read-shaped asks, fetch the week model
@@ -114,9 +114,25 @@ const READ_TRIGGERS: &[&str] = &[
 /// Read-verb openers: a message that *starts* with one of these is asking to be
 /// told something (as opposed to asking the family to DO something).
 const READ_VERBS: &[&str] = &[
-    "what", "when", "where", "which", "who", "how", "show", "tell", "give",
-    "remind", "list", "do we", "are there", "is there", "any", "anything",
-    "got any", "whats", "what's",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "how",
+    "show",
+    "tell",
+    "give",
+    "remind",
+    "list",
+    "do we",
+    "are there",
+    "is there",
+    "any",
+    "anything",
+    "got any",
+    "whats",
+    "what's",
 ];
 
 /// True when `message` is a question/read-shaped ask about the plan, calendar,
@@ -327,7 +343,10 @@ pub const CORRECTION_PREFIX: &str = "Correction: ";
 /// correction texts (already stripped of [`CORRECTION_PREFIX`]). `None` when
 /// there is nothing to replay.
 pub fn corrections_block(corrections: &[String]) -> Option<String> {
-    let items: Vec<&String> = corrections.iter().filter(|c| !c.trim().is_empty()).collect();
+    let items: Vec<&String> = corrections
+        .iter()
+        .filter(|c| !c.trim().is_empty())
+        .collect();
     if items.is_empty() {
         return None;
     }
@@ -378,7 +397,9 @@ pub fn is_formulaic_question(sentence: &str) -> bool {
         return false;
     }
     let norm = normalize(s);
-    FORMULAIC_OPENERS.iter().any(|o| norm.starts_with(o) || norm.contains(o))
+    FORMULAIC_OPENERS
+        .iter()
+        .any(|o| norm.starts_with(o) || norm.contains(o))
 }
 
 /// Split a reply's final sentence off and, if it is a formulaic filler
@@ -775,10 +796,7 @@ impl FamilyVoiceRoster {
 /// Load the family-voice roster from the same project-local sources that define
 /// the running household. Best-effort: malformed or absent files yield fewer
 /// names, never a panic and never a compiled-in fallback roster.
-pub fn load_family_voice_roster(
-    project_root: &Path,
-    workgraph_dir: &Path,
-) -> FamilyVoiceRoster {
+pub fn load_family_voice_roster(project_root: &Path, workgraph_dir: &Path) -> FamilyVoiceRoster {
     let mut roster = FamilyVoiceRoster::default();
 
     if let Ok(body) = std::fs::read_to_string(project_root.join("household.toml")) {
@@ -860,8 +878,18 @@ fn add_name_aliases(allowed: &mut HashSet<String>, raw: &str) {
 fn is_name_alias_stopword(word: &str) -> bool {
     matches!(
         word,
-        "a" | "an" | "the" | "coach" | "chef" | "dr" | "dr." | "mr" | "mr." | "mrs"
-            | "mrs." | "ms" | "ms."
+        "a" | "an"
+            | "the"
+            | "coach"
+            | "chef"
+            | "dr"
+            | "dr."
+            | "mr"
+            | "mr."
+            | "mrs"
+            | "mrs."
+            | "ms"
+            | "ms."
     )
 }
 
@@ -910,8 +938,7 @@ fn trim_attribution_separator(text: &str) -> &str {
 }
 
 static ATTR_AVATAR_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:[\p{So}\p{Sk}\u{FE0F}\u{200D}]\s*)+")
-        .expect("valid attribution-avatar regex")
+    Regex::new(r"^(?:[\p{So}\p{Sk}\u{FE0F}\u{200D}]\s*)+").expect("valid attribution-avatar regex")
 });
 
 /// Strip a leading persona attribution already carried by the sender/avatar
@@ -1058,11 +1085,7 @@ fn is_not_a_person(name: &str) -> bool {
     )
 }
 
-fn scrub_addressee_pattern(
-    text: &str,
-    pattern: &Regex,
-    roster: &FamilyVoiceRoster,
-) -> String {
+fn scrub_addressee_pattern(text: &str, pattern: &Regex, roster: &FamilyVoiceRoster) -> String {
     pattern
         .replace_all(text, |caps: &Captures<'_>| {
             let name = caps.name("name").map(|m| m.as_str()).unwrap_or("");
@@ -1095,11 +1118,9 @@ fn tidy_family_text(text: &str) -> String {
     let out = EMPTY_PARENS_RE.replace_all(text, "");
     let out = SPACE_PUNCT_RE.replace_all(&out, "$1");
     let out = MULTISPACE_RE.replace_all(&out, " ");
-    out.trim_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '—' | '–' | ',' | ';' | ':' | '-')
-    })
-    .trim()
-    .to_string()
+    out.trim_matches(|c: char| c.is_whitespace() || matches!(c, '—' | '–' | ',' | ';' | ':' | '-'))
+        .trim()
+        .to_string()
 }
 
 /// Remove a capitalised person reference that is absent from a real roster, but
@@ -1109,10 +1130,7 @@ fn tidy_family_text(text: &str) -> String {
 /// leave malformed copy such as "pass when ready", "we're to confirm", or "will
 /// join us". With no roster evidence this is a no-op; ordinary names elsewhere
 /// in a sentence are never guessed at or rewritten.
-pub fn scrub_off_roster_addressees(
-    reply: &str,
-    roster: &FamilyVoiceRoster,
-) -> String {
+pub fn scrub_off_roster_addressees(reply: &str, roster: &FamilyVoiceRoster) -> String {
     if !roster.has_evidence {
         return reply.to_string();
     }
@@ -1141,9 +1159,7 @@ pub fn scrub_off_roster_addressees(
 
 fn handoff_patterns(name_alt: &str) -> Vec<String> {
     vec![
-        format!(
-            r"(?:{name_alt})(?:'s|’s|\s+is|\s+has)?\s+got\s+(?:this|it|that)(?:\s+one)?"
-        ),
+        format!(r"(?:{name_alt})(?:'s|’s|\s+is|\s+has)?\s+got\s+(?:this|it|that)(?:\s+one)?"),
         format!(
             r"(?:hand(?:ing)?|pass(?:ing)?|kick(?:ing)?|send(?:ing)?|toss(?:ing)?|leav(?:e|ing))\s+(?:this|it|that)?\s*(?:one\s+)?(?:off\s+)?(?:over\s+)?to\s+(?:{name_alt})"
         ),
@@ -1163,15 +1179,15 @@ fn handoff_patterns(name_alt: &str) -> Vec<String> {
 }
 
 static ORPHANED_AVATAR_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:[\p{So}\p{Sk}\u{FE0F}\u{200D}]\s*)+$")
-        .expect("valid handoff-avatar regex")
+    Regex::new(r"(?:[\p{So}\p{Sk}\u{FE0F}\u{200D}]\s*)+$").expect("valid handoff-avatar regex")
 });
 
 /// Subject/connector fragments a removed handoff can strand before its verb.
 /// The list is deliberately closed and is consulted only after a terminal,
 /// roster-driven handoff matched.
-const DANGLING_HANDOFF_WORDS: &[&str] =
-    &["and", "but", "so", "then", "plus", "also", "i", "i'll", "we", "we'll"];
+const DANGLING_HANDOFF_WORDS: &[&str] = &[
+    "and", "but", "so", "then", "plus", "also", "i", "i'll", "we", "we'll",
+];
 
 fn trim_handoff_head(head: &str) -> String {
     let without_avatar = ORPHANED_AVATAR_SUFFIX_RE.replace(head.trim_end(), "");
@@ -1230,11 +1246,7 @@ pub fn strip_handoff_tail(reply: &str, roster: &FamilyVoiceRoster) -> String {
         return original;
     };
     let head = trim_handoff_head(&reply[..cut]);
-    if head.is_empty() {
-        String::new()
-    } else {
-        head
-    }
+    if head.is_empty() { String::new() } else { head }
 }
 
 static INFRA_SIGNALS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -1265,8 +1277,7 @@ pub fn has_infra_narration(reply: &str) -> bool {
 }
 
 static CLAUSE_SPLIT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:[.!?…;；]\s+|\s+[-•·—–]\s+|\r?\n+)")
-        .expect("valid family-clause splitter")
+    Regex::new(r"(?:[.!?…;；]\s+|\s+[-•·—–]\s+|\r?\n+)").expect("valid family-clause splitter")
 });
 
 fn family_clauses(text: &str) -> Vec<String> {
@@ -1281,8 +1292,7 @@ fn family_clauses(text: &str) -> Vec<String> {
             separator.start()
         };
         let mut clause = text[start..end].trim().to_string();
-        if first.is_some_and(|c| matches!(c, ';' | '；'))
-            && !clause.ends_with(['.', '!', '?', '…'])
+        if first.is_some_and(|c| matches!(c, ';' | '；')) && !clause.ends_with(['.', '!', '?', '…'])
         {
             clause.push('.');
         }
@@ -1363,9 +1373,8 @@ pub fn scrub_ops_jargon(reply: &str) -> String {
     )
 }
 
-static MD_BOLD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\*\*(\S(?:[^*\n]*\S)?)\*\*").expect("valid bold-markdown regex")
-});
+static MD_BOLD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\*\*(\S(?:[^*\n]*\S)?)\*\*").expect("valid bold-markdown regex"));
 static MD_ITALIC_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(^|[^\p{L}\p{N}_*])\*(\S(?:[^*\n]*\S)?)\*($|[^\p{L}\p{N}_*])")
         .expect("valid italic-markdown regex")
@@ -1540,15 +1549,15 @@ pub fn date_anchor(message: &str, now: NaiveDateTime) -> String {
     let norm = normalize(message);
     let mut parts: Vec<String> = Vec::new();
     if norm.contains("day after tomorrow") {
-        let d = today
-            .succ_opt()
-            .and_then(|d| d.succ_opt())
-            .unwrap_or(today);
+        let d = today.succ_opt().and_then(|d| d.succ_opt()).unwrap_or(today);
         parts.push(format!("\"day after tomorrow\" = {}", fmt(d)));
     } else if norm.contains("tomorrow") || norm.contains("tmrw") || norm.contains("tmw") {
         let d = today.succ_opt().unwrap_or(today);
         // "tomorrow night" is still tomorrow's date — the evening OF that day.
-        parts.push(format!("\"tomorrow\" (incl. \"tomorrow night\") = {}", fmt(d)));
+        parts.push(format!(
+            "\"tomorrow\" (incl. \"tomorrow night\") = {}",
+            fmt(d)
+        ));
     }
     if norm.contains("tonight") || norm.contains("today") || norm.contains("this evening") {
         parts.push(format!("\"tonight\"/\"today\" = {} (today)", fmt(today)));
@@ -1596,8 +1605,11 @@ pub fn detect_scope(message: &str, today: NaiveDate) -> AskScope {
     if norm.contains("tomorrow") || norm.contains("tmrw") || norm.contains("tmw") {
         return AskScope::Day(today.succ_opt().unwrap_or(today));
     }
-    if norm.contains("week") || norm.contains("weekend") || norm.contains("coming days")
-        || norm.contains("next few days") || norm.contains("days ahead")
+    if norm.contains("week")
+        || norm.contains("weekend")
+        || norm.contains("coming days")
+        || norm.contains("next few days")
+        || norm.contains("days ahead")
         || norm.contains("rest of")
     {
         return AskScope::Week;
@@ -1635,7 +1647,11 @@ pub fn parse_time_of_day(cell: &str) -> Option<NaiveTime> {
         None => (core.trim(), "0"),
     };
     let mut hour: u32 = h_str.parse().ok()?;
-    let minute: u32 = if m_str.is_empty() { 0 } else { m_str.parse().ok()? };
+    let minute: u32 = if m_str.is_empty() {
+        0
+    } else {
+        m_str.parse().ok()?
+    };
     if is_pm && hour < 12 {
         hour += 12;
     }
@@ -1669,8 +1685,7 @@ pub fn event_has_passed(time_cell: &str, event_day: NaiveDate, now: NaiveDateTim
 
 /// Does calendar/workout row `row_weekday` (a 3-letter code) fall on `day`?
 fn weekday_matches(row_weekday: &str, day: NaiveDate) -> bool {
-    family_plan::expand_weekday(row_weekday)
-        .eq_ignore_ascii_case(family_plan::long_weekday(day))
+    family_plan::expand_weekday(row_weekday).eq_ignore_ascii_case(family_plan::long_weekday(day))
 }
 
 /// Calendar events for `day`, matched by concrete date when present else by
@@ -2023,7 +2038,11 @@ pub fn grounding_fallback_line() -> String {
 /// day-ask grounds on that day's still-upcoming events; a week-ask grounds on
 /// every still-upcoming event in the week; a greeting (default scope) grounds on
 /// today. Pure — `now` is injected for fixed-clock tests.
-pub fn schedule_grounding_for(doc: &PlanDoc, now: NaiveDateTime, message: &str) -> ScheduleGrounding {
+pub fn schedule_grounding_for(
+    doc: &PlanDoc,
+    now: NaiveDateTime,
+    message: &str,
+) -> ScheduleGrounding {
     let today = now.date();
     let titles = match detect_scope(message, today) {
         AskScope::Day(day) => upcoming_titles_on(doc, day, now),
@@ -2060,7 +2079,11 @@ fn upcoming_titles_on(doc: &PlanDoc, day: NaiveDate, now: NaiveDateTime) -> Vec<
 /// when there is NO plan the grounding is EMPTY (strict): every schedule claim in
 /// the drafted reply is then treated as unsourced. This is the guard's data seam,
 /// the twin of [`fetch_scoped`] for the prompt-injection seam.
-pub fn fetch_schedule_grounding(root: &Path, now: NaiveDateTime, message: &str) -> ScheduleGrounding {
+pub fn fetch_schedule_grounding(
+    root: &Path,
+    now: NaiveDateTime,
+    message: &str,
+) -> ScheduleGrounding {
     let plans = family_plan::load_plans(root);
     match family_plan::current_plan(&plans, now.date()) {
         Some(doc) => schedule_grounding_for(doc, now, message),
@@ -2076,7 +2099,11 @@ pub fn fetch_schedule_grounding(root: &Path, now: NaiveDateTime, message: &str) 
 /// meeting/appointment/birthday or calling the day packed/back-to-back. Pure.
 pub fn schedule_context_line(doc: Option<&PlanDoc>, now: NaiveDateTime) -> String {
     let today = now.date();
-    let label = format!("{} {}", family_plan::long_weekday(today), today.format("%b %-d"));
+    let label = format!(
+        "{} {}",
+        family_plan::long_weekday(today),
+        today.format("%b %-d")
+    );
     let titles = doc
         .map(|d| upcoming_titles_on(d, today, now))
         .unwrap_or_default();
@@ -2149,12 +2176,7 @@ pub fn parse_week_context(text: &str) -> WeekContext {
         if let Some(rest) = line.strip_prefix("- ") {
             // "Saturday (July 25): Baked white fish" → day, dish.
             if let Some((left, dish)) = rest.split_once(':') {
-                let day = left
-                    .split('(')
-                    .next()
-                    .unwrap_or(left)
-                    .trim()
-                    .to_lowercase();
+                let day = left.split('(').next().unwrap_or(left).trim().to_lowercase();
                 let dish = dish.trim();
                 if weekday_token(&day).is_some()
                     && !dish.is_empty()
@@ -2212,9 +2234,30 @@ pub fn week_context_block(week_context: &str) -> Option<String> {
 // nothing is planned. Matched as whole words against the NORMALISED sentence
 // (apostrophes dropped, so "isn't"→"isnt", "nothing's"→"nothings").
 const WEEK_EMPTY_NEGATIONS: &[&str] = &[
-    "nothing", "nothings", "no", "not", "none", "nope", "nada", "havent", "hasnt", "hadnt",
-    "dont", "doesnt", "didnt", "isnt", "arent", "wasnt", "werent", "cant", "wont", "unplanned",
-    "undecided", "tbd", "blank", "empty",
+    "nothing",
+    "nothings",
+    "no",
+    "not",
+    "none",
+    "nope",
+    "nada",
+    "havent",
+    "hasnt",
+    "hadnt",
+    "dont",
+    "doesnt",
+    "didnt",
+    "isnt",
+    "arent",
+    "wasnt",
+    "werent",
+    "cant",
+    "wont",
+    "unplanned",
+    "undecided",
+    "tbd",
+    "blank",
+    "empty",
 ];
 
 // Planning-status stems: a normalised token STARTING with any of these, in a
@@ -2222,8 +2265,8 @@ const WEEK_EMPTY_NEGATIONS: &[&str] = &[
 // whole words) so "planned/planning", "locked", "scheduled", "decided",
 // "cooking", "figured", "eating" all match.
 const WEEK_PLAN_STEMS: &[&str] = &[
-    "plan", "lock", "schedul", "set", "settl", "decid", "menu", "figur", "nail", "sort",
-    "line", "dinner", "supper", "meal", "cook", "eat", "mak", "food",
+    "plan", "lock", "schedul", "set", "settl", "decid", "menu", "figur", "nail", "sort", "line",
+    "dinner", "supper", "meal", "cook", "eat", "mak", "food",
 ];
 
 /// Whole-word membership of `word` in the space-separated, already-normalised
@@ -2292,9 +2335,9 @@ pub fn false_empty_week_claims(draft: &str, wc: &WeekContext) -> Vec<(String, St
             continue;
         }
         let terms = day_terms_for(wc, weekday);
-        let hit = sentences.iter().any(|s| {
-            sentence_claims_empty(s) && terms.iter().any(|t| norm_has_word(s, t))
-        });
+        let hit = sentences
+            .iter()
+            .any(|s| sentence_claims_empty(s) && terms.iter().any(|t| norm_has_word(s, t)));
         if hit {
             out.push((capitalize_weekday(weekday), dish.clone()));
         }
@@ -2541,9 +2584,15 @@ mod tests {
     fn date_anchor_tonight_is_today() {
         let now = dt(2026, 7, 17, 9, 0);
         let anchor = date_anchor("what's for dinner tonight", now);
-        assert!(anchor.contains("(today)"), "tonight resolves to today, got: {anchor}");
+        assert!(
+            anchor.contains("(today)"),
+            "tonight resolves to today, got: {anchor}"
+        );
         assert!(anchor.contains("Friday, Jul 17"), "got: {anchor}");
-        assert!(!anchor.contains("Jul 18"), "tonight is not tomorrow, got: {anchor}");
+        assert!(
+            !anchor.contains("Jul 18"),
+            "tonight is not tomorrow, got: {anchor}"
+        );
     }
 
     const PLAN: &str = "\
@@ -2652,7 +2701,8 @@ mod tests {
     #[test]
     fn ground_repetition_flags_near_identical_stalls() {
         // The transcript's repeated stall, lightly reworded each time.
-        let a = "Meals are set, just waiting on confirmations from you and Nadin. Want the rundown?";
+        let a =
+            "Meals are set, just waiting on confirmations from you and Nadin. Want the rundown?";
         let b = "Meals are all set — still waiting on confirmations from you and Nadin. Want a rundown?";
         assert!(is_repetitive(b, a), "sim={}", similarity(a, b));
     }
@@ -2662,7 +2712,11 @@ mod tests {
         let stall = "Meals are set, waiting on confirmations from you and Nadin. Want the rundown?";
         let real = "Tomorrow (Tue) it's baked salmon with roasted potatoes and green beans, \
                     and you've got your PT check-in at 7:30pm.";
-        assert!(!is_repetitive(real, stall), "sim={}", similarity(stall, real));
+        assert!(
+            !is_repetitive(real, stall),
+            "sim={}",
+            similarity(stall, real)
+        );
     }
 
     #[test]
@@ -2699,7 +2753,10 @@ mod tests {
     #[test]
     fn ground_correction_ignores_ordinary_messages() {
         for msg in ["what's for dinner?", "thanks!", "swap Friday to tacos"] {
-            assert!(detect_correction(msg).is_none(), "should NOT detect: {msg:?}");
+            assert!(
+                detect_correction(msg).is_none(),
+                "should NOT detect: {msg:?}"
+            );
         }
     }
 
@@ -2770,8 +2827,14 @@ mod tests {
         let drafted = "Here's today: leftovers for dinner and your lower-body \
                        session. Anything else you want to know?";
         let shaped = enforce_answer_shape(drafted, false);
-        assert!(!shaped.trim_end().ends_with('?'), "still a question: {shaped:?}");
-        assert_eq!(shaped, "Here's today: leftovers for dinner and your lower-body session.");
+        assert!(
+            !shaped.trim_end().ends_with('?'),
+            "still a question: {shaped:?}"
+        );
+        assert_eq!(
+            shaped,
+            "Here's today: leftovers for dinner and your lower-body session."
+        );
 
         // A non-formulaic trailing question is stripped just the same — the
         // rule is hard, not limited to the "Anything specific…?" reflex.
@@ -2789,20 +2852,32 @@ mod tests {
         let doc = PlanDoc::parse("2026-W29", PLAN);
         // Asked at noon on Wed 07-15; Wed's dinner is Leftovers.
         let block = grounded_block(&doc, at(2026, 7, 15, 12, 0), "what's the plan today?");
-        assert!(block.contains("Leftovers"), "should have today's dinner:\n{block}");
+        assert!(
+            block.contains("Leftovers"),
+            "should have today's dinner:\n{block}"
+        );
         assert!(block.contains("Wednesday"));
         // NOTHING from other days may leak in.
         assert!(!block.contains("Baked salmon"), "Tue meal leaked:\n{block}");
         assert!(!block.contains("Chickpea"), "Mon meal leaked:\n{block}");
         assert!(!block.contains("Dentist"), "Thu appt leaked:\n{block}");
-        assert!(!block.contains("Luca PT check-in"), "Tue appt leaked:\n{block}");
+        assert!(
+            !block.contains("Luca PT check-in"),
+            "Tue appt leaked:\n{block}"
+        );
     }
 
     #[test]
     fn shape_detect_scope_reads_the_asked_window() {
         let today = date(2026, 7, 15); // Wednesday
-        assert_eq!(detect_scope("what's for dinner today?", today), AskScope::Day(today));
-        assert_eq!(detect_scope("what's the plan?", today), AskScope::Day(today));
+        assert_eq!(
+            detect_scope("what's for dinner today?", today),
+            AskScope::Day(today)
+        );
+        assert_eq!(
+            detect_scope("what's the plan?", today),
+            AskScope::Day(today)
+        );
         assert_eq!(
             detect_scope("plans for tomorrow?", today),
             AskScope::Day(date(2026, 7, 16))
@@ -2812,9 +2887,18 @@ mod tests {
             AskScope::Day(date(2026, 7, 17))
         );
         // A weekday that is today resolves to today, not next week.
-        assert_eq!(detect_scope("what's on wednesday?", today), AskScope::Day(today));
-        assert_eq!(detect_scope("how's the week looking?", today), AskScope::Week);
-        assert_eq!(detect_scope("anything this weekend?", today), AskScope::Week);
+        assert_eq!(
+            detect_scope("what's on wednesday?", today),
+            AskScope::Day(today)
+        );
+        assert_eq!(
+            detect_scope("how's the week looking?", today),
+            AskScope::Week
+        );
+        assert_eq!(
+            detect_scope("anything this weekend?", today),
+            AskScope::Week
+        );
     }
 
     #[test]
@@ -2824,7 +2908,10 @@ mod tests {
         let block = grounded_block(&doc, at(2026, 7, 15, 12, 0), "what's on tomorrow?");
         assert!(block.contains("Thursday"));
         assert!(block.contains("Dentist"), "Thu appt missing:\n{block}");
-        assert!(!block.contains("Leftovers"), "today's meal leaked into tomorrow:\n{block}");
+        assert!(
+            !block.contains("Leftovers"),
+            "today's meal leaked into tomorrow:\n{block}"
+        );
     }
 
     // (c) Clock-aware: past-time events drop given a fixed fake now.
@@ -2839,24 +2926,40 @@ mod tests {
         // A day already behind us is entirely past regardless of clock.
         assert!(event_has_passed("19:30", day, at(2026, 7, 15, 8, 0)));
         // A future day is never past.
-        assert!(!event_has_passed("09:00", date(2026, 7, 16), at(2026, 7, 14, 23, 0)));
+        assert!(!event_has_passed(
+            "09:00",
+            date(2026, 7, 16),
+            at(2026, 7, 14, 23, 0)
+        ));
         // Empty / all-day time on today is kept (not past).
         assert!(!event_has_passed("", day, at(2026, 7, 14, 23, 0)));
 
         let doc = PlanDoc::parse("2026-W29", PLAN);
         // At 15:00 on Tue the 19:30 check-in is still ahead → present.
         let early = grounded_block(&doc, at(2026, 7, 14, 15, 0), "what's the plan today?");
-        assert!(early.contains("Luca PT check-in"), "should still be upcoming:\n{early}");
+        assert!(
+            early.contains("Luca PT check-in"),
+            "should still be upcoming:\n{early}"
+        );
         // At 20:00 on Tue it has passed → gone from "still coming up".
         let late = grounded_block(&doc, at(2026, 7, 14, 20, 0), "what's the plan today?");
-        assert!(!late.contains("Luca PT check-in"), "past event should be dropped:\n{late}");
+        assert!(
+            !late.contains("Luca PT check-in"),
+            "past event should be dropped:\n{late}"
+        );
     }
 
     #[test]
     fn shape_time_parser_handles_common_forms() {
-        assert_eq!(parse_time_of_day("19:30"), NaiveTime::from_hms_opt(19, 30, 0));
+        assert_eq!(
+            parse_time_of_day("19:30"),
+            NaiveTime::from_hms_opt(19, 30, 0)
+        );
         assert_eq!(parse_time_of_day("9:00"), NaiveTime::from_hms_opt(9, 0, 0));
-        assert_eq!(parse_time_of_day("7:30pm"), NaiveTime::from_hms_opt(19, 30, 0));
+        assert_eq!(
+            parse_time_of_day("7:30pm"),
+            NaiveTime::from_hms_opt(19, 30, 0)
+        );
         assert_eq!(parse_time_of_day("7 pm"), NaiveTime::from_hms_opt(19, 0, 0));
         assert_eq!(parse_time_of_day("12am"), NaiveTime::from_hms_opt(0, 0, 0));
         assert_eq!(parse_time_of_day("12pm"), NaiveTime::from_hms_opt(12, 0, 0));
@@ -2889,7 +2992,10 @@ mod tests {
             block.to_lowercase().contains("nothing left"),
             "should announce the day is spent:\n{block}"
         );
-        assert!(block.contains("Farmers market"), "should offer tomorrow's item:\n{block}");
+        assert!(
+            block.contains("Farmers market"),
+            "should offer tomorrow's item:\n{block}"
+        );
     }
 
     // (d) A deliberation ask IS allowed to end with a question.
@@ -2901,7 +3007,10 @@ mod tests {
             "what should we do this weekend?",
             "not sure what to make — any ideas?",
         ] {
-            assert!(is_deliberation_request(ask), "should be deliberation: {ask:?}");
+            assert!(
+                is_deliberation_request(ask),
+                "should be deliberation: {ask:?}"
+            );
         }
         // When deliberation is invited, the trailing question is preserved.
         let reply = "We could do salmon or the curry. Which sounds better tonight?";
@@ -2930,12 +3039,23 @@ mod tests {
         let draft = "Morning! You've got a birthday today and back-to-back meetings — \
                      pretty packed day ahead.";
         let offenders = find_unsourced_schedule_claims(draft, &empty);
-        assert!(fabricates_schedule(draft, &empty), "must be flagged: {offenders:?}");
-        // Each distinct invented specific is caught.
-        assert!(offenders.iter().any(|o| o == "birthday"), "birthday missed: {offenders:?}");
-        assert!(offenders.iter().any(|o| o == "meetings"), "meetings missed: {offenders:?}");
         assert!(
-            offenders.iter().any(|o| o.contains("back") || o == "packed" || o == "packed day"),
+            fabricates_schedule(draft, &empty),
+            "must be flagged: {offenders:?}"
+        );
+        // Each distinct invented specific is caught.
+        assert!(
+            offenders.iter().any(|o| o == "birthday"),
+            "birthday missed: {offenders:?}"
+        );
+        assert!(
+            offenders.iter().any(|o| o == "meetings"),
+            "meetings missed: {offenders:?}"
+        );
+        assert!(
+            offenders
+                .iter()
+                .any(|o| o.contains("back") || o == "packed" || o == "packed day"),
             "load claim missed: {offenders:?}"
         );
     }
@@ -2951,7 +3071,10 @@ mod tests {
             "It's going to be a hectic day.",
             "Your day is booked solid.",
         ] {
-            assert!(fabricates_schedule(draft, &empty), "should reject: {draft:?}");
+            assert!(
+                fabricates_schedule(draft, &empty),
+                "should reject: {draft:?}"
+            );
         }
     }
 
@@ -2960,12 +3083,16 @@ mod tests {
     #[test]
     fn ground_fabrication_allows_sourced_claims() {
         // Two real events → "back-to-back" is grounded; "meeting" is on a title.
-        let g = build_schedule_grounding(&[
-            "Team meeting".to_string(),
-            "Dentist — Nadin".to_string(),
-        ]);
-        assert!(!fabricates_schedule("You've got a meeting then the dentist — a busy day.", &g));
-        assert!(!fabricates_schedule("Back-to-back today: the meeting and the dentist.", &g));
+        let g =
+            build_schedule_grounding(&["Team meeting".to_string(), "Dentist — Nadin".to_string()]);
+        assert!(!fabricates_schedule(
+            "You've got a meeting then the dentist — a busy day.",
+            &g
+        ));
+        assert!(!fabricates_schedule(
+            "Back-to-back today: the meeting and the dentist.",
+            &g
+        ));
         // But a birthday nobody scheduled is STILL a fabrication even here.
         assert!(fabricates_schedule("And it's someone's birthday too.", &g));
     }
@@ -2990,7 +3117,10 @@ mod tests {
             "Dinner tonight is salmon — sounds delicious.",
             "Good morning! Hope you slept well.",
         ] {
-            assert!(!fabricates_schedule(draft, &empty), "should NOT reject: {draft:?}");
+            assert!(
+                !fabricates_schedule(draft, &empty),
+                "should NOT reject: {draft:?}"
+            );
         }
     }
 
@@ -3001,14 +3131,24 @@ mod tests {
         // Greeting on Tue at 15:00 → today's still-upcoming event = PT check-in.
         let g = schedule_grounding_for(&doc, at(2026, 7, 14, 15, 0), "how's your day going?");
         assert_eq!(g.count, 1, "Tue has one upcoming event: text={:?}", g.text);
-        assert!(g.text.contains("pt check in") || g.text.contains("check in"), "text={:?}", g.text);
+        assert!(
+            g.text.contains("pt check in") || g.text.contains("check in"),
+            "text={:?}",
+            g.text
+        );
         // A reply grounded in that real event passes; an invented meeting fails.
-        assert!(!fabricates_schedule("You've got your PT check-in at 7:30.", &g));
+        assert!(!fabricates_schedule(
+            "You've got your PT check-in at 7:30.",
+            &g
+        ));
         assert!(fabricates_schedule("You've got a meeting at noon.", &g));
         // After 19:30 the check-in has passed → empty grounding → strict again.
         let spent = schedule_grounding_for(&doc, at(2026, 7, 14, 20, 0), "how's your day going?");
         assert_eq!(spent.count, 0);
-        assert!(fabricates_schedule("You've still got your check-in and a meeting.", &spent));
+        assert!(fabricates_schedule(
+            "You've still got your check-in and a meeting.",
+            &spent
+        ));
     }
 
     // The fallback is honest and volunteers no invented specifics.
@@ -3016,7 +3156,10 @@ mod tests {
     fn ground_fabrication_fallback_invents_nothing() {
         let empty = ScheduleGrounding::default();
         let fallback = grounding_fallback_line();
-        assert!(!fabricates_schedule(&fallback, &empty), "fallback must be clean: {fallback}");
+        assert!(
+            !fabricates_schedule(&fallback, &empty),
+            "fallback must be clean: {fallback}"
+        );
         assert!(fallback.to_lowercase().contains("calendar"));
     }
 
@@ -3028,15 +3171,27 @@ mod tests {
         let doc = PlanDoc::parse("2026-W29", PLAN);
         // Tue at 15:00 → names the real upcoming event, forbids invention.
         let with = schedule_context_line(Some(&doc), at(2026, 7, 14, 15, 0));
-        assert!(with.contains("PT check-in"), "should name the real event:\n{with}");
-        assert!(with.to_lowercase().contains("do not invent") || with.to_lowercase().contains("do not"), "{with}");
+        assert!(
+            with.contains("PT check-in"),
+            "should name the real event:\n{with}"
+        );
+        assert!(
+            with.to_lowercase().contains("do not invent") || with.to_lowercase().contains("do not"),
+            "{with}"
+        );
         // No plan at all → explicit empty-calendar truth.
         let none = schedule_context_line(None, at(2026, 7, 14, 15, 0));
-        assert!(none.to_lowercase().contains("nothing on the calendar"), "{none}");
+        assert!(
+            none.to_lowercase().contains("nothing on the calendar"),
+            "{none}"
+        );
         assert!(none.to_lowercase().contains("do not invent"), "{none}");
         // A spent day (asked Thu 20:00, after the 09:00 dentist) → clear.
         let spent = schedule_context_line(Some(&doc), at(2026, 7, 16, 20, 0));
-        assert!(spent.to_lowercase().contains("nothing on the calendar"), "{spent}");
+        assert!(
+            spent.to_lowercase().contains("nothing on the calendar"),
+            "{spent}"
+        );
     }
 
     // --- Rule 6: no dangling-promise deferral tail (task owner-pin-engine) ---
@@ -3137,8 +3292,7 @@ name = "Copper Finch"
             );
         }
 
-        let overlap =
-            FamilyVoiceRoster::from_names(["arc-2", "Arc"], std::iter::empty::<&str>());
+        let overlap = FamilyVoiceRoster::from_names(["arc-2", "Arc"], std::iter::empty::<&str>());
         assert!(
             !is_deferral_tail("Let me ask Parcel about that.", &overlap),
             "a configured name must not match inside another name"
@@ -3180,10 +3334,8 @@ name = "Copper Finch"
 
         // strip_deferral_tail still reports the tail for a body-bearing reply,
         // and reports None when there is no deferral.
-        let (body, tail) = strip_deferral_tail(
-            "It's 450 calories. Let me get her exact take.",
-            &roster,
-        );
+        let (body, tail) =
+            strip_deferral_tail("It's 450 calories. Let me get her exact take.", &roster);
         assert!(body.contains("450"), "{body}");
         assert!(tail.is_some(), "tail should be detected");
         let (body2, tail2) = strip_deferral_tail("It's 450 calories, enjoy!", &roster);
@@ -3221,9 +3373,7 @@ name = "The Hearth"
         )
         .unwrap();
         std::fs::write(
-            dir.path()
-                .join("claw3d-bridge")
-                .join("casa-gateway.toml"),
+            dir.path().join("claw3d-bridge").join("casa-gateway.toml"),
             r#"
 [[humans]]
 id = "human-fallback"
@@ -3316,10 +3466,7 @@ label = "Fallback Member"
             "a bare alias derived from an honorific persona name is attribution too",
         );
         assert_eq!(
-            strip_self_attribution(
-                "Coach Rowan 💬 Let's take a walk.",
-                &alias_roster,
-            ),
+            strip_self_attribution("Coach Rowan 💬 Let's take a walk.", &alias_roster,),
             "Let's take a walk.",
         );
         let ordinary = "Rowan says a walk sounds good.";
@@ -3334,10 +3481,7 @@ label = "Fallback Member"
     fn family_voice_handoff_is_terminal_and_roster_driven() {
         let roster = fixture_voice_roster();
         assert_eq!(
-            strip_handoff_tail(
-                "Dinner is ready. 🧭 The Wayfinder's got this one.",
-                &roster
-            ),
+            strip_handoff_tail("Dinner is ready. 🧭 The Wayfinder's got this one.", &roster),
             "Dinner is ready."
         );
         let mid = "I asked The Wayfinder and the plan is already settled.";
@@ -3355,10 +3499,7 @@ label = "Fallback Member"
             "without roster evidence no persona name is guessed"
         );
         assert_eq!(
-            strip_handoff_tail(
-                "Dinner (easy). 🧭 The Wayfinder's got this one.",
-                &roster
-            ),
+            strip_handoff_tail("Dinner (easy). 🧭 The Wayfinder's got this one.", &roster),
             "Dinner (easy).",
             "handoff cleanup does not eat balanced punctuation"
         );
@@ -3371,10 +3512,7 @@ label = "Fallback Member"
             "the gateway's person-for-this handoff shape is covered"
         );
         assert_eq!(
-            strip_handoff_tail(
-                "Dinner is ready. I'll hand this to The Wayfinder.",
-                &roster,
-            ),
+            strip_handoff_tail("Dinner is ready. I'll hand this to The Wayfinder.", &roster,),
             "Dinner is ready.",
             "removing a first-person handoff does not strand its auxiliary"
         );
@@ -3417,10 +3555,7 @@ label = "Fallback Member"
             "Check before serving, then pass it to Household Member."
         );
         assert_eq!(
-            scrub_off_roster_addressees(
-                "Dinner is ready; Zephyra will join us.",
-                &roster,
-            ),
+            scrub_off_roster_addressees("Dinner is ready; Zephyra will join us.", &roster,),
             "Dinner is ready.",
             "a semicolon boundary preserves the grounded clause before a phantom claim",
         );
@@ -3466,26 +3601,17 @@ label = "Fallback Member"
             "a coordinated multiword phantom is removed without a hardcoded roster"
         );
         assert_eq!(
-            scrub_off_roster_addressees(
-                "Dinner is ready. Pass it to Zephyra when warm.",
-                &roster
-            ),
+            scrub_off_roster_addressees("Dinner is ready. Pass it to Zephyra when warm.", &roster),
             "Dinner is ready.",
             "a phantom transfer clause is removed instead of leaving a bare verb"
         );
         assert_eq!(
-            scrub_off_roster_addressees(
-                "Dinner is ready. Zephyra will join us.",
-                &roster,
-            ),
+            scrub_off_roster_addressees("Dinner is ready. Zephyra will join us.", &roster,),
             "Dinner is ready.",
             "a declarative phantom-person clause is removed instead of being stated as fact"
         );
         assert_eq!(
-            scrub_off_roster_addressees(
-                "Dinner is ready. Household Member will join us.",
-                &roster,
-            ),
+            scrub_off_roster_addressees("Dinner is ready. Household Member will join us.", &roster,),
             "Dinner is ready. Household Member will join us.",
             "the same declarative shape survives for a roster-listed person"
         );
@@ -3520,9 +3646,7 @@ label = "Fallback Member"
             assert!(!has_infra_narration(clean), "should preserve: {clean}");
         }
         assert_eq!(
-            scrub_infra_narration(
-                "Dinner is ready. I'd need to pull that from the live gateway."
-            ),
+            scrub_infra_narration("Dinner is ready. I'd need to pull that from the live gateway."),
             "Dinner is ready."
         );
     }
@@ -3580,9 +3704,7 @@ label = "Fallback Member"
             handoff,
             "the exact engine-authored ownership line survives byte-for-byte"
         );
-        let body = format!(
-            "**Dinner is ready.** The Hearth's got this one.\n\n{handoff}"
-        );
+        let body = format!("**Dinner is ready.** The Hearth's got this one.\n\n{handoff}");
         assert_eq!(
             enforce_family_voice_with(
                 &body,
@@ -3626,7 +3748,10 @@ label = "Fallback Member"
     fn parse_week_context_records_only_planned_days() {
         let wc = parse_week_context(&sample_week_context());
         assert!(!wc.is_empty());
-        assert_eq!(wc.by_day.get("friday").map(String::as_str), Some("Chicken tray bake"));
+        assert_eq!(
+            wc.by_day.get("friday").map(String::as_str),
+            Some("Chicken tray bake")
+        );
         assert_eq!(
             wc.by_day.get("saturday").map(String::as_str),
             Some("Baked white fish with tomato, olives & capers")
@@ -3645,7 +3770,11 @@ label = "Fallback Member"
         let wc = parse_week_context(&sample_week_context());
         let draft = "Nothing's locked in for Saturday yet.";
         let claims = false_empty_week_claims(draft, &wc);
-        assert_eq!(claims.len(), 1, "expected one false-empty claim, got {claims:?}");
+        assert_eq!(
+            claims.len(),
+            1,
+            "expected one false-empty claim, got {claims:?}"
+        );
         assert_eq!(claims[0].0, "Saturday");
         let rewritten = week_grounding_rewrite(&claims);
         assert!(
@@ -3694,7 +3823,9 @@ label = "Fallback Member"
     fn week_context_absent_is_a_noop() {
         let empty = parse_week_context("");
         assert!(empty.is_empty());
-        assert!(false_empty_week_claims("Nothing's locked in for Saturday yet.", &empty).is_empty());
+        assert!(
+            false_empty_week_claims("Nothing's locked in for Saturday yet.", &empty).is_empty()
+        );
         assert!(week_context_block("").is_none());
         assert!(week_context_block("   ").is_none());
     }
@@ -3744,7 +3875,10 @@ label = "Fallback Member"
     fn memory_context_block_carries_facts_and_the_live_wins_label() {
         let block = memory_context_block(&sample_memory_context()).expect("block present");
         assert!(block.contains("Nina is allergic to peanuts"), "{block}");
-        assert!(block.contains("Gym is usually Wednesday evening (you)"), "{block}");
+        assert!(
+            block.contains("Gym is usually Wednesday evening (you)"),
+            "{block}"
+        );
         let lower = block.to_lowercase();
         assert!(lower.contains("not the current schedule"), "{block}");
         assert!(lower.contains("live truth and it wins"), "{block}");
@@ -3768,7 +3902,9 @@ label = "Fallback Member"
     fn memory_context_over_budget_is_trimmed_loudly_at_line_boundaries() {
         let mut huge = String::from("- Nina is allergic to peanuts\n");
         for i in 0..600 {
-            huge.push_str(&format!("- remembered filler fact number {i} about the week\n"));
+            huge.push_str(&format!(
+                "- remembered filler fact number {i} about the week\n"
+            ));
         }
         assert!(huge.len() > MEMORY_CONTEXT_MAX_CHARS);
 
@@ -3781,8 +3917,15 @@ label = "Fallback Member"
             "{block}"
         );
         // Bounded, and cut only at line boundaries — no half-sentence facts.
-        assert!(block.len() < MEMORY_CONTEXT_MAX_CHARS + 1200, "block len {}", block.len());
-        for line in block.lines().filter(|l| l.starts_with("- remembered filler")) {
+        assert!(
+            block.len() < MEMORY_CONTEXT_MAX_CHARS + 1200,
+            "block len {}",
+            block.len()
+        );
+        for line in block
+            .lines()
+            .filter(|l| l.starts_with("- remembered filler"))
+        {
             assert!(
                 line.ends_with("about the week"),
                 "a fact was sliced mid-line: {line}"

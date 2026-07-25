@@ -243,7 +243,14 @@ pub fn run(dir: &Path, json: bool) -> Result<()> {
         };
         println!(
             "  \x1b[1m{}\x1b[0m — {}  [{}{}\x1b[0m]{}  {}{}{}",
-            row.id, row.title, tag_color, status_tag, template_tag, next_tag, missed_tag, overdue_tag
+            row.id,
+            row.title,
+            tag_color,
+            status_tag,
+            template_tag,
+            next_tag,
+            missed_tag,
+            overdue_tag
         );
         println!("    {}", row.summary);
         println!("    {}  {}", last_tag, row.status);
