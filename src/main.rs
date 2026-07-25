@@ -3889,6 +3889,7 @@ fn main() -> Result<()> {
                 message,
                 group,
                 session_reply,
+                composed_reply,
                 compose,
                 compose_error,
             } => commands::telegram::run_conversation_dryrun(
@@ -3899,6 +3900,7 @@ fn main() -> Result<()> {
                 &message,
                 group,
                 session_reply.as_deref(),
+                composed_reply.as_deref(),
                 compose,
                 compose_error,
                 cli.json,

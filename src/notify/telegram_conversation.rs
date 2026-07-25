@@ -1041,12 +1041,12 @@ fn read_new_reply(
     session_ref: &str,
     baseline: u64,
     request_id: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<chat::ChatMessage>> {
     let msgs = chat::read_outbox_since_ref(workgraph_dir, session_ref, baseline)?;
     if let Some(m) = msgs.iter().find(|m| m.request_id == request_id) {
-        return Ok(Some(m.content.clone()));
+        return Ok(Some(m.clone()));
     }
-    Ok(msgs.into_iter().next().map(|m| m.content))
+    Ok(msgs.into_iter().next())
 }
 
 /// Run a single conversational turn per `plan`, sending via `sink`.
@@ -1141,50 +1141,38 @@ pub async fn run_conversation_turn(
 
 /// Deliver `text` to the human: edit the latency ack in place when one was sent
 /// (turning the hourglass into the final answer), else send a fresh message.
-///
-/// THE FAMILY-VOICE CHOKE POINT (task p1-engine-reply-guards). Every engine-sent
-/// reply — the composed answer, the graph-read status line, the graceful "glitch"
-/// follow-up, the legacy outbox reply — funnels through here, and here is the ONLY
-/// place the engine can hold them all to the same rules. The gateway applies six
-/// finalize rules at `familyVoice.gateComposedReply` (no self-attribution prefix,
-/// no off-roster human name, no hand-off tail, no infrastructure narration, no ops
-/// jargon, no markdown), but an engine-composed reply NEVER passes through that
-/// seam: it is sent by this process's own `ReplySink` and written to the feed by
-/// `FeedMirrorSink` in this process. So the rules are re-stated in Rust
-/// ([`grounding::gate_family_voice`]) and applied right before the bytes leave.
-///
-/// The gate is idempotent, so a caller that already gated its draft (to keep the
-/// session outbox and the sent message identical — see
-/// [`finalize_composed_reply`]) pays nothing here.
 async fn deliver_reply(
     sink: &dyn ReplySink,
     route: &ReplyRoute,
     ack_mid: Option<&str>,
     text: &str,
-    voice: &grounding::FamilyVoice,
+    roster: &grounding::FamilyVoiceRoster,
     authorized_handoff: Option<&str>,
 ) -> Result<()> {
-    let gated = grounding::gate_family_voice_with(
+    // Engine-originated replies never pass through the gateway finalizer:
+    // FeedMirrorSink mirrors the bytes sent here. Keep this as the single
+    // dynamic-delivery choke point so composed replies, graph status, graceful
+    // glitches, and legacy session replies all receive the same guard.
+    let guarded = grounding::enforce_family_voice_with(
         text,
-        voice,
-        grounding::GateOptions { authorized_handoff },
+        roster,
+        grounding::FamilyVoiceOptions {
+            authorized_handoff,
+        },
     );
-    if gated != text {
+    if guarded != text {
         eprintln!(
-            "[{}] family-voice gate: rewrote the reply before sending via {} (was {} chars, now {})",
+            "[{}] family-voice guard: cleaned a dynamic reply before delivery",
             chrono::Utc::now().format("%H:%M:%S"),
-            route.bot_id,
-            text.chars().count(),
-            gated.chars().count(),
         );
     }
-    let text = gated.as_str();
     match ack_mid {
         Some(mid) if !mid.is_empty() => {
-            sink.edit(&route.bot_id, &route.chat_id, mid, text).await
+            sink.edit(&route.bot_id, &route.chat_id, mid, &guarded)
+                .await
         }
         _ => sink
-            .send(&route.bot_id, &route.chat_id, text)
+            .send(&route.bot_id, &route.chat_id, &guarded)
             .await
             .map(|_| ()),
     }
@@ -1342,12 +1330,13 @@ async fn run_composed_turn(
     composer: &dyn ReplyComposer,
     origin: &crate::graph::TaskOrigin,
 ) -> Result<TurnOutcome> {
-    // The household's live roster, loaded ONCE per turn: the family-voice gate at
-    // the delivery choke point matches persona names (self-attribution, hand-off
-    // tails) and allowed human names (off-roster ghosts) against it. Best-effort —
-    // a household with no `household.toml` falls back to the shipped persona ids,
-    // and a missing binding map simply contributes no human names.
-    let voice = grounding::FamilyVoice::load(&project_root_of(workgraph_dir), workgraph_dir);
+    // Load the authoritative project-local roster once for every dynamic send
+    // this turn. The delivery choke point reuses it for graph answers, compose
+    // failures/timeouts, and the finalized answer.
+    let family_roster = grounding::load_family_voice_roster(
+        &project_root_of(workgraph_dir),
+        workgraph_dir,
+    );
 
     // ONE REPLY PER TURN (idempotency). A single turn is keyed by `request_id`,
     // and every reply we send is also appended to the outbox under that id. If an
@@ -1377,9 +1366,10 @@ async fn run_composed_turn(
     // persona's voice, without spinning up the model.
     if !origin.requester.trim().is_empty() && lifecycle::is_status_question(human_message) {
         if let Some(answer) = answer_status_from_graph(workgraph_dir, &origin.requester) {
+            let answer = grounding::enforce_family_voice(&answer, &family_roster);
             let _ = chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
             let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &answer, request_id);
-            deliver_reply(sink, route, None, &answer, &voice, None).await?;
+            deliver_reply(sink, route, None, &answer, &family_roster, None).await?;
             return Ok(TurnOutcome::Replied { acked: false });
         }
     }
@@ -1454,7 +1444,7 @@ async fn run_composed_turn(
                             ack_mid.as_deref(),
                             acked,
                             text,
-                            &voice,
+                            &family_roster,
                         )
                         .await;
                     }
@@ -1465,7 +1455,15 @@ async fn run_composed_turn(
                             "[{}] convo compose failed for {agent_id}: {e:#}",
                             chrono::Utc::now().format("%H:%M:%S"),
                         );
-                        deliver_reply(sink, route, ack_mid.as_deref(), &glitch_line(), &voice, None).await?;
+                        deliver_reply(
+                            sink,
+                            route,
+                            ack_mid.as_deref(),
+                            &glitch_line(),
+                            &family_roster,
+                            None,
+                        )
+                        .await?;
                         return Ok(TurnOutcome::Glitched { acked });
                     }
                 }
@@ -1482,7 +1480,15 @@ async fn run_composed_turn(
                         chrono::Utc::now().format("%H:%M:%S"),
                         timing.reply_timeout,
                     );
-                    deliver_reply(sink, route, ack_mid.as_deref(), &glitch_line(), &voice, None).await?;
+                    deliver_reply(
+                        sink,
+                        route,
+                        ack_mid.as_deref(),
+                        &glitch_line(),
+                        &family_roster,
+                        None,
+                    )
+                    .await?;
                     return Ok(TurnOutcome::Glitched { acked });
                 }
             }
@@ -1521,15 +1527,13 @@ async fn finalize_composed_reply(
     ack_mid: Option<&str>,
     acked: bool,
     first_text: String,
-    voice: &grounding::FamilyVoice,
+    family_roster: &grounding::FamilyVoiceRoster,
 ) -> Result<TurnOutcome> {
     let directive = lifecycle::extract_task_directive(first_text.trim());
     let mut reply_text = directive.reply.clone();
     // Audit the human-facing reply (with the machine tail already stripped).
     let audit = parity::audit_promise(&reply_text);
     let mut created: Option<String> = None;
-    // Set when the single-owner rule makes this voice defer out loud; the
-    // family-voice gate treats that tail as authorized (see below).
     let mut authorized_handoff: Option<String> = None;
 
     // SINGLE-OWNER RULE. Before any creation, resolve who OWNS this ask's domain
@@ -1583,10 +1587,9 @@ async fn finalize_composed_reply(
                 created =
                     try_create_origin_task(workgraph_dir, human_message, &title, &owner_origin);
                 let line = ownership::defer_line(&owner, domain);
-                // The family-voice gate strips a trailing hand-off to another
-                // persona (rule 2) — but THIS one is the engine's own ownership
-                // notice, not the composer passing the buck, so it is declared
-                // authorized and survives the gate verbatim.
+                // This exact suffix is authored here, after composition, to
+                // show where a re-routed ask landed. It is the only terminal
+                // handoff the family-voice guard may preserve.
                 authorized_handoff = Some(line.clone());
                 if reply_text.is_empty() {
                     reply_text = line;
@@ -1780,32 +1783,40 @@ async fn finalize_composed_reply(
         }
     }
 
-    // FAMILY-VOICE GATE (task p1-engine-reply-guards) — the six gateway finalize
-    // rules an engine-composed reply used to bypass entirely (no self-attribution
-    // prefix, no off-roster human name, no hand-off tail, no infrastructure
-    // narration, no ops jargon, no markdown). Applied HERE, before the outbox
-    // append, so the session outbox / TUI / casa feed carry EXACTLY the words the
-    // family was sent — the delivery choke point re-applies it (idempotently) for
-    // every other engine send.
+    // FAMILY-VISIBLE COPY GUARD. This is intentionally the LAST transform
+    // before both persistence and delivery: engine replies flow from here into
+    // the session outbox and the listener's FeedMirrorSink, so the gateway's
+    // JavaScript finalizer never sees them. Load names only from this project's
+    // household personas + live/fallback human roster, then remove self-attribution,
+    // terminal persona handoffs, plumbing/process narration, machine jargon,
+    // plain-text markdown, and strongly-shaped off-roster addressees.
     {
-        let gated = grounding::gate_family_voice_with(
+        let guarded = grounding::enforce_family_voice_with(
             &reply_text,
-            voice,
-            grounding::GateOptions {
+            family_roster,
+            grounding::FamilyVoiceOptions {
                 authorized_handoff: authorized_handoff.as_deref(),
             },
         );
-        if gated != reply_text {
+        if guarded != reply_text {
             eprintln!(
-                "[{}] family-voice gate: cleaned {agent_id}'s draft before delivery",
+                "[{}] family-voice guard: cleaned {agent_id}'s draft before delivery",
                 chrono::Utc::now().format("%H:%M:%S"),
             );
-            reply_text = gated;
+            reply_text = guarded;
         }
     }
 
     let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &reply_text, request_id);
-    deliver_reply(sink, route, ack_mid, &reply_text, voice, authorized_handoff.as_deref()).await?;
+    deliver_reply(
+        sink,
+        route,
+        ack_mid,
+        &reply_text,
+        family_roster,
+        authorized_handoff.as_deref(),
+    )
+    .await?;
     Ok(TurnOutcome::Replied { acked })
 }
 
@@ -2047,15 +2058,40 @@ async fn await_session_reply(
     route: &ReplyRoute,
     sink: &dyn ReplySink,
 ) -> Result<TurnOutcome> {
-    // Same household roster the composed path loads — the legacy outbox reply is
-    // still a reply a person reads, so it is held to the same family-voice rules
-    // (task p1-engine-reply-guards). Loaded once, outside the poll loop.
-    let voice = grounding::FamilyVoice::load(&project_root_of(workgraph_dir), workgraph_dir);
+    let family_roster = grounding::load_family_voice_roster(
+        &project_root_of(workgraph_dir),
+        workgraph_dir,
+    );
     let start = Instant::now();
     let mut acked = false;
     loop {
-        if let Some(text) = read_new_reply(workgraph_dir, session_ref, baseline, request_id)? {
-            deliver_reply(sink, route, None, &text, &voice, None).await?;
+        if let Some(reply) = read_new_reply(workgraph_dir, session_ref, baseline, request_id)? {
+            let guarded = grounding::enforce_family_voice(&reply.content, &family_roster);
+            if guarded != reply.content {
+                // A legacy session produced the outbox entry before this bridge
+                // saw it. Rewrite that exact entry so the persisted/TUI copy
+                // matches the guarded FeedMirrorSink send.
+                if let Err(error) = chat::edit_outbox_message_ref(
+                    workgraph_dir,
+                    session_ref,
+                    reply.id,
+                    &guarded,
+                ) {
+                    eprintln!(
+                        "[{}] family-voice guard: could not update legacy outbox copy: {error:#}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                    );
+                }
+            }
+            deliver_reply(
+                sink,
+                route,
+                None,
+                &guarded,
+                &family_roster,
+                None,
+            )
+            .await?;
             return Ok(TurnOutcome::Replied { acked });
         }
         let elapsed = start.elapsed();
@@ -3263,7 +3299,7 @@ mod tests {
     /// return a wrong answer if it were called, so a correct status line proves
     /// the short-circuit.
     #[tokio::test]
-    async fn lifecycle_status_question_answers_from_graph_not_the_model() {
+    async fn family_voice_guard_cleans_graph_status_delivery() {
         use crate::graph::{Node, OriginChannel, Status, Task, TaskOrigin, WorkGraph};
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
@@ -3272,11 +3308,13 @@ mod tests {
         bind_agent(&wg, "otto", &uuid).unwrap();
         confirm_human(&wg, "luca-1", "human-luca", "otto");
 
-        // Seed an in-progress task Luca asked for.
+        // Seed an in-progress task whose family-facing title contains markdown.
+        // Status copy is assembled after the composer finalizer, so only the
+        // dynamic-delivery choke point can clean it.
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(Task {
             id: "tweak-w29-meals".into(),
-            title: "tweak this week's meals".into(),
+            title: "**weekly refresh**".into(),
             status: Status::InProgress,
             origin: Some(TaskOrigin::new(
                 OriginChannel::TelegramDirect,
@@ -3308,6 +3346,14 @@ mod tests {
         let (_bot, _chat, text) = sink.calls().last().unwrap().clone();
         assert!(text.contains("on it now"), "status answer, got: {text}");
         assert!(!text.contains("WRONG"), "must not use the model: {text}");
+        assert!(!text.contains("**"), "status markdown bypassed delivery: {text}");
+        assert!(text.contains("weekly refresh"), "status title was lost: {text}");
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(text.as_str()),
+            "graph status must persist the same guarded bytes it sends"
+        );
     }
 
     /// An explicit "let me know when…" is acknowledged out loud, appended to the
@@ -3508,7 +3554,7 @@ mod tests {
     /// graceful "glitched" follow-up fast — never a permanent hourglass, never
     /// silence.
     #[tokio::test]
-    async fn compose_failure_sends_glitch_follow_up_fast() {
+    async fn family_voice_guard_preserves_clean_glitch_delivery() {
         let dir = tempdir().unwrap();
         let wg = dir.path().to_path_buf();
         let (_cfg, plan) = converse_fixture(&wg);
@@ -3532,7 +3578,11 @@ mod tests {
         assert_eq!(outcome, TurnOutcome::Glitched { acked: false });
         let calls = sink.calls();
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].2.contains("glitched"), "got: {:?}", calls[0].2);
+        assert_eq!(
+            calls[0].2,
+            glitch_line(),
+            "the clean glitch line survives the delivery guard byte-for-byte"
+        );
     }
 
     /// A slow compose (past `ack_after`) sends the ack, then EDITS it in place
@@ -4250,6 +4300,267 @@ mod tests {
         assert!(lc.contains("calendar"), "not the honest fallback: {last}");
     }
 
+    /// ENGINE DELIVERY-SEAM REGRESSION: a composed reply is cleaned on the
+    /// actual `run_conversation_turn → finalize → outbox + ReplySink` path.
+    /// The household uses fixture-only names to prove every name decision comes
+    /// from `household.toml`, not a roster compiled into the engine.
+    #[tokio::test]
+    async fn family_voice_guard_cleans_the_real_delivery_path() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[household]
+members = ["Household Member"]
+
+[[agent]]
+id = "hearth"
+name = "The Hearth"
+domains = ["coordination"]
+
+[[agent]]
+id = "wayfinder"
+name = "The Wayfinder"
+domains = ["calendar"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        add_binding(&wg, "member-1", "Household Member", true);
+        let plan =
+            plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
+
+        let raw = "**The Hearth** 💬 **Dinner is ready.** Check with **Zephyra** before serving. \
+                   That lives over in the pipeline. **Service:** dispatcher healthy — 2 agents. \
+                   🧭 The Wayfinder's got this one.";
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok(raw);
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "req-family-voice",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, TurnOutcome::Replied { .. }));
+        let delivered = sink.calls().last().unwrap().2.clone();
+        assert_eq!(delivered, "Dinner is ready. Check before serving.");
+
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|m| m.content.as_str()),
+            Some(delivered.as_str()),
+            "the guarded copy is persisted before FeedMirrorSink can mirror it"
+        );
+    }
+
+    #[tokio::test]
+    async fn family_voice_guard_replaces_unauthorized_handoff_only_composed_reply() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "hearth"
+name = "The Hearth"
+domains = ["coordination"]
+
+[[agent]]
+id = "wayfinder"
+name = "The Wayfinder"
+domains = ["calendar"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        add_binding(&wg, "member-1", "Household Member", true);
+        let plan =
+            plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
+
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok("The Wayfinder's got this one.");
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "req-handoff-only",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sink.calls().last().map(|call| call.2.as_str()),
+            Some(grounding::family_voice_fallback_line().as_str()),
+            "a composer-authored handoff-only reply must become neutral copy"
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(grounding::family_voice_fallback_line().as_str())
+        );
+    }
+
+    /// The no-composer compatibility path reads a reply that another session
+    /// already wrote to the outbox. It must enter the same delivery choke point,
+    /// and its persisted summary must be rewritten to the exact guarded send.
+    #[tokio::test]
+    async fn family_voice_guard_cleans_legacy_session_reply_and_outbox() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[household]
+members = ["Quillon Vale"]
+
+[[agent]]
+id = "hearth"
+name = "The Hearth"
+
+[[agent]]
+id = "wayfinder"
+name = "The Wayfinder"
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        add_binding(&wg, "member-1", "Household Member", true);
+        let plan =
+            plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
+
+        let raw = "**The Hearth** 💬 **Dinner is ready.** We're waiting on you and \
+                   **Quillon Vale** to confirm. 🧭 The Wayfinder's got this one.";
+        let responder_wg = wg.clone();
+        let responder_session = uuid.clone();
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let inbox =
+                    chat::read_inbox_ref(&responder_wg, &responder_session).unwrap_or_default();
+                if let Some(message) = inbox.iter().find(|message| message.role == "user") {
+                    chat::append_outbox_ref(
+                        &responder_wg,
+                        &responder_session,
+                        raw,
+                        &message.request_id,
+                    )
+                    .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("legacy fixture never received the inbox turn");
+        });
+
+        let sink = RecSink::default();
+        let outcome = run_conversation_turn(
+            &wg,
+            &plan,
+            "quick update",
+            "req-legacy-family-voice",
+            fast_timing(),
+            None,
+            &sink,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Replied { acked: false });
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 1, "the legacy bridge emits one guarded send");
+        assert_eq!(calls[0].2, "Dinner is ready.");
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(calls[0].2.as_str()),
+            "the legacy outbox summary must match the guarded send byte-for-byte"
+        );
+    }
+
+    /// The single-owner path appends one trusted `<owner>'s got this one` line
+    /// after composition. That exact engine-authored suffix survives; a
+    /// composer cannot grant itself the same exception.
+    #[tokio::test]
+    async fn family_voice_guard_preserves_exact_engine_authored_owner_handoff() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "hearth"
+name = "The Hearth"
+domains = ["coordination"]
+
+[[agent]]
+id = "pantry"
+name = "The Pantry"
+domains = ["meals"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[("hearth", Some("hearth")), ("pantry", Some("pantry"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "hearth", &uuid).unwrap();
+        add_binding(&wg, "member-1", "Household Member", true);
+        let plan =
+            plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
+
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok(
+            "Thursday soup is noted.\nTASK_CREATE: move Thursday dinner to soup",
+        );
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Thursday dinner to soup",
+            "req-owner-handoff",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let delivered = sink.calls().last().unwrap().2.clone();
+        let trusted = ownership::defer_line("pantry", ownership::Domain::MealPlanning);
+        assert_eq!(
+            delivered,
+            format!("Thursday soup is noted.\n\n{trusted}"),
+            "the exact ownership notice must survive after the guarded body"
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(delivered.as_str()),
+            "the ownership exception must produce identical outbox/send bytes"
+        );
+    }
+
     /// Seed a confirmed OR unconfirmed binding under `name` so the inviter
     /// resolver has a roster to read.
     fn add_binding(wg: &Path, sender: &str, name: &str, confirmed: bool) {
@@ -4325,143 +4636,5 @@ mod tests {
             Some("Robin"),
             "confirmed member should be the inviter"
         );
-    }
-
-    /// THE FINDING, end to end (task p1-engine-reply-guards). An engine-composed
-    /// reply is sent by THIS process's `ReplySink` and written to the feed by
-    /// `FeedMirrorSink` in THIS process — it never passes through the gateway's
-    /// `familyVoice.gateComposedReply` seam, so all six of that seam's rules were
-    /// unenforced on the real delivery path.
-    ///
-    /// This drives the LIVE path in a scratch project with a stub send: a real
-    /// household.toml roster, a confirmed human, a `plan_conversation` 1:1 route,
-    /// and a composer whose draft carries every one of the six leaks at once
-    /// (self-attribution prefix, markdown, a machine week number, a dispatcher
-    /// telemetry clause, infrastructure narration, a retired teammate's name, a
-    /// hand-off tail). What the RecSink records is what a person would have read,
-    /// and it must be clean — plus the session outbox (the TUI / casa feed's copy)
-    /// must carry EXACTLY the same words, so no surface renders the raw draft.
-    ///
-    /// Named for the `grounding` module the rules live in so the engine's
-    /// family-voice contract is covered by `cargo test grounding`.
-    #[tokio::test]
-    async fn grounding_gate_cleans_the_engine_sent_reply_and_the_outbox() {
-        let dir = tempdir().unwrap();
-        let wg = dir.path().to_path_buf();
-        // A real household roster, so the guards are roster-driven off the
-        // family's own file rather than any hardcoded name.
-        std::fs::write(
-            wg.join("household.toml"),
-            r#"
-[household]
-name = "Casa Rossi"
-members = ["Luca"]
-
-[[agent]]
-id = "nora"
-name = "Nora"
-domains = ["meals", "nutrition"]
-
-[[agent]]
-id = "otto"
-name = "Otto"
-domains = ["calendar", "coordination", "shopping"]
-"#,
-        )
-        .unwrap();
-
-        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
-        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "nora", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "nora");
-        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
-
-        // The dirty draft: all six leaks, no promise tail and no schedule claim
-        // (so the parity/anti-fabrication guards don't pre-empt what is under
-        // test here — the family-voice gate).
-        const DIRTY: &str = "Nora \u{1F4AC} **W29** is still a draft. The dispatcher has 3 agents alive. \
-                             Meals are set \u{2014} waiting on you and Nadin to confirm. \
-                             I'd need to pull from the live gateway for the rest. \
-                             \u{1F986} Otto's got this one.";
-
-        let sink = RecSink::default();
-        let composer = FakeComposer::ok(DIRTY);
-        let outcome = run_conversation_turn(
-            &wg,
-            &plan,
-            "hey",
-            "req-voice",
-            fast_timing(),
-            Some(&composer),
-            &sink,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, TurnOutcome::Replied { .. }));
-
-        // The roster the gate was built from — the same load the delivery path does.
-        let voice = grounding::FamilyVoice::load(&wg, &wg);
-        let personas = voice.persona_names().to_vec();
-
-        // NON-VACUOUS: the draft really does carry every leak. Without the gate,
-        // this is exactly what the family would have read.
-        assert!(grounding::has_self_attribution(DIRTY, &personas));
-        assert!(grounding::mentions_non_roster(DIRTY, &voice));
-        assert!(grounding::has_handoff_tail(DIRTY, &personas));
-        assert!(grounding::has_infra_narration(DIRTY));
-        assert!(grounding::has_ops_jargon(DIRTY));
-        assert!(grounding::has_markdown(DIRTY));
-
-        // What the stub sink actually received — the bytes a person reads.
-        let (bot, chat_id, sent) = sink.calls().last().expect("a reply was sent").clone();
-        assert_eq!(bot, "nora");
-        assert_eq!(chat_id, "555");
-
-        assert!(!sent.trim().is_empty(), "the engine must never send an empty reply");
-        assert!(!grounding::has_self_attribution(&sent, &personas), "attribution reached the family: {sent}");
-        assert!(!grounding::mentions_non_roster(&sent, &voice), "a retired teammate reached the family: {sent}");
-        assert!(!sent.to_lowercase().contains("nadin"), "{sent}");
-        assert!(!grounding::has_handoff_tail(&sent, &personas), "a hand-off tail reached the family: {sent}");
-        assert!(!grounding::has_infra_narration(&sent), "plumbing reached the family: {sent}");
-        assert!(!grounding::has_ops_jargon(&sent), "telemetry reached the family: {sent}");
-        assert!(!grounding::has_markdown(&sent), "raw markdown reached the family: {sent}");
-        assert!(!sent.contains("W29"), "a machine week number reached the family: {sent}");
-        assert!(!sent.contains('*') && !sent.contains('`'), "{sent}");
-        assert!(sent.contains("next week"), "the week ref was humanized, not deleted: {sent}");
-
-        // ONE TRUTH ACROSS SURFACES: the session outbox (what the TUI and the casa
-        // feed replay) must be the SAME cleaned words, not the raw draft.
-        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
-        let recorded = outbox
-            .iter()
-            .rev()
-            .find(|m| m.request_id == "req-voice")
-            .expect("the turn was recorded in the outbox");
-        assert_eq!(recorded.content.trim(), sent.trim(), "the outbox and the sent message diverged");
-        assert!(!recorded.content.contains("dispatcher"), "{}", recorded.content);
-    }
-
-    /// A CLEAN engine reply is delivered byte-for-byte. The gate sits in front of
-    /// every engine send, so this no-op is load-bearing: it is why adding it could
-    /// not change what an already-well-behaved persona says.
-    #[tokio::test]
-    async fn grounding_gate_leaves_a_clean_engine_reply_byte_for_byte() {
-        let dir = tempdir().unwrap();
-        let wg = dir.path().to_path_buf();
-        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
-        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "nora", &uuid).unwrap();
-        confirm_human(&wg, "luca-1", "human-luca", "nora");
-        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
-
-        const CLEAN: &str = "Dinner's chicken and rice tonight \u{1F957}";
-        let sink = RecSink::default();
-        let composer = FakeComposer::ok(CLEAN);
-        run_conversation_turn(&wg, &plan, "hey", "req-clean", fast_timing(), Some(&composer), &sink)
-            .await
-            .unwrap();
-
-        let (_bot, _chat, sent) = sink.calls().last().expect("a reply was sent").clone();
-        assert_eq!(sent, CLEAN, "the gate rewrote a clean reply");
     }
 }

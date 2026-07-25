@@ -5455,6 +5455,12 @@ fn parse_naive_now(s: &str) -> Option<chrono::NaiveDateTime> {
 /// session's inbox, a fixture responder writes `<text>` to the outbox, and the
 /// relayed reply is captured.
 ///
+/// With the hidden `--composed-reply <text>` test seam, the supplied draft is
+/// injected as a [`ReplyComposer`] result and therefore traverses the real
+/// finalize → outbox → delivery path. This is the credential-free scratch proof
+/// for post-composition guards; unlike `--session-reply`, it does not bypass the
+/// finalizer.
+///
 /// With `--compose` it exercises the REAL fix end-to-end: the converse turn is
 /// driven by the production [`OneshotComposer`] (a live one-shot `claude`
 /// spawn), so the captured reply is an actual session-generated answer — no
@@ -5610,6 +5616,7 @@ pub fn run_conversation_dryrun(
     message: &str,
     group: bool,
     session_reply: Option<&str>,
+    composed_reply: Option<&str>,
     compose: bool,
     compose_error: bool,
     json: bool,
@@ -5617,7 +5624,13 @@ pub fn run_conversation_dryrun(
     use std::sync::{Arc, Mutex};
     use worksgood::notify::telegram_conversation as convo;
 
-    let config = load_telegram_config().unwrap_or_default();
+    let config = if composed_reply.is_some() {
+        load_telegram_config().context(
+            "--composed-reply requires a project-local .wg/notify.toml so the real finalizer is reachable",
+        )?
+    } else {
+        load_telegram_config().unwrap_or_default()
+    };
     let entry = if group {
         convo::Entry::GroupElected
     } else {
@@ -5627,7 +5640,7 @@ pub fn run_conversation_dryrun(
     // Bind an ephemeral session to the addressed agent so the plan resolves to
     // `converse` and the turn has somewhere to land — needed for the fixture
     // round-trip AND both compose modes.
-    if session_reply.is_some() || compose || compose_error {
+    if session_reply.is_some() || composed_reply.is_some() || compose || compose_error {
         if let Some(agent_id) = convo::agent_for_channel(&config, channel) {
             let uuid = worksgood::chat_sessions::create_session(
                 workgraph_dir,
@@ -5680,6 +5693,23 @@ pub fn run_conversation_dryrun(
     }
     let sink = DryRunSink::default();
 
+    // Credential-free composed-turn fixture used only by smoke tests. Unlike
+    // `--session-reply`, this enters through ReplyComposer and therefore drives
+    // every production finalizer before the recording sink sees the reply.
+    struct FixtureComposer(String);
+    #[async_trait::async_trait]
+    impl convo::ReplyComposer for FixtureComposer {
+        async fn compose(
+            &self,
+            _wg: &Path,
+            _session_ref: &str,
+            _agent_id: &str,
+            _message: &str,
+        ) -> Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
     // Injected failing composer for `--compose-error`.
     struct FailingComposer;
     #[async_trait::async_trait]
@@ -5704,8 +5734,13 @@ pub fn run_conversation_dryrun(
     } else {
         None
     };
+    let fixture_composer = composed_reply.map(|reply| FixtureComposer(reply.to_string()));
     let failing_composer = FailingComposer;
-    let composer_ref: Option<&dyn convo::ReplyComposer> = if compose_error {
+    let composer_ref: Option<&dyn convo::ReplyComposer> = if let Some(fixture) =
+        fixture_composer.as_ref()
+    {
+        Some(fixture)
+    } else if compose_error {
         Some(&failing_composer)
     } else {
         real_composer.as_ref().map(|c| c as &dyn convo::ReplyComposer)

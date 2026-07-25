@@ -6787,6 +6787,15 @@ pub enum TelegramCommands {
         #[arg(long)]
         session_reply: Option<String>,
 
+        /// Test-only composed-turn fixture: inject this draft through the real
+        /// finalize → outbox → delivery path without spawning a model.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["session_reply", "compose", "compose_error"]
+        )]
+        composed_reply: Option<String>,
+
         /// Real-turn mode: drive the converse turn through the production
         /// one-shot `claude` composer (no fixture), capturing an actual
         /// session-generated answer. Requires a loadable wg config and auth.

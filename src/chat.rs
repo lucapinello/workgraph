@@ -1207,6 +1207,28 @@ pub fn edit_inbox_message_for(
     })
 }
 
+/// Replace one session outbox message's family-visible summary by ID.
+///
+/// The legacy Telegram conversation bridge consumes replies that another
+/// session process already appended. Its final family-voice guard therefore
+/// runs after that append; this targeted rewrite keeps the persisted/TUI copy
+/// byte-identical to the guarded send without disturbing neighboring messages.
+pub fn edit_outbox_message_ref(
+    workgraph_dir: &Path,
+    session_ref: &str,
+    message_id: u64,
+    new_content: &str,
+) -> Result<()> {
+    let path = outbox_path_ref(workgraph_dir, session_ref);
+    let content = new_content.to_string();
+    rewrite_jsonl(&path, |msg| {
+        if msg.id == message_id {
+            msg.content = content.clone();
+        }
+        true
+    })
+}
+
 /// Delete an inbox message by ID for a specific coordinator.
 /// Only works if the message hasn't been consumed by the coordinator yet.
 pub fn delete_inbox_message_for(

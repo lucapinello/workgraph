@@ -527,14 +527,6 @@ impl OwnerMap {
         self.owner_for_domain(classify_domain(ask))
     }
 
-    /// Every persona id in the map, in `household.toml` author order. The
-    /// family-voice gate ([`crate::notify::grounding::FamilyVoice::load`]) uses
-    /// this as its persona-roster fallback when no `household.toml` is found, so
-    /// the hand-off / self-attribution guards still have names to match on.
-    pub fn persona_ids(&self) -> Vec<&str> {
-        self.entries.iter().map(|(id, _)| id.as_str()).collect()
-    }
-
     /// The single-owner decision for `persona` creating a task from `ask`.
     ///
     /// * The resolved owner (case-insensitive id match) → [`OwnerDecision::Owner`].

@@ -45,10 +45,14 @@
 //!   seam) drops today's already-passed events; when the day is spent the block
 //!   says so in one line and offers tomorrow's first item.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
+use regex::{Captures, Regex};
 
+use crate::agency::TelegramBindingMap;
 use super::family_plan::{self, PlanDoc};
 
 // ---------------------------------------------------------------------------
@@ -637,6 +641,718 @@ pub fn enforce_no_deferral(reply: &str) -> String {
     match stripped {
         Some(_) if !body.trim().is_empty() => body,
         _ => reply.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Family-visible reply gate — the engine-side twin of the gateway seam
+// ---------------------------------------------------------------------------
+
+/// Names the engine is allowed to treat as real household members.
+///
+/// Persona names come from the project's `household.toml`; human names come
+/// from the live Telegram binding map, with the gateway's configured humans as
+/// the same bare-checkout fallback it uses. `household.members` is deliberately
+/// excluded: it seeds persona prompts but is not the live roster. The guard
+/// never bakes a particular family's names into the binary. Without an
+/// authoritative human-roster source, an unfamiliar capitalised word is not
+/// proof of a phantom person.
+#[derive(Debug, Clone, Default)]
+pub struct FamilyVoiceRoster {
+    persona_names: Vec<String>,
+    allowed_names: HashSet<String>,
+    has_evidence: bool,
+}
+
+impl FamilyVoiceRoster {
+    /// Build a roster from caller-supplied persona and human names. Public so
+    /// the pure guard can be tested with a household-independent fixture.
+    pub fn from_names<P, H, PS, HS>(personas: P, humans: H) -> Self
+    where
+        P: IntoIterator<Item = PS>,
+        H: IntoIterator<Item = HS>,
+        PS: Into<String>,
+        HS: Into<String>,
+    {
+        let mut roster = Self::default();
+        for name in personas {
+            roster.add_persona(name.into());
+        }
+        for name in humans {
+            roster.add_allowed(name.into());
+        }
+        roster
+    }
+
+    fn add_persona(&mut self, name: String) {
+        if name.trim().is_empty() {
+            return;
+        }
+        add_name_aliases(&mut self.allowed_names, &name);
+        if !self
+            .persona_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name.trim()))
+        {
+            self.persona_names.push(name.trim().to_string());
+        }
+    }
+
+    fn add_allowed(&mut self, name: String) {
+        if name.trim().is_empty() {
+            return;
+        }
+        self.has_evidence = true;
+        add_name_aliases(&mut self.allowed_names, &name);
+    }
+
+    fn allows(&self, name: &str) -> bool {
+        self.allowed_names.contains(&name.trim().to_lowercase())
+    }
+}
+
+/// Load the family-voice roster from the same project-local sources that define
+/// the running household. Best-effort: malformed or absent files yield fewer
+/// names, never a panic and never a compiled-in fallback roster.
+pub fn load_family_voice_roster(
+    project_root: &Path,
+    workgraph_dir: &Path,
+) -> FamilyVoiceRoster {
+    let mut roster = FamilyVoiceRoster::default();
+
+    if let Ok(body) = std::fs::read_to_string(project_root.join("household.toml")) {
+        if let Ok(value) = body.parse::<toml::Value>() {
+            if let Some(agents) = value.get("agent").and_then(toml::Value::as_array) {
+                for agent in agents {
+                    if let Some(id) = agent.get("id").and_then(toml::Value::as_str) {
+                        roster.add_persona(id.to_string());
+                    }
+                    if let Some(name) = agent.get("name").and_then(toml::Value::as_str) {
+                        roster.add_persona(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let bindings = TelegramBindingMap::load(&workgraph_dir.join("agency"))
+        .ok()
+        .map(|map| map.bindings)
+        .unwrap_or_default();
+    if bindings.is_empty() {
+        // HumansSource in the gateway uses configured humans only when there
+        // are no agency bindings. Mirror that precedence instead of merging a
+        // stale fallback name into the live roster.
+        let gateway_config = [
+            project_root.join("casa-gateway.toml"),
+            project_root.join("claw3d-bridge").join("casa-gateway.toml"),
+        ]
+        .into_iter()
+        .find_map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|body| body.parse::<toml::Value>().ok())
+        });
+        if let Some(value) = gateway_config {
+            roster.has_evidence = true;
+            if let Some(humans) = value.get("humans").and_then(toml::Value::as_array) {
+                for human in humans {
+                    if let Some(id) = human.get("id").and_then(toml::Value::as_str) {
+                        roster.add_allowed(id.to_string());
+                        if let Some(id) = id.strip_prefix("human-") {
+                            roster.add_allowed(id.to_string());
+                        }
+                    }
+                    if let Some(label) = human.get("label").and_then(toml::Value::as_str) {
+                        roster.add_allowed(label.to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        roster.has_evidence = true;
+        for binding in bindings {
+            roster.add_allowed(binding.name);
+            roster.add_allowed(binding.agent_id.clone());
+            if let Some(id) = binding.agent_id.strip_prefix("human-") {
+                roster.add_allowed(id.to_string());
+            }
+        }
+    }
+    roster
+}
+
+fn add_name_aliases(allowed: &mut HashSet<String>, raw: &str) {
+    let name = raw.trim().to_lowercase();
+    if name.is_empty() {
+        return;
+    }
+    allowed.insert(name.clone());
+    if let Some(alias) = name
+        .split_whitespace()
+        .find(|part| !is_name_alias_stopword(part))
+    {
+        allowed.insert(alias.to_string());
+    }
+}
+
+fn is_name_alias_stopword(word: &str) -> bool {
+    matches!(
+        word,
+        "a" | "an" | "the" | "coach" | "chef" | "dr" | "dr." | "mr" | "mr." | "mrs"
+            | "mrs." | "ms" | "ms."
+    )
+}
+
+fn persona_name_patterns(names: &[String]) -> Vec<String> {
+    let mut patterns = HashSet::new();
+    for raw in names {
+        let name = raw.trim();
+        if name.chars().count() >= 2 {
+            patterns.insert(name.to_string());
+        }
+    }
+    let mut out: Vec<String> = patterns.into_iter().collect();
+    out.sort_by_key(|name| std::cmp::Reverse(name.chars().count()));
+    out
+}
+
+/// Return the remaining text when `text` starts with `name`, case-insensitively
+/// and on a token boundary. Works for UTF-8 names without deriving byte offsets
+/// from a lower-cased string whose width may differ.
+fn strip_name_prefix_ci<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let count = name.chars().count();
+    let end = text
+        .char_indices()
+        .nth(count)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let candidate = text.get(..end)?;
+    if candidate.to_lowercase() != name.to_lowercase() {
+        return None;
+    }
+    let rest = &text[end..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(rest)
+}
+
+fn trim_attribution_separator(text: &str) -> &str {
+    text.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ':' | '：' | '—' | '–' | '-')
+    })
+}
+
+static ATTR_AVATAR_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[\p{So}\p{Sk}\u{FE0F}\u{200D}]\s*)+")
+        .expect("valid attribution-avatar regex")
+});
+
+/// Strip a leading persona attribution already carried by the sender/avatar
+/// fields: `Name 💬 …`, `💬 Name: …`, `Name: …`, or a bare leading `💬`.
+/// Persona matching is entirely roster-driven.
+pub fn strip_self_attribution(reply: &str, roster: &FamilyVoiceRoster) -> String {
+    let original = reply.trim();
+    if original.is_empty() {
+        return original.to_string();
+    }
+    let names = persona_name_patterns(&roster.persona_names);
+    let mut out = original;
+    for _ in 0..3 {
+        let before = out;
+        let plain = out.trim_start();
+
+        if let Some(rest) = plain.strip_prefix('💬') {
+            let rest = trim_attribution_separator(rest);
+            let mut after_name = None;
+            for name in &names {
+                if let Some(tail) = strip_name_prefix_ci(rest, name) {
+                    after_name = Some(trim_attribution_separator(tail));
+                    break;
+                }
+            }
+            out = after_name.unwrap_or(rest);
+        } else {
+            // A leading avatar/symbol is ignored only while probing for a
+            // roster name. No text is changed unless the name is followed by
+            // an attribution marker or required punctuation.
+            let probe = ATTR_AVATAR_PREFIX_RE
+                .find(plain)
+                .map(|prefix| &plain[prefix.end()..])
+                .unwrap_or(plain);
+            for name in &names {
+                let Some(tail) = strip_name_prefix_ci(probe, name) else {
+                    continue;
+                };
+                let spaced = tail.trim_start();
+                if let Some(rest) = spaced.strip_prefix('💬') {
+                    out = trim_attribution_separator(rest);
+                    break;
+                }
+                if spaced
+                    .chars()
+                    .next()
+                    .is_some_and(|c| matches!(c, ':' | '：' | '—' | '–'))
+                {
+                    out = trim_attribution_separator(spaced);
+                    break;
+                }
+            }
+        }
+
+        if out == before {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+static TRANSFER_ADDRESSEE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        (?P<action>(?i:\b(?:
+            hand(?:ed|\s+it)?(?:\s+(?:it|over))? |
+            pass(?:\s+it)? |
+            give(?:\s+it)?
+        )))\s+(?i:to)\s+
+        (?P<name>\p{Lu}[\p{L}'’\-]{2,}(?:\s+\p{Lu}[\p{L}'’\-]{2,}){0,2})\b",
+    )
+    .expect("valid transfer-addressee regex")
+});
+
+static CHECK_ADDRESSEE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        (?P<action>(?i:\b(?:check|confirm)))\s+(?i:with)\s+
+        (?P<name>\p{Lu}[\p{L}'’\-]{2,}(?:\s+\p{Lu}[\p{L}'’\-]{2,}){0,2})\b",
+    )
+    .expect("valid check-addressee regex")
+});
+
+static WAIT_ADDRESSEE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        (?i:\bwaiting\s+(?:on|for))\s+
+        (?:(?i:you|me|us|them|him|her)\s*,?\s*(?:(?i:and)|&)\s+)?
+        (?P<name>\p{Lu}[\p{L}'’\-]{2,}(?:\s+\p{Lu}[\p{L}'’\-]{2,}){0,2})\b",
+    )
+    .expect("valid waiting-addressee regex")
+});
+
+fn is_not_a_person(name: &str) -> bool {
+    matches!(
+        name.trim().to_lowercase().as_str(),
+        "monday"
+            | "tuesday"
+            | "wednesday"
+            | "thursday"
+            | "friday"
+            | "saturday"
+            | "sunday"
+            | "january"
+            | "february"
+            | "march"
+            | "april"
+            | "may"
+            | "june"
+            | "july"
+            | "august"
+            | "september"
+            | "october"
+            | "november"
+            | "december"
+            | "today"
+            | "tomorrow"
+            | "tonight"
+            | "yesterday"
+            | "everyone"
+            | "someone"
+            | "anyone"
+            | "you"
+            | "we"
+            | "them"
+            | "him"
+            | "her"
+            | "it"
+    )
+}
+
+fn scrub_addressee_pattern(
+    text: &str,
+    pattern: &Regex,
+    roster: &FamilyVoiceRoster,
+) -> String {
+    pattern
+        .replace_all(text, |caps: &Captures<'_>| {
+            let name = caps.name("name").map(|m| m.as_str()).unwrap_or("");
+            if roster.allows(name) || is_not_a_person(name) {
+                return caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
+            }
+            caps.name("action")
+                .map(|m| m.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .to_string()
+}
+
+fn has_off_roster_match(text: &str, pattern: &Regex, roster: &FamilyVoiceRoster) -> bool {
+    pattern.captures_iter(text).any(|caps| {
+        let name = caps.name("name").map(|m| m.as_str()).unwrap_or("");
+        !roster.allows(name) && !is_not_a_person(name)
+    })
+}
+
+fn tidy_family_text(text: &str) -> String {
+    static EMPTY_PARENS_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\(\s*\)").expect("valid empty-parens regex"));
+    static SPACE_PUNCT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\s+([.,;:!?])").expect("valid punctuation regex"));
+    static MULTISPACE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[ \t]{2,}").expect("valid multispace regex"));
+
+    let out = EMPTY_PARENS_RE.replace_all(text, "");
+    let out = SPACE_PUNCT_RE.replace_all(&out, "$1");
+    let out = MULTISPACE_RE.replace_all(&out, " ");
+    out.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '—' | '–' | ',' | ';' | ':' | '-')
+    })
+    .trim()
+    .to_string()
+}
+
+/// Remove a capitalised addressee that is absent from a real roster, but only
+/// in strong, unambiguous transfer/check/waiting constructions. A transfer or
+/// waiting clause that depends on a phantom person is dropped whole so the
+/// rewrite cannot leave malformed copy such as "pass when ready" or "we're to
+/// confirm". With no roster evidence this is a no-op; ordinary names elsewhere
+/// in a sentence are never guessed at or rewritten.
+pub fn scrub_off_roster_addressees(
+    reply: &str,
+    roster: &FamilyVoiceRoster,
+) -> String {
+    if !roster.has_evidence {
+        return reply.to_string();
+    }
+    let out = scrub_addressee_pattern(reply, &CHECK_ADDRESSEE_RE, roster);
+    let has_phantom_clause = has_off_roster_match(&out, &TRANSFER_ADDRESSEE_RE, roster)
+        || has_off_roster_match(&out, &WAIT_ADDRESSEE_RE, roster);
+    if !has_phantom_clause {
+        return if out == reply {
+            reply.to_string()
+        } else {
+            tidy_family_text(&out)
+        };
+    }
+    let out = family_clauses(&out)
+        .into_iter()
+        .filter(|clause| {
+            !has_off_roster_match(clause, &TRANSFER_ADDRESSEE_RE, roster)
+                && !has_off_roster_match(clause, &WAIT_ADDRESSEE_RE, roster)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    tidy_family_text(&out)
+}
+
+fn handoff_patterns(name_alt: &str) -> Vec<String> {
+    vec![
+        format!(
+            r"(?:{name_alt})(?:'s|’s|\s+is|\s+has)?\s+got\s+(?:this|it|that)(?:\s+one)?"
+        ),
+        format!(
+            r"(?:hand(?:ing)?|pass(?:ing)?|kick(?:ing)?|send(?:ing)?|toss(?:ing)?|leav(?:e|ing))\s+(?:this|it|that)?\s*(?:one\s+)?(?:off\s+)?(?:over\s+)?to\s+(?:{name_alt})"
+        ),
+        format!(r"over\s+to\s+(?:{name_alt})"),
+        format!(
+            r"(?:{name_alt})\s+(?:can|could|will|'ll|’ll|should|is\s+gonna|is\s+going\s+to)\s+(?:take|grab|handle|pick\s+up|sort|cover|help\s+with|run\s+with|jump\s+on)\s+(?:it|this|that)(?:\s+(?:one|up|out))?(?:\s+from\s+here)?"
+        ),
+        format!(r"(?:{name_alt})(?:'s|’s|\s+is)\s+on\s+(?:it|this|that)(?:\s+one)?"),
+        format!(
+            r"let\s+(?:{name_alt})\s+(?:take|handle|grab|sort|cover|run\s+with)\s+(?:it|this|that)"
+        ),
+        format!(r"(?:{name_alt})(?:'ll|’ll|\s+will)\s+pick\s+(?:this|it|that)\s+up"),
+        format!(
+            r"(?:{name_alt})(?:'s|’s|\s+is)\s+(?:your|the)\s+(?:go[- ]?to|person|one)\s+for\s+(?:this|that|it)"
+        ),
+    ]
+}
+
+static ORPHANED_AVATAR_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:[\p{So}\p{Sk}\u{FE0F}\u{200D}]\s*)+$")
+        .expect("valid handoff-avatar regex")
+});
+
+/// Strip a terminal handoff to a configured persona. Patterns are end-anchored,
+/// so a factual mid-sentence mention remains intact.
+pub fn strip_handoff_tail(reply: &str, roster: &FamilyVoiceRoster) -> String {
+    let original = reply.to_string();
+    let names = persona_name_patterns(&roster.persona_names);
+    if names.is_empty() || reply.trim().is_empty() {
+        return original;
+    }
+    let name_alt = names
+        .iter()
+        .map(|name| regex::escape(name))
+        .collect::<Vec<_>>()
+        .join("|");
+    let mut cut: Option<usize> = None;
+    for pattern in handoff_patterns(&name_alt) {
+        let Ok(re) = Regex::new(&format!(
+            r"(?i)(?:{pattern})[\s\p{{P}}\p{{S}}\u{{FE0F}}\u{{200D}}]*$"
+        )) else {
+            continue;
+        };
+        if let Some(found) = re.find(reply) {
+            cut = Some(cut.map_or(found.start(), |current| current.min(found.start())));
+        }
+    }
+    let Some(cut) = cut else {
+        return original;
+    };
+    let without_avatar =
+        ORPHANED_AVATAR_SUFFIX_RE.replace(reply[..cut].trim_end(), "");
+    let head = without_avatar
+        .trim()
+        .trim_end_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '—' | '–' | '-' | ',' | ';' | ':')
+        })
+        .trim();
+    if head.is_empty() {
+        String::new()
+    } else {
+        head.to_string()
+    }
+}
+
+static INFRA_SIGNALS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    let store = r"(?:gateway|pipeline|back[\s-]?end|database|datastore|data\s*store|data\s*feed|the\s+api|(?:the|our|your|this|that)\s+system)";
+    [
+        format!(
+            r"(?i)\b(?:pull|pulling|grab|grabbing|fetch|fetching|query|querying|load|loading|scrape|scraping|sync|syncing|hit|hitting|poll|polling|retrieve|retrieving|read)\b[^.!?…]{{0,40}}\b(?:from|off|out\s+of|into|against|to|up|via|through)\b[^.!?…]{{0,40}}{store}"
+        ),
+        r"(?i)\b(?:in|from|on|via|through|inside|within|across|over\s+(?:in|on|at))\s+(?:(?:the|our|a|this|that|live)\s+)*(?:gateway|pipeline|back[\s-]?end|database|datastore|data\s*store|data\s*feed|api)\b"
+            .to_string(),
+        format!(
+            r"(?i)\b(?:query|querying|hit|hitting|poll|polling|ping|pinging|scrape|scraping|fetch|fetching|pull|pulling)\b[^.!?…]{{0,12}}{store}"
+        ),
+        r"(?i)\bthe\s+live\s+gateway\b".to_string(),
+        r"(?i)\bdata\s+pipeline\b".to_string(),
+        r"(?i)\b(?:in|from|inside|within)\s+(?:the|our|your|this|that)\s+system\b"
+            .to_string(),
+    ]
+    .into_iter()
+    .map(|pattern| Regex::new(&pattern).expect("valid infrastructure regex"))
+    .collect()
+});
+
+/// True when the reply narrates its data plumbing rather than speaking in
+/// family terms. A bare `system` is intentionally not enough.
+pub fn has_infra_narration(reply: &str) -> bool {
+    INFRA_SIGNALS.iter().any(|re| re.is_match(reply))
+}
+
+static CLAUSE_SPLIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:[.!?…]\s+|\s+[-•·—–]\s+|\r?\n+)")
+        .expect("valid family-clause splitter")
+});
+
+fn family_clauses(text: &str) -> Vec<String> {
+    let mut clauses = Vec::new();
+    let mut start = 0usize;
+    for separator in CLAUSE_SPLIT_RE.find_iter(text) {
+        let raw = &text[separator.start()..separator.end()];
+        let first = raw.chars().next();
+        let end = if first.is_some_and(|c| matches!(c, '.' | '!' | '?' | '…')) {
+            separator.start() + first.unwrap().len_utf8()
+        } else {
+            separator.start()
+        };
+        let clause = text[start..end].trim();
+        if !clause.is_empty() {
+            clauses.push(clause.to_string());
+        }
+        start = separator.end();
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        clauses.push(tail.to_string());
+    }
+    clauses
+}
+
+/// Drop clauses that narrate infrastructure while keeping any ordinary family
+/// content around them.
+pub fn scrub_infra_narration(reply: &str) -> String {
+    if reply.trim().is_empty() || !has_infra_narration(reply) {
+        return reply.to_string();
+    }
+    tidy_family_text(
+        &family_clauses(reply)
+            .into_iter()
+            .filter(|clause| !has_infra_narration(clause))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+static WEEK_REF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:\d{4}-)?W\d{1,2}\b").expect("valid week regex"));
+
+static OPS_SIGNALS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"(?i)\bagent-\d+\b",
+        r"(?i)\bdispatcher\b",
+        r"(?i)\bclaude[:/][a-z0-9._-]+",
+        r"(?i)\bexecutor\b",
+        r"(?i)\b(?:max\s+\d+\s+agents?|\d+\s+max\s+(?:agents?|workers?)|max\s+workers?)\b",
+        r"(?i)\b\d+\s+agents?\b",
+        r"(?i)\b\d+\s+alive\b",
+        r"(?i)\b\d+\s+(?:in-progress|in\s+progress)\b",
+        r"(?i)\bcron\b",
+        r"(?i)\bnext\s+fire\b",
+        r"(?i)\buptime\b",
+        r"(?i)\bPID\s*\d+",
+        r"(?i)\bopenrouter\b",
+        r"(?i)\bregistry\s+refresh\b",
+        r"(?i)\bdaemon\b",
+        r"(?i)\bwg\s+\w+",
+        r"(?i)\b\d+\s+(?:recurring|paused|blocked)\b",
+    ]
+    .into_iter()
+    .map(|pattern| Regex::new(pattern).expect("valid operations-jargon regex"))
+    .collect()
+});
+
+pub fn has_ops_jargon(reply: &str) -> bool {
+    OPS_SIGNALS.iter().any(|re| re.is_match(reply))
+}
+
+/// Rewrite machine week tokens and drop orchestration/telemetry clauses.
+pub fn scrub_ops_jargon(reply: &str) -> String {
+    if reply.trim().is_empty() {
+        return reply.to_string();
+    }
+    let weeked = WEEK_REF_RE.replace_all(reply, "next week").to_string();
+    if !has_ops_jargon(&weeked) {
+        return weeked;
+    }
+    tidy_family_text(
+        &family_clauses(&weeked)
+            .into_iter()
+            .filter(|clause| !has_ops_jargon(clause))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+static MD_BOLD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\*\*(\S(?:[^*\n]*\S)?)\*\*").expect("valid bold-markdown regex")
+});
+static MD_ITALIC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(^|[^\p{L}\p{N}_*])\*(\S(?:[^*\n]*\S)?)\*($|[^\p{L}\p{N}_*])")
+        .expect("valid italic-markdown regex")
+});
+static MD_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"`(\S(?:[^`\n]*\S)?)`").expect("valid code-markdown regex"));
+
+/// Strip paired emphasis/code markers from the plain-text family surfaces.
+/// Lone and arithmetic asterisks remain unchanged.
+pub fn strip_markdown(reply: &str) -> String {
+    let mut out = MD_BOLD_RE.replace_all(reply, "$1").to_string();
+    loop {
+        let next = MD_ITALIC_RE.replace_all(&out, "$1$2$3").to_string();
+        if next == out {
+            break;
+        }
+        out = next;
+    }
+    MD_CODE_RE.replace_all(&out, "$1").to_string()
+}
+
+pub fn family_voice_fallback_line() -> String {
+    "I don't have a useful answer to share yet.".to_string()
+}
+
+/// Per-reply exceptions authored by the engine after composition.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FamilyVoiceOptions<'a> {
+    /// An exact terminal ownership notice produced by
+    /// [`crate::notify::ownership::defer_line`]. The composer cannot authorize
+    /// its own handoff: callers must supply the exact engine-authored suffix.
+    pub authorized_handoff: Option<&'a str>,
+}
+
+/// Apply every family-visible copy guard at the last engine seam before a
+/// reply is persisted and delivered. Clean replies take the no-op path through
+/// each transformer; a draft reduced to only plumbing/telemetry becomes an
+/// honest neutral line rather than an empty send or a raw console dump.
+pub fn enforce_family_voice(reply: &str, roster: &FamilyVoiceRoster) -> String {
+    enforce_family_voice_with(reply, roster, FamilyVoiceOptions::default())
+}
+
+/// [`enforce_family_voice`] with narrow, per-reply engine-authored exceptions.
+pub fn enforce_family_voice_with(
+    reply: &str,
+    roster: &FamilyVoiceRoster,
+    options: FamilyVoiceOptions<'_>,
+) -> String {
+    let original = reply.trim();
+    if original.is_empty() {
+        return family_voice_fallback_line();
+    }
+    // Ownership routing appends one trusted handoff *after* composition. Split
+    // only an exact suffix supplied by that call site, fully guard the body,
+    // then restore the trusted bytes. An invented tail elsewhere is still
+    // stripped; an unauthorized handoff-only draft still becomes the fallback.
+    if let Some(tail) = options
+        .authorized_handoff
+        .map(str::trim)
+        .filter(|tail| !tail.is_empty())
+    {
+        if let Some(head) = original.strip_suffix(tail) {
+            let head = head.trim();
+            if head.is_empty() {
+                return tail.to_string();
+            }
+            let guarded_head = enforce_family_voice_with(
+                head,
+                roster,
+                FamilyVoiceOptions {
+                    authorized_handoff: None,
+                },
+            );
+            return format!("{guarded_head}\n\n{tail}");
+        }
+    }
+    // Paired markdown can wrap the very tokens the roster-aware rules inspect
+    // (`**Name** 💬`, `check with **Name**`). Normalize it before those rules,
+    // then once more at the end for idempotence.
+    let mut out = strip_markdown(original);
+    out = strip_self_attribution(&out, roster);
+    out = scrub_off_roster_addressees(&out, roster);
+    out = strip_handoff_tail(&out, roster);
+    if has_infra_narration(&out) {
+        let clean = scrub_infra_narration(&out);
+        out = if clean.trim().is_empty() {
+            "Happy to dig into that — want me to take a proper look and get you the details?"
+                .to_string()
+        } else {
+            clean
+        };
+    }
+    out = scrub_ops_jargon(&out);
+    out = strip_markdown(&out);
+    let out = out.trim();
+    if out.is_empty() {
+        family_voice_fallback_line()
+    } else {
+        out.to_string()
     }
 }
 
@@ -1611,1115 +2327,6 @@ fn clamp_memory_context(text: &str) -> (String, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// FAMILY VOICE (task p1-engine-reply-guards) — the engine-side twin of the
-// gateway's `claw3d-bridge/src/familyVoice.mjs` finalize gate.
-//
-// WHY THIS MUST LIVE HERE. The gateway applies six rules to a composed persona
-// reply at ONE seam (`gateComposedReply`, called from `gatewayCore.routeChat` /
-// `_finalizeGroupReply`): no self-attribution prefix, no off-roster human name,
-// no hand-off tail, no infrastructure narration, no ops jargon, no markdown. But
-// an ENGINE-originated reply never passes through that seam: `wg telegram listen`
-// composes in-process, sends through its own `ReplySink`, and writes the feed via
-// `FeedMirrorSink` in the ENGINE process. So every one of those six rules was
-// unenforced on the real delivery path — exactly the gap the never-claim-empty
-// week guard above was added for, one layer further out.
-//
-// This section is the Rust twin of those rules: pure functions plus one
-// best-effort loader ([`FamilyVoice::load`]), applied at the engine's single
-// delivery choke point (`telegram_conversation::deliver_reply`).
-//
-// TWIN, NOT TRANSLATION. Rust's `regex` has no look-around, so the pair-matching
-// rules (markdown emphasis, the attribution prefix, the clause split) are
-// hand-written scanners with the same contract rather than transliterated
-// regexes. Two deliberate, documented differences from the JS twin are noted at
-// their call sites ([`strip_handoff_tail`] keeps terminal punctuation;
-// [`gate_family_voice`] never returns empty because Telegram rejects an empty
-// send). Everything else is rule-for-rule identical, and the shipped guarantees
-// are asserted in this module's tests.
-//
-// ROSTER-DRIVEN, NEVER HARDCODED (the no-hardcoded-names contract). The persona
-// and human names both come from the household's own files — `household.toml`
-// `[[agent]]`/`[household] members` and the confirmed Telegram bindings under
-// `<workgraph_dir>/agency`. The only hardcoded list is [`RETIRED_PERSONAS`], and
-// even those are cross-checked against the live roster so a name that is
-// genuinely a member again is never scrubbed. The persona fallback used when no
-// `household.toml` is found mirrors `ownership::OwnerMap::casa_default` (persona
-// ids are product vocabulary, not a family's personal data).
-// ---------------------------------------------------------------------------
-
-/// Personas retired from the product. A retired name surfacing in a composed
-/// reply is a tell that the composer invented a teammate; the gate strips it.
-/// Lowercased, word-boundary matched — the Rust twin of `ledger.mjs`'s
-/// `RETIRED_PERSONAS`.
-pub const RETIRED_PERSONAS: &[&str] = &["nadin"];
-
-/// 💬 — the speech-balloon relay-attribution glyph the gateway's group mirror
-/// prefixes an agent line with. A composer that echoes the feed format it sees
-/// in its context window bakes this into its own reply text; the attribution
-/// belongs in the sender/avatar fields ONLY.
-const CHAT_MARK: char = '\u{1F4AC}';
-
-/// Honorific first-words that are NOT a name to match a hand-off / attribution
-/// on, so "Coach Mira" contributes "mira" but never a bare "coach".
-const HANDOFF_NAME_STOPWORDS: &[&str] = &["coach", "chef", "dr", "mr", "mrs", "ms", "the", "a", "an"];
-
-/// Words that look like a capitalised name in an addressee slot but are NOT
-/// people — so the roster-driven addressee scan never eats a weekday or a month.
-const NOT_A_PERSON: &[&str] = &[
-    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january",
-    "february", "march", "april", "may", "june", "july", "august", "september", "october",
-    "november", "december", "today", "tomorrow", "tonight", "yesterday", "everyone", "someone",
-    "anyone", "i", "ill", "id", "ive", "im", "you", "youll", "youd", "we", "well", "us", "them",
-    "him", "her", "it", "itll",
-];
-
-/// The live roster a composed reply is held to: which persona names may be
-/// spoken as a voice (self-attribution + hand-off tails are matched against
-/// these) and which human names may be NAMED at all.
-///
-/// Built from the household's own files by [`FamilyVoice::load`], or directly
-/// from name lists by [`FamilyVoice::from_rosters`] for pure/unit use.
-#[derive(Debug, Clone, Default)]
-pub struct FamilyVoice {
-    /// Persona display names + ids in author order (the hand-off / attribution
-    /// alternation is built from these).
-    persona_names: Vec<String>,
-    /// Every allowed name token, lowercased: persona names/ids and their first
-    /// words, plus every known human's name/id and first word.
-    allowed: std::collections::HashSet<String>,
-    /// Known-retired persona names to strip when they are not on the roster.
-    retired: Vec<String>,
-}
-
-impl FamilyVoice {
-    /// Build from explicit rosters: `personas` are persona display names and/or
-    /// ids, `humans` are human display names and/or ids. Pure — this is the
-    /// constructor the unit tests and any non-filesystem caller use.
-    ///
-    /// EVERY known human is an allowed name — confirmed AND pending alike (the
-    /// JS twin's rule): a persona may legitimately name a still-pending invitee
-    /// ("I've asked Pia to join and confirm"), so gating their name would garble
-    /// an honest reply. Only a name in NO roster at all is scrubbed.
-    pub fn from_rosters<S: AsRef<str>, T: AsRef<str>>(personas: &[S], humans: &[T]) -> Self {
-        let mut persona_names = Vec::new();
-        let mut allowed = std::collections::HashSet::new();
-        let add = |set: &mut std::collections::HashSet<String>, raw: &str| {
-            let s = raw.trim().to_lowercase();
-            if s.is_empty() {
-                return;
-            }
-            set.insert(s.clone());
-            // First word too, so "Coach Mira" also allows "Mira".
-            if let Some(first) = s.split_whitespace().next() {
-                if !first.is_empty() {
-                    set.insert(first.to_string());
-                }
-            }
-        };
-        for p in personas {
-            let raw = p.as_ref().trim();
-            if raw.is_empty() {
-                continue;
-            }
-            persona_names.push(raw.to_string());
-            add(&mut allowed, raw);
-        }
-        for h in humans {
-            let raw = h.as_ref().trim();
-            if raw.is_empty() {
-                continue;
-            }
-            // A binding id ("human-luca") also allows the bare name ("luca").
-            add(&mut allowed, raw);
-            if let Some(rest) = raw.strip_prefix("human-") {
-                add(&mut allowed, rest);
-            }
-        }
-        Self {
-            persona_names,
-            allowed,
-            retired: RETIRED_PERSONAS.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    /// Override the retired-persona list (tests; a household that renamed a
-    /// persona out of the product).
-    pub fn with_retired<S: AsRef<str>>(mut self, retired: &[S]) -> Self {
-        self.retired = retired
-            .iter()
-            .map(|s| s.as_ref().trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        self
-    }
-
-    /// Load the live roster for a household: personas from `<root>/household.toml`
-    /// `[[agent]]` (`name` + `id`, author order), humans from that file's
-    /// `[household] members` PLUS every Telegram binding under
-    /// `<workgraph_dir>/agency` (the same source `family_inviter_name` reads).
-    ///
-    /// Best-effort by design — the gate must never be the reason a reply fails to
-    /// go out. A missing/unparseable `household.toml` falls back to the shipped
-    /// persona ids (mirroring `ownership::OwnerMap::casa_default`); unreadable
-    /// bindings simply contribute no human names.
-    pub fn load(root: &Path, workgraph_dir: &Path) -> Self {
-        let (mut personas, mut humans) = household_rosters(root).unwrap_or_default();
-        if personas.is_empty() {
-            personas = super::ownership::OwnerMap::casa_default()
-                .persona_ids()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
-        }
-        if let Ok(map) =
-            crate::agency::TelegramBindingMap::load(&workgraph_dir.join("agency"))
-        {
-            for b in &map.bindings {
-                if !b.name.trim().is_empty() {
-                    humans.push(b.name.trim().to_string());
-                }
-                if !b.agent_id.trim().is_empty() {
-                    humans.push(b.agent_id.trim().to_string());
-                }
-            }
-        }
-        Self::from_rosters(&personas, &humans)
-    }
-
-    /// The persona display names + ids the hand-off / attribution guards match on.
-    pub fn persona_names(&self) -> &[String] {
-        &self.persona_names
-    }
-
-    /// True when `name` is on the live roster (persona or human), case-insensitive.
-    pub fn allows(&self, name: &str) -> bool {
-        self.allowed.contains(&name.trim().to_lowercase())
-    }
-
-    /// No roster at all — the name guards are then no-ops (a pure caller that
-    /// supplied nothing must never have its reply mangled).
-    pub fn is_empty(&self) -> bool {
-        self.persona_names.is_empty() && self.allowed.is_empty()
-    }
-}
-
-/// Parse `<root>/household.toml` into `(persona names+ids, human member names)`.
-/// `None` when the file is absent or unparseable.
-fn household_rosters(root: &Path) -> Option<(Vec<String>, Vec<String>)> {
-    let body = std::fs::read_to_string(root.join("household.toml")).ok()?;
-    let value: toml::Value = body.parse().ok()?;
-    let mut personas = Vec::new();
-    if let Some(agents) = value.get("agent").and_then(|a| a.as_array()) {
-        for a in agents {
-            if let Some(name) = a.get("name").and_then(|n| n.as_str()) {
-                personas.push(name.to_string());
-            }
-            if let Some(id) = a.get("id").and_then(|i| i.as_str()) {
-                personas.push(id.to_string());
-            }
-        }
-    }
-    let mut humans = Vec::new();
-    if let Some(members) = value
-        .get("household")
-        .and_then(|h| h.get("members"))
-        .and_then(|m| m.as_array())
-    {
-        for m in members {
-            if let Some(s) = m.as_str() {
-                humans.push(s.to_string());
-            }
-        }
-    }
-    Some((personas, humans))
-}
-
-// ── Rule 0: no self-attribution prefix ───────────────────────────────────────
-// A persona reply carries its attribution in the sender/avatar fields ONLY —
-// never baked into the visible text. The live bug (Luca, 2026-07-24): the kiosk
-// greeting rendered as "The Chiller 💬 Hi! All quiet…" — the persona name AND the
-// 💬 relay mark were inside the message text, so the row showed the avatar + name
-// twice, once as chrome and once as words.
-//
-// Conservative by construction: a BARE persona name at the start is peeled ONLY
-// when an attribution separator follows (💬 / ":" / an em/en dash), so an ordinary
-// reply that merely opens with a name ("Nora says hi!") is untouched.
-
-/// True when `c` reads as an attribution/avatar glyph: a non-alphanumeric,
-/// non-whitespace, non-ASCII character (an emoji, a variation selector, a ZWJ).
-/// Used instead of `\p{Extended_Pictographic}` (which Rust's `regex` gates behind
-/// a Unicode table the crate does not enable) — the predicate is intentionally
-/// broad because it is only ever applied to a LEADING or TRAILING run.
-fn is_attr_glyph(c: char) -> bool {
-    !c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace()
-}
-
-/// A colon / em-dash / en-dash: the separators that make a leading bare persona
-/// name read as attribution rather than as the first word of a sentence.
-fn is_strict_attr_sep(c: char) -> bool {
-    matches!(c, ':' | '\u{FF1A}' | '\u{2014}' | '\u{2013}')
-}
-
-/// The strict separators plus a plain hyphen, allowed where the 💬 mark has
-/// already established that the prefix IS attribution.
-fn is_loose_attr_sep(c: char) -> bool {
-    is_strict_attr_sep(c) || c == '-'
-}
-
-/// Lowercased persona name tokens (display names + their first words), longest
-/// first so "coach mira" is tried before "mira", with the honorific stopwords
-/// dropped so a bare "coach" never matches.
-fn persona_name_tokens<S: AsRef<str>>(persona_names: &[S]) -> Vec<String> {
-    let mut set = std::collections::HashSet::new();
-    for n in persona_names {
-        let s = n.as_ref().trim().to_lowercase();
-        if s.chars().count() >= 2 {
-            set.insert(s.clone());
-        }
-        // The first AND last words as aliases, so a household that configures only
-        // a display name ("Coach Mira", "The Chiller") still has the bare name
-        // ("mira", "chiller") to match a hand-off / attribution on. The honorific
-        // stopwords ("coach", "the") never survive this, so a bare title can't
-        // stand in for a persona.
-        let mut words = s.split_whitespace();
-        let first = words.next();
-        let last = words.next_back().or(first);
-        for alias in [first, last].into_iter().flatten() {
-            if alias.chars().count() >= 2 && !HANDOFF_NAME_STOPWORDS.contains(&alias) {
-                set.insert(alias.to_string());
-            }
-        }
-    }
-    let mut out: Vec<String> = set
-        .into_iter()
-        .filter(|s| !HANDOFF_NAME_STOPWORDS.contains(&s.as_str()))
-        .collect();
-    out.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then(a.cmp(b)));
-    out
-}
-
-/// Match one of `names` at `chars[i..]`, case-insensitively, requiring a
-/// non-alphanumeric boundary after it (so "nora" does not match "Norah").
-/// Returns the index just past the matched name.
-fn match_name_at(chars: &[char], i: usize, names: &[String]) -> Option<usize> {
-    for name in names {
-        let nc: Vec<char> = name.chars().collect();
-        if i + nc.len() > chars.len() {
-            continue;
-        }
-        let hit = chars[i..i + nc.len()]
-            .iter()
-            .zip(nc.iter())
-            .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()));
-        if !hit {
-            continue;
-        }
-        let end = i + nc.len();
-        if end < chars.len() && chars[end].is_alphanumeric() {
-            continue; // "Norah" is not "Nora"
-        }
-        return Some(end);
-    }
-    None
-}
-
-fn skip_ws(chars: &[char], mut i: usize) -> usize {
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    i
-}
-
-fn skip_glyphs(chars: &[char], mut i: usize) -> usize {
-    while i < chars.len() && (is_attr_glyph(chars[i]) || chars[i].is_whitespace()) {
-        i += 1;
-    }
-    i
-}
-
-/// Peel ONE leading self-attribution prefix, or `None` when the text does not
-/// open with one. The four shapes are the JS twin's four alternatives:
-///   a. `<glyph>* <Name> 💬`         — the reported shape
-///   b. `💬 <Name>[sep]`             — the mark leads, then the name
-///   c. `<glyph>* <Name><strict sep>` — a bare name attribution
-///   d. `💬[sep]`                    — the bare relay mark
-fn peel_self_attribution(text: &str, names: &[String]) -> Option<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let start = skip_ws(&chars, 0);
-    let rest_from = |i: usize| -> String { chars[skip_ws(&chars, i)..].iter().collect() };
-
-    // (a) / (c): an optional glyph run, then the persona's own name.
-    if !names.is_empty() {
-        let after_glyphs = skip_glyphs(&chars, start);
-        if let Some(end) = match_name_at(&chars, after_glyphs, names) {
-            let k = skip_ws(&chars, end);
-            if k < n && chars[k] == CHAT_MARK {
-                return Some(rest_from(k + 1)); // (a) "<Name> 💬 …"
-            }
-            if k < n && is_strict_attr_sep(chars[k]) {
-                return Some(rest_from(k + 1)); // (c) "<Name>: …"
-            }
-        }
-    }
-
-    // (b) / (d): the 💬 mark leads.
-    if start < n && chars[start] == CHAT_MARK {
-        let after_mark = skip_ws(&chars, start + 1);
-        if !names.is_empty() {
-            if let Some(end) = match_name_at(&chars, after_mark, names) {
-                let mut k = skip_ws(&chars, end);
-                if k < n && is_loose_attr_sep(chars[k]) {
-                    k += 1;
-                }
-                return Some(rest_from(k)); // (b) "💬 <Name>: …"
-            }
-        }
-        let mut k = after_mark;
-        if k < n && is_loose_attr_sep(chars[k]) {
-            k += 1;
-        }
-        return Some(rest_from(k)); // (d) "💬 …"
-    }
-    None
-}
-
-/// Strip a leading self-attribution prefix from a composed reply. Repeated
-/// prefixes are peeled (bounded at three, so a line that is NOTHING but
-/// attribution cannot loop); a strip that would empty the reply keeps the
-/// original.
-pub fn strip_self_attribution<S: AsRef<str>>(text: &str, persona_names: &[S]) -> String {
-    let original = text.trim();
-    if original.is_empty() {
-        return text.to_string();
-    }
-    let names = persona_name_tokens(persona_names);
-    let mut out = original.to_string();
-    for _ in 0..3 {
-        match peel_self_attribution(&out, &names) {
-            Some(next) if next != out => out = next,
-            _ => break,
-        }
-    }
-    if out.trim().is_empty() {
-        original.to_string()
-    } else {
-        out.trim().to_string()
-    }
-}
-
-/// True when `text` opens with a self-attribution prefix — used by the tests and
-/// the smoke gate to prove the guarantee holds (a stripped reply reports false).
-pub fn has_self_attribution<S: AsRef<str>>(text: &str, persona_names: &[S]) -> bool {
-    strip_self_attribution(text, persona_names) != text.trim()
-}
-
-// ── Rule 1: no off-roster human name ─────────────────────────────────────────
-// A persona may only name a human who is actually in the live roster. The live
-// bug: a retired test person ("Nadin") kept resurfacing in composed replies
-// ("waiting on you and Nadin to confirm") long after every seed file was
-// scrubbed, because freshly-composed LLM text can invent a teammate.
-
-/// Verbs that introduce a person being HANDED a thing or ASKED to confirm — the
-/// shapes where a phantom teammate leaks in. Kept to STRONG, unambiguous
-/// hand-off/confirm verbs (not a bare "and"/"with"/"to") so ordinary speech is
-/// never mistaken for a person. The captured group is the candidate name.
-fn addressee_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?:hand(?:ed| it)?(?:\s+(?:it|over))?\s+to|pass(?:\s+it)?\s+to|give\s+(?:it\s+)?to|check\s+with|confirm\s+with|waiting\s+(?:on|for))\s+([A-Z][A-Za-zÀ-ÿ'’-]{2,})\b",
-        )
-        .expect("addressee regex compiles")
-    })
-}
-
-/// Capitalised addressee names in `text` that are NOT on the roster and don't
-/// look like a date word — the phantom people to strip.
-pub fn non_roster_addressees(text: &str, voice: &FamilyVoice) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for caps in addressee_re().captures_iter(text) {
-        let name = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        // The candidate may arrive possessive ("waiting on Tomorrow's list",
-        // "hand it to Priya's team"). Test the roster against the BASE name so a
-        // roster member / a date word is recognised through the "'s"; strip the
-        // whole possessive token when it turns out to be a phantom, so no
-        // dangling "'s" is left behind.
-        let base = name
-            .strip_suffix("'s")
-            .or_else(|| name.strip_suffix('\u{2019}'))
-            .or_else(|| name.strip_suffix("\u{2019}s"))
-            .unwrap_or(name)
-            .trim_end_matches(['\'', '\u{2019}']);
-        let key = base.to_lowercase();
-        if voice.allows(&key) || NOT_A_PERSON.contains(&key.as_str()) {
-            continue;
-        }
-        if !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
-        }
-    }
-    out
-}
-
-/// The full strip list for a composed reply: the known-retired personas that are
-/// NOT currently on the roster and DO appear in this text, plus any capitalised
-/// off-roster addressee the text itself names.
-pub fn non_roster_ghosts(text: &str, voice: &FamilyVoice) -> Vec<String> {
-    let mut ghosts: Vec<String> = Vec::new();
-    for r in &voice.retired {
-        if voice.allows(r) {
-            continue; // genuinely back on the roster
-        }
-        if word_present(text, r) && !ghosts.iter().any(|g| g.eq_ignore_ascii_case(r)) {
-            ghosts.push(r.clone());
-        }
-    }
-    for n in non_roster_addressees(text, voice) {
-        if !ghosts.iter().any(|g| g.eq_ignore_ascii_case(&n)) {
-            ghosts.push(n);
-        }
-    }
-    ghosts
-}
-
-/// True when a composed reply still names a human who is not on the roster —
-/// the assertion the tests and the smoke gate make.
-pub fn mentions_non_roster(text: &str, voice: &FamilyVoice) -> bool {
-    !non_roster_ghosts(text, voice).is_empty()
-}
-
-/// Case-insensitive whole-word presence of `needle` in `haystack`.
-fn word_present(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let h: Vec<char> = haystack.chars().collect();
-    let nd: Vec<char> = needle.chars().collect();
-    let mut i = 0;
-    while i + nd.len() <= h.len() {
-        let hit = h[i..i + nd.len()]
-            .iter()
-            .zip(nd.iter())
-            .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()));
-        if hit {
-            let left_ok = i == 0 || !h[i - 1].is_alphanumeric();
-            let right = i + nd.len();
-            let right_ok = right >= h.len() || !h[right].is_alphanumeric();
-            if left_ok && right_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Remove ghost human names from free text, then tidy the dangling connectors
-/// they leave behind — the Rust twin of `weekSource.scrubGhostNames`. Driven
-/// ENTIRELY by the caller's list; no name is hardcoded here.
-pub fn scrub_ghost_names<S: AsRef<str>>(text: &str, ghosts: &[S]) -> String {
-    let mut s = text.to_string();
-    if ghosts.is_empty() {
-        return s;
-    }
-    for g in ghosts {
-        let name = g.as_ref().trim();
-        if name.is_empty() {
-            continue;
-        }
-        let esc = regex::escape(name);
-        // "w/ Nadin", "with Nadin", "for Nadin", "to Nadin", "and Nadin". The
-        // locatives ("on"/"from"/"about") go beyond the JS twin's list so
-        // "waiting on Nadin" collapses to "waiting" rather than "waiting on".
-        s = replace_all(
-            &s,
-            &format!(r"(?i)\s*\b(?:w/|with|for|to|by|and|or|on|from|about)\s+{esc}\b"),
-            "",
-        );
-        // "Nadin —" (owner prefix) and "— Nadin" (suffix)
-        s = replace_all(&s, &format!(r"(?i)\b{esc}\s*[—-]\s*"), "");
-        s = replace_all(&s, &format!(r"(?i)\s*[—-]\s*\b{esc}\b"), "");
-        // any remaining standalone mention
-        s = replace_all(&s, &format!(r"(?i)\b{esc}\b"), "");
-    }
-    let s = replace_all(&s, r"\(\s*\)", ""); // emptied "(…)"
-    let s = replace_all(&s, r"\s+([.,;:])", "$1"); // space before punctuation
-    let s = replace_all(&s, r"\s{2,}", " "); // collapsed doubles
-    s.trim_matches(|c: char| c.is_whitespace() || matches!(c, '—' | ',' | ';' | ':' | '-'))
-        .to_string()
-}
-
-/// Compile-and-replace helper: a pattern that fails to compile leaves the text
-/// untouched, so the gate can never panic on a household-derived name.
-fn replace_all(text: &str, pattern: &str, replacement: &str) -> String {
-    match regex::Regex::new(pattern) {
-        Ok(re) => re.replace_all(text, replacement).into_owned(),
-        Err(_) => text.to_string(),
-    }
-}
-
-// ── Rule 2: no hand-off tail ─────────────────────────────────────────────────
-// A DELIVERED answer ends after its content. It must not trail off by handing
-// the turn to another persona — the live 19:2x leak was a Nora delivery that
-// ended "🦆 Otto's got this one". The family asked ONE assistant and got the
-// answer; a hand-off tail reads as buck-passing.
-
-/// Hand-off constructions as templates, `__N__` where a roster persona name
-/// goes. Each is checked only where it runs to the END of the reply, so a
-/// mid-sentence mention ("I asked Nora and she's on it, plus the plan's set") is
-/// never over-stripped.
-const HANDOFF_TEMPLATES: &[&str] = &[
-    // "Otto's got this (one)", "Nora has got it"
-    r"(?:__N__)(?:'s|’s| is| has)?\s+got\s+(?:this|it|that)(?:\s+one)?",
-    // "hand/pass/kick/send (this) (off) (over) to Otto"
-    r"(?:hand(?:ing)?|pass(?:ing)?|kick(?:ing)?|send(?:ing)?|toss(?:ing)?|leav(?:e|ing))\s+(?:this|it|that)?\s*(?:one\s+)?(?:off\s+)?(?:over\s+)?to\s+(?:__N__)",
-    // "over to Otto"
-    r"over\s+to\s+(?:__N__)",
-    // "Otto can/will/'ll/should take/grab/handle/pick up/cover it (from here)"
-    r"(?:__N__)\s+(?:can|could|will|'ll|’ll| ll|should|is\s+gonna|is\s+going\s+to)\s+(?:take|grab|handle|pick\s+up|sort|cover|help\s+with|run\s+with|jump\s+on)\s+(?:it|this|that)(?:\s+(?:one|up|out))?(?:\s+from\s+here)?",
-    // "Otto's on it/this/that (one)"
-    r"(?:__N__)(?:'s|’s| is)\s+(?:on|got)\s+(?:it|this|that)(?:\s+one)?",
-    // "let Otto take/handle/grab it"
-    r"let\s+(?:__N__)\s+(?:take|handle|grab|sort|cover|run\s+with)\s+(?:it|this|that)",
-    // "Otto'll pick this up", "Otto will pick it up"
-    r"(?:__N__)(?:'ll|’ll| will)\s+pick\s+(?:this|it|that)\s+up",
-    // "Otto's your/the person/go-to for this"
-    r"(?:__N__)(?:'s|’s| is)\s+(?:your|the)\s+(?:go[- ]?to|person|one)\s+for\s+(?:this|that|it)",
-];
-
-/// The alternation of roster persona names (+ first-word aliases), regex-escaped
-/// and longest-first. `None` when the roster yields no usable name — the tail
-/// guard is then a no-op (a pure caller's reply is never mangled).
-fn persona_alternation<S: AsRef<str>>(persona_names: &[S]) -> Option<String> {
-    let tokens = persona_name_tokens(persona_names);
-    if tokens.is_empty() {
-        return None;
-    }
-    Some(
-        tokens
-            .iter()
-            .map(|t| regex::escape(t))
-            .collect::<Vec<_>>()
-            .join("|"),
-    )
-}
-
-/// True when everything after a hand-off clause is only trailing slack —
-/// punctuation, whitespace, an orphaned avatar emoji. This replaces the JS
-/// twin's `$`-anchored `[\p{Extended_Pictographic}…]*$` tail: a hand-off is a
-/// TAIL only when no further words follow it.
-fn is_tail_slack(rest: &str) -> bool {
-    rest.chars().all(|c| !c.is_alphanumeric())
-}
-
-/// The byte index where a trailing hand-off begins, or `None` when there is none.
-fn handoff_cut_index(text: &str, alt: &str) -> Option<usize> {
-    let mut cut: Option<usize> = None;
-    for tpl in HANDOFF_TEMPLATES {
-        let pat = format!("(?i)(?:{})", tpl.replace("__N__", alt));
-        let re = match regex::Regex::new(&pat) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for m in re.find_iter(text) {
-            if is_tail_slack(&text[m.end()..]) {
-                if cut.is_none_or(|c| m.start() < c) {
-                    cut = Some(m.start());
-                }
-                break; // find_iter is left-to-right: this is the earliest tail hit
-            }
-        }
-    }
-    cut
-}
-
-/// Strip a trailing hand-off to another persona, roster-driven. A reply with no
-/// hand-off tail is returned unchanged; a reply that is NOTHING but a hand-off
-/// keeps its original text (never emptied).
-///
-/// DELIBERATE DIFFERENCE from the JS twin: the connector tidy-up keeps terminal
-/// punctuation, so "Dinner's set. Otto's got this one." leaves "Dinner's set."
-/// with its period rather than the JS twin's bare "Dinner's set". Same rule, one
-/// less rough edge in the family's reading.
-pub fn strip_handoff_tail<S: AsRef<str>>(text: &str, persona_names: &[S]) -> String {
-    if text.trim().is_empty() {
-        return text.to_string();
-    }
-    let alt = match persona_alternation(persona_names) {
-        Some(a) => a,
-        None => return text.to_string(),
-    };
-    let cut = match handoff_cut_index(text, &alt) {
-        Some(c) => c,
-        None => return text.to_string(),
-    };
-    let head = trim_handoff_head(&text[..cut]);
-    if head.trim().is_empty() {
-        text.trim().to_string()
-    } else {
-        head
-    }
-}
-
-/// Subject/auxiliary fragments a removed hand-off clause leaves dangling: "…
-/// Tuesday's set. I'll hand it over to Bruno." cuts at "hand", stranding a bare
-/// "I'll". Stripped only while the head does NOT already end on a complete
-/// sentence, so ordinary words are never eaten.
-const DANGLING_TAIL_WORDS: &[&str] = &["and", "but", "so", "then", "plus", "also", "i", "i'll", "we", "we'll"];
-
-/// Tidy the text left in front of a removed hand-off tail: the orphaned avatar
-/// emoji, the connector the tail hung off, and any dangling subject/auxiliary.
-/// Terminal punctuation is KEPT (the one deliberate difference from the JS twin),
-/// and it also acts as the stop condition: once the head reads as a finished
-/// sentence, nothing more is trimmed.
-fn trim_handoff_head(head: &str) -> String {
-    let mut s = head.to_string();
-    for _ in 0..4 {
-        let t = s
-            // an orphaned avatar emoji the tail hung off
-            .trim_end_matches(|c: char| is_attr_glyph(c) || c.is_whitespace())
-            // the dangling connector it hung off (terminal punctuation is KEPT)
-            .trim_end_matches(|c: char| {
-                matches!(c, '—' | '–' | '-' | ',' | ';' | ':') || c.is_whitespace()
-            })
-            .trim_end();
-        if t.ends_with(['.', '!', '?', '\u{2026}']) {
-            return t.to_string();
-        }
-        let Some(last) = t.split_whitespace().next_back() else {
-            return t.to_string();
-        };
-        let key: String = last
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '\'' || *c == '\u{2019}')
-            .collect::<String>()
-            .to_lowercase()
-            .replace('\u{2019}', "'");
-        if !DANGLING_TAIL_WORDS.contains(&key.as_str()) {
-            return t.to_string();
-        }
-        s = t[..t.len() - last.len()].to_string();
-    }
-    s.trim_end().to_string()
-}
-
-/// True when `text` ends on a hand-off to a roster persona.
-pub fn has_handoff_tail<S: AsRef<str>>(text: &str, persona_names: &[S]) -> bool {
-    match persona_alternation(persona_names) {
-        Some(alt) => handoff_cut_index(text, &alt).is_some(),
-        None => false,
-    }
-}
-
-// ── Rule 3: no infrastructure narration ──────────────────────────────────────
-// A composed reply must NEVER narrate HOW it reaches data. The family hears a
-// person, not a program describing its own plumbing: the live 19:2x leak was
-// "I'd need to pull from what's actually in the system… Want me to grab that from
-// the live gateway so you get the real take?".
-//
-// CAREFUL WITH "system": it is an ordinary family word ("a good bedtime system",
-// "our chore system"). So only the INFRA COLLOCATIONS match — a data-access verb
-// or a locative bound to "the system"/a gateway/pipeline/backend/database —
-// never "system" standing alone. Tested BOTH directions.
-const INFRA_NOUN: &str = r"(?:gateway|pipeline|back[\s-]?end|database|datastore|data\s*store|data\s*feed|the\s+api|(?:the|our|your|this|that)\s+system)";
-
-fn infra_signals() -> &'static Vec<regex::Regex> {
-    static RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
-    RES.get_or_init(|| {
-        let pats = [
-            // A data-access verb bound to an infra store: "pull from the system",
-            // "grab that from the live gateway", "query the backend".
-            format!(
-                r"(?i)\b(?:pull|pulling|grab|grabbing|fetch|fetching|query|querying|load|loading|scrape|scraping|sync|syncing|hit|hitting|poll|polling|retrieve|retrieving|read)\b[^.!?]{{0,40}}\b(?:from|off|out\s+of|into|against|to|up|via)\b[^.!?]{{0,24}}{INFRA_NOUN}"
-            ),
-            // A locative binding an infra store: "in the system", "on the backend".
-            format!(
-                r"(?i)\b(?:in|from|on|via|through|inside|within|across|over\s+(?:in|on|at))\s+(?:the\s+|our\s+|a\s+|this\s+|that\s+|live\s+)*{INFRA_NOUN}"
-            ),
-            // A data-fetch verb DIRECTLY on an infra store, no preposition.
-            format!(
-                r"(?i)\b(?:query|querying|hit|hitting|poll|polling|ping|pinging|scrape|scraping|fetch|fetching|pull|pulling)\b[^.!?]{{0,12}}{INFRA_NOUN}"
-            ),
-            // Strong bare infra references that are ~never benign in family chat.
-            r"(?i)\bthe\s+live\s+gateway\b".to_string(),
-            r"(?i)\bdata\s+pipeline\b".to_string(),
-        ];
-        pats.iter()
-            .map(|p| regex::Regex::new(p).expect("infra signal compiles"))
-            .collect()
-    })
-}
-
-/// True if the text narrates data-access infrastructure.
-pub fn has_infra_narration(text: &str) -> bool {
-    infra_signals().iter().any(|re| re.is_match(text))
-}
-
-/// Drop the clauses that narrate infrastructure while preserving the surrounding
-/// family voice. Clean lines are returned unchanged via the fast path. A line
-/// that was ENTIRELY infra narration scrubs to "" — the caller then substitutes
-/// [`infra_fallback_line`] rather than sending nothing.
-pub fn scrub_infra_narration(text: &str) -> String {
-    if text.trim().is_empty() || !has_infra_narration(text) {
-        return text.to_string();
-    }
-    let clauses = split_clauses(text, &['.', '!', '?', '\u{2026}'], &['-', '•', '·', '—', '–']);
-    let kept: Vec<String> = clauses
-        .into_iter()
-        .filter(|c| !has_infra_narration(c))
-        .collect();
-    tidy_after_clause_drop(&kept.join(" "))
-}
-
-/// The warm, family-voice offer used when a reply was ENTIRELY infrastructure
-/// narration. It answers like a person — offers to do the real work — and names
-/// no plumbing.
-pub fn infra_fallback_line(sender: &str) -> String {
-    let who = sender.trim();
-    let tail = if who.is_empty() {
-        String::new()
-    } else {
-        format!(", {who}")
-    };
-    format!("Happy to dig into that{tail} — want me to take a proper look and get you the details?")
-}
-
-// ── Rule 4: no ops / orchestration jargon ────────────────────────────────────
-// A persona's "status"/"orient" reply can arrive full of developer telemetry — a
-// dispatcher line, worker/task-status counts, the model executor name, cron
-// schedules, PIDs, raw agent ids. That is console output, not something a family
-// writes or reads.
-
-fn ops_signals() -> &'static Vec<regex::Regex> {
-    static RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
-    RES.get_or_init(|| {
-        [
-            r"(?i)\bagent-\d+\b",
-            r"(?i)\bdispatcher\b",
-            r"(?i)\bclaude[:/][a-z0-9._-]+",
-            r"(?i)\bexecutor\b",
-            r"(?i)\b(?:max\s+\d+\s+agents?|\d+\s+max\s+(?:agents?|workers?)|max\s+workers?)\b",
-            r"(?i)\b\d+\s+agents?\b",
-            r"(?i)\b\d+\s+alive\b",
-            r"(?i)\b(?:in-progress|in progress)\b",
-            r"(?i)\bcron\b",
-            r"(?i)\bnext\s+fire\b",
-            r"(?i)\buptime\b",
-            r"(?i)\bPID\s*\d+",
-            r"(?i)\bopenrouter\b",
-            r"(?i)\bregistry\s+refresh\b",
-            r"(?i)\bdaemon\b",
-            r"(?i)\bwg\s+\w+",
-            // Task-status tally — a count DIRECTLY on a scheduler word. Kept TIGHT
-            // so ordinary family speech ("3 bags ready to go") never trips.
-            r"(?i)\b\d+\s+(?:recurring|paused|blocked)\b",
-        ]
-        .iter()
-        .map(|p| regex::Regex::new(p).expect("ops signal compiles"))
-        .collect()
-    })
-}
-
-/// True if the text carries any orchestration-jargon signal.
-pub fn has_ops_jargon(text: &str) -> bool {
-    ops_signals().iter().any(|re| re.is_match(text))
-}
-
-/// Humanize machine week references to family voice: "W29" / "2026-W29" → "next
-/// week". A TOKEN-level rewrite (not a clause drop) because a week number sits
-/// INSIDE an otherwise-family sentence — the live 2026-07-16 leak ("W29`s still
-/// sitting as a draft") is exactly this shape. Idempotent and safe on clean text.
-pub fn humanize_week_refs(text: &str) -> String {
-    static ISO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static BARE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let iso = ISO.get_or_init(|| regex::Regex::new(r"(?i)\b\d{4}-W\d{1,2}\b").unwrap());
-    let bare = BARE.get_or_init(|| regex::Regex::new(r"\bW\d{1,2}\b").unwrap());
-    let out = iso.replace_all(text, "next week").into_owned();
-    bare.replace_all(&out, "next week").into_owned()
-}
-
-/// Strip orchestration telemetry from a human-facing line while preserving the
-/// surrounding family voice. Clean messages are returned byte-for-byte via the
-/// fast path. When jargon IS present the line is split into clauses, any clause
-/// carrying a signal is dropped whole, and the leftover greeting/closing is
-/// tidied. A line that was ENTIRELY telemetry scrubs to "".
-pub fn scrub_ops_jargon(text: &str) -> String {
-    if text.trim().is_empty() {
-        return text.to_string();
-    }
-    // Humanize machine week refs FIRST — before the fast-path check, so a line
-    // whose only jargon is "W29" is still cleaned.
-    let weeked = humanize_week_refs(text);
-    if !has_ops_jargon(&weeked) {
-        return weeked; // fast path: no telemetry clauses to drop
-    }
-    let clauses = split_clauses(&weeked, &['.', '!', '?'], &['-', '•', '·']);
-    let kept: Vec<String> = clauses.into_iter().filter(|c| !has_ops_jargon(c)).collect();
-    tidy_after_clause_drop(&kept.join(" "))
-}
-
-/// Split a line into clauses on sentence ends and markdown-bullet boundaries.
-/// The Rust twin of the JS twin's look-behind split — the feed collapses newlines
-/// to spaces, so a status dump arrives as one long "**Label:** …, … — …" line.
-fn split_clauses(text: &str, enders: &[char], bullets: &[char]) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut i = 0;
-    while i < n {
-        let c = chars[i];
-        // A sentence ender followed by whitespace ends the clause.
-        if enders.contains(&c) {
-            cur.push(c);
-            i += 1;
-            if i < n && chars[i].is_whitespace() {
-                i = skip_ws(&chars, i);
-                out.push(cur.trim().to_string());
-                cur = String::new();
-            }
-            continue;
-        }
-        // " - " / " • " / " · " — a bullet item boundary.
-        if c.is_whitespace() {
-            let j = skip_ws(&chars, i);
-            if j < n && bullets.contains(&chars[j]) && j + 1 < n && chars[j + 1].is_whitespace() {
-                out.push(cur.trim().to_string());
-                cur = String::new();
-                i = skip_ws(&chars, j + 1);
-                continue;
-            }
-        }
-        cur.push(c);
-        i += 1;
-    }
-    out.push(cur.trim().to_string());
-    out.into_iter()
-        .map(|c| {
-            // A leading bullet + space the split left behind.
-            let t = c.trim();
-            let mut ch = t.chars();
-            match ch.next() {
-                Some(first) if bullets.contains(&first) => {
-                    let rest = ch.as_str();
-                    if rest.starts_with(char::is_whitespace) {
-                        rest.trim().to_string()
-                    } else {
-                        t.to_string()
-                    }
-                }
-                _ => t.to_string(),
-            }
-        })
-        .filter(|c| !c.is_empty())
-        .collect()
-}
-
-/// Tidy the leftover after clauses were dropped: the dangling markdown and
-/// label-colons a removed clause leaves behind.
-fn tidy_after_clause_drop(joined: &str) -> String {
-    let s = joined.replace("**", "").replace('`', "");
-    let s = replace_all(&s, r"\s+([.,!?;:])", "$1"); // no space before punctuation
-    let s = replace_all(&s, r":\s+([A-Z])", ". $1"); // dangling "…right now:" → break
-    let s = replace_all(&s, r"[ \t]{2,}", " ");
-    let s = s.trim().to_string();
-    // A dangling label colon / connector at the very end → a clean period.
-    replace_all(&s, r"[:—–-]\s*$", ".").trim().to_string()
-}
-
-// ── Rule 5: plain-text surfaces ──────────────────────────────────────────────
-// The conversation pane and the Telegram relay render PLAIN TEXT — a markdown
-// marker shows up as a literal asterisk/backtick (live: Nora's "**180–220
-// calories**" arrived with the stars visible). Strip the emphasis PAIRS to their
-// words; a lone or arithmetic asterisk is not emphasis and must survive
-// ("5*7" stays "5*7").
-
-/// Strip markdown emphasis pairs to their words: `**bold**` / `*italic*` /
-/// `` `code` `` → the words, markers dropped. EMOJI and ordinary punctuation are
-/// untouched, and a marker that is not part of a well-formed emphasis pair
-/// survives verbatim.
-pub fn strip_markdown(text: &str) -> String {
-    if text.is_empty() {
-        return text.to_string();
-    }
-    // Bold before italic (so "**x**" is not seen as two italic markers), then code.
-    let out = strip_emphasis_pairs(text, '*', 2, false);
-    let out = strip_emphasis_pairs(&out, '*', 1, true);
-    strip_emphasis_pairs(&out, '`', 1, false)
-}
-
-/// True when `text` carries a strippable markdown emphasis pair.
-pub fn has_markdown(text: &str) -> bool {
-    strip_markdown(text) != text
-}
-
-/// Strip `marker`-run pairs of exactly `count` markers around a non-empty body
-/// that holds no marker and no newline and neither opens nor closes on
-/// whitespace. When `boundary` is set the opener must not be preceded — and the
-/// closer must not be followed — by a word character, which is what keeps
-/// arithmetic ("2*3*4") and snake_case intact.
-fn strip_emphasis_pairs(text: &str, marker: char, count: usize, boundary: bool) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < n {
-        let opener = i + count <= n
-            && chars[i..i + count].iter().all(|&c| c == marker)
-            && (i + count >= n || chars[i + count] != marker)
-            && (!boundary || i == 0 || (!is_word(chars[i - 1]) && chars[i - 1] != marker));
-        if opener {
-            // Scan for the closing run: the body may hold neither the marker nor
-            // a newline (mirrors the JS twin's `[^*\n]+?`).
-            let body_start = i + count;
-            let mut j = body_start;
-            let mut closer = None;
-            while j < n {
-                if chars[j] == '\n' {
-                    break;
-                }
-                if chars[j] == marker {
-                    let mut k = j;
-                    while k < n && chars[k] == marker {
-                        k += 1;
-                    }
-                    if k - j == count {
-                        closer = Some(j);
-                    }
-                    break;
-                }
-                j += 1;
-            }
-            if let Some(close) = closer {
-                let body: String = chars[body_start..close].iter().collect();
-                let after = close + count;
-                let right_ok = !boundary
-                    || after >= n
-                    || (!is_word(chars[after]) && chars[after] != marker);
-                if !body.is_empty()
-                    && !body.starts_with(|c: char| c.is_whitespace())
-                    && !body.ends_with(|c: char| c.is_whitespace())
-                    && right_ok
-                {
-                    out.push_str(&body);
-                    i = after;
-                    continue;
-                }
-            }
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
-}
-
-// ── THE GATE ─────────────────────────────────────────────────────────────────
-
-/// THE engine-side family-voice gate: all six rules, in the JS twin's order, on
-/// an engine-composed reply about to reach a person. Applied at the engine's one
-/// delivery choke point (`telegram_conversation::deliver_reply`) so the Telegram
-/// send, the ack edit, and the `FeedMirrorSink` feed line all inherit it.
-///
-/// DELIBERATE DIFFERENCE from the JS twin: `gateComposedReply` may return "" for
-/// a reply that was NOTHING but telemetry (the gateway then records/mirrors
-/// nothing). The engine cannot — Telegram rejects an empty send and a silent
-/// engine reads as a dead assistant — so a reply the gate empties becomes the
-/// honest [`infra_fallback_line`] offer rather than nothing OR the raw jargon.
-pub fn gate_family_voice(text: &str, voice: &FamilyVoice) -> String {
-    gate_family_voice_with(text, voice, GateOptions::default())
-}
-
-/// Per-reply exemptions the gate must honour.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GateOptions<'a> {
-    /// A hand-off tail the ENGINE ITSELF appended — the single-owner defer line
-    /// (`ownership::defer_line`, "Nora's got this one 🥗") that an off-domain
-    /// voice adds so a re-routed ask visibly lands with its owner.
-    ///
-    /// WHY AN EXEMPTION EXISTS. Rule 2 targets a tail the COMPOSER invented
-    /// INSTEAD of answering (the live 19:2x leak: Nora delivered the answer, then
-    /// tacked on "🦆 Otto's got this one" — buck-passing). The defer line is the
-    /// opposite: it is ownership routing made visible, authored by the engine
-    /// after the single-owner rule re-routed the task, and stripping it would
-    /// leave the family with no idea where their ask went. Only an EXACT suffix
-    /// match is honoured, so this cannot be used to smuggle a composer tail
-    /// through. Composer-invented tails ELSEWHERE in the same reply are still cut.
-    pub authorized_handoff: Option<&'a str>,
-}
-
-/// [`gate_family_voice`] with per-reply exemptions ([`GateOptions`]).
-pub fn gate_family_voice_with(text: &str, voice: &FamilyVoice, opts: GateOptions<'_>) -> String {
-    let original = text.trim();
-    if original.is_empty() {
-        return text.to_string();
-    }
-    // An engine-authored defer tail is split off, the reply BODY is gated, and the
-    // tail is re-attached verbatim — so the body still loses any composer-invented
-    // hand-off while the ownership notice survives.
-    if let Some(tail) = opts.authorized_handoff.map(str::trim).filter(|t| !t.is_empty()) {
-        if let Some(head) = original.strip_suffix(tail) {
-            let head = head.trim();
-            if head.is_empty() {
-                return tail.to_string();
-            }
-            let gated_head = gate_family_voice_with(
-                head,
-                voice,
-                GateOptions {
-                    authorized_handoff: None,
-                },
-            );
-            return format!("{gated_head}\n\n{tail}");
-        }
-    }
-    let personas = voice.persona_names();
-
-    // 0. NO SELF-ATTRIBUTION PREFIX — peel it FIRST so every gate below (and the
-    //    pane / Telegram render) sees de-attributed words.
-    let mut out = strip_self_attribution(original, personas);
-
-    // 1. NO OFF-ROSTER HUMAN NAME. If scrubbing would empty the message (a reply
-    //    ENTIRELY about a phantom person), keep the de-attributed text.
-    let ghosts = non_roster_ghosts(&out, voice);
-    if !ghosts.is_empty() {
-        let scrubbed = scrub_ghost_names(&out, &ghosts);
-        if !scrubbed.trim().is_empty() {
-            out = scrubbed;
-        }
-    }
-
-    // 2. NO HAND-OFF TAIL — a delivered answer ends after its content.
-    let tailless = strip_handoff_tail(&out, personas);
-    if !tailless.trim().is_empty() {
-        out = tailless;
-    }
-
-    // 3. NO INFRASTRUCTURE NARRATION. When dropping the offending clauses empties
-    //    the reply (it was ENTIRELY fetch-narration, the live 19:2x leak),
-    //    substitute a warm family-voice offer rather than leaking the plumbing.
-    if has_infra_narration(&out) {
-        let de_infra = scrub_infra_narration(&out);
-        out = if de_infra.trim().is_empty() {
-            infra_fallback_line("")
-        } else {
-            de_infra
-        };
-    }
-
-    // 4. NO MACHINE JARGON, then 5. PLAIN TEXT (markdown last, so both the
-    //    jargon tidy-up and the emphasis strip land on the final words).
-    let gated = strip_markdown(scrub_ops_jargon(&out).trim());
-    if gated.trim().is_empty() {
-        // The whole reply was telemetry. Say something honest, never nothing and
-        // never the raw console dump.
-        return infra_fallback_line("");
-    }
-    gated
-}
-
-// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -3397,6 +3004,336 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // FAMILY-VISIBLE ENGINE REPLY GATE
+    // -----------------------------------------------------------------------
+
+    fn fixture_voice_roster() -> FamilyVoiceRoster {
+        FamilyVoiceRoster::from_names(
+            ["hearth", "The Hearth", "wayfinder", "The Wayfinder"],
+            ["Household Member"],
+        )
+    }
+
+    #[test]
+    fn family_voice_roster_uses_live_humans_not_prompt_seed_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(dir.path().join("claw3d-bridge")).unwrap();
+        std::fs::create_dir_all(wg.join("agency")).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[household]
+members = ["Prompt Seed"]
+
+[[agent]]
+id = "hearth"
+name = "The Hearth"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("claw3d-bridge")
+                .join("casa-gateway.toml"),
+            r#"
+[[humans]]
+id = "human-fallback"
+label = "Fallback Member"
+"#,
+        )
+        .unwrap();
+
+        let fallback = load_family_voice_roster(dir.path(), &wg);
+        assert!(fallback.has_evidence);
+        assert!(fallback.allows("The Hearth"));
+        assert!(fallback.allows("Hearth"));
+        assert!(!fallback.allows("The"), "articles are not name aliases");
+        assert!(fallback.allows("Fallback Member"));
+        assert!(!fallback.allows("Prompt Seed"));
+
+        let agency_dir = wg.join("agency");
+        let mut bindings = TelegramBindingMap::default();
+        let pending = crate::agency::TelegramBinding::new(
+            "123",
+            "human-bound",
+            "Bound Member",
+            Some("hearth".to_string()),
+            chrono::Utc::now(),
+        );
+        assert!(
+            !pending.confirmed,
+            "the live-roster proof must exercise a pending binding"
+        );
+        bindings.add(pending).unwrap();
+        bindings.save(&agency_dir).unwrap();
+
+        let live = load_family_voice_roster(dir.path(), &wg);
+        assert!(live.allows("Bound Member"));
+        assert!(live.allows("bound"));
+        assert!(
+            !live.allows("Fallback Member"),
+            "agency bindings replace, rather than merge with, fallback humans"
+        );
+        assert!(
+            !live.allows("Prompt Seed"),
+            "household.members is prompt context, not roster evidence"
+        );
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Dinner is ready. We're waiting on you and Bound Member to confirm.",
+                &live,
+            ),
+            "Dinner is ready. We're waiting on you and Bound Member to confirm.",
+            "a pending live binding is a trusted human"
+        );
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Dinner is ready. We're waiting on you and Prompt Seed to confirm.",
+                &live,
+            ),
+            "Dinner is ready.",
+            "a stale prompt-seed member is not a live human"
+        );
+    }
+
+    #[test]
+    fn family_voice_self_attribution_is_roster_driven() {
+        let roster = fixture_voice_roster();
+        assert_eq!(
+            strip_self_attribution("The Hearth 💬 Hi! All calm here.", &roster),
+            "Hi! All calm here."
+        );
+        assert_eq!(
+            strip_self_attribution("💬 The Hearth: All calm here.", &roster),
+            "All calm here."
+        );
+        assert_eq!(
+            strip_self_attribution("The Hearth says the room is calm.", &roster),
+            "The Hearth says the room is calm.",
+            "a name without an attribution separator is ordinary content"
+        );
+        let quoted = "“The Hearth: A Family Guide” is on the shelf.";
+        assert_eq!(
+            strip_self_attribution(quoted, &roster),
+            quoted,
+            "leading quotation punctuation is not an avatar"
+        );
+    }
+
+    #[test]
+    fn family_voice_handoff_is_terminal_and_roster_driven() {
+        let roster = fixture_voice_roster();
+        assert_eq!(
+            strip_handoff_tail(
+                "Dinner is ready. 🧭 The Wayfinder's got this one.",
+                &roster
+            ),
+            "Dinner is ready."
+        );
+        let mid = "I asked The Wayfinder and the plan is already settled.";
+        assert_eq!(
+            strip_handoff_tail(mid, &roster),
+            mid,
+            "a mid-sentence roster mention is not a handoff tail"
+        );
+        assert_eq!(
+            strip_handoff_tail(
+                "Dinner is ready. 🧭 The Wayfinder's got this one.",
+                &FamilyVoiceRoster::default()
+            ),
+            "Dinner is ready. 🧭 The Wayfinder's got this one.",
+            "without roster evidence no persona name is guessed"
+        );
+        assert_eq!(
+            strip_handoff_tail(
+                "Dinner (easy). 🧭 The Wayfinder's got this one.",
+                &roster
+            ),
+            "Dinner (easy).",
+            "handoff cleanup does not eat balanced punctuation"
+        );
+        assert_eq!(
+            strip_handoff_tail(
+                "Dinner is ready. The Wayfinder's your person for this.",
+                &roster
+            ),
+            "Dinner is ready.",
+            "the gateway's person-for-this handoff shape is covered"
+        );
+        assert_eq!(
+            enforce_family_voice("The Wayfinder's got this one.", &roster),
+            family_voice_fallback_line(),
+            "a handoff-only draft becomes neutral instead of leaking intact"
+        );
+    }
+
+    #[test]
+    fn family_voice_off_roster_scan_is_narrow_and_configuration_backed() {
+        let roster = fixture_voice_roster();
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Check with Zephyra before serving, then pass it to Household Member.",
+                &roster
+            ),
+            "Check before serving, then pass it to Household Member."
+        );
+        let unconfigured = FamilyVoiceRoster::default();
+        let raw = "Check with Zephyra before serving.";
+        assert_eq!(
+            scrub_off_roster_addressees(raw, &unconfigured),
+            raw,
+            "an empty roster cannot prove a name is off-roster"
+        );
+        let ordinary = "Friday starts with a capital and stays untouched.";
+        assert_eq!(
+            scrub_off_roster_addressees(ordinary, &roster),
+            ordinary,
+            "ordinary capitalised words outside an addressee slot are untouched"
+        );
+        let date_slot = "Check with Friday before serving.";
+        assert_eq!(
+            scrub_off_roster_addressees(date_slot, &roster),
+            date_slot,
+            "a weekday in an addressee-shaped slot is not a person"
+        );
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Dinner is ready. We're waiting on Zephyra Moon to confirm.",
+                &roster
+            ),
+            "Dinner is ready.",
+            "a phantom-dependent waiting clause is removed without broken grammar"
+        );
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Dinner is ready. We're waiting on you and Quillon Vale to confirm.",
+                &roster
+            ),
+            "Dinner is ready.",
+            "a coordinated multiword phantom is removed without a hardcoded roster"
+        );
+        assert_eq!(
+            scrub_off_roster_addressees(
+                "Dinner is ready. Pass it to Zephyra when warm.",
+                &roster
+            ),
+            "Dinner is ready.",
+            "a phantom transfer clause is removed instead of leaving a bare verb"
+        );
+        let clean_multiline = "Dinner is in progress.\nFriday still works.";
+        assert_eq!(
+            scrub_off_roster_addressees(clean_multiline, &roster),
+            clean_multiline,
+            "a clean reply takes the byte-for-byte fast path"
+        );
+    }
+
+    #[test]
+    fn family_voice_infra_guard_keeps_benign_system_language() {
+        for leak in [
+            "I'd need to pull that from the live gateway.",
+            "That lives over in the pipeline.",
+            "Let me query the database.",
+        ] {
+            assert!(has_infra_narration(leak), "should flag: {leak}");
+        }
+        for clean in [
+            "We've got a good bedtime system.",
+            "This soup is kind to the immune system.",
+            "Want me to check our recipe book?",
+        ] {
+            assert!(!has_infra_narration(clean), "should preserve: {clean}");
+        }
+        assert_eq!(
+            scrub_infra_narration(
+                "Dinner is ready. I'd need to pull that from the live gateway."
+            ),
+            "Dinner is ready."
+        );
+    }
+
+    #[test]
+    fn family_voice_ops_and_markdown_are_plain_family_text() {
+        assert_eq!(
+            scrub_ops_jargon(
+                "Next week is taking shape. Dispatcher healthy — 2 agents. \
+                 6 in-progress. W31 is still a draft."
+            ),
+            "Next week is taking shape. next week is still a draft."
+        );
+        assert_eq!(
+            scrub_ops_jargon("Dinner is in progress."),
+            "Dinner is in progress.",
+            "ordinary family progress is not a scheduler tally"
+        );
+        assert_eq!(
+            strip_markdown("A peach is about **60 calories** — a *light* snack. Use `filter`."),
+            "A peach is about 60 calories — a light snack. Use filter."
+        );
+        assert_eq!(strip_markdown("5*7 is 35"), "5*7 is 35");
+    }
+
+    #[test]
+    fn family_voice_full_gate_composes_all_rules_without_leaking() {
+        let roster = fixture_voice_roster();
+        let raw = "**The Hearth** 💬 **Dinner is ready.** Check with **Zephyra** before serving. \
+                   That lives over in the pipeline. **Service:** dispatcher healthy — 2 agents. \
+                   🧭 The Wayfinder's got this one.";
+        assert_eq!(
+            enforce_family_voice(raw, &roster),
+            "Dinner is ready. Check before serving."
+        );
+    }
+
+    #[test]
+    fn family_voice_only_preserves_the_exact_authorized_ownership_handoff() {
+        let roster = fixture_voice_roster();
+        let handoff = "The Wayfinder's got this one. 🧭";
+        assert_eq!(
+            enforce_family_voice(handoff, &roster),
+            family_voice_fallback_line(),
+            "composer-authored handoff-only copy must not pass through"
+        );
+        assert_eq!(
+            enforce_family_voice_with(
+                handoff,
+                &roster,
+                FamilyVoiceOptions {
+                    authorized_handoff: Some(handoff),
+                },
+            ),
+            handoff,
+            "the exact engine-authored ownership line survives byte-for-byte"
+        );
+        let body = format!(
+            "**Dinner is ready.** The Hearth's got this one.\n\n{handoff}"
+        );
+        assert_eq!(
+            enforce_family_voice_with(
+                &body,
+                &roster,
+                FamilyVoiceOptions {
+                    authorized_handoff: Some(handoff),
+                },
+            ),
+            format!("Dinner is ready.\n\n{handoff}"),
+            "authorizing the final suffix must not authorize a composer handoff in the body"
+        );
+        assert_eq!(
+            enforce_family_voice_with(
+                handoff,
+                &roster,
+                FamilyVoiceOptions {
+                    authorized_handoff: Some("The Wayfinder's got this one."),
+                },
+            ),
+            family_voice_fallback_line(),
+            "a near match is not an authorization"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // WEEK CONTEXT / never-claim-empty guard (task week-grounding-engine)
     // -----------------------------------------------------------------------
 
@@ -3582,470 +3519,4 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FAMILY VOICE (task p1-engine-reply-guards) — the six gateway finalize
-    // rules, now enforced engine-side on the real delivery path. Each rule is
-    // asserted in BOTH directions: the leak is caught, and ordinary family
-    // speech that merely resembles it is left alone (the false-positive half is
-    // what makes a gate safe to put in front of every send).
-    // -----------------------------------------------------------------------
-
-    /// A live-shaped roster: five personas (one with an honorific, one
-    /// two-worder) and two humans. Roster-driven throughout — no name in the
-    /// guards themselves.
-    fn voice() -> FamilyVoice {
-        FamilyVoice::from_rosters(
-            &["Nora", "nora", "Bruno", "bruno", "Coach Mira", "mira", "Otto", "otto", "The Chiller", "chiller"],
-            &["Luca", "human-luca", "Erik"],
-        )
-    }
-
-    fn personas() -> Vec<String> {
-        voice().persona_names().to_vec()
-    }
-
-    // ── Rule 0: self-attribution ───────────────────────────────────────────
-
-    /// THE reported bug (Luca, 2026-07-24): the kiosk greeting rendered as
-    /// "The Chiller 💬 Hi! All quiet…" — the persona name AND the relay mark
-    /// baked into the words, so the row showed the avatar + name twice.
-    #[test]
-    fn self_attribution_prefix_is_peeled_from_the_text() {
-        let p = personas();
-        let out = strip_self_attribution("The Chiller \u{1F4AC} Hi! All quiet here.", &p);
-        assert_eq!(out, "Hi! All quiet here.");
-        assert_eq!(strip_self_attribution("\u{1F4AC} Nora: dinner's at seven.", &p), "dinner's at seven.");
-        assert_eq!(strip_self_attribution("Otto — the plan's up.", &p), "the plan's up.");
-        assert_eq!(strip_self_attribution("\u{1F957} Nora: pasta tonight.", &p), "pasta tonight.");
-        assert_eq!(strip_self_attribution("\u{1F4AC} we're all set.", &p), "we're all set.");
-        // Stacked attribution unwinds.
-        assert_eq!(
-            strip_self_attribution("\u{1F4AC} Otto: Otto: the plan's up.", &p),
-            "the plan's up."
-        );
-    }
-
-    /// A reply that merely OPENS with a persona name is ordinary speech, not
-    /// attribution — a separator is REQUIRED before anything is peeled. And a
-    /// non-persona capitalised opener is never touched.
-    #[test]
-    fn a_bare_name_opener_is_not_attribution() {
-        let p = personas();
-        for line in [
-            "Nora says hi!",
-            "Otto is on the calendar tonight, by the way.",
-            "Dinner: pasta with the good tomatoes.",
-            "\u{1F957} Dinner: pasta.",
-            "Luca — you're up for the market run.",
-        ] {
-            assert_eq!(strip_self_attribution(line, &p), line, "over-stripped {line:?}");
-            assert!(!has_self_attribution(line, &p), "false positive on {line:?}");
-        }
-        // A near-name is not the name.
-        assert_eq!(strip_self_attribution("Norah: hello", &p), "Norah: hello");
-    }
-
-    /// With NO roster the attribution guard still peels a bare 💬 relay mark
-    /// (that glyph is the gateway's own, never a family's word) but cannot know
-    /// any persona name, so it touches nothing else.
-    #[test]
-    fn self_attribution_without_a_roster_only_peels_the_relay_mark() {
-        let none: [&str; 0] = [];
-        assert_eq!(strip_self_attribution("\u{1F4AC} all set.", &none), "all set.");
-        assert_eq!(strip_self_attribution("Otto — the plan's up.", &none), "Otto — the plan's up.");
-    }
-
-    // ── Rule 1: off-roster human names ─────────────────────────────────────
-
-    /// The exorcise-nadin leak: a composed reply names a retired teammate.
-    #[test]
-    fn a_retired_persona_name_is_stripped() {
-        let v = voice();
-        let draft = "Meals are set — still waiting on you and Nadin to confirm.";
-        assert!(mentions_non_roster(draft, &v));
-        assert_eq!(non_roster_ghosts(draft, &v), vec!["nadin".to_string()]);
-        let out = gate_family_voice(draft, &v);
-        assert!(!out.to_lowercase().contains("nadin"), "{out}");
-        assert!(out.contains("Meals are set"), "the real content survives: {out}");
-    }
-
-    /// A capitalised name in a hand-off slot that is on NO roster is a phantom
-    /// teammate and goes; a roster HUMAN in the same slot stays.
-    #[test]
-    fn an_off_roster_addressee_goes_and_a_roster_human_stays() {
-        let v = voice();
-        let phantom = "I'll hand it to Priya to confirm the market run.";
-        assert_eq!(non_roster_addressees(phantom, &v), vec!["Priya".to_string()]);
-        assert!(!gate_family_voice(phantom, &v).contains("Priya"));
-
-        let real = "I'll check with Luca before we lock the market run.";
-        assert!(non_roster_addressees(real, &v).is_empty(), "a roster human is not a ghost");
-        assert_eq!(gate_family_voice(real, &v), real);
-
-        // A weekday / relative day in the addressee slot is not a person.
-        for line in ["Waiting on Friday to confirm.", "I'll check with Tomorrow's list."] {
-            assert!(non_roster_addressees(line, &v).is_empty(), "date word eaten in {line:?}");
-        }
-        // A persona in the slot is fine too.
-        assert!(non_roster_addressees("I'll pass it to Bruno.", &v).is_empty());
-    }
-
-    /// A retired name that is genuinely BACK on the roster is never scrubbed —
-    /// the hardcoded list is always cross-checked against the live household.
-    #[test]
-    fn a_retired_name_back_on_the_roster_is_kept() {
-        let v = FamilyVoice::from_rosters(&["Nora"], &["Nadin"]);
-        let draft = "Checking with Nadin on the swim times.";
-        assert!(!mentions_non_roster(draft, &v));
-        assert_eq!(gate_family_voice(draft, &v), draft);
-    }
-
-    /// Scrubbing tidies the connectors a removed name leaves behind rather than
-    /// leaving "waiting on you and  to confirm".
-    #[test]
-    fn scrubbing_a_ghost_tidies_the_dangling_connector() {
-        let out = scrub_ghost_names("Meals are set — waiting on you and Nadin to confirm.", &["Nadin"]);
-        assert!(!out.contains("and  "), "{out}");
-        assert!(!out.contains(" ."), "{out}");
-        assert!(out.starts_with("Meals are set"), "{out}");
-    }
-
-    // ── Rule 2: hand-off tails ─────────────────────────────────────────────
-
-    /// The live 19:2x leak: a Nora DELIVERY that ended "🦆 Otto's got this one".
-    /// The family asked one assistant and got the answer; the tail reads as
-    /// buck-passing.
-    #[test]
-    fn a_trailing_handoff_is_stripped() {
-        let p = personas();
-        for (draft, keep) in [
-            ("Dinner's chicken and rice. \u{1F986} Otto's got this one.", "Dinner's chicken and rice."),
-            ("Here's the plan for tonight — over to Otto.", "Here's the plan for tonight"),
-            ("Tuesday's set. I'll hand it over to Bruno.", "Tuesday's set."),
-            ("The times are in — Coach Mira can take it from here.", "The times are in"),
-            ("Shopping's frozen. Otto'll pick this up.", "Shopping's frozen."),
-            ("It's on the calendar. Let Otto handle it", "It's on the calendar."),
-        ] {
-            assert!(has_handoff_tail(draft, &p), "missed a hand-off in {draft:?}");
-            assert_eq!(strip_handoff_tail(draft, &p), keep, "bad strip of {draft:?}");
-        }
-    }
-
-    /// A MID-sentence persona mention is not a hand-off — the answer continues
-    /// after it, so nothing is cut.
-    #[test]
-    fn a_mid_sentence_mention_is_not_a_handoff() {
-        let p = personas();
-        for line in [
-            "I asked Nora and she's on it, plus the plan's set for Thursday.",
-            "Bruno's got this one covered and I've already added the shallots to the list.",
-            "Otto is on the calendar tonight, so Friday is free.",
-        ] {
-            assert!(!has_handoff_tail(line, &p), "false hand-off in {line:?}");
-            assert_eq!(strip_handoff_tail(line, &p), line);
-        }
-    }
-
-    /// The tail guard is roster-DRIVEN: with no roster it is a no-op, and an
-    /// honorific alone ("coach") never counts as a name.
-    #[test]
-    fn the_handoff_guard_is_roster_driven() {
-        let none: [&str; 0] = [];
-        let line = "All set. Otto's got this one.";
-        assert!(!has_handoff_tail(line, &none));
-        assert_eq!(strip_handoff_tail(line, &none), line);
-        // "Coach Mira" contributes "mira", never a bare "coach".
-        let only_mira = ["Coach Mira".to_string()];
-        assert!(!has_handoff_tail("All set. Coach's got this one.", &only_mira));
-        assert!(has_handoff_tail("All set. Mira's got this one.", &only_mira));
-    }
-
-    /// A reply that is NOTHING but a hand-off keeps its text — the gate never
-    /// silences a reply, it only cleans one.
-    #[test]
-    fn a_pure_handoff_reply_is_never_emptied() {
-        let p = personas();
-        let out = strip_handoff_tail("Otto's got this one.", &p);
-        assert!(!out.trim().is_empty(), "emptied a pure hand-off");
-    }
-
-    // ── Rule 3: infrastructure narration ───────────────────────────────────
-
-    /// The live 19:2x leak, verbatim: the family heard a program describing its
-    /// own plumbing. The whole reply was fetch-narration, so the gate answers
-    /// with a warm family-voice offer instead of leaking it back.
-    #[test]
-    fn infrastructure_narration_is_dropped() {
-        let v = voice();
-        let draft = "I'd need to pull from what's actually in the system. \
-                     Want me to grab that from the live gateway so you get the real take?";
-        assert!(has_infra_narration(draft));
-        let out = gate_family_voice(draft, &v);
-        let lower = out.to_lowercase();
-        assert!(!lower.contains("gateway"), "{out}");
-        assert!(!lower.contains("in the system"), "{out}");
-        assert!(!out.trim().is_empty(), "the gate must never send nothing");
-
-        // A partial leak keeps the family sentence and drops only the plumbing.
-        let mixed = "Thursday is pasta night. Let me query the database for the rest.";
-        let cleaned = gate_family_voice(mixed, &v);
-        assert!(cleaned.contains("Thursday is pasta night"), "{cleaned}");
-        assert!(!cleaned.to_lowercase().contains("database"), "{cleaned}");
-    }
-
-    /// "System" is an ordinary family word. Only the INFRA COLLOCATIONS match —
-    /// this is the false-positive direction that makes the rule safe.
-    #[test]
-    fn ordinary_family_speech_about_systems_survives() {
-        let v = voice();
-        for line in [
-            "We need a better bedtime system for the school week.",
-            "Her immune system is finally back to normal.",
-            "Our chore system works if everyone actually looks at the chart.",
-            "I'll check the calendar and call Mom about Sunday.",
-            "Want me to check our recipe book for something quicker?",
-        ] {
-            assert!(!has_infra_narration(line), "false infra hit on {line:?}");
-            assert_eq!(gate_family_voice(line, &v), line, "over-gated {line:?}");
-        }
-    }
-
-    // ── Rule 4: ops jargon ─────────────────────────────────────────────────
-
-    /// The live 2026-07-16 leak, verbatim shape: a machine week number inside an
-    /// otherwise-family sentence. A TOKEN rewrite, so the sentence survives.
-    #[test]
-    fn a_machine_week_number_becomes_family_words() {
-        let v = voice();
-        assert_eq!(humanize_week_refs("W29's still sitting as a draft"), "next week's still sitting as a draft");
-        assert_eq!(humanize_week_refs("2026-W29 is a draft"), "next week is a draft");
-        let out = gate_family_voice("W29's still sitting as a draft — want me to publish it?", &v);
-        assert!(!out.contains("W29"), "{out}");
-        assert!(out.contains("next week"), "{out}");
-        assert!(out.contains("publish it"), "the sentence survives: {out}");
-    }
-
-    /// A telemetry clause is dropped WHOLE (a token snip would leave a garbled
-    /// half-sentence) while the surrounding family voice is kept.
-    #[test]
-    fn a_telemetry_clause_is_dropped_whole() {
-        let v = voice();
-        let draft = "Morning! The dispatcher has 3 agents alive and 6 in-progress. \
-                     Dinner is chicken and rice tonight.";
-        assert!(has_ops_jargon(draft));
-        let out = gate_family_voice(draft, &v);
-        let lower = out.to_lowercase();
-        assert!(!lower.contains("dispatcher"), "{out}");
-        assert!(!lower.contains("in-progress"), "{out}");
-        assert!(!lower.contains("agents"), "{out}");
-        assert!(out.contains("Morning!"), "{out}");
-        assert!(out.contains("Dinner is chicken and rice tonight."), "{out}");
-    }
-
-    /// Ordinary family speech that carries a NUMBER, a "ready", or a "done" is
-    /// not a status dump. It is the count-in-a-tally shape that marks telemetry.
-    #[test]
-    fn ordinary_family_counts_are_not_telemetry() {
-        let v = voice();
-        for line in [
-            "3 bags are ready to go by the door.",
-            "Dinner's ready in ten.",
-            "We're done with the market run — two things left on the list.",
-            "The kids have 2 swim sessions this week.",
-        ] {
-            assert!(!has_ops_jargon(line), "false ops hit on {line:?}");
-            assert_eq!(gate_family_voice(line, &v), line, "over-gated {line:?}");
-        }
-    }
-
-    /// A reply that was NOTHING but a console dump becomes an honest offer — the
-    /// engine can never send an empty message (Telegram rejects it) and must
-    /// never send the raw dump back either.
-    #[test]
-    fn a_pure_console_dump_becomes_an_honest_offer() {
-        let v = voice();
-        let dump = "dispatcher: 3 agents alive, 6 in-progress, 1 blocked, executor claude:opus, PID 4412, uptime 3h.";
-        let out = gate_family_voice(dump, &v);
-        assert!(!out.trim().is_empty(), "the engine must say something");
-        assert!(!has_ops_jargon(&out), "still leaking telemetry: {out}");
-        assert!(out.contains("Happy to dig into that"), "{out}");
-    }
-
-    // ── Rule 5: plain text ─────────────────────────────────────────────────
-
-    /// Live: Nora's "**180–220 calories**" arrived on the pane with the stars
-    /// visible, because the pane and the Telegram relay render PLAIN TEXT.
-    #[test]
-    fn markdown_emphasis_is_stripped_to_its_words() {
-        assert_eq!(strip_markdown("About **180–220 calories** each."), "About 180–220 calories each.");
-        assert_eq!(strip_markdown("*definitely* worth it"), "definitely worth it");
-        assert_eq!(strip_markdown("use the `big pot`"), "use the big pot");
-        assert_eq!(strip_markdown("**Dinner:** pasta and *good* bread"), "Dinner: pasta and good bread");
-        assert!(has_markdown("**bold**"));
-    }
-
-    /// A lone or arithmetic marker is NOT emphasis and must survive verbatim.
-    #[test]
-    fn a_lone_or_arithmetic_marker_survives() {
-        for line in ["5*7 is 35", "2*3*4", "a * b", "an unclosed *marker here", "one ` tick"] {
-            assert_eq!(strip_markdown(line), line, "mangled {line:?}");
-            assert!(!has_markdown(line), "false markdown hit on {line:?}");
-        }
-        // Emoji and ordinary punctuation are untouched.
-        assert_eq!(strip_markdown("Dinner's at seven \u{1F957} — see you!"), "Dinner's at seven \u{1F957} — see you!");
-    }
-
-    // ── The gate as a whole ────────────────────────────────────────────────
-
-    /// One draft carrying ALL SIX leaks at once comes out clean — this is the
-    /// contract `deliver_reply` relies on.
-    #[test]
-    fn the_gate_cleans_all_six_rules_in_one_pass() {
-        let v = voice();
-        let p = personas();
-        let draft = "Nora \u{1F4AC} **W29** is still a draft, and the dispatcher has 3 agents alive. \
-                     I'd need to pull from the live gateway. \
-                     Waiting on Nadin to confirm. \u{1F986} Otto's got this one.";
-        let out = gate_family_voice(draft, &v);
-
-        assert!(!has_self_attribution(&out, &p), "attribution left: {out}");
-        assert!(!mentions_non_roster(&out, &v), "off-roster name left: {out}");
-        assert!(!has_handoff_tail(&out, &p), "hand-off tail left: {out}");
-        assert!(!has_infra_narration(&out), "infra narration left: {out}");
-        assert!(!has_ops_jargon(&out), "ops jargon left: {out}");
-        assert!(!has_markdown(&out), "markdown left: {out}");
-        assert!(!out.contains("W29"), "machine week ref left: {out}");
-        assert!(!out.trim().is_empty(), "the gate emptied the reply");
-    }
-
-    /// A CLEAN family reply is returned byte-for-byte. The gate sits in front of
-    /// EVERY engine send, so a no-op on ordinary speech is load-bearing: the ack
-    /// edit, the honest fallbacks, and the plain answers must all pass through
-    /// untouched.
-    #[test]
-    fn a_clean_reply_passes_through_untouched() {
-        let v = voice();
-        for line in [
-            "Dinner's chicken and rice tonight — Luca's cooking.",
-            "Nothing's on the calendar for Saturday, so the day is yours.",
-            "I've added shallots and the good tomatoes to the list.",
-            "Saturday's dinner is baked white fish with tomato, olives & capers.",
-            "Happy to dig into that — want me to take a proper look and get you the details?",
-            "I don't want to just repeat myself — want me to actually go read the plan?",
-        ] {
-            assert_eq!(gate_family_voice(line, &v), line, "gate changed a clean reply: {line:?}");
-        }
-        // Blank in, blank out (the caller decides what to do about it).
-        assert_eq!(gate_family_voice("   ", &v), "   ");
-    }
-
-    /// The gate is IDEMPOTENT. `finalize_composed_reply` gates before writing the
-    /// session outbox and `deliver_reply` gates again at the send, so a second
-    /// pass must be a no-op or the outbox and the sent message would diverge.
-    #[test]
-    fn the_gate_is_idempotent() {
-        let v = voice();
-        for draft in [
-            "Nora \u{1F4AC} **W29** is a draft. I'd need to pull from the live gateway. \u{1F986} Otto's got this one.",
-            "Meals are set — waiting on you and Nadin to confirm.",
-            "The dispatcher has 3 agents alive. Dinner is pasta.",
-            "About **180–220 calories** each.",
-        ] {
-            let once = gate_family_voice(draft, &v);
-            let twice = gate_family_voice(&once, &v);
-            assert_eq!(once, twice, "not idempotent for {draft:?}");
-        }
-    }
-
-    /// The roster comes from the household's OWN files, never a hardcoded name.
-    #[test]
-    fn the_roster_loads_from_household_toml_and_the_binding_map() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("household.toml"),
-            r#"
-[household]
-name = "Casa Rossi"
-members = ["Alex"]
-
-[[agent]]
-id = "vera"
-name = "Vera"
-domains = ["meals"]
-
-[[agent]]
-id = "tobi"
-name = "Coach Tobi"
-domains = ["workouts"]
-"#,
-        )
-        .unwrap();
-        let v = FamilyVoice::load(root, root);
-        // The household's personas, not the shipped ones.
-        assert!(v.allows("vera") && v.allows("Coach Tobi") && v.allows("tobi"));
-        assert!(v.allows("alex"), "a household member is an allowed name");
-        assert!(!v.allows("nora"), "a foreign roster's persona is not allowed here");
-        // And the hand-off guard now matches THIS family's cast.
-        let p = v.persona_names().to_vec();
-        assert!(has_handoff_tail("All set. Vera's got this one.", &p));
-        assert!(has_handoff_tail("All set. Tobi's got this one.", &p));
-        assert!(!has_handoff_tail("All set. Otto's got this one.", &p));
-    }
-
-    /// With NO `household.toml` the loader still yields the shipped persona ids,
-    /// so a fresh deploy's replies are gated rather than un-guarded.
-    #[test]
-    fn the_roster_falls_back_to_the_shipped_personas() {
-        let dir = tempfile::tempdir().unwrap();
-        let v = FamilyVoice::load(dir.path(), dir.path());
-        assert!(!v.is_empty(), "the fallback roster must not be empty");
-        let p = v.persona_names().to_vec();
-        assert!(has_handoff_tail("All set. Otto's got this one.", &p));
-    }
-
-    /// THE ENGINE'S OWN DEFER LINE SURVIVES. `ownership::defer_line` produces
-    /// exactly the shape rule 2 strips ("Nora's got this one 🥗"), but it is the
-    /// single-owner routing notice the engine appends after re-routing an ask —
-    /// not the composer passing the buck. Stripping it would leave the family with
-    /// no idea where their ask went, so an EXACT authorized suffix survives while
-    /// the reply body is still fully gated.
-    #[test]
-    fn an_authorized_defer_tail_survives_but_the_body_is_still_gated() {
-        let v = voice();
-        let p = personas();
-        let defer = "Nora's got this one \u{1F957}";
-        let reply = format!("**Nice** protein swap. W29 is a draft.\n\n{defer}");
-        let out = gate_family_voice_with(
-            &reply,
-            &v,
-            GateOptions {
-                authorized_handoff: Some(defer),
-            },
-        );
-        assert!(out.ends_with(defer), "the ownership notice was stripped: {out}");
-        assert!(!has_markdown(&out), "the body was not gated: {out}");
-        assert!(!out.contains("W29"), "the body was not gated: {out}");
-        assert!(out.contains("next week"), "{out}");
-
-        // Without the authorization, the SAME tail is cut (so the exemption is
-        // doing the work, not a hole in rule 2).
-        let unauthorized = gate_family_voice(&reply, &v);
-        assert!(!unauthorized.contains("got this one"), "{unauthorized}");
-        assert!(!has_handoff_tail(&unauthorized, &p));
-
-        // A reply that is NOTHING but the defer line is delivered as-is.
-        assert_eq!(
-            gate_family_voice_with(defer, &v, GateOptions { authorized_handoff: Some(defer) }),
-            defer
-        );
-        // A composer tail that is NOT the authorized suffix is still cut.
-        let smuggled = format!("All set. \u{1F986} Otto's got this one.\n\n{defer}");
-        let out2 = gate_family_voice_with(
-            &smuggled,
-            &v,
-            GateOptions { authorized_handoff: Some(defer) },
-        );
-        assert!(out2.ends_with(defer), "{out2}");
-        assert!(!out2.contains("Otto"), "a composer hand-off rode in on the exemption: {out2}");
-    }
 }
