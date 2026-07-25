@@ -579,10 +579,12 @@ impl OwnerMap {
 }
 
 /// A family-voice one-liner a deferring voice can add so the ask visibly lands
-/// with its owner instead of vanishing ("Nora's got this one 🥗"). `owner` is a
-/// persona id; the display name is a simple capitalization.
-pub fn defer_line(owner: &str, domain: Domain) -> String {
-    let name = display_name(owner);
+/// with its configured owner instead of vanishing.
+///
+/// Persona ids are machine routing keys, not family-visible names. Use only an
+/// authored, family-safe display name from `household.toml`; when none exists,
+/// describe the ownership without inventing a name from the id.
+pub fn defer_line(owner_map: &OwnerMap, owner: &str, domain: Domain) -> String {
     let emoji = match domain {
         Domain::MealPlanning => " 🥗",
         Domain::Cooking => " 🍳",
@@ -591,16 +593,15 @@ pub fn defer_line(owner: &str, domain: Domain) -> String {
         Domain::Shopping => " 🛒",
         Domain::Coordination => "",
     };
-    format!("{name}'s got this one{emoji}")
-}
-
-/// Capitalize a persona id into a display name ("nora" → "Nora"). Good enough for
-/// a defer line; the roster's real display name is used where one is available.
-fn display_name(id: &str) -> String {
-    let mut chars = id.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
+    let display_name = owner_map
+        .display_names
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(owner.trim()))
+        .map(|(_, name)| name.trim())
+        .filter(|name| crate::notify::lifecycle::is_family_safe_name(name));
+    match display_name {
+        Some(name) => format!("{name}'s got this one{emoji}"),
+        None => format!("This one's for the right person{emoji}"),
     }
 }
 

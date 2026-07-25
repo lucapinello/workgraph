@@ -1567,24 +1567,21 @@ async fn finalize_composed_reply(
     let mut created: Option<String> = None;
     let mut authorized_handoff: Option<String> = None;
 
-    // SINGLE-OWNER RULE. Before any creation, resolve who OWNS this ask's domain
-    // (from `household.toml`, else the Casa default). Exactly one persona — the
-    // owner — mints the task; every other voice in a collective turn defers. This
-    // is the fix for Luca's tofu bug: one group ask electing the whole roster no
-    // longer mints one task per persona (with Coach Mira taking on a cooking task).
-    let decision = {
-        let root = project_root_of(workgraph_dir);
-        ownership::OwnerMap::load(&root).decide_owner(&origin.persona, human_message)
-    };
+    // SINGLE-OWNER RULE. Before any creation, resolve who owns this ask's domain
+    // from `household.toml`. Exactly one configured persona mints the task; every
+    // other voice in a collective turn defers. With no valid project owner the
+    // decision fails open so a real ask is not dropped.
+    let root = project_root_of(workgraph_dir);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let decision = owner_map.decide_owner(&origin.persona, human_message);
 
-    // DEFER DISCIPLINE (morning-taco-bugs): the defer line ("Bruno's got this
-    // one 🍳") must NEVER appear on the OWNER's own reply. `decide_owner` keys on
+    // DEFER DISCIPLINE: the defer line must never appear on the owner's own
+    // reply. `decide_owner` keys on
     // `origin.persona`, but a group-elected turn stamps that from the bot's
     // agent id — and a bot with no configured `agent_id` falls back to its bot id
-    // ("bruno_casapinello_bot"), which does not textually equal the owner id
-    // ("bruno"). That mismatch made Bruno defer to *himself* out loud. Correct a
-    // Defer back to Owner whenever the speaking voice actually IS the owner (by
-    // persona or bot id), so only a genuinely off-domain voice ever defers.
+    // (which need not textually equal the owner id). Correct a Defer back to
+    // Owner whenever the speaking voice actually is the owner by persona or bot
+    // id, so only a genuinely off-domain voice ever defers.
     let decision = match decision {
         ownership::OwnerDecision::Defer { owner } if speaker_is_owner(origin, &owner) => {
             ownership::OwnerDecision::Owner
@@ -1617,7 +1614,7 @@ async fn finalize_composed_reply(
                 let owner_origin = origin_as_persona(origin, &owner);
                 created =
                     try_create_origin_task(workgraph_dir, human_message, &title, &owner_origin);
-                let line = ownership::defer_line(&owner, domain);
+                let line = ownership::defer_line(&owner_map, &owner, domain);
                 // This exact suffix is authored here, after composition, to
                 // show where a re-routed ask landed. It is the only terminal
                 // handoff the family-voice guard may preserve.
@@ -1869,17 +1866,17 @@ fn try_create_origin_task(
 
     // AUTHORITATIVE OFF-DOMAIN GUARD — the round-2 fix. EVERY conversationally
     // created task funnels through this choke point: a collective round, a
-    // single-voice/concierge turn (Otto answering 1:1-style in the group), a
-    // parity retry, a fallback — and a restart-replayed sibling of any of them.
+    // single-voice turn in the group, a parity retry, a fallback — and a
+    // restart-replayed sibling of any of them.
     // finalize_composed_reply already routes the COLLECTIVE case, but its guard
     // keys on the election shape; a single-voice turn that reaches creation with
-    // the answering voice as `origin.persona` would otherwise land a meals task on
-    // Otto (Luca, 2026-07-14: "why is otto dealing with dishes"). So ownership is
-    // decided HERE, next to the intent dedupe, independent of who called: whatever
-    // persona the caller stamped, re-route ownership to the ask's DOMAIN OWNER
-    // from household.toml (Casa default as fallback). A voice that already owns the
-    // domain, or an ask whose owner cannot be resolved, is left untouched
-    // (fail-open — a real ask is never dropped; the intent ledger still dedupes).
+    // the answering voice as `origin.persona` could otherwise land a task on an
+    // off-domain voice. So ownership is decided HERE, next to the intent dedupe,
+    // independent of who called: whatever persona the caller stamped, re-route
+    // ownership to the ask's configured domain owner. A voice that already owns
+    // the domain, or an ask whose owner cannot be resolved from project config,
+    // is left untouched (fail-open — a real ask is never dropped; the intent
+    // ledger still dedupes).
     let owned_origin = match ownership::OwnerMap::load(&root)
         .decide_owner(&origin.persona, human_message)
     {
@@ -4447,7 +4444,13 @@ domains = ["calendar"]
         let cfg = cfg_with_bots(&[("hearth", Some("hearth"))]);
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
         bind_agent(&wg, "hearth", &uuid).unwrap();
-        add_binding(&wg, "member-1", "Household Member", true);
+        add_binding_for_bot(
+            &wg,
+            "member-1",
+            "Household Member",
+            true,
+            "coordination-lantern",
+        );
         let plan =
             plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
 
@@ -4615,9 +4618,9 @@ name = "The Wayfinder"
         );
     }
 
-    /// The single-owner path appends one trusted `<owner>'s got this one` line
-    /// after composition. That exact engine-authored suffix survives; a
-    /// composer cannot grant itself the same exception.
+    /// The single-owner path appends one trusted authored-name handoff after
+    /// composition. That exact engine-authored suffix survives; a composer
+    /// cannot grant itself the same exception.
     #[tokio::test]
     async fn family_voice_guard_preserves_exact_engine_authored_owner_handoff() {
         let dir = tempdir().unwrap();
@@ -4627,24 +4630,33 @@ name = "The Wayfinder"
             dir.path().join("household.toml"),
             r#"
 [[agent]]
-id = "hearth"
-name = "The Hearth"
+id = "coordination-lantern"
+name = "Evening Lantern"
 domains = ["coordination"]
 
 [[agent]]
-id = "pantry"
-name = "The Pantry"
+id = "meal-cairn"
+name = "Cedar Table"
 domains = ["meals"]
 "#,
         )
         .unwrap();
 
-        let cfg = cfg_with_bots(&[("hearth", Some("hearth")), ("pantry", Some("pantry"))]);
+        let cfg = cfg_with_bots(&[
+            ("coordination-lantern", Some("coordination-lantern")),
+            ("meal-cairn", Some("meal-cairn")),
+        ]);
         let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
-        bind_agent(&wg, "hearth", &uuid).unwrap();
+        bind_agent(&wg, "coordination-lantern", &uuid).unwrap();
         add_binding(&wg, "member-1", "Household Member", true);
-        let plan =
-            plan_conversation(&wg, &cfg, "telegram:hearth", "555", "member-1", Entry::Direct);
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:coordination-lantern",
+            "555",
+            "member-1",
+            Entry::Direct,
+        );
 
         let sink = RecSink::default();
         let composer = FakeComposer::ok(
@@ -4663,17 +4675,102 @@ domains = ["meals"]
         .unwrap();
 
         let delivered = sink.calls().last().unwrap().2.clone();
-        let trusted = ownership::defer_line("pantry", ownership::Domain::MealPlanning);
+        let owner_map = ownership::OwnerMap::load(dir.path());
+        let trusted =
+            ownership::defer_line(&owner_map, "meal-cairn", ownership::Domain::MealPlanning);
         assert_eq!(
             delivered,
             format!("Thursday soup is noted.\n\n{trusted}"),
             "the exact ownership notice must survive after the guarded body"
+        );
+        assert!(
+            delivered.contains("Cedar Table"),
+            "the family sees the authored multiword display name: {delivered}",
+        );
+        assert!(
+            !delivered.contains("meal-cairn"),
+            "the opaque routing id must not become family-visible copy: {delivered}",
         );
         let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
         assert_eq!(
             outbox.last().map(|message| message.content.as_str()),
             Some(delivered.as_str()),
             "the ownership exception must produce identical outbox/send bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_handoff_without_a_safe_display_name_is_name_free() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            dir.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "coordination-lantern"
+name = "Evening Lantern"
+domains = ["coordination"]
+
+[[agent]]
+id = "meal-cairn"
+domains = ["meals"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = cfg_with_bots(&[
+            ("coordination-lantern", Some("coordination-lantern")),
+            ("meal-cairn", Some("meal-cairn")),
+        ]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "coordination-lantern", &uuid).unwrap();
+        add_binding_for_bot(
+            &wg,
+            "member-2",
+            "Household Member",
+            true,
+            "coordination-lantern",
+        );
+        let plan = plan_conversation(
+            &wg,
+            &cfg,
+            "telegram:coordination-lantern",
+            "556",
+            "member-2",
+            Entry::Direct,
+        );
+
+        let sink = RecSink::default();
+        let composer =
+            FakeComposer::ok("Saturday stew is noted.\nTASK_CREATE: move Saturday dinner to stew");
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "swap Saturday dinner to stew",
+            "req-name-free-owner-handoff",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let delivered = sink.calls().last().unwrap().2.clone();
+        assert_eq!(
+            delivered,
+            "Saturday stew is noted.\n\nThis one's for the right person 🥗",
+            "a missing authored name gets grounded name-free copy",
+        );
+        assert!(
+            !delivered.contains("meal-cairn"),
+            "the routing id must stay private even when no display name exists: {delivered}",
+        );
+        let outbox = chat::read_outbox_since_ref(&wg, &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|message| message.content.as_str()),
+            Some(delivered.as_str()),
+            "the name-free ownership notice must match persisted and sent bytes",
         );
     }
 
@@ -4687,6 +4784,28 @@ domains = ["meals"]
             &format!("agent-{sender}"),
             name,
             Some("otto".to_string()),
+            Utc::now(),
+        );
+        b.confirmed = confirmed;
+        b.confirmed_at = confirmed.then(Utc::now);
+        map.add(b).unwrap();
+        map.save(&agency_dir).unwrap();
+    }
+
+    fn add_binding_for_bot(
+        wg: &Path,
+        sender: &str,
+        name: &str,
+        confirmed: bool,
+        bot_id: &str,
+    ) {
+        let agency_dir = wg.join("agency");
+        let mut map = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+        let mut b = crate::agency::TelegramBinding::new(
+            sender,
+            &format!("agent-{sender}"),
+            name,
+            Some(bot_id.to_string()),
             Utc::now(),
         );
         b.confirmed = confirmed;
