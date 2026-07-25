@@ -9,7 +9,8 @@
 #   - explicit addressed name        → that agent
 #   - reply to a bot's message       → that agent (reply-chain)
 #   - COLLECTIVE address ("hey guys") → ALL FOUR answer, roster order
-#   - team-directed unaddressed ask  → OTTO (group coordinator)
+#   - domain-matched ask             → configured household owner
+#   - unmatched team ask             → configured group coordinator
 #   - pure human-to-human small talk → SILENCE
 #
 # Drives the REAL binary against a fixture Casa-Pinello notify.toml, so it
@@ -25,6 +26,29 @@ require_wg
 
 scratch="$(make_scratch)"
 mkdir -p "$scratch/.wg"
+
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "nora"
+name = "Nora"
+emoji = "🥗"
+domains = ["meals", "nutrition"]
+[[agent]]
+id = "bruno"
+name = "Bruno"
+emoji = "🍳"
+domains = ["meals", "cooking", "recipes"]
+[[agent]]
+id = "mira"
+name = "Coach Mira"
+emoji = "💪"
+domains = ["workouts"]
+[[agent]]
+id = "otto"
+name = "Otto"
+emoji = "📋"
+domains = ["calendar", "coordination", "shopping"]
+TOML
 
 # Fixture: the four Casa Pinello voices, each with its @handle username.
 cat >"$scratch/.wg/notify.toml" <<'TOML'
@@ -93,9 +117,10 @@ expect_grep "fuzzy-summon/hi-guyz" "$out" "collective address — the whole rost
 # present (`--humans 2`) so the conservative silence rule is in force.
 expect_grep "fuzzy-summon/narration-not-summon" "$(elect "he said hey to me yesterday?" --humans 2)" "silence (small-talk)"
 
-echo "e. team-directed unaddressed ask → otto coordinates:"
-expect_grep "ask/someone" "$(elect "can someone plan Saturday dinner?")" "answered by otto (by concierge)"
-expect_grep "ask/domain-q" "$(elect "what's the plan for dinner tonight?")" "answered by otto (by concierge)"
+echo "e. domain asks use the configured owner; unmatched asks use the coordinator:"
+expect_grep "ask/someone-domain" "$(elect "can someone plan Saturday dinner?")" "answered by nora (by domain:meal-planning)"
+expect_grep "ask/domain-q" "$(elect "what's the plan for dinner tonight?")" "answered by nora (by domain:meal-planning)"
+expect_grep "ask/unmatched" "$(elect "can someone handle this?")" "answered by otto (by concierge)"
 
 echo "f. pure small talk with 2+ humans → SILENCE (family chatter protected):"
 # `--humans 2` forces the conservative rule: with more than one human in the
@@ -139,6 +164,28 @@ fi
 echo "h. @mention resolves & beats silence with NO username configured (live-config shape):"
 nou_scratch="$(make_scratch)"
 mkdir -p "$nou_scratch/.wg"
+cat >"$nou_scratch/household.toml" <<'TOML'
+[[agent]]
+id = "nora"
+name = "Nora"
+emoji = "🥗"
+domains = ["meals", "nutrition"]
+[[agent]]
+id = "bruno"
+name = "Bruno"
+emoji = "🍳"
+domains = ["meals", "cooking", "recipes"]
+[[agent]]
+id = "mira"
+name = "Coach Mira"
+emoji = "💪"
+domains = ["workouts"]
+[[agent]]
+id = "otto"
+name = "Otto"
+emoji = "📋"
+domains = ["calendar", "coordination", "shopping"]
+TOML
 cat >"$nou_scratch/.wg/notify.toml" <<'TOML'
 [telegram.bots.nora]
 bot_token = "0000000000:nora-dummy-token"
@@ -174,12 +221,12 @@ expect_grep "no-username/bruno-question" \
     "$(elect_nou "@bruno_casapinello_bot?")" \
     "answered by bruno (by @mention)"
 # The rest of the ladder still holds without usernames (reply-chain resolves the
-# real handle too; a team ask still coordinates through otto; chatter is silent).
+# real handle too; an unmatched ask still uses the coordinator; chatter is silent).
 expect_grep "no-username/reply-chain" \
     "$(elect_nou "sounds good" --reply-to-bot mira_casapinello_bot)" \
     "answered by mira (by reply-chain)"
 expect_grep "no-username/ask-otto" \
-    "$(elect_nou "can someone plan dinner?")" \
+    "$(elect_nou "can someone handle this?")" \
     "answered by otto (by concierge)"
 # Two humans present so the conservative silence rule holds (this fixture has no
 # agency/, i.e. zero onboarded humans, which would otherwise answer greetings).
@@ -187,4 +234,4 @@ expect_grep "no-username/small-talk-silent" \
     "$(elect_nou "haha yeah that was fun" --humans 2)" \
     "silence (small-talk)"
 
-echo "PASS: responder election (name / mention-beats-name / reply-chain / collective→4 / ask→otto / small-talk→silence / @mention-without-username→that-agent)"
+echo "PASS: responder election (name / mention-beats-name / reply-chain / collective / configured domain owner / unmatched ask coordinator / small-talk silence / @mention without username)"

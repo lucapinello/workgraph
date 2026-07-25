@@ -33,7 +33,30 @@ mkdir -p "$scratch/.wg" "$scratch/plans"
 cp "$scenario_dir/../../fixtures/family_plan_w29.md" \
     "$scratch/plans/2026-W29-family-plan.md"
 
-# The four Casa Pinello voices so /standup + owner routing have a roster.
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "nora"
+name = "Nora"
+emoji = "🥗"
+domains = ["meals", "nutrition"]
+[[agent]]
+id = "bruno"
+name = "Bruno"
+emoji = "🍳"
+domains = ["meals", "cooking", "recipes"]
+[[agent]]
+id = "mira"
+name = "Coach Mira"
+emoji = "💪"
+domains = ["workouts"]
+[[agent]]
+id = "otto"
+name = "Otto"
+emoji = "📋"
+domains = ["calendar", "coordination", "shopping"]
+TOML
+
+# Matching bots for /standup; order/presentation comes from household.toml.
 cat >"$scratch/.wg/notify.toml" <<'TOML'
 [telegram.bots.nora]
 bot_token = "0000000000:nora-dummy-token"

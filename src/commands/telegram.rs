@@ -2327,7 +2327,7 @@ pub fn run_route(
         "private" => println!("private chat — 1:1 passthrough (not group-routed)"),
         "drop" => println!("dropped — no chat id, or no voice to route to"),
         "standup" => {
-            println!("/standup — intercepted; posts the whole roster (nora, bruno, mira, otto)")
+            println!("/standup — intercepted; posts the configured household roster")
         }
         _ => println!(
             "routed to {} (by {}): {}",
@@ -2431,10 +2431,10 @@ pub fn run_elect(
             Election::Private => ("private", None, None, message.to_string()),
             Election::Silence(reason) => ("silence", None, Some(reason.to_string()), message.to_string()),
             Election::All { body, .. } => {
-                let roster = worksgood::notify::telegram_standup::plan_roster(
+                let roster = worksgood::notify::telegram_standup::load_project_roster(
+                    &project_root(workgraph_dir),
                     &config,
-                    worksgood::notify::telegram_standup::DEFAULT_ROSTER,
-                )
+                )?
                 .into_iter()
                 .map(|m| m.bot_id)
                 .collect::<Vec<_>>()
@@ -2480,7 +2480,7 @@ pub fn run_elect(
             who.as_deref().unwrap_or("(none configured)")
         ),
         "standup" => {
-            println!("/standup — intercepted; posts the whole roster (nora, bruno, mira, otto)")
+            println!("/standup — intercepted; posts the configured household roster")
         }
         _ => println!(
             "answered by {} (by {}): {}",
@@ -2497,12 +2497,13 @@ pub fn run_elect(
 ///
 /// Runs the exact [`elect_responders`] decision the listener uses, then applies
 /// the same [`is_discussion_ask`] gate the live `Election::All` handler uses to
-/// split a collective election into a discussion round vs today's four
-/// independent hellos. Prints the category and, for a round, the voices in
-/// contribution order plus the synthesizer (Otto). This is the scripted-test
-/// seam (sibling of `wg telegram elect`): a discussion ask → `discussion-round`;
-/// a plain collective greeting → `collective-greeting`; a named/concierge ask →
-/// `single-voice`; small talk → `silence`. Nothing is sent.
+/// split a collective election into a discussion round vs independent roster
+/// replies. Prints the category and, for a round, the household-authored voices
+/// in contribution order plus the configured coordination-owner synthesizer.
+/// This is the scripted-test seam (sibling of `wg telegram elect`): a discussion
+/// ask → `discussion-round`; a plain collective greeting →
+/// `collective-greeting`; a named/concierge ask → `single-voice`; small talk →
+/// `silence`. Nothing is sent.
 pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()> {
     use worksgood::notify::telegram_discussion as discussion;
     use worksgood::notify::telegram_standup as standup;
@@ -2526,7 +2527,8 @@ pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()
     );
 
     let is_discussion = is_discussion_ask(message);
-    let roster_ids: Vec<String> = standup::plan_roster(&config, standup::DEFAULT_ROSTER)
+    let roster_ids: Vec<String> =
+        standup::load_project_roster(&project_root(workgraph_dir), &config)?
         .into_iter()
         .map(|m| m.bot_id)
         .collect();
@@ -3027,9 +3029,9 @@ pub async fn run_group_standup(
 ) -> Result<()> {
     use worksgood::notify::telegram_standup as standup;
 
-    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
     if roster.is_empty() {
-        eprintln!("No named bots configured — /standup has no voices to post.");
+        eprintln!("No household roster entries have matching Telegram bots.");
         return Ok(());
     }
 
@@ -3086,9 +3088,9 @@ pub async fn run_group_collective(
     use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_standup as standup;
 
-    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
     if roster.is_empty() {
-        eprintln!("No named bots configured — collective reply has no voices to post.");
+        eprintln!("No household roster entries have matching Telegram bots.");
         return Ok(());
     }
 
@@ -3195,8 +3197,9 @@ pub async fn run_group_collective(
 /// Orchestrate a **discussion round** (collective election + an opinion /
 /// discussion ask). Instead of four independent replies the family talks it
 /// through: each bound-session persona contributes one short in-voice take, in
-/// roster order and *reacting* to the takes so far, then Otto closes with a
-/// synthesis when at least two other voices weighed in.
+/// roster order and *reacting* to the takes so far, then the configured
+/// coordination owner closes with a synthesis when at least two other voices
+/// weighed in.
 ///
 /// This is the deliberative sibling of [`run_group_collective`]: same sole
 /// orchestrator (the single listener), same per-voice bot, same
@@ -3221,9 +3224,9 @@ pub async fn run_group_discussion(
     use worksgood::notify::grounding;
     use worksgood::notify::telegram_standup as standup;
 
-    let roster = standup::plan_roster(config, standup::DEFAULT_ROSTER);
+    let roster = standup::load_project_roster(&project_root(workgraph_dir), config)?;
     if roster.is_empty() {
-        eprintln!("No named bots configured — discussion round has no voices.");
+        eprintln!("No household roster entries have matching Telegram bots.");
         return Ok(());
     }
 
@@ -3248,6 +3251,7 @@ pub async fn run_group_discussion(
         {
             voices.push(discussion::DiscussionVoice {
                 bot_id: member.bot_id.clone(),
+                display_name: member.display_name.clone(),
                 agent_id,
                 session_ref,
             });
@@ -3725,7 +3729,7 @@ pub fn run_web_inbound(
     if dry_run {
         let who: Option<String> = match &election {
             Election::All { .. } => Some(
-                standup::plan_roster(&config, standup::DEFAULT_ROSTER)
+                standup::load_project_roster(&project_root(workgraph_dir), &config)?
                     .into_iter()
                     .map(|m| m.bot_id)
                     .collect::<Vec<_>>()
@@ -4045,7 +4049,7 @@ pub async fn run_family_command(
         return run_group_standup(workgraph_dir, config, target).await;
     }
 
-    let text = compose_family_reply(workgraph_dir, config, cmd);
+    let text = compose_family_reply(workgraph_dir, config, cmd)?;
 
     // Family-voice gate: a command reply bound for a family chat must never
     // carry coordinator content (markdown backticks or the WG claim/done
@@ -4140,7 +4144,7 @@ fn compose_family_reply(
     workgraph_dir: &Path,
     config: &TelegramConfig,
     cmd: &family_commands::FamilyCommand,
-) -> String {
+) -> Result<String> {
     compose_family_reply_on(
         workgraph_dir,
         config,
@@ -4158,19 +4162,25 @@ fn compose_family_reply_on(
     cmd: &family_commands::FamilyCommand,
     today: chrono::NaiveDate,
     now: chrono::DateTime<chrono::Utc>,
-) -> String {
-    let plans = family_plan::load_plans(&project_root(workgraph_dir));
+) -> Result<String> {
+    let root = project_root(workgraph_dir);
+    let plans = family_plan::load_plans(&root);
     let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
     let humans = human_agent_id_set(workgraph_dir);
+    let roster = if cmd.kind == family_commands::CommandKind::Roster {
+        worksgood::notify::telegram_standup::load_project_roster(&root, config)?
+    } else {
+        Vec::new()
+    };
     let ctx = family_commands::CommandContext {
         graph: graph.as_ref(),
-        config,
+        roster: &roster,
         plans: &plans,
         today,
         now,
         human_agents: &humans,
     };
-    family_commands::compose(cmd, &ctx)
+    Ok(family_commands::compose(cmd, &ctx))
 }
 
 /// `wg telegram register-commands` — register the shared family command set with
@@ -4285,7 +4295,7 @@ pub fn run_command(
         .map(|dt| dt.and_utc())
         .unwrap_or_else(chrono::Utc::now);
 
-    let text = compose_family_reply_on(workgraph_dir, &config, cmd, today, now);
+    let text = compose_family_reply_on(workgraph_dir, &config, cmd, today, now)?;
     let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
     let owner = cmd.owner(&owner_map);
 
@@ -5958,13 +5968,13 @@ pub fn run_standup(workgraph_dir: &Path, chat_id: Option<&str>, dry_run: bool) -
     use worksgood::notify::telegram_standup as standup;
 
     let config = load_telegram_config()?;
-    let roster = standup::plan_roster(&config, standup::DEFAULT_ROSTER);
+    let roster = standup::load_project_roster(&project_root(workgraph_dir), &config)?;
     if roster.is_empty() {
-        anyhow::bail!("No named bots configured under [telegram.bots.*] — nothing to post.");
+        anyhow::bail!("No household roster entries have matching Telegram bots.");
     }
 
-    // Target: explicit --chat-id, else the first named bot's configured chat id
-    // (in Casa Pinello every bot shares the group chat id).
+    // Target: explicit --chat-id, else the first roster bot's configured chat
+    // id (a household's roster bots normally share the group chat id).
     let target = chat_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| roster[0].bot.chat_id.clone());

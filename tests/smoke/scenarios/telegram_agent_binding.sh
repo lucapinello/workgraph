@@ -29,6 +29,29 @@ require_wg
 scratch="$(make_scratch)"
 mkdir -p "$scratch/.wg"
 
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "nora"
+name = "Nora"
+emoji = "🥗"
+domains = ["meals", "nutrition"]
+[[agent]]
+id = "bruno"
+name = "Bruno"
+emoji = "🍳"
+domains = ["meals", "cooking", "recipes"]
+[[agent]]
+id = "mira"
+name = "Coach Mira"
+emoji = "💪"
+domains = ["workouts"]
+[[agent]]
+id = "otto"
+name = "Otto"
+emoji = "📋"
+domains = ["calendar", "coordination", "shopping"]
+TOML
+
 # ── Case 1: agent_id set for all four bots (the fixed config) ───────────────
 cat >"$scratch/.wg/notify.toml" <<'TOML'
 [telegram.bots.nora]
@@ -70,11 +93,11 @@ if echo "$bound_out" | grep -q "no agent binding"; then
     loud_fail "a bot rendered as unbound despite agent_id being set — the otto(unbound) regression is back: $bound_out"
 fi
 
-# The election resolves the bound voice for a team-directed unaddressed ask.
-elect_out="$(cd "$scratch" && WG_DIR= wg telegram elect "can someone plan Saturday dinner?" --chat-type supergroup 2>&1)" \
+# The election resolves the bound coordinator for an unmatched team ask.
+elect_out="$(cd "$scratch" && WG_DIR= wg telegram elect "can someone handle this?" --chat-type supergroup 2>&1)" \
     || loud_fail "elect exited non-zero: $elect_out"
 echo "$elect_out" | grep -q "answered by otto" \
-    || loud_fail "expected the concierge (otto) to answer the unaddressed team ask, got: $elect_out"
+    || loud_fail "expected the configured coordinator to answer the unmatched team ask, got: $elect_out"
 
 # ── Case 2: agent_id absent → bot is honestly reported as shared/unbound ────
 cat >"$scratch/.wg/notify.toml" <<'TOML'

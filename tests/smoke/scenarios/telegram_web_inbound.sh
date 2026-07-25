@@ -36,7 +36,30 @@ scratch="$(make_scratch)"
     wg agency human confirm 8905220378 >/dev/null 2>&1
 )
 
-# The four family voices, so a collective/round has a roster.
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "nora"
+name = "Nora"
+emoji = "🥗"
+domains = ["meals", "nutrition"]
+[[agent]]
+id = "bruno"
+name = "Bruno"
+emoji = "🍳"
+domains = ["meals", "cooking", "recipes"]
+[[agent]]
+id = "mira"
+name = "Coach Mira"
+emoji = "💪"
+domains = ["workouts"]
+[[agent]]
+id = "otto"
+name = "Otto"
+emoji = "📋"
+domains = ["calendar", "coordination", "shopping"]
+TOML
+
+# Matching bots; collective order comes from household.toml.
 cat >"$scratch/.wg/notify.toml" <<'TOML'
 [telegram]
 chat_id = "-1000000000001"

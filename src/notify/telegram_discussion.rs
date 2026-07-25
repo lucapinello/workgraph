@@ -84,6 +84,8 @@ impl DiscussionTiming {
 pub struct DiscussionVoice {
     /// The `[telegram.bots.<id>]` persona id — the bot that sends this take.
     pub bot_id: String,
+    /// Project-local display name from the ordered household roster.
+    pub display_name: String,
     /// The graph agent id whose bound session grounds the take.
     pub agent_id: String,
     /// The persona's bound persistent session.
@@ -94,31 +96,23 @@ pub struct DiscussionVoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Take {
     pub bot_id: String,
+    pub display_name: String,
     pub text: String,
 }
 
-/// The result of running a round — what was said, what was skipped, and Otto's
-/// wrap-up (present only when the synthesis threshold was met). No token or chat
-/// id — safe to log.
+/// The result of running a round — what was said, what was skipped, and the
+/// configured coordination owner's wrap-up (present only when the synthesis
+/// threshold was met). No token or chat id — safe to log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscussionOutcome {
     /// Takes that landed, in contribution order.
     pub takes: Vec<Take>,
-    /// Otto's closing synthesis, when it fired (≥2 non-Otto takes landed).
+    /// The configured owner's closing synthesis, when it fired (at least two
+    /// other voices landed).
     pub synthesis: Option<String>,
     /// Persona bot ids skipped (session errored, timed out, or send failed) —
     /// never surfaced to the group, but recorded for the observability log.
     pub skipped: Vec<String>,
-}
-
-/// Title-case a persona id for the prior-takes list in a compose prompt
-/// (`"nora"` → `"Nora"`). ASCII-only; leaves anything else intact.
-fn display_name(bot_id: &str) -> String {
-    let mut chars = bot_id.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => bot_id.to_string(),
-    }
 }
 
 /// Clamp a take to [`TAKE_CHAR_CAP`], cutting on a word boundary with an ellipsis
@@ -153,7 +147,7 @@ pub fn discussion_take_message(topic: &str, prior: &[Take]) -> String {
         m.push_str("Here's what the family have said so far:\n");
         for t in prior {
             m.push_str("- ");
-            m.push_str(&display_name(&t.bot_id));
+            m.push_str(&t.display_name);
             m.push_str(": ");
             m.push_str(t.text.trim());
             m.push('\n');
@@ -171,7 +165,7 @@ pub fn discussion_take_message(topic: &str, prior: &[Take]) -> String {
     m
 }
 
-/// Build the framed "message" Otto composes the closing synthesis against. Pure.
+/// Build the framed message the configured synthesizer composes against. Pure.
 pub fn synthesis_message(topic: &str, takes: &[Take]) -> String {
     let mut m = String::new();
     m.push_str("The family just talked through: \"");
@@ -179,7 +173,7 @@ pub fn synthesis_message(topic: &str, takes: &[Take]) -> String {
     m.push_str("\". Here's what everyone said:\n");
     for t in takes {
         m.push_str("- ");
-        m.push_str(&display_name(&t.bot_id));
+        m.push_str(&t.display_name);
         m.push_str(": ");
         m.push_str(t.text.trim());
         m.push('\n');
@@ -273,6 +267,7 @@ pub async fn run_discussion_round(
             Some(text) => match sink.send(&voice.bot_id, chat_id, &text).await {
                 Ok(_) => takes.push(Take {
                     bot_id: voice.bot_id.clone(),
+                    display_name: voice.display_name.clone(),
                     text,
                 }),
                 // A send failure is a delivery problem, not an error to surface —
@@ -285,7 +280,8 @@ pub async fn run_discussion_round(
 
     // Synthesis closes the round — but only when the discussion had substance:
     // at least two voices OTHER than the synthesizer actually weighed in. A round
-    // where only Otto (or a single peer) spoke needs no "the consensus is…".
+    // where only the synthesizer (or a single peer) spoke needs no
+    // "the consensus is…".
     let non_synth_takes = takes.iter().filter(|t| t.bot_id != synthesizer_bot).count();
     let mut synthesis = None;
     if non_synth_takes >= 2 {
@@ -413,6 +409,7 @@ mod tests {
     fn voice(bot: &str) -> DiscussionVoice {
         DiscussionVoice {
             bot_id: bot.to_string(),
+            display_name: format!("Display {bot}"),
             agent_id: bot.to_string(),
             session_ref: format!("session-{bot}"),
         }
@@ -488,11 +485,13 @@ mod tests {
         // The message a voice composes against must embed the prior takes so it
         // can react — proven via the pure builder the runner feeds the composer.
         let prior = vec![Take {
-            bot_id: "nora".to_string(),
+            bot_id: "agent-7f3".to_string(),
+            display_name: "Morning Compass".to_string(),
             text: "Pasta!".to_string(),
         }];
         let msg = discussion_take_message("dinner?", &prior);
-        assert!(msg.contains("Nora: Pasta!"));
+        assert!(msg.contains("Morning Compass: Pasta!"));
+        assert!(!msg.contains("Agent-7f3"));
         // The first voice's message has no prior-takes block.
         let first = discussion_take_message("dinner?", &[]);
         assert!(first.contains("first to weigh in"));

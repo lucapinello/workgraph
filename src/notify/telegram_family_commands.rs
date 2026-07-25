@@ -45,8 +45,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use super::family_plan::{self, PlanDoc};
 use super::ownership::{Domain, OwnerMap};
-use super::telegram::TelegramConfig;
-use super::telegram_standup::{self, humanize_title, DEFAULT_ROSTER};
+use super::telegram_standup::{self, StandupMember, humanize_title};
 use crate::graph::{Status, WorkGraph};
 
 /// How a command's reply is delivered.
@@ -99,8 +98,8 @@ pub struct CommandContext<'a> {
     /// the graph could not be loaded — composers then report an empty/quiet
     /// state rather than failing.
     pub graph: Option<&'a WorkGraph>,
-    /// The Telegram roster config (for `/standup` voice ordering).
-    pub config: &'a TelegramConfig,
+    /// The ordered project-local Telegram roster (for `/standup`).
+    pub roster: &'a [StandupMember],
     /// Parsed weekly plans, sorted oldest→newest (for `/dinner`, `/shopping`,
     /// `/week`).
     pub plans: &'a [PlanDoc],
@@ -348,7 +347,7 @@ fn compose_reminders(ctx: &CommandContext<'_>) -> String {
 fn compose_standup(ctx: &CommandContext<'_>) -> String {
     let empty = WorkGraph::new();
     let graph = ctx.graph.unwrap_or(&empty);
-    let posts = telegram_standup::plan_standup(graph, ctx.config, DEFAULT_ROSTER);
+    let posts = telegram_standup::plan_standup(graph, ctx.roster);
     posts
         .iter()
         .map(|p| p.text.clone())
@@ -487,6 +486,8 @@ fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
 mod tests {
     use super::*;
     use crate::graph::{Node, Task, WaitCondition, WaitSpec};
+    use crate::notify::telegram::TelegramConfig;
+    use crate::notify::telegram_standup::HouseholdPersona;
     use std::collections::HashMap;
 
     const W29: &str = include_str!("../../tests/fixtures/family_plan_w29.md");
@@ -520,16 +521,33 @@ mod tests {
         }
     }
 
+    fn casa_roster(config: &TelegramConfig) -> Vec<StandupMember> {
+        let presentations = [
+            ("nora", "Nora", "🥗"),
+            ("bruno", "Bruno", "🍳"),
+            ("mira", "Coach Mira", "💪"),
+            ("otto", "Otto", "📋"),
+        ]
+        .into_iter()
+        .map(|(id, name, emoji)| HouseholdPersona {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            emoji: emoji.to_string(),
+        })
+        .collect::<Vec<_>>();
+        telegram_standup::plan_roster(config, &presentations).unwrap()
+    }
+
     fn ctx<'a>(
         plans: &'a [PlanDoc],
         graph: Option<&'a WorkGraph>,
         humans: &'a HashSet<String>,
-        config: &'a TelegramConfig,
+        roster: &'a [StandupMember],
         today: NaiveDate,
     ) -> CommandContext<'a> {
         CommandContext {
             graph,
-            config,
+            roster,
             plans,
             today,
             now: now(),
@@ -584,7 +602,8 @@ mod tests {
         let plans: Vec<PlanDoc> = Vec::new();
         let humans = HashSet::new();
         let cfg = casa_config();
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let roster = casa_roster(&cfg);
+        let c = ctx(&plans, None, &humans, &roster, date(2026, 7, 15));
         for cmd in FAMILY_COMMANDS {
             let out = compose(cmd, &c);
             assert!(
@@ -599,8 +618,7 @@ mod tests {
     fn help_lists_every_command_in_the_table() {
         let plans: Vec<PlanDoc> = Vec::new();
         let humans = HashSet::new();
-        let cfg = casa_config();
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
         let help = compose_help(&c);
         for cmd in FAMILY_COMMANDS {
             assert!(help.contains(cmd.keyword), "help missing {}", cmd.keyword);
@@ -618,9 +636,8 @@ mod tests {
     fn dinner_returns_the_actual_dish_for_today() {
         let plans = w29();
         let humans = HashSet::new();
-        let cfg = casa_config();
         // Wednesday 07-15 in the fixture is the lentil & beet salad.
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
         let out = compose_dinner(&c);
         assert!(out.contains("Lentil & roasted-beet salad"), "got: {out}");
         assert!(out.contains("30 min"), "prep time surfaced: {out}");
@@ -631,9 +648,8 @@ mod tests {
     fn dinner_is_honest_when_today_has_no_plan() {
         let plans = w29();
         let humans = HashSet::new();
-        let cfg = casa_config();
         // 07-12 is the day before W29 begins — no covering plan.
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 12));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 12));
         let out = compose_dinner(&c);
         assert!(out.to_lowercase().contains("don't have"), "got: {out}");
         assert!(out.to_lowercase().contains("plan"), "offers to plan: {out}");
@@ -643,8 +659,7 @@ mod tests {
     fn shopping_lists_real_items_under_store_sections() {
         let plans = w29();
         let humans = HashSet::new();
-        let cfg = casa_config();
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
         let out = compose_shopping(&c);
         assert!(out.contains("Fishmonger"), "store section: {out}");
         assert!(out.contains("Salmon fillets"), "grounded item: {out}");
@@ -655,8 +670,7 @@ mod tests {
     fn week_shows_meals_as_weekday_names_plus_workouts() {
         let plans = w29();
         let humans = HashSet::new();
-        let cfg = casa_config();
-        let c = ctx(&plans, None, &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
         let out = compose_week(&c);
         assert!(out.contains("Monday"), "weekday name, not a date: {out}");
         assert!(!out.contains("07-13"), "no raw dates: {out}");
@@ -667,13 +681,12 @@ mod tests {
 
     #[test]
     fn reminders_lists_pending_human_task_and_is_cheerful_when_empty() {
-        let cfg = casa_config();
         let plans: Vec<PlanDoc> = Vec::new();
 
         // Empty graph → cheerful.
         let empty = WorkGraph::new();
         let humans = HashSet::new();
-        let c = ctx(&plans, Some(&empty), &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, Some(&empty), &humans, &[], date(2026, 7, 15));
         let out = compose_reminders(&c);
         assert!(out.to_lowercase().contains("caught up"), "got: {out}");
 
@@ -689,7 +702,7 @@ mod tests {
         }));
         let mut humans = HashSet::new();
         humans.insert("human-nadin".to_string());
-        let c = ctx(&plans, Some(&graph), &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, Some(&graph), &humans, &[], date(2026, 7, 15));
         let out = compose_reminders(&c);
         assert!(out.contains("Waiting on a reply"), "section: {out}");
         assert!(out.contains("Ask Nadin"), "grounded title: {out}");
@@ -697,7 +710,6 @@ mod tests {
 
     #[test]
     fn reminders_surfaces_upcoming_cron_task() {
-        let cfg = casa_config();
         let plans: Vec<PlanDoc> = Vec::new();
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(Task {
@@ -713,7 +725,7 @@ mod tests {
             ..Default::default()
         }));
         let humans = HashSet::new();
-        let c = ctx(&plans, Some(&graph), &humans, &cfg, date(2026, 7, 15));
+        let c = ctx(&plans, Some(&graph), &humans, &[], date(2026, 7, 15));
         let out = compose_reminders(&c);
         assert!(out.contains("Coming up"), "section: {out}");
         assert!(out.contains("Draft next week"), "grounded title: {out}");
@@ -725,7 +737,8 @@ mod tests {
         let plans: Vec<PlanDoc> = Vec::new();
         let graph = WorkGraph::new();
         let humans = HashSet::new();
-        let c = ctx(&plans, Some(&graph), &humans, &cfg, date(2026, 7, 15));
+        let roster = casa_roster(&cfg);
+        let c = ctx(&plans, Some(&graph), &humans, &roster, date(2026, 7, 15));
         let out = compose_standup(&c);
         assert!(out.contains("Nora"));
         assert!(out.contains("Bruno"));

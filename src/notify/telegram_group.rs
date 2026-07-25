@@ -2065,6 +2065,26 @@ mod tests {
         ])
     }
 
+    fn casa_test_roster(
+        config: &TelegramConfig,
+    ) -> Vec<crate::notify::telegram_standup::StandupMember> {
+        use crate::notify::telegram_standup::{HouseholdPersona, plan_roster};
+        let personas = [
+            ("nora", "Nora", "🥗"),
+            ("bruno", "Bruno", "🍳"),
+            ("mira", "Coach Mira", "💪"),
+            ("otto", "Otto", "📋"),
+        ]
+        .into_iter()
+        .map(|(id, name, emoji)| HouseholdPersona {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            emoji: emoji.to_string(),
+        })
+        .collect::<Vec<_>>();
+        plan_roster(config, &personas).unwrap()
+    }
+
     fn route(text: &str, reply_to_bot: Option<&str>) -> NaturalRoute {
         route_natural_with_owner_map(
             Some("supergroup"),
@@ -2250,7 +2270,8 @@ mod tests {
         }
 
         // And the intercept posts exactly four voices in roster order.
-        let posts = standup::plan_standup(&WorkGraph::new(), &cfg, standup::DEFAULT_ROSTER);
+        let roster = casa_test_roster(&cfg);
+        let posts = standup::plan_standup(&WorkGraph::new(), &roster);
         let ids: Vec<&str> = posts.iter().map(|p| p.bot_id.as_str()).collect();
         assert_eq!(ids, vec!["nora", "bruno", "mira", "otto"]);
     }
@@ -3152,9 +3173,10 @@ domains = ["coordination", "calendar"]
     #[test]
     fn collective_reply_plans_four_posts_in_roster_order() {
         use crate::graph::WorkGraph;
-        use crate::notify::telegram_standup::{DEFAULT_ROSTER, plan_group_reply};
+        use crate::notify::telegram_standup::plan_group_reply;
         let cfg = casa_config();
-        let posts = plan_group_reply(&WorkGraph::new(), &cfg, DEFAULT_ROSTER);
+        let roster = casa_test_roster(&cfg);
+        let posts = plan_group_reply(&WorkGraph::new(), &roster);
         let ids: Vec<&str> = posts.iter().map(|p| p.bot_id.as_str()).collect();
         assert_eq!(ids, vec!["nora", "bruno", "mira", "otto"], "roster order");
         // Conversational, not a status report — grounded "all quiet" line.

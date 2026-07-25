@@ -15,7 +15,8 @@
 #     the diagnostic surfaces is_bot so the guard's input is visible.
 #
 #   Fix #4a: a content question with no greeting must NOT elect a four-way
-#     collective — it goes to the concierge (otto). A pure greeting still does.
+#     collective — it goes to the configured domain owner. A pure greeting
+#     still does.
 #     Proven through `wg telegram elect --json` (the listener's real election).
 #
 # Credential-free: both subcommands only read local config/bindings; nothing is
@@ -39,7 +40,30 @@ scratch="$(make_scratch)"
     wg agency human confirm 8905220378 >/dev/null 2>&1
 )
 
-# The four family voices, so `wg telegram elect` has a roster to elect from.
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "nora"
+name = "Nora"
+emoji = "🥗"
+domains = ["meals", "nutrition"]
+[[agent]]
+id = "bruno"
+name = "Bruno"
+emoji = "🍳"
+domains = ["meals", "cooking", "recipes"]
+[[agent]]
+id = "mira"
+name = "Coach Mira"
+emoji = "💪"
+domains = ["workouts"]
+[[agent]]
+id = "otto"
+name = "Otto"
+emoji = "📋"
+domains = ["calendar", "coordination", "shopping"]
+TOML
+
+# Matching configured bots; speaking order comes from household.toml.
 cat >"$scratch/.wg/notify.toml" <<'TOML'
 [telegram.bots.nora]
 bot_token = "0000000000:nora-dummy-token"
@@ -105,10 +129,10 @@ echo "Fix #5: an unbound sender is unrecognized (not mis-resolved):"
 out="$(resolve '{"message":{"from":{"id":999999,"is_bot":false},"text":"hi"}}')"
 expect_grep   "unbound sender resolves to no agent"    "$out" '"agent_id": null'
 
-echo "Fix #4a: a content question with no greeting elects the concierge (otto), NOT a collective:"
+echo "Fix #4a: a content question with no greeting elects its configured domain owner, NOT a collective:"
 out="$(elect 'what is on the menu tomorrow?' --chat-type supergroup)"
-expect_grep   "elected the single concierge voice"     "$out" '"who": "otto"'
-expect_grep   "by the concierge rule"                  "$out" '"addressed_by": "concierge"'
+expect_grep   "elected the single meal-planning voice" "$out" '"who": "nora"'
+expect_grep   "by the configured domain rule"          "$out" '"addressed_by": "domain:meal-planning"'
 expect_absent "did NOT fan out to the roster"          "$out" '"kind": "collective"'
 
 echo "Fix #4a regression: a PURE greeting still elects the whole roster (collective):"
