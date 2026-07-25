@@ -1157,11 +1157,11 @@ pub fn strip_handoff_tail(reply: &str, roster: &FamilyVoiceRoster) -> String {
     let mut cut: Option<usize> = None;
     for pattern in handoff_patterns(&name_alt) {
         let Ok(re) = Regex::new(&format!(
-            r"(?i)(?:{pattern})[\s\p{{P}}\p{{S}}\u{{FE0F}}\u{{200D}}]*$"
+            r"(?i)(?:^|[^\p{{L}}\p{{N}}_])({pattern})[\s\p{{P}}\p{{S}}\u{{FE0F}}\u{{200D}}]*$"
         )) else {
             continue;
         };
-        if let Some(found) = re.find(reply) {
+        if let Some(found) = re.captures(reply).and_then(|captures| captures.get(1)) {
             cut = Some(cut.map_or(found.start(), |current| current.min(found.start())));
         }
     }
@@ -3219,6 +3219,27 @@ label = "Fallback Member"
             enforce_family_voice("The Wayfinder's got this one.", &roster),
             family_voice_fallback_line(),
             "a handoff-only draft becomes neutral instead of leaking intact"
+        );
+    }
+
+    #[test]
+    fn family_voice_handoff_never_matches_inside_a_human_name() {
+        let roster = FamilyVoiceRoster::from_names(["Mira"], ["Samira"]);
+        let human = "Samira's got this one.";
+        assert_eq!(
+            strip_handoff_tail(human, &roster),
+            human,
+            "a configured human name containing a persona suffix must remain whole",
+        );
+        assert_eq!(
+            enforce_family_voice(human, &roster),
+            human,
+            "the full delivery guard must preserve the configured human too",
+        );
+        assert_eq!(
+            strip_handoff_tail("Dinner is ready. Mira's got this one.", &roster),
+            "Dinner is ready.",
+            "the same phrase beginning with the standalone persona remains a handoff",
         );
     }
 
