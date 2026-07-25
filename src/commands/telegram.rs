@@ -3772,7 +3772,12 @@ pub fn run_web_inbound(
     if convo::sender_is_confirmed(workgraph_dir, &auth_sender) {
         let today = chrono::Local::now().date_naive();
         if let fast_lane::FastLaneResult::Applied { report, op, .. } =
-            fast_lane::run_fast_lane(&project_root(workgraph_dir), message, today)
+            fast_lane::run_fast_lane_with_calendar_owner(
+                &project_root(workgraph_dir),
+                message,
+                today,
+                owner_map.owner_for_domain(ownership::Domain::Calendar),
+            )
         {
             let (bot_id, chat) = fast_lane_reply_target(&election, &config, &target);
             let persona = convo::agent_for_bot(&config, &bot_id);

@@ -856,6 +856,19 @@ pub fn apply_to_content(
     content: &str,
     op: &FastLaneOp,
 ) -> Result<String, FastLaneError> {
+    apply_to_content_with_calendar_owner(week_code, content, op, None)
+}
+
+/// Apply one fast-lane operation with the project-configured owner for calendar
+/// rows. Reminder writes fail closed when no owner is available; every other
+/// operation is unchanged. Keeping this value caller-supplied prevents the plan
+/// from depending on a compiled household persona.
+pub fn apply_to_content_with_calendar_owner(
+    week_code: &str,
+    content: &str,
+    op: &FastLaneOp,
+    calendar_owner: Option<&str>,
+) -> Result<String, FastLaneError> {
     let edited = match op {
         FastLaneOp::MealSwap { day, dish } => {
             edit_meal_dish(content, *day, &DishEdit::Replace(dish.clone()))
@@ -873,19 +886,36 @@ pub fn apply_to_content(
         FastLaneOp::ShoppingAdd { item } => add_shopping_item(content, item)
             .ok_or_else(|| FastLaneError::NotApplicable("no shopping list to add to".into()))?,
         FastLaneOp::ReminderSet { text, day, time } => {
-            add_reminder_row(content, week_code, text, *day, time.as_deref())
+            let owner = calendar_owner
+                .map(str::trim)
+                .filter(|owner| {
+                    !owner.is_empty()
+                        && !owner
+                            .chars()
+                            .any(|c| matches!(c, '|' | '\n' | '\r'))
+                })
+                .ok_or_else(|| {
+                    FastLaneError::NotApplicable(
+                        "no configured calendar owner for the reminder".into(),
+                    )
+                })?;
+            add_reminder_row(content, week_code, text, *day, time.as_deref(), owner)
                 .ok_or_else(|| FastLaneError::NotApplicable("no calendar to add a reminder to".into()))?
         }
     };
 
     // Round-trip: the edited document MUST parse back to the change we intended.
     let doc = PlanDoc::parse(week_code, &edited);
-    verify_round_trip(&doc, op)?;
+    verify_round_trip(&doc, op, calendar_owner)?;
     Ok(edited)
 }
 
 /// Assert the parsed, re-read document actually reflects the operation.
-fn verify_round_trip(doc: &PlanDoc, op: &FastLaneOp) -> Result<(), FastLaneError> {
+fn verify_round_trip(
+    doc: &PlanDoc,
+    op: &FastLaneOp,
+    calendar_owner: Option<&str>,
+) -> Result<(), FastLaneError> {
     let dish_on = |wd: Weekday| -> Option<String> {
         doc.meals
             .iter()
@@ -933,11 +963,15 @@ fn verify_round_trip(doc: &PlanDoc, op: &FastLaneOp) -> Result<(), FastLaneError
             let key: String = text.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
             let present = doc.calendar.iter().any(|e| {
                 let ev = e.event.to_lowercase();
-                ev.contains("reminder") && ev.contains(&key.to_lowercase())
+                ev.contains("reminder")
+                    && ev.contains(&key.to_lowercase())
+                    && calendar_owner
+                        .map(|owner| e.source.eq_ignore_ascii_case(owner.trim()))
+                        .unwrap_or(false)
             });
             if !present {
                 return Err(FastLaneError::RoundTrip(
-                    "reminder row absent from calendar after re-parse".into(),
+                    "reminder row or configured owner absent after re-parse".into(),
                 ));
             }
         }
@@ -1092,6 +1126,7 @@ fn add_reminder_row(
     text: &str,
     day: Option<Weekday>,
     time: Option<&str>,
+    owner: &str,
 ) -> Option<String> {
     // Resolve the concrete date for the day cell from the plan week.
     let doc = PlanDoc::parse(week_code, content);
@@ -1105,7 +1140,7 @@ fn add_reminder_row(
     let short = weekday_short(target.weekday());
     let mmdd = format!("{:02}-{:02}", target.month(), target.day());
     let time = time.unwrap_or("09:00");
-    let row = format!("| {short} {mmdd} | {time} | ⏰ Reminder: {text} | Otto |");
+    let row = format!("| {short} {mmdd} | {time} | ⏰ Reminder: {text} | {owner} |");
 
     // Insert as the last row of the calendar table.
     let mut in_cal = false;
@@ -1246,6 +1281,18 @@ fn week_code_of(stem: &str) -> Option<String> {
 /// plan, an edit that would not round-trip — returns [`FastLaneResult::Fallback`]
 /// and the caller runs the full pipeline exactly as today.
 pub fn run_fast_lane(root: &Path, message: &str, today: NaiveDate) -> FastLaneResult {
+    run_fast_lane_with_calendar_owner(root, message, today, None)
+}
+
+/// Run the file-level fast lane with the project-configured calendar owner.
+/// The caller derives this from `household.toml`; a missing owner makes only a
+/// reminder operation fall back without changing the plan.
+pub fn run_fast_lane_with_calendar_owner(
+    root: &Path,
+    message: &str,
+    today: NaiveDate,
+    calendar_owner: Option<&str>,
+) -> FastLaneResult {
     let op = match classify(message, today) {
         Classification::FastLane(op) => op,
         Classification::Fallback(reason) => {
@@ -1273,7 +1320,12 @@ pub fn run_fast_lane(root: &Path, message: &str, today: NaiveDate) -> FastLaneRe
         }
     };
 
-    match apply_to_content(&week_code, &content, &op) {
+    match apply_to_content_with_calendar_owner(
+        &week_code,
+        &content,
+        &op,
+        calendar_owner,
+    ) {
         Ok(edited) => {
             if let Err(e) = crate::atomic_file::write_atomic(&path, edited.as_bytes()) {
                 return FastLaneResult::Fallback {
@@ -1593,18 +1645,42 @@ mod tests {
 
     #[test]
     fn fast_lane_apply_reminder_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "harbor"
+domains = ["calendar", "coordination"]
+
+[[agent]]
+id = "cedar"
+domains = ["meals"]
+"#,
+        )
+        .unwrap();
+        let owners = crate::notify::ownership::OwnerMap::load(root.path());
+        let calendar_owner =
+            owners.owner_for_domain(crate::notify::ownership::Domain::Calendar);
         let op = FastLaneOp::ReminderSet {
             text: "defrost the chicken".into(),
             day: Some(Weekday::Fri),
             time: Some("17:00".into()),
         };
-        let edited = apply_to_content("2026-W29", W29, &op).expect("reminder applies");
+        let edited = apply_to_content_with_calendar_owner(
+            "2026-W29",
+            W29,
+            &op,
+            calendar_owner,
+        )
+        .expect("reminder applies");
         let doc = PlanDoc::parse("2026-W29", &edited);
         assert!(doc.calendar.iter().any(|e| {
             e.event.to_lowercase().contains("reminder")
                 && e.event.to_lowercase().contains("defrost")
                 && e.weekday == "Fri"
                 && e.time == "17:00"
+                && e.source == "harbor"
         }));
     }
 
@@ -1690,5 +1766,31 @@ mod tests {
         let result = run_fast_lane(&dir, "swap Friday to tacos", today());
         assert!(matches!(result, FastLaneResult::Fallback { .. }));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fast_lane_reminder_without_calendar_owner_leaves_plan_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let plans = root.path().join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan_path = plans.join("2026-W29-family-plan.md");
+        std::fs::write(&plan_path, W29).unwrap();
+        let before = std::fs::read(&plan_path).unwrap();
+
+        let result = run_fast_lane_with_calendar_owner(
+            root.path(),
+            "remind me to defrost the chicken Friday at 5pm",
+            today(),
+            None,
+        );
+        assert!(
+            matches!(result, FastLaneResult::Fallback { .. }),
+            "a missing project owner must fall back, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&plan_path).unwrap(),
+            before,
+            "a refused reminder must not mutate the plan"
+        );
     }
 }
