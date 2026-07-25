@@ -411,6 +411,10 @@ pub fn classify_domain(ask: &str) -> Domain {
 pub struct OwnerMap {
     /// `(persona_id, domain_tags)` in `household.toml` author order.
     entries: Vec<(String, Vec<String>)>,
+    /// `(persona_id, authored display name)` in the same order. Kept beside the
+    /// domain entries so routing can recognize household-authored names without
+    /// assuming that a bot id resembles a person's visible name.
+    display_names: Vec<(String, String)>,
 }
 
 /// The single-owner decision for one (persona, ask) pair.
@@ -444,6 +448,7 @@ impl OwnerMap {
                 entry("mira", &["workouts"]),
                 entry("otto", &["calendar", "coordination", "shopping"]),
             ],
+            display_names: Vec::new(),
         }
     }
 
@@ -470,7 +475,10 @@ impl OwnerMap {
                 Some((id, tags))
             })
             .collect();
-        Self { entries }
+        Self {
+            entries,
+            display_names: Vec::new(),
+        }
     }
 
     /// Parse `<root>/household.toml`'s `[[agent]]` blocks (id + domains). Returns
@@ -498,7 +506,17 @@ impl OwnerMap {
         if pairs.is_empty() {
             return None;
         }
-        Some(Self::from_pairs(pairs))
+        let display_names = agents
+            .iter()
+            .filter_map(|agent| {
+                let id = agent.get("id")?.as_str()?.trim().to_lowercase();
+                let name = agent.get("name")?.as_str()?.trim().to_string();
+                (!id.is_empty() && !name.is_empty()).then_some((id, name))
+            })
+            .collect();
+        let mut map = Self::from_pairs(pairs);
+        map.display_names = display_names;
+        Some(map)
     }
 
     /// Load the owner map for a project root. With no valid project roster the
@@ -520,6 +538,16 @@ impl OwnerMap {
             }
         }
         None
+    }
+
+    /// Household-authored `(persona id, display name)` pairs in roster order.
+    ///
+    /// Missing names simply do not appear. Callers must retain id/handle
+    /// addressing as a fallback rather than inventing a display name.
+    pub fn display_names(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.display_names
+            .iter()
+            .map(|(id, name)| (id.as_str(), name.as_str()))
     }
 
     /// The persona id that owns the ask (classify + resolve).

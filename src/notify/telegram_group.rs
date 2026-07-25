@@ -452,7 +452,9 @@ pub fn route_natural_with_owner_map(
     }
 
     // 2. First family name in the text.
-    if let Some(bot) = first_named_bot(text, config) {
+    if let Some(bot) = addressed_display_name_bot(text, config, owner_map)
+        .or_else(|| first_named_bot(text, config))
+    {
         return NaturalRoute::ToBot {
             bot,
             reply_chat,
@@ -1250,6 +1252,75 @@ fn has_imperative_discussion_verb(tokens: &[String]) -> bool {
     false
 }
 
+/// Find the first household-authored display name in `text` that is used to
+/// *address* an agent.
+///
+/// Display names may be multi-word and need not resemble the opaque persona id
+/// or bot handle. The positioning rules mirror [`addressed_name_bot`]: a name
+/// must be a leading/trailing vocative or follow an addressing cue. A matching
+/// phrase buried in narration is deliberately ignored.
+fn addressed_display_name_bot(
+    text: &str,
+    config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
+) -> Option<ResolvedBot> {
+    let raw_words: Vec<&str> = text.split_whitespace().collect();
+    let clean = |raw: &str| {
+        raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
+            .to_lowercase()
+    };
+    let words: Vec<String> = raw_words.iter().map(|raw| clean(raw)).collect();
+
+    // Text order wins, just as it does for id/handle addressing. Roster order
+    // only breaks the impossible tie where two configured display names are
+    // byte-identical at the same position.
+    for start in 0..words.len() {
+        for (persona_id, display_name) in owner_map.display_names() {
+            let name_words: Vec<String> = display_name
+                .split_whitespace()
+                .map(clean)
+                .filter(|word| !word.is_empty())
+                .collect();
+            if name_words.is_empty() || start + name_words.len() > words.len() {
+                continue;
+            }
+            if words[start..start + name_words.len()] != name_words {
+                continue;
+            }
+
+            let end = start + name_words.len() - 1;
+            let last = raw_words[end].trim_start_matches(|c: char| {
+                !c.is_alphanumeric() && c != '_' && c != '@'
+            });
+            let last_word =
+                last.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'');
+            let trailing = last.strip_prefix(last_word).unwrap_or_default();
+            let vocative_punct = trailing.starts_with([',', ':', '!', '?', '-', ';', '.']);
+            let is_first = start == 0;
+            let is_last = end + 1 == words.len();
+            let previous = start.checked_sub(1).and_then(|i| raw_words.get(i));
+            let previous_word = previous.map(|word| clean(word)).unwrap_or_default();
+            let previous_is_cue = ADDRESSING_CUES.contains(&previous_word.as_str());
+            let previous_ends_comma = previous
+                .map(|word| word.trim_end().ends_with(','))
+                .unwrap_or(false);
+            let next_word = words.get(end + 1).cloned().unwrap_or_default();
+            let next_is_request = ADDRESS_FOLLOWERS.contains(&next_word.as_str());
+
+            let addressed = (is_first
+                && (vocative_punct || name_words.len() == words.len() || next_is_request))
+                || previous_is_cue
+                || (is_last && previous_ends_comma);
+            if addressed {
+                if let Some(bot) = resolve_mentioned_bot(persona_id, config) {
+                    return Some(bot);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Find the first family name in `text` that is used to *address* an agent
 /// (not merely mentioned in passing) and resolve it to a configured bot.
 ///
@@ -1467,7 +1538,9 @@ pub fn elect_responders_with_owner_map(
     }
 
     // a. Explicit addressed name.
-    if let Some(bot) = addressed_name_bot(text, config) {
+    if let Some(bot) = addressed_display_name_bot(text, config, owner_map)
+        .or_else(|| addressed_name_bot(text, config))
+    {
         return Election::One {
             bot,
             reply_chat,
@@ -3696,6 +3769,65 @@ domains = ["coordination", "calendar"]
         assert_eq!(
             addressed_name_bot("hey mira", &cfg).unwrap().agent_id.as_deref(),
             Some("mira")
+        );
+    }
+
+    #[test]
+    fn authored_multiword_display_names_route_opaque_persona_ids() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("household.toml"),
+            r#"
+[[agent]]
+id = "unit-7"
+name = "Cedar Keeper"
+domains = ["meals"]
+
+[[agent]]
+id = "unit-2"
+name = "Copper Ladle"
+domains = ["cooking"]
+"#,
+        )
+        .unwrap();
+        let owners =
+            crate::notify::ownership::OwnerMap::from_household_toml(root.path()).unwrap();
+        let config = cfg_with_bots(&[
+            ("unit-7", "-100999", Some("unit-7"), Some("opaque_one_bot")),
+            ("unit-2", "-100999", Some("unit-2"), Some("opaque_two_bot")),
+        ]);
+
+        let elected = |text: &str| {
+            elect_responders_with_owner_map(
+                Some("supergroup"),
+                Some("-100999"),
+                text,
+                &[],
+                None,
+                false,
+                2,
+                &config,
+                &owners,
+            )
+        };
+        let assert_name = |text: &str, expected: &str| match elected(text) {
+            Election::One {
+                bot,
+                addressed_by: AddressedBy::Name,
+                ..
+            } => assert_eq!(bot.agent_id.as_deref(), Some(expected), "text={text:?}"),
+            other => panic!("expected authored-name election for {text:?}, got {other:?}"),
+        };
+
+        assert_name("Cedar Keeper, could you check dinner?", "unit-7");
+        assert_name("hey Copper Ladle", "unit-2");
+        assert_name("what do you think, Cedar Keeper?", "unit-7");
+        assert!(
+            matches!(
+                elected("Cedar Keeper from school called today"),
+                Election::Silence(SilenceReason::SmallTalk)
+            ),
+            "a display name buried in narration must not summon a bot"
         );
     }
 
