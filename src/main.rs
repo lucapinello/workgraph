@@ -4043,12 +4043,19 @@ fn main() -> Result<()> {
                         .ok()
                         .filter(|s| !s.trim().is_empty())
                 });
+                // The gateway creates one opaque occurrence id per accepted web
+                // turn. A true dispatcher refire preserves it; a later turn gets
+                // a new id even when the household repeats the same words.
+                let turn_id = std::env::var("WG_TURN_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty());
                 commands::telegram::run_web_inbound(
                     &workgraph_dir,
                     &sender,
                     &message,
                     chat_id.as_deref(),
                     owner_pin.as_deref(),
+                    turn_id.as_deref(),
                     dry_run,
                     cli.json,
                 )

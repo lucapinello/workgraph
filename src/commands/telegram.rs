@@ -18,7 +18,7 @@ use worksgood::notify::fast_lane;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
 use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_voice;
-use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
+use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet, hash_text};
 use worksgood::notify::ownership;
 use worksgood::notify::telegram_group::{
     Election, NaturalRoute, elect_group_inbound_with_owner_map, elect_responders_with_owner_map,
@@ -1340,6 +1340,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             &feed_path,
                             body,
                             &auth_sender,
+                            &telegram_physical_turn_key(&msg),
                         )
                         .await
                     } else {
@@ -1359,6 +1360,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             &feed_path,
                             body,
                             &auth_sender,
+                            &telegram_physical_turn_key(&msg),
                         )
                         .await
                     };
@@ -3175,6 +3177,11 @@ async fn run_standup_for_scope(
 /// bound session** (or the sender isn't a confirmed human) do we fall back to
 /// the task-grounded in-voice line ([`telegram_standup::render_conversational`])
 /// — never silence, never a status dump.
+///
+/// `physical_turn_key` identifies the inbound household turn that elected this
+/// roster. Every voice gets its own request id derived from that shared key:
+/// redelivery of one physical turn remains idempotent, while a later turn in
+/// the same chat cannot collide with an earlier voice's outbox entry.
 pub async fn run_group_collective(
     workgraph_dir: &Path,
     config: &TelegramConfig,
@@ -3182,6 +3189,7 @@ pub async fn run_group_collective(
     feed_path: &Path,
     human_message: &str,
     sender: &str,
+    physical_turn_key: &str,
 ) -> Result<()> {
     use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_standup as standup;
@@ -3236,7 +3244,7 @@ pub async fn run_group_collective(
                 ReplyScope::Group,
                 GuardPolicy::AlreadyGuarded,
             );
-            let request_id = format!("tg-collective-{}-{}", target, member.bot_id);
+            let request_id = collective_request_id(target, &member.bot_id, physical_turn_key);
             let composer = wg_config
                 .clone()
                 .map(convo::OneshotComposer::from_config);
@@ -3313,6 +3321,7 @@ pub async fn run_group_discussion(
     feed_path: &Path,
     human_message: &str,
     sender: &str,
+    physical_turn_key: &str,
 ) -> Result<()> {
     use worksgood::notify::telegram_conversation as convo;
     use worksgood::notify::telegram_discussion as discussion;
@@ -3365,6 +3374,7 @@ pub async fn run_group_discussion(
             feed_path,
             human_message,
             sender,
+            physical_turn_key,
         )
         .await;
     }
@@ -3399,6 +3409,7 @@ pub async fn run_group_discussion(
                 feed_path,
                 human_message,
                 sender,
+                physical_turn_key,
             )
             .await;
         }
@@ -3718,8 +3729,8 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 ///
 /// [`SilenceReason::BotSender`]: worksgood::notify::telegram_group::SilenceReason
 ///
-/// The idempotency key for a web-inbound single-voice turn — UNIQUE per message,
-/// STABLE on a genuine re-fire.
+/// The idempotency key for a web-inbound single-voice turn — UNIQUE per
+/// physical turn, STABLE on a genuine re-fire.
 ///
 /// `run_composed_turn`'s "one reply per turn" guard keys "already answered" on the
 /// `request_id` (an outbox entry under that id ⇒ skip compose+send). A request_id that
@@ -3730,17 +3741,74 @@ fn resolve_web_sender(workgraph_dir: &Path, sender: &str) -> String {
 /// "single voice (nora) answered [replied]" yet the pane got silence, because the guard
 /// treated a brand-new question as a duplicate of an earlier one.
 ///
-/// Folding a stable content hash of the message body into the id fixes both directions:
-/// a genuine re-fire (identical body — a listener re-poll, a gateway retry, a
-/// restart-replay) still collides and dedupes, while a NEW question gets a NEW id and is
-/// actually answered. `DefaultHasher` is fixed-key SipHash (deterministic across runs —
-/// the same convention `casa_feed`/`reminder` use), so the dedupe survives a restart.
-fn web_inbound_request_id(reply_chat: &str, bot_id: &str, body: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    body.trim().hash(&mut h);
-    format!("web-{}-{}-{:016x}", reply_chat, bot_id, h.finish())
+/// The gateway supplies the physical-turn key once per accepted occurrence.
+/// Hashing that opaque key preserves a real dispatcher refire while allowing a
+/// household member to repeat identical words later and receive another answer.
+fn web_inbound_request_id(
+    reply_chat: &str,
+    bot_id: &str,
+    physical_turn_key: &str,
+) -> String {
+    format!(
+        "web-{}-{}-{:016x}",
+        reply_chat,
+        bot_id,
+        hash_text(physical_turn_key),
+    )
+}
+
+/// Stable physical-turn key for a Telegram collective election.
+///
+/// Telegram `message_id` is intentionally excluded: each privacy-off bot sees
+/// the same physical group message with a different id. Use the exact
+/// cross-bot-stable fields from [`DedupeKey`] instead — chat, stable sender,
+/// sent-at second, and body hash — then fold them so no household identifier or
+/// message text is exposed in an outbox request id.
+fn telegram_physical_turn_key(message: &worksgood::notify::IncomingMessage) -> String {
+    let sender = message
+        .sender_id
+        .as_deref()
+        .unwrap_or(message.sender.as_str());
+    let key = DedupeKey::from_content(
+        message.chat_id.as_deref().unwrap_or(""),
+        sender,
+        message.sent_at.unwrap_or(i64::MIN),
+        &message.body,
+    );
+    let material = format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{:016x}",
+        key.chat_id, key.sender_id, key.date, key.text_hash,
+    );
+    format!("telegram-turn-{:016x}", hash_text(&material))
+}
+
+/// Physical-turn key for a gateway-originated group turn.
+///
+/// A supplied opaque occurrence id distinguishes two later turns with identical
+/// words. Missing ids retain the legacy chat + trimmed-body fallback so older
+/// gateways remain compatible. The returned fingerprint never exposes the
+/// occurrence id or message body.
+fn web_physical_turn_key(reply_chat: &str, body: &str, turn_id: Option<&str>) -> String {
+    let (kind, occurrence) = turn_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| ("id", id))
+        .unwrap_or_else(|| ("body", body.trim()));
+    let material = format!("{reply_chat}\u{1f}{kind}\u{1f}{occurrence}");
+    format!("web-turn-{:016x}", hash_text(&material))
+}
+
+/// Request id stored in one persona session's outbox for a collective turn.
+/// Voice, chat, and physical turn all participate: the same physical redelivery
+/// is stable, a later turn is distinct, and two voices never suppress each
+/// other even if they share a session implementation.
+fn collective_request_id(reply_chat: &str, bot_id: &str, physical_turn_key: &str) -> String {
+    format!(
+        "tg-collective-{}-{}-{:016x}",
+        reply_chat,
+        bot_id,
+        hash_text(physical_turn_key),
+    )
 }
 
 /// Pick the `(bot_id, chat)` a fast-lane confirmation should go out as: the
@@ -3816,6 +3884,7 @@ pub fn run_web_inbound(
     message: &str,
     chat_id_override: Option<&str>,
     owner_pin: Option<&str>,
+    turn_id: Option<&str>,
     dry_run: bool,
     json: bool,
 ) -> Result<()> {
@@ -3939,6 +4008,15 @@ pub fn run_web_inbound(
     let feed_path = casa_feed::feed_path_for(&project_root(workgraph_dir));
     let family_delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
 
+    // One physical-turn key is shared by every elected voice and both delivery
+    // shapes. A gateway occurrence id wins; older callers fall back to the
+    // election body fingerprint.
+    let turn_body = match &election {
+        Election::All { body, .. } | Election::One { body, .. } => body.as_str(),
+        _ => message.trim(),
+    };
+    let physical_turn_key = web_physical_turn_key(&target, turn_body, turn_id);
+
     let category = match &election {
         Election::Silence(_) => "silence",
         Election::Private => "private",
@@ -3982,6 +4060,7 @@ pub fn run_web_inbound(
                 // credential-free so the DM-guard is provable through the real
                 // binary without a live compose (which the dry-run seam skips).
                 "clarify_target": clarify_chat,
+                "turn_fingerprint": physical_turn_key,
                 "who": who,
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
@@ -4083,6 +4162,7 @@ pub fn run_web_inbound(
                         &feed_path,
                         body,
                         &auth_sender,
+                        &physical_turn_key,
                     )
                     .await?;
                     Ok("discussion round posted".to_string())
@@ -4094,6 +4174,7 @@ pub fn run_web_inbound(
                         &feed_path,
                         body,
                         &auth_sender,
+                        &physical_turn_key,
                     )
                     .await?;
                     Ok("collective reply posted".to_string())
@@ -4122,7 +4203,8 @@ pub fn run_web_inbound(
                     ReplyScope::Group,
                     GuardPolicy::AlreadyGuarded,
                 );
-                let request_id = web_inbound_request_id(reply_chat, &bot.bot_id, body);
+                let request_id =
+                    web_inbound_request_id(reply_chat, &bot.bot_id, &physical_turn_key);
                 let timing = convo::AckTiming::from_env();
                 let wg_config = worksgood::config::Config::load_merged(workgraph_dir).ok();
                 let composer = wg_config.map(convo::OneshotComposer::from_config);
@@ -8408,36 +8490,132 @@ domains = ["cooking"]
     }
 
     #[test]
-    fn web_inbound_request_id_is_unique_per_message_stable_on_refire() {
-        // THE 17:03 LIE (task live-compose-reliability): the id was CONSTANT per
-        // (chat, bot), so the idempotency guard treated the SECOND named ask to Nora
-        // as a duplicate of the first and returned `[replied]` while sending nothing.
-        let a = web_inbound_request_id("-100777", "nora", "what's for dinner Monday?");
-        let b = web_inbound_request_id("-100777", "nora", "and what about Tuesday?");
-        assert_ne!(
-            a, b,
-            "two DIFFERENT questions to the same voice must get DIFFERENT ids (else the 2nd is silently deduped)"
-        );
+    fn collective_request_id_is_unique_per_turn_stable_on_refire() {
+        let mut first = gate_msg("supergroup", false);
+        first.channel = "telegram:voice-7".to_string();
+        first.sender = "member-4".to_string();
+        first.sender_id = Some("member-id-4".to_string());
+        first.sent_at = Some(1_720_000_000);
+        first.body = "hello household".to_string();
+        first.message_id = Some("41".to_string());
+        first.chat_id = Some("-100700".to_string());
 
-        // A genuine re-fire — the SAME body (a listener re-poll / gateway retry /
-        // restart-replay) — must still collide so the double-post guard holds.
-        let a_again = web_inbound_request_id("-100777", "nora", "what's for dinner Monday?");
-        assert_eq!(a, a_again, "an identical re-fire must dedupe to the SAME id");
-
-        // Whitespace-only differences are a re-fire, not a new turn (body is trimmed).
+        let first_turn = telegram_physical_turn_key(&first);
+        // The same physical group message arrives through another bot with a
+        // different channel and message_id. Those transport-local fields must
+        // not split the shared turn key.
+        let mut cross_bot_refire = first.clone();
+        cross_bot_refire.channel = "telegram:voice-9".to_string();
+        cross_bot_refire.message_id = Some("907".to_string());
+        let first_refire = telegram_physical_turn_key(&cross_bot_refire);
         assert_eq!(
-            web_inbound_request_id("-100777", "nora", "  what's for dinner Monday?  "),
-            a,
-            "leading/trailing whitespace must not defeat the re-fire dedupe",
+            first_turn, first_refire,
+            "cross-bot Telegram deliveries must retain one physical-turn key",
         );
 
-        // Distinct chat or bot ⇒ distinct id (a shared body across voices/chats is
-        // still separate turns).
-        assert_ne!(a, web_inbound_request_id("-100888", "nora", "what's for dinner Monday?"));
-        assert_ne!(a, web_inbound_request_id("-100777", "bruno", "what's for dinner Monday?"));
+        let mut later = first.clone();
+        later.message_id = Some("42".to_string());
+        later.sent_at = Some(1_720_000_001);
+        let later_turn = telegram_physical_turn_key(&later);
+        assert_ne!(
+            first_turn, later_turn,
+            "a later same-body Telegram turn must not reuse the earlier key",
+        );
 
-        // The id keeps its stable, greppable prefix for log correlation.
-        assert!(a.starts_with("web--100777-nora-"), "unexpected id shape: {a}");
+        let first_id = collective_request_id("-100700", "voice-7", &first_turn);
+        let refire_id = collective_request_id("-100700", "voice-7", &first_refire);
+        let later_id = collective_request_id("-100700", "voice-7", &later_turn);
+        assert_eq!(
+            first_id, refire_id,
+            "the outbox guard must dedupe a true refire",
+        );
+        assert_ne!(
+            first_id, later_id,
+            "the outbox guard must admit the later household turn",
+        );
+        assert_ne!(
+            first_id,
+            collective_request_id("-100700", "voice-8", &first_turn),
+            "each configured roster voice needs its own request id",
+        );
+
+        // A transport that omits message_id uses the same key because message_id
+        // never participates in the physical fingerprint.
+        let mut fallback = first.clone();
+        fallback.message_id = None;
+        let fallback_key = telegram_physical_turn_key(&fallback);
+        assert_eq!(
+            first_turn, fallback_key,
+            "message_id presence must not affect the cross-bot key",
+        );
+
+        // Web collective callers share the explicit occurrence id across voices.
+        let web_first =
+            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-a"));
+        assert_eq!(
+            web_first,
+            web_physical_turn_key(
+                "-100700",
+                "body changes do not matter on a true refire",
+                Some("turn-fixture-a"),
+            ),
+            "web refires retain the explicit occurrence fingerprint",
+        );
+        assert_ne!(
+            web_first,
+            web_physical_turn_key(
+                "-100700",
+                "hello household",
+                Some("turn-fixture-b"),
+            ),
+            "a later web occurrence gets a fresh collective key even with identical words",
+        );
+    }
+
+    #[test]
+    fn web_inbound_request_id_distinguishes_identical_later_turns() {
+        let chat = "-100777";
+        let voice = "voice-3";
+        let words = "please help with the weekend";
+        let first_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"));
+        let refire_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"));
+        let later_key = web_physical_turn_key(chat, words, Some("opaque-turn-b9"));
+
+        let first = web_inbound_request_id(chat, voice, &first_key);
+        let refire = web_inbound_request_id(chat, voice, &refire_key);
+        let later = web_inbound_request_id(chat, voice, &later_key);
+        assert_eq!(
+            first, refire,
+            "the same explicit turn id must remain stable on dispatcher refire",
+        );
+        assert_ne!(
+            first, later,
+            "different occurrence ids must admit later identical words",
+        );
+
+        // Missing WG_TURN_ID retains the legacy trimmed-body fallback for an
+        // older gateway, including its original refire behavior.
+        let fallback = web_physical_turn_key(chat, words, None);
+        assert_eq!(
+            fallback,
+            web_physical_turn_key(chat, "  please help with the weekend  ", None),
+        );
+        assert_ne!(
+            fallback,
+            web_physical_turn_key(chat, "a different legacy message", None),
+        );
+        assert_ne!(
+            first,
+            web_inbound_request_id("-100888", voice, &first_key),
+        );
+        assert_ne!(
+            first,
+            web_inbound_request_id(chat, "voice-8", &first_key),
+        );
+        assert!(
+            first.starts_with("web--100777-voice-3-"),
+            "unexpected id shape: {first}",
+        );
     }
 
     #[test]
