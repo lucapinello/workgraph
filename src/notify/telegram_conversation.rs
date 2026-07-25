@@ -58,7 +58,6 @@ use crate::notify::grounding;
 use crate::notify::lifecycle;
 use crate::notify::ownership;
 use crate::notify::parity;
-use crate::notify::telegram_dedupe::hash_text;
 
 use super::NotificationChannel;
 use super::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
@@ -543,6 +542,41 @@ pub trait ReplySink: Send + Sync {
 // Durable physical-turn delivery guard
 // ---------------------------------------------------------------------------
 
+/// Prefix stored on every durable Telegram digest.
+///
+/// The prefix is part of the persisted request-id / delivery-ledger contract:
+/// a future encoding or hash change must use a new prefix instead of silently
+/// reinterpreting existing claims.
+pub const DURABLE_TELEGRAM_DIGEST_PREFIX: &str = "b3-v1";
+
+/// Version-stable BLAKE3 digest for durable Telegram turn identities.
+///
+/// Encoding is explicit and platform-independent: a fixed v1 preamble, then
+/// the domain and each UTF-8 field as an unsigned 64-bit big-endian byte length
+/// followed by the bytes (with the field count encoded the same way). The full
+/// 256-bit digest is hex-encoded and prefixed with [`DURABLE_TELEGRAM_DIGEST_PREFIX`].
+///
+/// Listener-local [`crate::notify::telegram_dedupe::DedupeKey`] hashing does not
+/// use this helper because that set never survives a process restart.
+pub fn durable_telegram_digest_v1(domain: &str, fields: &[&str]) -> String {
+    fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"worksgood.telegram.durable-digest.v1\0");
+    update_sized(&mut hasher, domain.as_bytes());
+    hasher.update(&(fields.len() as u64).to_be_bytes());
+    for field in fields {
+        update_sized(&mut hasher, field.as_bytes());
+    }
+    format!(
+        "{DURABLE_TELEGRAM_DIGEST_PREFIX}-{}",
+        hasher.finalize().to_hex(),
+    )
+}
+
 /// Local state for one logical family-visible reply.
 ///
 /// The filesystem claim is the cross-process authority. This state only keeps
@@ -581,17 +615,18 @@ impl<'a> TurnDeliverySink<'a> {
         let claim_path = if delivery_id.trim().is_empty() {
             None
         } else {
-            let material =
-                format!("telegram-delivery-v1\u{1f}{delivery_id}\u{1f}{bot_id}\u{1f}{chat_id}");
-            // Two independently salted 64-bit hashes keep the filename opaque
-            // and make accidental collisions negligible without persisting
-            // household ids or message text.
-            let first = hash_text(&material);
-            let second = hash_text(&format!("reply\u{1f}{material}"));
+            // The filename itself starts with `b3-v1-`, making its encoding
+            // version explicit on disk. Hash all routing fields with a
+            // length-delimited canonical encoding so the ledger exposes no
+            // household ids, bot ids, or message text.
+            let digest = durable_telegram_digest_v1(
+                "telegram-delivery-claim",
+                &[delivery_id, bot_id, chat_id],
+            );
             Some(
                 workgraph_dir
                     .join("telegram-deliveries")
-                    .join(format!("{first:016x}{second:016x}.sent")),
+                    .join(format!("{digest}.sent")),
             )
         };
         let retry_path = claim_path.as_ref().map(|path| path.with_extension("retry"));
@@ -2655,6 +2690,42 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[test]
+    fn durable_delivery_digest_has_versioned_stable_vector() {
+        let digest = durable_telegram_digest_v1(
+            "telegram-delivery-claim",
+            &["physical-turn-42", "voice-7", "-100700"],
+        );
+        let expected =
+            "b3-v1-4b104375ef8b7da0364f0eed5c0d3d89892964585c454af7859842b60ec24db9";
+        assert_eq!(digest, expected);
+
+        let dir = tempdir().unwrap();
+        let inner = RecSink::default();
+        let sink = TurnDeliverySink::new(
+            dir.path(),
+            "physical-turn-42",
+            "voice-7",
+            "-100700",
+            &inner,
+        );
+        assert_eq!(
+            sink.claim_path
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some(format!("{expected}.sent").as_str()),
+            "the on-disk ledger filename must carry the digest version",
+        );
+        assert_eq!(
+            sink.retry_path
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some(format!("{expected}.retry").as_str()),
+        );
+    }
 
     /// Recording sink: captures every (bot_id, chat_id, text) send so tests can
     /// assert *which bot* replied *in which chat* with *what text*. Sends return

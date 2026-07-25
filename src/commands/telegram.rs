@@ -16,9 +16,10 @@ use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
 use worksgood::notify::fast_lane;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
+use worksgood::notify::telegram_conversation::durable_telegram_digest_v1;
 use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_voice;
-use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet, hash_text};
+use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
 use worksgood::notify::ownership;
 use worksgood::notify::telegram_group::{
     Election, NaturalRoute, elect_group_inbound_with_owner_map, elect_responders_with_owner_map,
@@ -3778,10 +3779,11 @@ fn web_inbound_request_id(
     physical_turn_key: &str,
 ) -> String {
     format!(
-        "web-{}-{}-{:016x}",
-        reply_chat,
-        bot_id,
-        hash_text(physical_turn_key),
+        "web-request-{}",
+        durable_telegram_digest_v1(
+            "web-inbound-request",
+            &[reply_chat, bot_id, physical_turn_key],
+        ),
     )
 }
 
@@ -3789,25 +3791,29 @@ fn web_inbound_request_id(
 ///
 /// Telegram `message_id` is intentionally excluded: each privacy-off bot sees
 /// the same physical group message with a different id. Use the exact
-/// cross-bot-stable fields from [`DedupeKey`] instead — chat, stable sender,
-/// sent-at second, and body hash — then fold them so no household identifier or
-/// message text is exposed in an outbox request id.
+/// cross-bot-stable fields used by [`DedupeKey`] instead — chat, stable sender,
+/// sent-at second, and the complete body. The durable digest hashes that
+/// canonical material directly; it must not embed `DedupeKey::text_hash`,
+/// whose listener-local `DefaultHasher` algorithm is not a persistence
+/// contract.
 fn telegram_physical_turn_key(message: &worksgood::notify::IncomingMessage) -> String {
     let sender = message
         .sender_id
         .as_deref()
         .unwrap_or(message.sender.as_str());
-    let key = DedupeKey::from_content(
-        message.chat_id.as_deref().unwrap_or(""),
-        sender,
-        message.sent_at.unwrap_or(i64::MIN),
-        &message.body,
-    );
-    let material = format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{:016x}",
-        key.chat_id, key.sender_id, key.date, key.text_hash,
-    );
-    format!("telegram-turn-{:016x}", hash_text(&material))
+    let sent_at = message.sent_at.unwrap_or(i64::MIN).to_string();
+    format!(
+        "telegram-turn-{}",
+        durable_telegram_digest_v1(
+            "telegram-physical-turn",
+            &[
+                message.chat_id.as_deref().unwrap_or(""),
+                sender,
+                &sent_at,
+                &message.body,
+            ],
+        ),
+    )
 }
 
 /// Physical-turn key for a gateway-originated group turn.
@@ -3822,8 +3828,13 @@ fn web_physical_turn_key(reply_chat: &str, body: &str, turn_id: Option<&str>) ->
         .filter(|id| !id.is_empty())
         .map(|id| ("id", id))
         .unwrap_or_else(|| ("body", body.trim()));
-    let material = format!("{reply_chat}\u{1f}{kind}\u{1f}{occurrence}");
-    format!("web-turn-{:016x}", hash_text(&material))
+    format!(
+        "web-turn-{}",
+        durable_telegram_digest_v1(
+            "web-physical-turn",
+            &[reply_chat, kind, occurrence],
+        ),
+    )
 }
 
 /// Request id stored for one persona's reply to a Telegram group turn.
@@ -3834,10 +3845,11 @@ fn web_physical_turn_key(reply_chat: &str, body: &str, turn_id: Option<&str>) ->
 /// even if they share a session implementation.
 fn collective_request_id(reply_chat: &str, bot_id: &str, physical_turn_key: &str) -> String {
     format!(
-        "tg-collective-{}-{}-{:016x}",
-        reply_chat,
-        bot_id,
-        hash_text(physical_turn_key),
+        "tg-collective-{}",
+        durable_telegram_digest_v1(
+            "telegram-collective-request",
+            &[reply_chat, bot_id, physical_turn_key],
+        ),
     )
 }
 
@@ -8602,6 +8614,43 @@ domains = ["cooking"]
         );
     }
 
+    #[test]
+    fn durable_turn_ids_have_stable_vectors() {
+        let mut message = gate_msg("supergroup", false);
+        message.channel = "telegram:voice-7".to_string();
+        message.sender = "member-display".to_string();
+        message.sender_id = Some("member-id-4".to_string());
+        message.sent_at = Some(1_720_000_000);
+        message.body = "hello household".to_string();
+        message.message_id = Some("transport-local-41".to_string());
+        message.chat_id = Some("-100700".to_string());
+
+        let telegram_turn = telegram_physical_turn_key(&message);
+        assert_eq!(
+            telegram_turn,
+            "telegram-turn-b3-v1-5c81580a6d5538a35b1233961550e48f16c2f8633615ecb2501491deb9673a83",
+        );
+
+        let web_turn =
+            web_physical_turn_key("-100700", "hello household", Some("opaque-turn-a7"));
+        assert_eq!(
+            web_turn,
+            "web-turn-b3-v1-62753b68ec0fbd6e844d7728ecd3ce10560f707a7ef63f394b400dc60eeaa930",
+        );
+        assert_eq!(
+            web_physical_turn_key("-100700", "hello household", None),
+            "web-turn-b3-v1-6debece65596fe4ed96650f648c8ee482b351c65978c3dfd5bb9652ad7168fab",
+        );
+        assert_eq!(
+            collective_request_id("-100700", "voice-7", &telegram_turn),
+            "tg-collective-b3-v1-49ba9313a9bf36256388d82b83660fe204196d1aa270cfb2e3add5544b818750",
+        );
+        assert_eq!(
+            web_inbound_request_id("-100700", "voice-7", &web_turn),
+            "web-request-b3-v1-96ebd0939919bcb2a67b9baf8c50cb15fcc489edb598f3d5d1085e8e210f5115",
+        );
+    }
+
     /// Behavior gate for every conversational group-delivery shape. One
     /// physical Telegram turn is replayed through a fresh invocation, then the
     /// same words arrive one second later as a distinct turn. The replay sends
@@ -8947,7 +8996,7 @@ domains = ["cooking"]
             web_inbound_request_id(chat, "voice-8", &first_key),
         );
         assert!(
-            first.starts_with("web--100777-voice-3-"),
+            first.starts_with("web-request-b3-v1-"),
             "unexpected id shape: {first}",
         );
     }
