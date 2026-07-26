@@ -2376,6 +2376,346 @@ pub fn week_grounding_rewrite(days: &[(String, String)]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// WRONG-PLACEMENT WEEK CLAIMS (task meal-claim-slot) — live-cert finding C004.
+//
+// THE GAP. The never-claim-empty guard above covers ONE lie direction: "nothing's
+// planned" for a day the Dinners table fills. C004 is the OTHER direction, and it
+// slipped straight through: Bruno told Luca to enjoy "that frittata tomorrow …
+// for lunch" while the live plan had that frittata on SUNDAY, at DINNER. The dish
+// was real, no day was called empty, nothing was invented — the claim simply MOVED
+// the dish: wrong day AND wrong slot. The family reads that as fact and eats the
+// wrong meal on the wrong day.
+//
+// THE RULE. When a reply asserts dish X at day D or slot S, and the forwarded
+// `WG_WEEK_CONTEXT` carries X at a DIFFERENT day (or the table's only slot is
+// dinner and the reply says lunch/breakfast/brunch/snack), the offending SENTENCE
+// is replaced with the truthful placement. Everything else in the reply survives —
+// this is a surgical splice, not a whole-reply clobber, because the rest of the
+// reply is usually fine and the family should not lose it over one bad clause.
+//
+// WHAT MUST PASS UNTOUCHED (the guard's blast radius is the reason it is safe):
+//   * a CASUAL mention with no day and no slot claim — "the frittata was great" —
+//     asserts no placement, so there is nothing to contradict;
+//   * a TRUTHFUL placement — "Sunday's frittata" — the claimed day IS the real one;
+//   * a LEFTOVERS line — "the leftover frittata for lunch" — that is a claim about
+//     eating leftovers, not about where the plan puts the meal;
+//   * an AMBIGUOUS mention — the matched words fit two different days' dishes, so
+//     no single truth can be named;
+//   * generic prep/filler overlap ("keep Wednesday warm and easy" against a dish
+//     with "warm" in it) — filler words never identify a dish.
+// ---------------------------------------------------------------------------
+
+/// Dish words that identify NO dish: prep verbs, textures, serving nouns, meal
+/// words, and ordinary filler. A sentence matching only these has not named the
+/// dish, so it can never trip the placement guard (the false-positive floor).
+const DISH_FILLER_WORDS: &[&str] = &[
+    "with",
+    "over",
+    "under",
+    "onto",
+    "into",
+    "from",
+    "plus",
+    "and",
+    "the",
+    "for",
+    "warm",
+    "warmed",
+    "cold",
+    "chilled",
+    "easy",
+    "quick",
+    "simple",
+    "fresh",
+    "leftover",
+    "leftovers",
+    "night",
+    "nights",
+    "style",
+    "some",
+    "that",
+    "this",
+    "then",
+    "made",
+    "make",
+    "sheet",
+    "tray",
+    "oven",
+    "stove",
+    "pan",
+    "bowl",
+    "plate",
+    "side",
+    "sides",
+    "served",
+    "serve",
+    "extra",
+    "homemade",
+    "dinner",
+    "dinners",
+    "supper",
+    "lunch",
+    "breakfast",
+    "brunch",
+    "snack",
+    "meal",
+    "meals",
+    "food",
+    "mins",
+    "minutes",
+];
+
+/// Non-dinner meal-slot stems and the label to report them by. The forwarded week
+/// context is the DINNERS table, so a dish found there placed at any of these
+/// slots is a wrong-slot claim. `dinner`/`supper` are deliberately absent — they
+/// are the truthful slot.
+const NON_DINNER_SLOT_STEMS: &[(&str, &str)] = &[
+    ("breakfast", "breakfast"),
+    ("brunch", "brunch"),
+    ("lunch", "lunch"),
+    ("midday", "midday"),
+    ("snack", "snack"),
+];
+
+/// Cues that a sentence is about eating LEFTOVERS rather than asserting where the
+/// plan puts a meal. "The leftover frittata makes a good lunch" is true and must
+/// not be rewritten.
+const LEFTOVER_CUES: &[&str] = &["leftover", "leftovers", "left over", "reheat", "reheated"];
+
+/// A misplaced-placement claim: the dish, where the plan REALLY puts it, what the
+/// draft claimed instead, and the byte span of the offending sentence in the draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MisplacedWeekClaim {
+    /// The dish exactly as the plan's Dinners table spells it.
+    pub dish: String,
+    /// The capitalised weekday the plan actually holds the dish on.
+    pub true_day: String,
+    /// The capitalised weekday the draft placed it on, when that is the wrong day.
+    pub claimed_day: Option<String>,
+    /// The non-dinner slot the draft placed it at ("lunch"), when it named one.
+    pub claimed_slot: Option<String>,
+    /// Byte range of the offending sentence within the draft.
+    pub span: (usize, usize),
+}
+
+/// A sentence of the draft plus its byte span, so a rewrite can splice one clause
+/// and leave the rest of the reply byte-identical.
+struct SpannedSentence {
+    norm: String,
+    start: usize,
+    end: usize,
+}
+
+/// Split `draft` into sentences carrying their byte spans. Terminators (`.!?;` and
+/// newlines) stay INSIDE the span they close, so replacing a span yields clean
+/// prose. Leading whitespace is excluded from the span. Em dashes are NOT
+/// terminators: "enjoy that frittata tomorrow — perfect for lunch" is ONE claim,
+/// and splitting it would hide the slot half from the day half.
+fn split_sentences_with_spans(draft: &str) -> Vec<SpannedSentence> {
+    let is_term = |c: char| matches!(c, '.' | '!' | '?' | ';' | '\n');
+    let mut out: Vec<SpannedSentence> = Vec::new();
+    let chars: Vec<(usize, char)> = draft.char_indices().collect();
+    let mut seg_start: Option<usize> = None;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (pos, ch) = chars[idx];
+        let start = match seg_start {
+            Some(s) => s,
+            None => {
+                if ch.is_whitespace() {
+                    idx += 1;
+                    continue;
+                }
+                seg_start = Some(pos);
+                pos
+            }
+        };
+        if is_term(ch) {
+            // Swallow a run of terminators ("!?", "…") into the sentence they close.
+            let mut end = pos + ch.len_utf8();
+            let mut j = idx + 1;
+            while j < chars.len() && is_term(chars[j].1) {
+                end = chars[j].0 + chars[j].1.len_utf8();
+                j += 1;
+            }
+            let norm = normalize(&draft[start..end]);
+            if !norm.is_empty() {
+                out.push(SpannedSentence { norm, start, end });
+            }
+            seg_start = None;
+            idx = j;
+            continue;
+        }
+        idx += 1;
+    }
+    if let Some(start) = seg_start {
+        // A final sentence with no terminator: the span stops at the last
+        // non-whitespace byte so trailing space stays outside any splice.
+        let end = start + draft[start..].trim_end().len();
+        let norm = normalize(&draft[start..end]);
+        if !norm.is_empty() {
+            out.push(SpannedSentence { norm, start, end });
+        }
+    }
+    out
+}
+
+/// The full lowercase name of a weekday — the key shape `WeekContext::by_day`
+/// uses, so an abbreviation in a draft canonicalises to the table's key.
+fn weekday_full_name(wd: Weekday) -> &'static str {
+    match wd {
+        Weekday::Mon => "monday",
+        Weekday::Tue => "tuesday",
+        Weekday::Wed => "wednesday",
+        Weekday::Thu => "thursday",
+        Weekday::Fri => "friday",
+        Weekday::Sat => "saturday",
+        Weekday::Sun => "sunday",
+    }
+}
+
+/// The dish's identifying words: normalised tokens of ≥4 chars that are not
+/// generic prep/filler. ONE of these in a sentence identifies the dish, because
+/// families use shorthand ("that frittata") and never the table's full phrase.
+fn dish_content_tokens(dish: &str) -> Vec<String> {
+    normalize(dish)
+        .split(' ')
+        .filter(|w| w.len() >= 4 && !DISH_FILLER_WORDS.contains(w))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Does the normalised `sentence` name this dish (by any identifying word)? The
+/// plural/possessive form counts too: normalisation drops apostrophes, so "that
+/// frittata's tomorrow" arrives as the token "frittatas".
+fn sentence_names_dish(sentence: &str, dish: &str) -> bool {
+    dish_content_tokens(dish).iter().any(|t| {
+        norm_has_word(sentence, t) || norm_has_word(sentence, &format!("{t}s"))
+    })
+}
+
+/// Every weekday the normalised `sentence` places something on, in the order the
+/// terms appear: a weekday name, or "today"/"tonight"/"tomorrow" resolved through
+/// the week context's own family-local markers. A relative term the context does
+/// not resolve is skipped (we cannot know which day it meant).
+fn claimed_days_in(sentence: &str, wc: &WeekContext) -> Vec<String> {
+    let mut days: Vec<String> = Vec::new();
+    for tok in sentence.split(' ') {
+        let resolved = match tok {
+            "today" | "tonight" => wc.today.clone(),
+            "tomorrow" => wc.tomorrow.clone(),
+            // Canonicalise to the FULL lowercase name so an abbreviation ("Sat")
+            // compares equal to the table's key ("saturday").
+            _ => weekday_token(tok).map(|wd| weekday_full_name(wd).to_string()),
+        };
+        if let Some(day) = resolved {
+            if !days.contains(&day) {
+                days.push(day);
+            }
+        }
+    }
+    days
+}
+
+/// The non-dinner slot the normalised `sentence` names, if any.
+fn claimed_slot_in(sentence: &str) -> Option<String> {
+    for tok in sentence.split(' ') {
+        for (stem, label) in NON_DINNER_SLOT_STEMS {
+            if tok.starts_with(stem) {
+                return Some((*label).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// True when the sentence frames the dish as leftovers/reheated — a claim about
+/// eating again, not about where the plan puts the meal.
+fn mentions_leftovers(sentence: &str) -> bool {
+    LEFTOVER_CUES.iter().any(|cue| sentence.contains(cue))
+}
+
+/// Sentences of `draft` that place a planned dish on the WRONG day or at the WRONG
+/// meal slot, against the forwarded week context. Conservative by construction: a
+/// sentence must NAME a dish the table holds and then contradict its placement.
+/// Casual mentions, truthful placements, leftovers lines, and mentions that fit
+/// two days at once are all left alone. Pure; spans are non-overlapping and sorted.
+pub fn misplaced_week_claims(draft: &str, wc: &WeekContext) -> Vec<MisplacedWeekClaim> {
+    if wc.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<MisplacedWeekClaim> = Vec::new();
+    for sentence in split_sentences_with_spans(draft) {
+        // Which planned dishes does this sentence name? Exactly one, or we cannot
+        // name a single truth (two days' dishes sharing a word ⇒ leave it alone).
+        let named: Vec<(&String, &String)> = wc
+            .by_day
+            .iter()
+            .filter(|(_, dish)| sentence_names_dish(&sentence.norm, dish))
+            .collect();
+        if named.len() != 1 {
+            continue;
+        }
+        let (true_day, dish) = named[0];
+        if mentions_leftovers(&sentence.norm) {
+            continue;
+        }
+        let days = claimed_days_in(&sentence.norm, wc);
+        // The sentence names the real day (possibly alongside another, as a
+        // contrast) — it is grounded, or too tangled to safely rewrite.
+        if days.iter().any(|d| d == true_day) {
+            continue;
+        }
+        let claimed_day = days.first().map(|d| capitalize_weekday(d));
+        let claimed_slot = claimed_slot_in(&sentence.norm);
+        // No day claim and no slot claim ⇒ a casual mention. Nothing to correct.
+        if claimed_day.is_none() && claimed_slot.is_none() {
+            continue;
+        }
+        out.push(MisplacedWeekClaim {
+            dish: dish.clone(),
+            true_day: capitalize_weekday(true_day),
+            claimed_day,
+            claimed_slot,
+            span: (sentence.start, sentence.end),
+        });
+    }
+    out.sort_by_key(|c| c.span.0);
+    out
+}
+
+/// The truthful placement sentence for one misplaced claim — the same shape the
+/// never-claim-empty rewrite uses, so both guards speak with one voice.
+pub fn week_placement_truth_line(claim: &MisplacedWeekClaim) -> String {
+    format!("{}'s dinner is {}.", claim.true_day, claim.dish)
+}
+
+/// Rewrite `draft` so each misplaced claim's sentence states the truthful
+/// placement, leaving every other byte of the reply exactly as composed. Claims
+/// must come from `misplaced_week_claims` on the SAME draft (sorted, disjoint
+/// spans). Idempotent: the replacement names the real day, so a second pass finds
+/// nothing to fix.
+pub fn week_placement_rewrite(draft: &str, claims: &[MisplacedWeekClaim]) -> String {
+    if claims.is_empty() {
+        return draft.to_string();
+    }
+    let mut out = String::with_capacity(draft.len() + 32);
+    let mut cursor = 0usize;
+    for claim in claims {
+        let (start, end) = claim.span;
+        if start < cursor || end > draft.len() {
+            continue; // defensive: never splice with a stale span
+        }
+        out.push_str(&draft[cursor..start]);
+        out.push_str(&week_placement_truth_line(claim));
+        cursor = end;
+    }
+    out.push_str(&draft[cursor..]);
+    // A spliced-away trailing clause can leave dangling separators ("… — ").
+    out.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
 // TIER-1 DURABLE MEMORY (task p1-engine-memory-reader) — the engine-side READER
 // for the block the gateway already builds and forwards.
 //
@@ -3839,6 +4179,200 @@ label = "Fallback Member"
         let lower = block.to_lowercase();
         assert!(lower.contains("never say it is empty"), "{block}");
         assert!(lower.contains("from this table"), "{block}");
+    }
+
+    // -----------------------------------------------------------------------
+    // WRONG-PLACEMENT claims (task meal-claim-slot) — live-cert C004
+    // -----------------------------------------------------------------------
+
+    /// The C004 week: the frittata is on SUNDAY, and Sunday is TODAY — so "that
+    /// frittata tomorrow" moves it to Monday, and "for lunch" moves the slot.
+    /// Saturday and Monday carry distinct dishes so a mis-attributed match is loud.
+    fn c004_week_context() -> String {
+        "This week's dinners, parsed from the family plan's Dinners table:\n\
+         - Saturday (July 25): Sheet-pan margherita pizza\n\
+         - Sunday (July 26): Zucchini & potato frittata\n\
+         - Monday (July 27): Chickpea & spinach curry\n\
+         Today is Sunday — dinner: Zucchini & potato frittata.\n\
+         Tomorrow is Monday — dinner: Chickpea & spinach curry."
+            .to_string()
+    }
+
+    /// THE C004 BUG, exactly as it went out: Bruno told Luca to enjoy "that
+    /// frittata tomorrow … for lunch" while the plan holds it SUNDAY at DINNER.
+    /// The claim moved BOTH day and slot; the guard names the truthful placement
+    /// and leaves the rest of the reply — greeting, sign-off emoji — untouched.
+    #[test]
+    fn misplaced_claim_moving_day_and_slot_is_rewritten_to_the_truth() {
+        let wc = parse_week_context(&c004_week_context());
+        let draft = "Hope the weekend's treating you well, Luca. Enjoy that frittata tomorrow — perfect for lunch! 🍳";
+        let claims = misplaced_week_claims(draft, &wc);
+        assert_eq!(claims.len(), 1, "expected one misplaced claim, got {claims:?}");
+        assert_eq!(claims[0].true_day, "Sunday");
+        assert_eq!(claims[0].claimed_day.as_deref(), Some("Monday"), "{claims:?}");
+        assert_eq!(claims[0].claimed_slot.as_deref(), Some("lunch"), "{claims:?}");
+        let fixed = week_placement_rewrite(draft, &claims);
+        assert!(
+            fixed.contains("Sunday's dinner is Zucchini & potato frittata."),
+            "the truthful placement must land:\n{fixed}"
+        );
+        assert!(
+            !fixed.contains("tomorrow") && !fixed.contains("lunch"),
+            "the moved day/slot claim survived:\n{fixed}"
+        );
+        assert!(
+            fixed.starts_with("Hope the weekend's treating you well, Luca."),
+            "the rest of the reply must survive byte-for-byte:\n{fixed}"
+        );
+        assert!(fixed.ends_with("🍳"), "the sign-off must survive:\n{fixed}");
+    }
+
+    /// A CASUAL mention asserts no placement — no day, no slot — so there is
+    /// nothing to contradict and the reply passes through untouched.
+    #[test]
+    fn casual_dish_mention_without_a_placement_claim_passes_untouched() {
+        let wc = parse_week_context(&c004_week_context());
+        let draft = "That frittata was a hit — glad it landed. 🍳";
+        assert!(
+            misplaced_week_claims(draft, &wc).is_empty(),
+            "a casual mention must not be flagged"
+        );
+        assert_eq!(week_placement_rewrite(draft, &[]), draft);
+    }
+
+    /// A TRUTHFUL placement (the real day, the real slot) is never touched.
+    #[test]
+    fn truthful_placement_is_left_alone() {
+        let wc = parse_week_context(&c004_week_context());
+        for draft in [
+            "Sunday's dinner is the zucchini & potato frittata.",
+            "Tonight's frittata is on the stove at 18:30.",
+            "The frittata is dinner tonight, not lunch.",
+        ] {
+            assert!(
+                misplaced_week_claims(draft, &wc).is_empty(),
+                "a truthful placement was flagged: {draft}"
+            );
+        }
+    }
+
+    /// WRONG SLOT ALONE — right day, wrong meal. The table is the DINNERS table,
+    /// so "the frittata's your lunch" misplaces the slot even with no day named.
+    #[test]
+    fn wrong_slot_alone_is_corrected() {
+        let wc = parse_week_context(&c004_week_context());
+        let draft = "The frittata's your lunch.";
+        let claims = misplaced_week_claims(draft, &wc);
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].claimed_slot.as_deref(), Some("lunch"));
+        assert_eq!(claims[0].claimed_day, None, "no day was claimed");
+        assert_eq!(
+            week_placement_rewrite(draft, &claims),
+            "Sunday's dinner is Zucchini & potato frittata."
+        );
+    }
+
+    /// WRONG DAY ALONE — the dish is right and the slot is right, but the day is
+    /// moved (a named weekday, not a relative one).
+    #[test]
+    fn wrong_day_alone_is_corrected() {
+        let wc = parse_week_context(&c004_week_context());
+        let draft = "Saturday's dinner is the zucchini frittata.";
+        let claims = misplaced_week_claims(draft, &wc);
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].claimed_day.as_deref(), Some("Saturday"));
+        assert_eq!(claims[0].true_day, "Sunday");
+        assert_eq!(
+            week_placement_rewrite(draft, &claims),
+            "Sunday's dinner is Zucchini & potato frittata."
+        );
+    }
+
+    /// LEFTOVERS are not a placement claim — eating Sunday's frittata again on
+    /// Monday for lunch is true, and the guard must not "correct" it.
+    #[test]
+    fn leftovers_line_is_left_alone() {
+        let wc = parse_week_context(&c004_week_context());
+        assert!(
+            misplaced_week_claims("The leftover frittata makes a great lunch tomorrow.", &wc)
+                .is_empty(),
+            "a leftovers line must not be rewritten"
+        );
+    }
+
+    /// TEETH against false positives: generic prep/filler words in a dish never
+    /// identify it, so an unrelated sentence that happens to share one is safe.
+    #[test]
+    fn generic_prep_words_never_identify_a_dish() {
+        let wc = parse_week_context(
+            "- Friday (July 24): Pan-seared salmon over warm Puy lentils\n\
+             Today is Thursday — dinner: Halloumi traybake.\n\
+             Tomorrow is Friday — dinner: Pan-seared salmon over warm Puy lentils.",
+        );
+        assert!(!wc.is_empty(), "the fixture must hold Friday's dish");
+        for draft in [
+            "Let's keep Monday warm and easy — sheet pan, one bowl, done.",
+            "I'll serve lunch on the tray Saturday.",
+        ] {
+            assert!(
+                misplaced_week_claims(draft, &wc).is_empty(),
+                "filler-word overlap must never trip the guard: {draft}"
+            );
+        }
+    }
+
+    /// AMBIGUITY is left alone: when the named words fit TWO days' dishes there is
+    /// no single truthful placement to state, so the reply is not rewritten.
+    #[test]
+    fn ambiguous_dish_across_two_days_is_left_alone() {
+        let wc = parse_week_context(
+            "- Tuesday (July 21): Grilled salmon skewers\n\
+             - Friday (July 24): Salmon rice bowls\n\
+             Today is Sunday — dinner: not planned yet.\n\
+             Tomorrow is Monday — dinner: not planned yet.",
+        );
+        assert!(
+            misplaced_week_claims("The salmon is tomorrow, for lunch.", &wc).is_empty(),
+            "an ambiguous dish match must not be rewritten to a guessed day"
+        );
+    }
+
+    /// No forwarded context → the placement guard is a no-op (Telegram-listener
+    /// path, env unset), and an unresolvable relative day claims nothing.
+    #[test]
+    fn placement_guard_is_a_noop_without_a_forwarded_context() {
+        let empty = parse_week_context("");
+        let draft = "Enjoy that frittata tomorrow — perfect for lunch!";
+        assert!(misplaced_week_claims(draft, &empty).is_empty());
+        assert_eq!(week_placement_rewrite(draft, &[]), draft);
+        // A table with no today/tomorrow markers cannot resolve "tomorrow", so a
+        // relative-day claim is not treated as naming a (wrong) day.
+        let no_markers = parse_week_context("- Sunday (July 26): Zucchini & potato frittata");
+        let claims = misplaced_week_claims("Enjoy that frittata tomorrow.", &no_markers);
+        assert!(
+            claims.is_empty(),
+            "an unresolvable relative day must not be guessed: {claims:?}"
+        );
+    }
+
+    /// The rewrite is IDEMPOTENT and composes with the never-claim-empty rewrite:
+    /// both guards emit "<Day>'s dinner is <dish>.", which names the real day, so a
+    /// second pass finds nothing to fix.
+    #[test]
+    fn placement_rewrite_is_idempotent_and_composes_with_never_claim_empty() {
+        let wc = parse_week_context(&c004_week_context());
+        let draft = "Enjoy that frittata tomorrow for lunch!";
+        let once = week_placement_rewrite(draft, &misplaced_week_claims(draft, &wc));
+        let twice = week_placement_rewrite(&once, &misplaced_week_claims(&once, &wc));
+        assert_eq!(once, twice, "the rewrite must be idempotent");
+        // The never-claim-empty rewrite's own output is likewise stable here.
+        let false_empty = false_empty_week_claims("Nothing's planned for tonight.", &wc);
+        assert_eq!(false_empty.len(), 1, "{false_empty:?}");
+        let honest = week_grounding_rewrite(&false_empty);
+        assert!(
+            misplaced_week_claims(&honest, &wc).is_empty(),
+            "the honest never-claim-empty line must not be re-flagged: {honest}"
+        );
     }
 
     // -----------------------------------------------------------------------

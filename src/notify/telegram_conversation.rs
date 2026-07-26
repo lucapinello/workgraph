@@ -2633,6 +2633,37 @@ async fn finalize_composed_reply(
             );
             reply_text = grounding::week_grounding_rewrite(&false_empty);
         }
+        // WRONG-PLACEMENT GUARD (task meal-claim-slot, live-cert C004): the third
+        // lie direction. Never-claim-empty catches DENYING a planned dish; anti-
+        // fabrication catches INVENTING one; this catches MOVING one — Bruno's
+        // "enjoy that frittata tomorrow … for lunch" while the table holds that
+        // frittata on SUNDAY at DINNER. The dish is real and no day is called
+        // empty, so neither existing guard fires, yet the family eats the wrong
+        // meal on the wrong day. Runs after the never-claim-empty rewrite (whose
+        // output names the real day, so it is never re-flagged) and splices only
+        // the offending sentence — a casual "that frittata was great" claims no
+        // placement and passes through untouched.
+        let misplaced = grounding::misplaced_week_claims(&reply_text, &wc);
+        if !misplaced.is_empty() {
+            eprintln!(
+                "[{}] wrong-placement guard: {agent_id}'s draft moves {:?} — rewriting to the plan's real placement",
+                chrono::Utc::now().format("%H:%M:%S"),
+                misplaced
+                    .iter()
+                    .map(|c| format!(
+                        "{} → claimed {}{}, really {}'s dinner",
+                        c.dish,
+                        c.claimed_day.as_deref().unwrap_or("(no day)"),
+                        c.claimed_slot
+                            .as_deref()
+                            .map(|s| format!(" {s}"))
+                            .unwrap_or_default(),
+                        c.true_day,
+                    ))
+                    .collect::<Vec<_>>(),
+            );
+            reply_text = grounding::week_placement_rewrite(&reply_text, &misplaced);
+        }
     }
 
     // REPETITION GUARD (rule 2): never send the same summary a third time. If
