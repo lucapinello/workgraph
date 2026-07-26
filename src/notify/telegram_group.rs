@@ -687,6 +687,59 @@ pub const GRATITUDE_OPENERS: &[&str] = &[
     "merci",
 ];
 
+/// Farewell / sign-off markers — the CLOSING half of social courtesy ("good
+/// night", "bye", "see you later", "sleep well", "off to bed", "take care",
+/// "ttyl"). Counterpart to [`GREETING_TOKENS`]; both feed
+/// [`is_social_courtesy`]. Fuzzy-matched for 4+ chars.
+///
+/// WHY THIS EXISTS (task social-closers-single-voice). The 2026-07-26 live
+/// certification ABORTED at conversation 004: one human sent
+/// `Good night, everyone.` to the real family group and FOUR bots answered it
+/// (5.0s, 10.8s, 15.2s, 19.3s — four distinct persona ids on one human line).
+/// `everyone` is a [`COLLECTIVE_TRIGGERS`] word, so rule d elected
+/// [`Election::All`] and the whole roster said goodnight in turn. A sign-off is
+/// courtesy, not a broadcast ask: it gets ONE voice. Individual words are loose
+/// on purpose ("see", "bed", "care") — [`is_social_courtesy`] additionally
+/// requires that EVERY token in the message be social, which is what keeps
+/// "see you at the dentist" and "movie night with the guys" out.
+pub const FAREWELL_TOKENS: &[&str] = &[
+    "bye", "byebye", "byee", "goodbye", "goodnite", "farewell", "cya", "ttyl", "l8r", "adios",
+    "arrivederci", "notte", "dreams", "sleep", "asleep", "bed", "bedtime", "see", "care", "later",
+    "laters", "tomorrow", "soon", "night", "nite", "nighty", "tschuss", "buonanotte",
+];
+
+/// Well-wish markers ("hope everyone is well", "wishing you all a good night"). A
+/// well-wish is courtesy in exactly the way a greeting or a sign-off is, so it counts
+/// as a [`is_social_courtesy`] MARKER rather than filler — otherwise "hope everyone is
+/// well" would reduce to all-filler with no marker and fall through to the roster
+/// broadcast. Fuzzy-matched for 4+ chars.
+pub const WELLWISH_TOKENS: &[&str] = &["hope", "hopes", "hoping", "wish", "wishes", "wishing"];
+
+/// The ONLY non-marker words a purely social line may still carry — collective
+/// nouns are covered by [`BROAD_ADDRESS_TOKENS`] / [`PLURAL_YOU_FOLLOWERS`], and
+/// these are the connective / politeness / mood tokens that carry no request:
+/// "hey guys, how's it going?", "off to bed, night all", "hope everyone is well".
+/// If ANY token in a message falls outside this set plus the marker sets, the
+/// message carries real content and [`is_social_courtesy`] refuses it.
+///
+/// Matched EXACTLY for words under 5 chars and fuzzily (edit distance 1) at 5+,
+/// so a mic/typo slip still reduces ("aroind" → "around") while a 3-letter
+/// content word can never be swallowed by a 1-character neighbour ("add" would
+/// otherwise fuzzy-match "and" and turn a shopping ask into a greeting).
+pub const SOCIAL_FILLER_TOKENS: &[&str] = &[
+    // connectives / articles / pronouns
+    "a", "an", "the", "to", "and", "so", "of", "is", "are", "am", "be", "been", "was", "it", "it's",
+    "its", "im", "i'm", "i", "me", "my", "our", "your", "you", "u", "ya", "this", "that", "there",
+    "here", "at", "on", "in", "up", "yet", "still", "again", "now", "today", "tonight", "lately",
+    "around", "about", "just", "very", "much", "too", "also", "but",
+    // mood / politeness / small-talk verbs — none of them a request
+    "good", "great", "well", "fine", "ok", "okay", "cool", "nice", "chill", "chillin", "chilling",
+    "relaxing", "bored", "sleepy", "tired", "please", "welcome", "doing", "going",
+    "goes", "gone", "off", "heading", "headed", "head", "turning", "saying", "said", "checking",
+    "how", "how's", "hows", "what's", "whats", "wassup", "wasup", "everything", "all's", "alls",
+    "yes", "yeah", "yep", "take", "takes", "sweet", "rest",
+];
+
 /// Endearment verbs ("love you all", "miss you guys"). When one *opens* the
 /// message, or sits immediately before the second-person pronoun, the "you all"
 /// is the object of affection — small-talk the bots stay out of — not an address
@@ -1156,6 +1209,84 @@ pub fn is_greeting_collective(text: &str) -> bool {
     })
 }
 
+/// True if `text` is PURE SOCIAL COURTESY — a greeting, a sign-off, or a thank-you
+/// and *nothing else*. This is the predicate that stops a collective address from
+/// fanning the roster out (task social-closers-single-voice).
+///
+/// THE P0 IT EXISTS FOR. 2026-07-26 live certification, ABORTED at conversation
+/// 004: one human sent `Good night, everyone.` to the real family group and FOUR
+/// bots answered the one message. `everyone` is a [`COLLECTIVE_TRIGGERS`] word, so
+/// rule d elected [`Election::All`] and every persona said goodnight in turn. Two
+/// personas answering one message is the user-defined P0 duplicate class; four is
+/// four times that. Collective address + no content = ONE point-of-contact voice.
+/// `Election::All` is kept for REAL broadcast asks — a discussion ask, a
+/// second-person-plural request ("can you guys discuss this"), a team announcement
+/// ("team, quick update") — every one of which leaves content words behind here.
+///
+/// The test is a REDUCTION, not a keyword hit: every token must be a social marker
+/// ([`GREETING_TOKENS`] / [`TIME_OF_DAY_WORDS`] / [`FAREWELL_TOKENS`] /
+/// [`WELLWISH_TOKENS`] / [`GRATITUDE_OPENERS`]), a collective noun
+/// ([`BROAD_ADDRESS_TOKENS`] / [`PLURAL_YOU_FOLLOWERS`]) or a
+/// [`SOCIAL_FILLER_TOKENS`] connective — AND at least one marker must be present.
+/// That marker requirement is what keeps a bare
+/// summons ("everyone", "team") and an all-filler question ("are you all good?")
+/// out of this lane, and the all-tokens-social requirement is what keeps content
+/// out: "good night — and add milk" leaves "add"/"milk", "see you at the dentist"
+/// leaves "dentist", "movie night with the guys" leaves "movie". Those still route
+/// to their owner exactly as before.
+///
+/// This is the Rust twin of the gateway's `socialResponder.detectGreetingIntent`
+/// (family repo, `claw3d-bridge/src/socialResponder.mjs`) — the gateway lane keeps
+/// a kiosk/web social line off the heavy pipeline entirely; this is the backstop
+/// for every line that reaches the fork election anyway (a real Telegram group
+/// message, which never touches the gateway lane).
+pub fn is_social_courtesy(text: &str) -> bool {
+    let tokens = word_list(text);
+    // A paragraph is a real message however politely it opens.
+    if tokens.is_empty() || tokens.len() > 12 {
+        return false;
+    }
+    // Fuzzy at 5+ chars only: a 3-letter content word must never be swallowed by a
+    // one-character neighbour ("add" vs the filler "and").
+    let filler_matches = |w: &str| {
+        SOCIAL_FILLER_TOKENS.iter().any(|t| {
+            *t == w || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
+        })
+    };
+    // The farewell set holds several short, everyday words ("see", "care", "bed"), so
+    // it matches on the SAME symmetric 5+ rule as the filler rather than the module's
+    // usual 4+ fuzz. Otherwise "are" is one edit from "care" and "are you all good"
+    // would read as a sign-off.
+    let farewell_matches = |w: &str| {
+        FAREWELL_TOKENS.iter().any(|t| {
+            *t == w || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
+        })
+    };
+    let mut saw_marker = false;
+    for w in &tokens {
+        let is_marker = GREETING_TOKENS.iter().any(|t| fuzzy_token_matches(w, t))
+            || TIME_OF_DAY_WORDS.iter().any(|t| fuzzy_token_matches(w, t))
+            || farewell_matches(w)
+            || WELLWISH_TOKENS.iter().any(|t| fuzzy_token_matches(w, t))
+            || GRATITUDE_OPENERS.iter().any(|t| fuzzy_token_matches(w, t));
+        if is_marker {
+            saw_marker = true;
+            continue;
+        }
+        let is_collective_noun = BROAD_ADDRESS_TOKENS
+            .iter()
+            .any(|t| fuzzy_token_matches(w, t))
+            || PLURAL_YOU_FOLLOWERS
+                .iter()
+                .any(|t| fuzzy_token_matches(w, t));
+        if is_collective_noun || filler_matches(w) {
+            continue;
+        }
+        return false;
+    }
+    saw_marker
+}
+
 /// True if `text` collectively addresses the family (see [`COLLECTIVE_TRIGGERS`]).
 ///
 /// Matching is typo-tolerant (task fuzzy-summon): multi-word triggers match as
@@ -1618,6 +1749,37 @@ fn domain_voice(
     Some((bot, domain))
 }
 
+/// The SOCIAL BACKSTOP (task social-closers-single-voice): a purely social line
+/// never fans out. Returns `Some(One{concierge})` when `text` reduces to greeting /
+/// sign-off / thank-you courtesy ([`is_social_courtesy`]), otherwise `None` so the
+/// caller keeps its own [`Election::All`].
+///
+/// Called at every rule that would otherwise broadcast, so the fix is
+/// correct-by-construction: this can only ever DOWNGRADE a fan-out to one voice.
+/// It never promotes a message the ladder would have silenced — the conservative
+/// rule-f silence that protects human-to-human chatter in a multi-human group is
+/// reached later and is untouched, and gratitude ("thanks everyone") still never
+/// gets past [`is_collective_address`] to reach this at all.
+fn social_single_voice(
+    text: &str,
+    reply_chat: &str,
+    config: &TelegramConfig,
+    owner_map: &crate::notify::ownership::OwnerMap,
+) -> Option<Election> {
+    if !is_social_courtesy(text) {
+        return None;
+    }
+    Some(match concierge_bot(config, owner_map) {
+        Some(bot) => Election::One {
+            bot,
+            reply_chat: reply_chat.to_string(),
+            body: text.to_string(),
+            addressed_by: AddressedBy::Concierge,
+        },
+        None => Election::Silence(SilenceReason::NoVoicesConfigured),
+    })
+}
+
 /// Resolve the project's coordination owner to a configured Telegram bot.
 ///
 /// Missing/malformed household configuration yields `None`; it never invents a
@@ -1706,6 +1868,12 @@ pub fn elect_responders_with_owner_map(
     // / silence rules. Bare "everyone"/"everybody" stays with rule d (below) so
     // the ask check keeps precedence for "tell everyone dinner's ready".
     if is_plural_you_address(text) {
+        // …unless the "you guys" is pure courtesy ("night you guys", "hey guys" with
+        // nothing else in it): a social line gets ONE voice, never a roster round
+        // (task social-closers-single-voice).
+        if let Some(single) = social_single_voice(text, &reply_chat, config, owner_map) {
+            return single;
+        }
         return Election::All {
             reply_chat,
             body: text.to_string(),
@@ -1778,6 +1946,16 @@ pub fn elect_responders_with_owner_map(
     if is_collective_address(text) {
         let explicit_broadcast = has_collective_trigger(text) || is_greeting_collective(text);
         if explicit_broadcast || domain_voice(text, config, owner_map).is_none() {
+            // THE C004 BACKSTOP (task social-closers-single-voice). "Good night,
+            // everyone." lands exactly here: `everyone` is a collective trigger, so
+            // this rule used to elect the whole roster and FOUR bots said goodnight
+            // to one human line on the real family surface (live cert 2026-07-26,
+            // aborted). Addressing the family is not the same as ASKING the family:
+            // courtesy with no content is one point-of-contact voice. A real
+            // broadcast ask leaves content words behind and still fans out below.
+            if let Some(single) = social_single_voice(text, &reply_chat, config, owner_map) {
+                return single;
+            }
             return Election::All {
                 reply_chat,
                 body: text.to_string(),
@@ -1806,6 +1984,13 @@ pub fn elect_responders_with_owner_map(
         // whole-roster greeting.
         let domain = domain_voice(text, config, owner_map);
         if domain.is_none() && is_greeting_shaped(text) {
+            // A bare "hello" / "good night" in a one-human group is answered — never
+            // silence (that was the 02:45 live miss) — but by ONE voice, not four
+            // (task social-closers-single-voice). Four bots greeting one "hello" is
+            // the same pile-on class as the C004 sign-off above.
+            if let Some(single) = social_single_voice(text, &reply_chat, config, owner_map) {
+                return single;
+            }
             return Election::All {
                 reply_chat,
                 body: text.to_string(),
@@ -2956,27 +3141,22 @@ domains = ["coordination", "calendar"]
             AddressedBy::Domain(Domain::Cooking),
         );
 
-        // BARE greetings — no domain ask — stay a warm whole-roster greeting, in
-        // BOTH the single-human group and (for the explicit-broadcast forms) the
-        // two-human group.
+        // BARE greetings — no domain ask — are ANSWERED (never the old
+        // silence:small-talk miss) but by ONE point-of-contact voice, in BOTH the
+        // single-human group and (for the explicit-broadcast forms) the two-human
+        // group. They used to elect the whole roster; task
+        // social-closers-single-voice flipped that after the 2026-07-26 live
+        // certification aborted on four bots answering one social line.
         for t in [
             "hey",
             "hey guys are you around?",
             "morning everybody",
             "hello all",
         ] {
-            assert!(
-                matches!(elect_solo(t, &[], None), Election::All { .. }),
-                "bare greeting {t:?} must stay collective, got {:?}",
-                elect_solo(t, &[], None)
-            );
+            assert_one(&elect_solo(t, &[], None), "otto", AddressedBy::Concierge);
         }
         for t in ["hey guys are you around?", "morning everybody", "hello all"] {
-            assert!(
-                matches!(elect(t, &[], None), Election::All { .. }),
-                "explicit broadcast {t:?} must stay collective (2 humans), got {:?}",
-                elect(t, &[], None)
-            );
+            assert_one(&elect(t, &[], None), "otto", AddressedBy::Concierge);
         }
     }
 
@@ -3135,9 +3315,15 @@ domains = ["coordination", "calendar"]
             agent_of(&elect("yes that works", &[], Some("otto_casapinello_bot"))),
             (Some("otto".to_string()), Some(AddressedBy::ReplyChain))
         );
-        // 4. collective greeting → the whole roster.
+        // 4. collective COURTESY → ONE point-of-contact voice, not the roster (task
+        //    social-closers-single-voice; live-cert C004 pile-on). A real broadcast
+        //    ASK — a discussion prompt, "team, quick update" — still fans out.
+        assert_eq!(
+            agent_of(&elect("hey everyone!", &[], None)),
+            (Some("otto".to_string()), Some(AddressedBy::Concierge))
+        );
         assert!(matches!(
-            elect("hey everyone!", &[], None),
+            elect("can you guys discuss this and decide", &[], None),
             Election::All { .. }
         ));
         // 5. unaddressed coordination ask → the concierge (otto). A food/workout
@@ -3187,32 +3373,41 @@ domains = ["coordination", "calendar"]
 
     // ---- d. collective address -> ALL FOUR in roster order ---------------
 
+    /// A collective GREETING is one voice, not the roster (task
+    /// social-closers-single-voice). This test asserted the opposite until the
+    /// 2026-07-26 live certification aborted on the four-persona pile-on: addressing
+    /// the family is not the same as ASKING the family, and four bots answering one
+    /// "hey guys" is the same P0 duplicate class as four bots answering one
+    /// "Good night, everyone.". The point of contact answers; the roster does not.
     #[test]
-    fn elect_collective_hey_guys_is_all() {
-        assert_eq!(
-            elect("hey guys, how's it going?", &[], None),
-            Election::All {
-                reply_chat: "-100999".to_string(),
-                body: "hey guys, how's it going?".to_string(),
-            }
+    fn elect_collective_hey_guys_is_one_point_of_contact_voice() {
+        assert_one(
+            &elect("hey guys, how's it going?", &[], None),
+            "otto",
+            AddressedBy::Concierge,
         );
     }
 
     #[test]
-    fn elect_collective_variants_all_fire() {
+    fn elect_collective_variants_split_courtesy_from_broadcast() {
+        // PURE COURTESY addressed to the family → ONE point-of-contact voice. Every
+        // one of these used to elect the whole roster; that is the pile-on the live
+        // certification stopped on (task social-closers-single-voice).
         for t in [
             "hi everyone!",
             "hello all",
-            "team, quick update",
             "ciao a tutti",
             "ciao ragazzi",
             "morning everybody",
         ] {
-            assert!(
-                matches!(elect(t, &[], None), Election::All { .. }),
-                "expected collective for {t:?}"
-            );
+            assert_one(&elect(t, &[], None), "otto", AddressedBy::Concierge);
         }
+        // A real BROADCAST — an announcement/ask to the whole family, not courtesy —
+        // still fans out. "quick update" is content; the reduction keeps it collective.
+        assert!(
+            matches!(elect("team, quick update", &[], None), Election::All { .. }),
+            "a genuine team broadcast must still reach the whole roster"
+        );
     }
 
     // ---- d-plural. mid-sentence second-person-plural address -> ALL ------
@@ -3227,7 +3422,6 @@ domains = ["coordination", "calendar"]
             "can you guys discuss this and find consensus", // live miss #1
             "the meaning of life tell me what you all think", // live miss #2
             "what do you all think?",
-            "hey guys", // greeting-shaped collective still fires (via rule d)
             "so what do all of you reckon we should do?",
             "each of you should weigh in on this",
             "the whole team should decide together",
@@ -3252,6 +3446,13 @@ domains = ["coordination", "calendar"]
                 "live miss {t:?} must elect the roster even in a single-human group, got {:?}",
                 elect_solo(t, &[], None)
             );
+        }
+        // A plural-you address with NOTHING BUT courtesy in it is the other side of
+        // the same coin: one voice, never a round (task social-closers-single-voice).
+        // "hey guys" used to elect the roster here; four bots on a bare hello is the
+        // pile-on the 2026-07-26 live certification aborted on.
+        for t in ["hey guys", "night you guys", "sleep well you all"] {
+            assert_one(&elect(t, &[], None), "otto", AddressedBy::Concierge);
         }
     }
 
@@ -3388,9 +3589,12 @@ domains = ["coordination", "calendar"]
                 true,
             ),
             ("thoughts on the holiday plan everyone?", true, true),
-            // Collective greeting → collective, but NOT a round.
-            ("hey guys are you around?", true, false),
-            ("hi everyone!", true, false),
+            // Collective COURTESY → NOT collective at all any more, so certainly not
+            // a round: a greeting/sign-off is one point-of-contact voice (task
+            // social-closers-single-voice, live-cert C004). It is still never silent.
+            ("hey guys are you around?", false, false),
+            ("hi everyone!", false, false),
+            ("good night, everyone.", false, false),
             // Plain concierge / single-voice ask → not collective (so no round).
             ("what's for dinner tonight?", false, false),
             // Named address → not collective.
@@ -3670,29 +3874,34 @@ domains = ["coordination", "calendar"]
     }
 
     #[test]
-    fn elect_pure_greeting_still_collective() {
-        // Regression guard: a greeting with NO ask stays collective (rule d).
-        assert!(matches!(
-            elect("hey everyone, how's it going?", &[], None),
-            Election::All { .. }
-        ));
+    fn elect_pure_greeting_is_one_voice_never_silent() {
+        // Regression guard, updated by task social-closers-single-voice: a greeting
+        // with NO ask is ANSWERED (the original bug was silence) — by exactly ONE
+        // voice, the point of contact. It used to elect the whole roster, which is
+        // the pile-on the 2026-07-26 live certification aborted on.
+        assert_one(
+            &elect("hey everyone, how's it going?", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
     }
 
     // ---- fuzzy-summon: typo-tolerant collective detection ----------------
 
     #[test]
-    fn elect_luca_typo_greeting_question_is_collective() {
-        // THE LIVE CASE. Luca wrote "hey guyd are you aroind?" — the typos
-        // ("guyd","aroind") made exact-phrase matching miss, so the roster
-        // wrongly elected silence:small-talk. A human reads this as an
-        // unambiguous group summon → the whole roster now answers.
+    fn elect_typo_greeting_question_is_answered_by_one_voice() {
+        // THE LIVE CASE. A human wrote "hey guyd are you aroind?" — the typos
+        // ("guyd","aroind") made exact-phrase matching miss, so the roster wrongly
+        // elected silence:small-talk. The FIX THAT MATTERS is that it is answered at
+        // all; the fuzzy reduction still recognises the typos. Who answers changed in
+        // task social-closers-single-voice: ONE point-of-contact voice, not four bots
+        // in a row (live-cert C004). Silence would still be a bug.
+        let e = elect("hey guyd are you aroind?", &[], None);
         assert!(
-            matches!(
-                elect("hey guyd are you aroind?", &[], None),
-                Election::All { .. }
-            ),
-            "Luca's typo'd greeting-question must elect the collective, not silence"
+            !matches!(e, Election::Silence(_)),
+            "a typo'd greeting-question must never be silenced, got {e:?}"
         );
+        assert_one(&e, "otto", AddressedBy::Concierge);
     }
 
     #[test]
@@ -3708,17 +3917,13 @@ domains = ["coordination", "calendar"]
     }
 
     #[test]
-    fn elect_more_typo_summons_are_collective() {
-        // Fuzzy trigger phrase ("hi guyz") and fuzzy greeting-question openers.
-        assert!(matches!(elect("hi guyz!", &[], None), Election::All { .. }));
-        assert!(matches!(
-            elect("hey are you all aroind?", &[], None),
-            Election::All { .. }
-        ));
-        assert!(matches!(
-            elect("helo everyone up yet?", &[], None),
-            Election::All { .. }
-        ));
+    fn elect_more_typo_summons_are_answered_by_one_voice() {
+        // Fuzzy trigger phrase ("hi guyz") and fuzzy greeting-question openers: the
+        // typo tolerance still fires (never silence) and the answer is ONE voice
+        // (task social-closers-single-voice).
+        for t in ["hi guyz!", "hey are you all aroind?", "helo everyone up yet?"] {
+            assert_one(&elect(t, &[], None), "otto", AddressedBy::Concierge);
+        }
     }
 
     #[test]
@@ -3738,19 +3943,19 @@ domains = ["coordination", "calendar"]
     // ---- membership-aware silence (single-human vs 2+ humans) ------------
 
     #[test]
-    fn elect_solo_bare_hello_is_brief_collective() {
-        // THE LIVE CASE (02:45): Luca posted a bare "hello" in a group that holds
-        // one human and four bots. With no human-to-human chatter to protect the
-        // greeting is necessarily for the team → a brief whole-roster greeting,
-        // NOT silence:small-talk.
-        assert_eq!(
-            elect_solo("hello", &[], None),
-            Election::All {
-                reply_chat: "-100999".to_string(),
-                body: "hello".to_string(),
-            },
+    fn elect_solo_bare_hello_is_one_warm_voice() {
+        // THE LIVE CASE (02:45): a bare "hello" in a group that holds one human and
+        // four bots. With no human-to-human chatter to protect, the greeting is
+        // necessarily for the house → it must be ANSWERED, not silence:small-talk.
+        // Task social-closers-single-voice changed WHO answers: ONE point-of-contact
+        // voice. Four bots taking turns on one "hello" is the same pile-on class the
+        // 2026-07-26 live certification aborted on (C004).
+        let e = elect_solo("hello", &[], None);
+        assert!(
+            !matches!(e, Election::Silence(_)),
             "a bare greeting in a single-human group must warmly greet, not go silent"
         );
+        assert_one(&e, "otto", AddressedBy::Concierge);
     }
 
     #[test]
@@ -3764,23 +3969,99 @@ domains = ["coordination", "calendar"]
         );
     }
 
+    /// THE C004 REGRESSION GATE (task social-closers-single-voice).
+    ///
+    /// 2026-07-26 live certification, ABORTED at conversation 004: one human sent
+    /// `Good night, everyone.` to the real family group and FOUR bots answered the
+    /// one message — Nora at 5.0s, Bruno at 10.8s, Coach Mira at 15.2s, Otto at
+    /// 19.3s, four distinct stable persona ids against a single human feed entry.
+    /// `everyone` is a [`COLLECTIVE_TRIGGERS`] word, so rule d elected
+    /// [`Election::All`] and the roster said goodnight in turn. Two personas
+    /// answering one message is the user-defined P0 duplicate class.
+    ///
+    /// A sign-off addressed to the family gets exactly ONE point-of-contact voice,
+    /// in EVERY membership, and is never silenced. This test carries the EXACT live
+    /// wording, permanently.
     #[test]
-    fn elect_goodnight_guys_is_collective_in_both_memberships() {
-        // "goodnight guys" carries a collective word ("guys") on a greeting, so it
-        // is a broadcast in ANY membership — the whole roster answers whether the
-        // group has one human or five.
-        let expected = Election::All {
-            reply_chat: "-100999".to_string(),
-            body: "goodnight guys".to_string(),
-        };
-        assert_eq!(elect_solo("goodnight guys", &[], None), expected, "solo");
-        assert_eq!(elect("goodnight guys", &[], None), expected, "two-human");
+    fn elect_c004_family_signoff_is_exactly_one_voice_in_both_memberships() {
+        // Sign-offs that address the family EXPLICITLY (a collective trigger word, or a
+        // greeting-token sign-off plus a broad address) reach rule d in ANY membership,
+        // which is exactly where the four-way fan-out happened. They must now be one
+        // point-of-contact voice, solo group and multi-human group alike.
+        for text in [
+            "Good night, everyone.", // the live C004 wording, verbatim
+            "goodnight guys",
+            "good night everybody",
+            "bye everyone",
+            "sleep well everyone",
+            "night night everyone",
+        ] {
+            for (label, e) in [
+                ("solo", elect_solo(text, &[], None)),
+                ("two-human", elect(text, &[], None)),
+            ] {
+                assert!(
+                    !matches!(e, Election::All { .. }),
+                    "{label}: a family sign-off must NEVER fan out the roster \
+                     (live-cert C004 was FOUR replies to one line) — {text:?} got {e:?}"
+                );
+                assert_one(&e, "otto", AddressedBy::Concierge);
+            }
+        }
+        // Sign-offs with a LOOSER address ("all", "guys" with no greeting token) never
+        // reached rule d, so they were already single-voice. In the one-human group
+        // (the shape a Casa deploy actually runs: one human, four helpers) they are
+        // answered by that one voice; with 2+ humans the module's deliberate rule-f
+        // silence protecting human-to-human chatter still applies and is untouched
+        // here — the contract this task fixes is "never more than one", not "always
+        // answer". Either way, never a roster fan-out.
+        for text in ["night all", "see you tomorrow guys", "bye bye all"] {
+            assert_one(&elect_solo(text, &[], None), "otto", AddressedBy::Concierge);
+            assert!(
+                !matches!(elect(text, &[], None), Election::All { .. }),
+                "{text:?} must never fan out the roster, got {:?}",
+                elect(text, &[], None)
+            );
+        }
+    }
+
+    /// The other half of the C004 contract: a sign-off that carries a REAL ASK is
+    /// still routed by content, and a genuine broadcast ask still reaches everyone.
+    #[test]
+    fn elect_signoff_with_content_still_routes_by_domain_and_broadcast_survives() {
+        // "good night — and add milk" is a shopping ask wearing a sign-off. The
+        // reduction leaves "add"/"milk" behind, so courtesy does not swallow it.
+        assert!(
+            !is_social_courtesy("good night everyone and add milk to the list"),
+            "a sign-off carrying a shopping ask is not pure courtesy"
+        );
+        assert!(
+            !is_social_courtesy("night, can you move my workout to friday"),
+            "a sign-off carrying a workout ask is not pure courtesy"
+        );
+        // Third-person / content uses of the same words never read as courtesy.
+        for t in [
+            "movie night with the guys",
+            "see you at the dentist appointment",
+            "everyone",
+            "team, quick update",
+            "are you all good",
+            "can you guys discuss this and find consensus",
+        ] {
+            assert!(!is_social_courtesy(t), "{t:?} must not read as pure courtesy");
+        }
+        // A REAL broadcast ask still fans out — All is kept for exactly this.
+        assert!(matches!(
+            elect("can you guys discuss this and find consensus", &[], None),
+            Election::All { .. }
+        ));
     }
 
     #[test]
-    fn elect_solo_greeting_variants_are_collective() {
-        // Every greeting shape earns a brief roster greeting in a single-human
-        // group, including typo'd and time-of-day forms.
+    fn elect_solo_greeting_variants_get_one_brief_voice() {
+        // Every greeting/sign-off shape earns a brief answer in a single-human group,
+        // including typo'd and time-of-day forms — from ONE point-of-contact voice,
+        // never the whole roster (task social-closers-single-voice).
         for t in [
             "hi",
             "hey",
@@ -3791,11 +4072,16 @@ domains = ["coordination", "calendar"]
             "good morning",
             "good night",
             "buongiorno",
+            "bye",
+            "see you later",
+            "sleep well",
         ] {
+            let e = elect_solo(t, &[], None);
             assert!(
-                matches!(elect_solo(t, &[], None), Election::All { .. }),
-                "expected brief collective for solo greeting {t:?}"
+                !matches!(e, Election::Silence(_)),
+                "solo greeting {t:?} must never be silenced, got {e:?}"
             );
+            assert_one(&e, "otto", AddressedBy::Concierge);
         }
     }
 
@@ -3831,9 +4117,15 @@ domains = ["coordination", "calendar"]
             "otto",
             AddressedBy::Concierge,
         );
-        // A pure collective greeting is still a roster broadcast.
+        // A pure collective GREETING is one point-of-contact voice now, not a roster
+        // broadcast (task social-closers-single-voice); a real broadcast ASK still is.
+        assert_one(
+            &elect_solo("hey everyone!", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
         assert!(matches!(
-            elect_solo("hey everyone!", &[], None),
+            elect_solo("what do you all think we should do", &[], None),
             Election::All { .. }
         ));
     }
@@ -3923,6 +4215,81 @@ domains = ["coordination", "calendar"]
         assert!(!is_greeting_shaped_summon("he said hey to me yesterday?"));
         // No greeting at all.
         assert!(!is_greeting_shaped_summon("is the car booked?"));
+    }
+
+    /// The reduction unit matrix for [`is_social_courtesy`] — the predicate that stops
+    /// a collective address from fanning out (task social-closers-single-voice). The
+    /// corpus mirrors the gateway's `socialResponder` twin (family repo,
+    /// `claw3d-bridge/src/socialResponder.mjs`) so the two layers agree on what
+    /// "purely social" means.
+    #[test]
+    fn is_social_courtesy_unit_matrix() {
+        // PURE COURTESY — greetings, sign-offs, thank-yous, and the collective forms.
+        for t in [
+            "Good night, everyone.", // the live-cert C004 wording, verbatim
+            "goodnight",
+            "goodnight guys",
+            "good night everybody",
+            "night all",
+            "night night",
+            "bye",
+            "bye everyone",
+            "goodbye all",
+            "see you",
+            "see you later",
+            "see you tomorrow guys",
+            "sleep well everyone",
+            "sweet dreams",
+            "off to bed",
+            "heading to bed, night",
+            "take care all",
+            "ttyl",
+            "cya",
+            "buonanotte a tutti",
+            "hey",
+            "hey guys",
+            "hi everyone!",
+            "hello all",
+            "hey guys, how's it going?",
+            "morning everybody",
+            "ciao a tutti",
+            "hope everyone is well",
+            // typo/mic slips still reduce (5+ chars, one edit)
+            "hey guyd are you aroind?",
+            "helo everyone",
+        ] {
+            assert!(is_social_courtesy(t), "expected pure courtesy for {t:?}");
+        }
+
+        // NOT COURTESY — content survives the reduction, so these still route by the
+        // normal ladder (domain owner, concierge ask, discussion round, or silence).
+        for t in [
+            // a sign-off wearing a real ask
+            "good night everyone and add milk to the list",
+            "night, can you move my workout to friday",
+            "bye, but first buy eggs",
+            // the same words used as content, not as courtesy
+            "movie night with the guys",
+            "see you at the dentist appointment",
+            "those guys were so loud last night",
+            "did you have a good day",
+            "are you all good",
+            // a bare summons is an address, not courtesy — the ladder still decides
+            "everyone",
+            "team",
+            "team, quick update",
+            // real broadcast asks keep Election::All
+            "can you guys discuss this and find consensus",
+            "what do you all think",
+            "the whole team should decide together",
+            "each of you should weigh in on this",
+            // a paragraph is a real message however politely it opens
+            "hey everyone just wanted to write a long note about the school run and the \
+             holiday plan and what we should do next",
+            "",
+        ] {
+            assert!(!is_social_courtesy(t), "{t:?} must NOT read as pure courtesy");
+        }
     }
 
     #[test]
@@ -4080,8 +4447,17 @@ domains = ["cooking"]
 
     #[test]
     fn decision_line_for_collective() {
-        let line = decision("hey guys, how's it going?", &[], None);
+        // A REAL broadcast ask still logs rule=collective target=roster…
+        let line = decision("can you guys discuss this and find consensus", &[], None);
         assert_eq!(line, "msg=42 chat=supergroup rule=collective target=roster");
+        // …while collective COURTESY logs the single concierge voice it now elects
+        // (task social-closers-single-voice). The live-cert log line that read
+        // `[collective]` for "Good night, everyone." was the visible fingerprint of
+        // the four-persona pile-on; it must never read that way for courtesy again.
+        let courtesy = decision("hey guys, how's it going?", &[], None);
+        assert_eq!(courtesy, "msg=42 chat=supergroup rule=concierge target=otto");
+        let signoff = decision("Good night, everyone.", &[], None);
+        assert_eq!(signoff, "msg=42 chat=supergroup rule=concierge target=otto");
     }
 
     #[test]
