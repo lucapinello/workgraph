@@ -1595,13 +1595,28 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         // to defrost the trout" registers a scheduled nudge and
                         // confirms in one line — no session round-trip. Only a
                         // confirmed human triggers it (else onboarding runs first).
-                        if let Some(confirmation) = try_register_reminder(
+                        //
+                        // CANCELLATION IS CHECKED FIRST: "cancel the reminder about
+                        // the dentist" carries the reminder verb and would otherwise
+                        // be filed as a SECOND reminder (date-reminder-fail (c)).
+                        let reminder_now = chrono::Local::now().naive_local();
+                        let reminder_reply = try_cancel_reminder(
                             &workgraph_dir,
                             &auth_sender,
                             &msg.sender,
                             &route_body,
-                            chrono::Local::now().naive_local(),
-                        ) {
+                            reminder_now,
+                        )
+                        .or_else(|| {
+                            try_register_reminder(
+                                &workgraph_dir,
+                                &auth_sender,
+                                &msg.sender,
+                                &route_body,
+                                reminder_now,
+                            )
+                        });
+                        if let Some(confirmation) = reminder_reply {
                             let owner_map =
                                 ownership::OwnerMap::load(&project_root(&workgraph_dir));
                             let coordination_owner = owner_map
@@ -1635,7 +1650,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 }
                             }
                             println!(
-                                "[{}] Registered reminder from {} -> confirmed via {}",
+                                "[{}] Handled reminder request from {} -> confirmed via {}",
                                 chrono::Utc::now().format("%H:%M:%S"),
                                 msg.sender,
                                 bot_id,
@@ -1909,6 +1924,50 @@ fn try_register_reminder(
         }
     }
     Some(intent.confirmation)
+}
+
+/// Detect a "cancel the reminder about …" request and drop the ONE pending
+/// ad-hoc reminder it names, returning the one-line confirmation.
+///
+/// Returns `None` — leaving the turn to the composer, which can ask — when the
+/// text is not a cancellation, when it matches no pending reminder, or when it
+/// matches more than one. It never creates anything: this runs BEFORE
+/// [`try_register_reminder`] precisely so a cancel phrase cannot be filed as a
+/// brand-new reminder (date-reminder-fail (c)).
+fn try_cancel_reminder(
+    workgraph_dir: &Path,
+    sender: &str,
+    sender_display: &str,
+    body: &str,
+    now: chrono::NaiveDateTime,
+) -> Option<String> {
+    use worksgood::agency::TelegramBindingMap;
+    use worksgood::notify::reminder::{self, AdHocStore};
+
+    let req = reminder::parse_reminder_cancel(body)?;
+
+    // Same gate as registration: only a confirmed human can change the schedule.
+    let agency_dir = workgraph_dir.join("agency");
+    let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+    match bindings.find_by_identity(Some(sender), Some(sender_display)) {
+        Some(b) if b.confirmed => {}
+        _ => return None,
+    }
+
+    let root = project_root(workgraph_dir);
+    let path = AdHocStore::path(&root);
+    let mut store = AdHocStore::load(&path);
+    let cancelled = match store.cancel(&req, now) {
+        Ok(Some(r)) => r,
+        // Nothing pending matches, or several do — the composer asks rather than
+        // dropping the wrong one.
+        Ok(None) | Err(_) => return None,
+    };
+    if let Err(e) = store.save(&path) {
+        eprintln!("Failed to persist the reminder cancellation: {e}");
+        return None;
+    }
+    Some(format!("Cancelled — {} \u{2713}", cancelled.text))
 }
 
 /// Resolve an inbound message's sender to the identity downstream auth uses
@@ -9581,6 +9640,104 @@ mod tests {
             }
             other => panic!("positive owner pin must outrank no-default: {other:?}"),
         }
+    }
+
+    /// date-reminder-fail: the DM seam must CANCEL on a cancel phrase, answer a
+    /// "remind me what …" question without filing anything, and never let either
+    /// shape reach the registration path.
+    #[test]
+    fn dm_reminder_seam_cancels_reads_and_never_double_files() {
+        use worksgood::notify::reminder::AdHocStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "garden-relay"
+name = "Garden Relay"
+domains = ["coordination"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
+        let now =
+            chrono::NaiveDateTime::parse_from_str("2026-07-12T10:00", "%Y-%m-%dT%H:%M").unwrap();
+
+        // One real reminder is filed.
+        assert!(
+            try_register_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "remind me Thursday at 7pm to defrost the trout",
+                now,
+            )
+            .is_some()
+        );
+        assert_eq!(AdHocStore::load(&AdHocStore::path(root)).reminders.len(), 1);
+
+        // (a) A memory question files nothing.
+        assert!(
+            try_register_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "Remind me what was in Monday's risotto",
+                now,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            AdHocStore::load(&AdHocStore::path(root)).reminders.len(),
+            1,
+            "a read must not add a reminder"
+        );
+
+        // (c) The cancel phrase cancels — and never registers a second reminder.
+        assert!(
+            try_register_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "cancel the reminder about the trout",
+                now,
+            )
+            .is_none()
+        );
+        let confirmation = try_cancel_reminder(
+            &wg,
+            "7001001",
+            "household-handle",
+            "cancel the reminder about the trout",
+            now,
+        )
+        .expect("the cancel is honoured");
+        assert!(
+            confirmation.to_lowercase().contains("trout"),
+            "the confirmation names what went: {confirmation}"
+        );
+        assert!(
+            AdHocStore::load(&AdHocStore::path(root))
+                .reminders
+                .is_empty(),
+            "the pending reminder should be gone"
+        );
+
+        // A cancel that matches nothing leaves the turn to the composer.
+        assert!(
+            try_cancel_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "cancel the reminder about the trout",
+                now,
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -494,6 +494,17 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
     if !low.contains("remind") {
         return None;
     }
+    // FAIL CLOSED (date-reminder-fail). Three shapes carry the reminder verb and
+    // are emphatically NOT a request to schedule one:
+    //   (a) an interrogative after "remind me" — "remind me what was in Monday's
+    //       risotto" asks the family memory; it is answered, never filed;
+    //   (b) a day already elapsed — "remind me last Monday …" cannot be honoured
+    //       by scheduling anything, so the composer asks instead;
+    //   (c) a cancellation — "cancel the reminder about the dentist" must never
+    //       create a second reminder (see [`parse_reminder_cancel`]).
+    if is_reminder_read(&low) || names_past_day(&low) || parse_reminder_cancel(text).is_some() {
+        return None;
+    }
 
     let (date, day_label) = resolve_day(&low, now.date());
     let (time, time_label, had_time) = resolve_time(&low, now, date);
@@ -505,10 +516,16 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
     }
 
     let due = date.and_time(time);
-    // If everything resolved to a moment already in the past today, roll to
-    // tomorrow so "remind me at 7" late in the evening still means the next 7.
-    let due = if due <= now && day_label.is_none() {
-        (date + Duration::days(1)).and_time(time)
+    // Never file a moment that has already passed. With no day word, roll to
+    // tomorrow ("remind me at 7", said at 8pm, means the next 7). With a bare
+    // weekday, roll a whole week — "remind me Monday at 8am", said on Monday
+    // afternoon, means the UPCOMING Monday, never this morning.
+    let due = if due <= now {
+        match (&day_label, named_weekday(&low)) {
+            (None, _) => (date + Duration::days(1)).and_time(time),
+            (Some(_), Some(_)) => (date + Duration::days(7)).and_time(time),
+            (Some(_), None) => due,
+        }
     } else {
         due
     };
@@ -537,6 +554,165 @@ pub fn intent_to_reminder(intent: &AdHocIntent, recipient: &str, bot: &str) -> R
         text: intent.text.clone(),
         source: ReminderSource::AdHoc,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed guards: a read, a past day, and a cancellation (date-reminder-fail)
+// ---------------------------------------------------------------------------
+
+/// Words that turn "remind me …" into a QUESTION about something that already
+/// happened or is already known — a read the composer answers, never a write.
+const REMIND_INTERROGATIVES: &[&str] = &[
+    "what", "whats", "what's", "how", "when", "where", "who", "whom", "whose", "which", "why",
+    "whether", "if", "was", "were", "did", "does", "is", "are", "do",
+];
+
+/// Fillers between "remind me" and the interrogative ("remind me again what …").
+const REMIND_FILLERS: &[&str] = &["again", "please", "quickly", "quick", "once", "briefly"];
+
+/// Verbs that cancel rather than create.
+const CANCEL_VERBS: &[&str] = &[
+    "stop reminding",
+    "don't remind",
+    "dont remind",
+    "no longer need",
+    "get rid of",
+    "call off",
+    "cancel",
+    "delete",
+    "remove",
+    "scrap",
+    "forget",
+    "undo",
+    "unset",
+    "drop",
+    "clear",
+];
+
+/// True when `low` (already lowercased) reads `remind me <interrogative> …` —
+/// the memory/read ask that must never be filed as a reminder.
+pub fn is_reminder_read(low: &str) -> bool {
+    for opener in ["remind me ", "remind us ", "reminder "] {
+        let Some(idx) = low.find(opener) else { continue };
+        let rest = &low[idx + opener.len()..];
+        let mut words = rest.split_whitespace().skip_while(|w| {
+            REMIND_FILLERS.contains(&w.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        });
+        let Some(first) = words.next() else { continue };
+        let first = first.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'');
+        if REMIND_INTERROGATIVES.contains(&first) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the text explicitly points at an ELAPSED day ("last Monday",
+/// "yesterday", "last night").
+fn names_past_day(low: &str) -> bool {
+    if contains_word(low, "yesterday") || low.contains("last night") || low.contains("last week") {
+        return true;
+    }
+    for lead in ["last ", "this past ", "past "] {
+        let mut start = 0;
+        while let Some(pos) = low[start..].find(lead) {
+            let i = start + pos + lead.len();
+            let next = low[i..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            if WEEKDAYS
+                .iter()
+                .any(|(names, _)| names.contains(&next))
+            {
+                return true;
+            }
+            start = i;
+        }
+    }
+    false
+}
+
+/// A request to CANCEL a pending reminder, parsed from a chat message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelRequest {
+    /// Fuzzy title fragment ("dentist"); empty when only a day was named.
+    pub target: String,
+    /// The weekday named, if any.
+    pub day: Option<Weekday>,
+}
+
+/// Detect "cancel the reminder about the dentist" / "stop reminding me about
+/// the bins" / "delete my Friday reminder".
+///
+/// Returns `None` for anything that is not a reminder cancellation, and also for
+/// a cancellation too vague to act on ("cancel my reminders") — the caller then
+/// asks rather than guessing which one to drop.
+pub fn parse_reminder_cancel(text: &str) -> Option<CancelRequest> {
+    let low = text.to_ascii_lowercase();
+    if !low.contains("remind") {
+        return None;
+    }
+    let (idx, verb) = CANCEL_VERBS
+        .iter()
+        .filter_map(|v| low.find(v).map(|i| (i, *v)))
+        .min_by_key(|(i, _)| *i)?;
+    let tail = &low[idx + verb.len()..];
+    let day = named_weekday(tail);
+    let target = scrub_cancel_noise(tail);
+    if target.is_empty() && day.is_none() {
+        return None;
+    }
+    Some(CancelRequest { target, day })
+}
+
+/// Strip reminder nouns, day words and connectors off a cancel tail, leaving the
+/// title fragment: "the reminder about the dentist" → "dentist".
+fn scrub_cancel_noise(frag: &str) -> String {
+    const NOISE: &[&str] = &[
+        "reminder",
+        "reminders",
+        "remind",
+        "reminding",
+        "me",
+        "us",
+        "my",
+        "our",
+        "the",
+        "that",
+        "a",
+        "an",
+        "about",
+        "for",
+        "to",
+        "on",
+        "of",
+        "please",
+        "any",
+        "more",
+        "anymore",
+        "set",
+        "have",
+        "we",
+        "i",
+        "today",
+        "tonight",
+        "tomorrow",
+        "morning",
+        "afternoon",
+        "evening",
+        "night",
+    ];
+    frag.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\''))
+        .filter(|w| {
+            !w.is_empty()
+                && !NOISE.contains(w)
+                && !WEEKDAYS.iter().any(|(names, _)| names.contains(w))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Resolve the day part of a time expression. Returns the date and a friendly
@@ -569,18 +745,24 @@ const WEEKDAYS: &[(&[&str], Weekday)] = &[
     (&["sunday", "sun"], Weekday::Sun),
 ];
 
-/// The next date on or after `from` whose weekday is `wd`, always strictly in the
-/// future when `from` itself is that weekday (so "remind me Monday" on a Monday
-/// means next Monday, not this morning).
+/// The next date ON or after `from` whose weekday is `wd` — a bare weekday
+/// always points FORWARD. Today counts when it is that weekday; the caller rolls
+/// a whole week on when the resolved *instant* has already passed, so "remind me
+/// Monday at 8am" said on Monday afternoon lands next Monday, not this morning.
 fn next_weekday(from: NaiveDate, wd: Weekday) -> NaiveDate {
-    let mut d = from + Duration::days(1);
-    for _ in 0..7 {
-        if d.weekday() == wd {
-            return d;
-        }
-        d += Duration::days(1);
-    }
-    from
+    let delta =
+        (wd.num_days_from_monday() as i64) - (from.weekday().num_days_from_monday() as i64);
+    from + Duration::days(delta.rem_euclid(7))
+}
+
+/// The weekday a bare day name in `low` refers to, if any.
+fn named_weekday(low: &str) -> Option<Weekday> {
+    WEEKDAYS.iter().find_map(|(names, wd)| {
+        names
+            .iter()
+            .any(|n| contains_word(low, n))
+            .then_some(*wd)
+    })
 }
 
 fn long_weekday_name(wd: Weekday) -> &'static str {
@@ -847,6 +1029,63 @@ impl AdHocStore {
         self.reminders.push(r);
         true
     }
+
+    /// The PENDING reminders a cancel request matches, as of `now`.
+    ///
+    /// Fuzzy on the title: every significant word of the fragment must appear in
+    /// the reminder text. An already-fired/elapsed reminder is never a match —
+    /// there is nothing left to cancel — and neither is one on another weekday
+    /// when a day was named. Returning the matches (rather than removing them)
+    /// lets the caller ASK when more than one qualifies.
+    pub fn matching(&self, req: &CancelRequest, now: NaiveDateTime) -> Vec<&Reminder> {
+        self.reminders
+            .iter()
+            .filter(|r| {
+                if r.due <= now {
+                    return false;
+                }
+                if let Some(wd) = req.day {
+                    if r.due.date().weekday() != wd {
+                        return false;
+                    }
+                }
+                let text = r.text.to_ascii_lowercase();
+                let mut words = req
+                    .target
+                    .split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .peekable();
+                if words.peek().is_none() {
+                    return req.day.is_some();
+                }
+                words.all(|w| text.contains(w))
+            })
+            .collect()
+    }
+
+    /// Cancel the ONE pending reminder a request matches.
+    ///
+    /// `Ok(Some(r))` removed it; `Ok(None)` matched nothing; `Err(n)` matched `n`
+    /// reminders and removed NOTHING — the caller asks which one was meant.
+    pub fn cancel(&mut self, req: &CancelRequest, now: NaiveDateTime) -> Result<Option<Reminder>, usize> {
+        let ids: Vec<String> = self
+            .matching(req, now)
+            .into_iter()
+            .map(|r| r.id.clone())
+            .collect();
+        match ids.len() {
+            0 => Ok(None),
+            1 => {
+                let idx = self
+                    .reminders
+                    .iter()
+                    .position(|r| r.id == ids[0])
+                    .expect("matched id is present");
+                Ok(Some(self.reminders.remove(idx)))
+            }
+            n => Err(n),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1071,6 +1310,160 @@ mod tests {
         assert!(parse_reminder_intent("what's for dinner Thursday?", now).is_none());
         // "remind" but no time signal: leave to the normal composer.
         assert!(parse_reminder_intent("remind me to call mum", now).is_none());
+    }
+
+    // ---- date-reminder-fail: the DM path fails closed on three shapes -----
+
+    #[test]
+    fn remind_me_what_is_a_read_and_files_nothing() {
+        // (a) The live-cert phrase. It asks the family memory; it must not file
+        // a reminder titled "was in risotto".
+        let now = dt(2026, 7, 12, 10, 0);
+        assert!(parse_reminder_intent("Remind me what was in Monday's risotto", now).is_none());
+        for msg in [
+            "remind me how the oven timer works",
+            "remind me when the dentist is on Friday",
+            "remind me again what Tuesday's dinner was",
+            "otto remind me who is picking up the kids monday",
+        ] {
+            assert!(
+                parse_reminder_intent(msg, now).is_none(),
+                "{msg:?} is a read — it must never be filed"
+            );
+        }
+        // A genuine request still registers.
+        assert!(parse_reminder_intent("remind me Thursday to defrost the trout", now).is_some());
+    }
+
+    #[test]
+    fn bare_weekday_resolves_forward_never_into_the_past() {
+        // (b) On Monday 2026-07-20 at 08:00, "Monday at 6pm" is TODAY at 18:00 —
+        // still ahead. The same ask at 20:00 rolls a full week, never to this
+        // morning and never to the week's elapsed Monday.
+        let morning = dt(2026, 7, 20, 8, 0);
+        let ahead = parse_reminder_intent("remind me Monday at 6pm to move the car", morning)
+            .expect("intent");
+        assert_eq!(ahead.due, dt(2026, 7, 20, 18, 0));
+
+        let evening = dt(2026, 7, 20, 20, 0);
+        let rolled = parse_reminder_intent("remind me Monday at 6pm to move the car", evening)
+            .expect("intent");
+        assert_eq!(rolled.due, dt(2026, 7, 27, 18, 0));
+        assert!(rolled.due > evening, "a reminder is never due in the past");
+
+        // Every weekday, from every day of the week, resolves ahead of now.
+        for offset in 0..7 {
+            let now = dt(2026, 7, 20, 12, 0) + Duration::days(offset);
+            for day in ["monday", "wednesday", "friday", "sunday"] {
+                let intent =
+                    parse_reminder_intent(&format!("remind me {day} to call the vet"), now)
+                        .expect("intent");
+                assert!(
+                    intent.due.date() >= now.date(),
+                    "{day} from {now} resolved backwards to {}",
+                    intent.due
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_elapsed_day_is_never_scheduled() {
+        let now = dt(2026, 7, 22, 10, 0);
+        for msg in [
+            "remind me last Monday to take the bins out",
+            "remind me yesterday to call the plumber",
+        ] {
+            assert!(
+                parse_reminder_intent(msg, now).is_none(),
+                "{msg:?} must not schedule anything"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_phrases_never_create_a_second_reminder() {
+        // (c) The cancel shapes, none of which may register anything.
+        let now = dt(2026, 7, 12, 10, 0);
+        for msg in [
+            "cancel the reminder about the dentist",
+            "delete the reminder to defrost the trout on Thursday",
+            "remove my Friday reminder",
+            "stop reminding me about the bins tomorrow",
+            "forget the reminder about the dentist Thursday morning",
+        ] {
+            assert!(
+                parse_reminder_intent(msg, now).is_none(),
+                "{msg:?} created a reminder instead of cancelling one"
+            );
+            assert!(
+                parse_reminder_cancel(msg).is_some(),
+                "{msg:?} should parse as a cancellation"
+            );
+        }
+        // Too vague to act on → no request at all, so the caller asks.
+        assert!(parse_reminder_cancel("cancel my reminders").is_none());
+        // Not about reminders at all.
+        assert!(parse_reminder_cancel("cancel Thursday's dinner").is_none());
+    }
+
+    #[test]
+    fn cancel_drops_the_one_matching_pending_reminder() {
+        let now = dt(2026, 7, 12, 10, 0);
+        let mut store = AdHocStore::default();
+        for (text, due) in [
+            ("Book the dentist", dt(2026, 7, 16, 9, 0)),
+            ("Defrost the trout", dt(2026, 7, 17, 17, 0)),
+            ("Pay the deposit", dt(2026, 7, 10, 9, 0)), // already elapsed
+        ] {
+            store.add(Reminder {
+                id: format!("adhoc:{}", text),
+                due,
+                recipient: "Luca".into(),
+                bot: "otto".into(),
+                text: text.into(),
+                source: ReminderSource::AdHoc,
+            });
+        }
+
+        let req = parse_reminder_cancel("cancel the reminder about the dentist").unwrap();
+        let gone = store.cancel(&req, now).expect("unambiguous").expect("a hit");
+        assert_eq!(gone.text, "Book the dentist");
+        assert_eq!(store.reminders.len(), 2);
+
+        // An elapsed reminder has nothing left to cancel.
+        let elapsed = parse_reminder_cancel("cancel the reminder about the deposit").unwrap();
+        assert_eq!(store.cancel(&elapsed, now), Ok(None));
+
+        // A day-only cancel picks the reminder on that day.
+        let friday = parse_reminder_cancel("delete my Friday reminder").unwrap();
+        assert_eq!(
+            store
+                .cancel(&friday, now)
+                .expect("unambiguous")
+                .expect("a hit")
+                .text,
+            "Defrost the trout"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_cancel_removes_nothing() {
+        let now = dt(2026, 7, 12, 10, 0);
+        let mut store = AdHocStore::default();
+        for (id, text) in [("a", "Call the dentist about Ada"), ("b", "Call the dentist back")] {
+            store.add(Reminder {
+                id: id.into(),
+                due: dt(2026, 7, 16, 9, 0),
+                recipient: "Luca".into(),
+                bot: "otto".into(),
+                text: text.into(),
+                source: ReminderSource::AdHoc,
+            });
+        }
+        let req = parse_reminder_cancel("cancel the reminder about the dentist").unwrap();
+        assert_eq!(store.cancel(&req, now), Err(2));
+        assert_eq!(store.reminders.len(), 2, "nothing may be dropped on a guess");
     }
 
     #[test]

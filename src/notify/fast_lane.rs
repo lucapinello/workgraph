@@ -51,8 +51,27 @@ pub enum FastLaneOp {
     /// Set a reminder: "remind me to defrost the chicken Friday at 5pm".
     ReminderSet {
         text: String,
+        /// The weekday the family NAMED, when they named one. Copy only — the
+        /// row is written for `date`.
         day: Option<Weekday>,
+        /// The resolved calendar date the reminder fires on. A bare weekday
+        /// always resolves FORWARD (the next occurrence on or after today), so a
+        /// reminder is never filed on a date that has already elapsed
+        /// (date-reminder-fail: "Monday" once meant the week's stale Jul 20).
+        date: NaiveDate,
         time: Option<String>,
+    },
+    /// Cancel a pending reminder: "cancel the reminder about the dentist".
+    /// NEVER a creation — a cancel phrase that matches nothing (or matches more
+    /// than one pending reminder) falls back so the family is ASKED.
+    ReminderCancel {
+        /// Fuzzy title fragment ("dentist"); empty when only a day was named.
+        target: String,
+        /// The weekday named, if any — matched against a pending row's own day.
+        day: Option<Weekday>,
+        /// Today, at classification time. A cancel never deletes an already
+        /// elapsed row; only pending reminders can be cancelled.
+        not_before: NaiveDate,
     },
 }
 
@@ -65,6 +84,7 @@ impl FastLaneOp {
             FastLaneOp::MealRemove { .. } => "meal-remove",
             FastLaneOp::ShoppingAdd { .. } => "shopping-add",
             FastLaneOp::ReminderSet { .. } => "reminder-set",
+            FastLaneOp::ReminderCancel { .. } => "reminder-cancel",
         }
     }
 }
@@ -151,6 +171,20 @@ pub fn classify(message: &str, today: NaiveDate) -> Classification {
         return Classification::Fallback(FallbackReason::NotASimpleEdit);
     }
 
+    // "Remind me WHAT was in Monday's risotto" is a memory/READ ask that merely
+    // opens with the reminder verb. It is answered, never written
+    // (date-reminder-fail (a): it once filed a reminder titled "was in risotto").
+    if is_reminder_read(&s) {
+        return Classification::Fallback(FallbackReason::NotASimpleEdit);
+    }
+
+    // A reminder ask that points at an ELAPSED day ("last Monday", "yesterday")
+    // cannot be honoured by scheduling anything; writing a past-dated row is the
+    // stale-date bug. Ask instead of writing.
+    if is_reminder_ask(&s) && names_past_day(&s) {
+        return Classification::Fallback(FallbackReason::NotASimpleEdit);
+    }
+
     match match_single_op(&s, today) {
         Some(op) => Classification::FastLane(op),
         None => Classification::Fallback(FallbackReason::NotASimpleEdit),
@@ -183,6 +217,89 @@ fn is_query(s: &str) -> bool {
     ];
     OPENERS.iter().any(|o| s.starts_with(o))
 }
+
+/// Words that make whatever follows `remind me` a QUESTION rather than a thing
+/// to be reminded of. "remind me what was in Monday's risotto" asks the family
+/// memory; "remind me when the dentist is" asks the calendar. Both are answered,
+/// never filed — and an ambiguous one ("remind me when to leave") is likewise
+/// left to the composer, which can ask, rather than written blind.
+const REMIND_INTERROGATIVES: &[&str] = &[
+    "what", "whats", "what's", "how", "when", "where", "who", "whom", "whose", "which", "why",
+    "whether", "if", "was", "were", "did", "does", "is", "are", "do",
+];
+
+/// Fillers that may sit between `remind me` and the interrogative
+/// ("remind me again what …").
+const REMIND_FILLERS: &[&str] = &["again", "please", "quickly", "quick", "once", "briefly"];
+
+/// True when the turn mentions reminders at all.
+fn is_reminder_ask(s: &str) -> bool {
+    contains_word(s, "remind")
+        || contains_word(s, "reminder")
+        || contains_word(s, "reminders")
+        || contains_word(s, "reminding")
+}
+
+/// True when the text is `remind me/us <interrogative> …` — an interrogative
+/// after the reminder verb makes the turn a READ, never a write.
+fn is_reminder_read(s: &str) -> bool {
+    const OPENERS: &[&str] = &["remind me ", "remind us ", "reminder "];
+    for opener in OPENERS {
+        let Some(idx) = s.find(opener) else { continue };
+        let rest = &s[idx + opener.len()..];
+        let mut words = rest.split_whitespace().skip_while(|w| {
+            REMIND_FILLERS.contains(&w.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        });
+        let Some(first) = words.next() else { continue };
+        let first = first
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
+            .to_ascii_lowercase();
+        if REMIND_INTERROGATIVES.contains(&first.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the text explicitly points BACKWARD in time ("last Monday",
+/// "yesterday", "last night", "this past Friday").
+fn names_past_day(s: &str) -> bool {
+    if contains_word(s, "yesterday") || s.contains("last night") || s.contains("last week") {
+        return true;
+    }
+    for lead in ["last ", "this past ", "past "] {
+        let mut start = 0;
+        while let Some(pos) = s[start..].find(lead) {
+            let i = start + pos + lead.len();
+            let next = s[i..].split_whitespace().next().unwrap_or("");
+            if is_day_word(next) {
+                return true;
+            }
+            start = i;
+        }
+    }
+    false
+}
+
+/// Verbs that CANCEL something rather than create it. Matched as substrings so
+/// multi-word forms ("get rid of", "stop reminding") are caught.
+const CANCEL_VERBS: &[&str] = &[
+    "stop reminding",
+    "don't remind",
+    "dont remind",
+    "no longer need",
+    "get rid of",
+    "call off",
+    "cancel",
+    "delete",
+    "remove",
+    "scrap",
+    "forget",
+    "undo",
+    "unset",
+    "drop",
+    "clear",
+];
 
 /// Lowercase, collapse whitespace, and drop a trailing courtesy so extraction
 /// sees a tidy string. Dish/item casing is intentionally not preserved — a plan
@@ -231,6 +348,12 @@ fn segment_is_edit(seg: &str) -> bool {
 /// checked before the meal ops because they share verbs ("add") but are pinned
 /// by their own keywords ("remind", "list"/"shopping").
 fn match_single_op(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
+    // Cancellation is checked BEFORE creation: "cancel the reminder about the
+    // dentist" carries the reminder keyword and would otherwise be filed as a
+    // brand-new reminder titled "dentist" (date-reminder-fail (c)).
+    if is_reminder_ask(s) && names_cancel(s) {
+        return match_reminder_cancel(s, today);
+    }
     if let Some(op) = match_reminder(s, today) {
         return Some(op);
     }
@@ -276,7 +399,82 @@ fn match_reminder(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
     if text.is_empty() {
         return None;
     }
-    Some(FastLaneOp::ReminderSet { text, day, time })
+    // The date is resolved here, FORWARD from today — a named weekday means its
+    // next occurrence, a dayless ask means today. The plan week never anchors it
+    // (that is what filed "Monday" on the week's already-elapsed Monday).
+    let date = day.map(|wd| upcoming_weekday(today, wd)).unwrap_or(today);
+    Some(FastLaneOp::ReminderSet {
+        text,
+        day,
+        date,
+        time,
+    })
+}
+
+/// True when the turn asks to CANCEL rather than create.
+fn names_cancel(s: &str) -> bool {
+    CANCEL_VERBS.iter().any(|v| s.contains(v))
+}
+
+/// Match a reminder CANCELLATION: "cancel the reminder about the dentist",
+/// "delete my Monday reminder", "stop reminding me about the bins".
+///
+/// Returns `None` — a fallback, so the family is asked — when the ask names
+/// neither a title fragment nor a day ("cancel my reminders" is too broad to act
+/// on blind). It NEVER returns a creation.
+fn match_reminder_cancel(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
+    let verb = CANCEL_VERBS
+        .iter()
+        .filter_map(|v| s.find(v).map(|i| (i, *v)))
+        .min_by_key(|(i, _)| *i)?;
+    let tail = &s[verb.0 + verb.1.len()..];
+    let (day, tail) = pull_day(tail, today);
+    let target = scrub_reminder_words(&tail);
+    if target.is_empty() && day.is_none() {
+        return None;
+    }
+    Some(FastLaneOp::ReminderCancel {
+        target,
+        day,
+        not_before: today,
+    })
+}
+
+/// Strip the reminder nouns and connectors off a cancel tail so what remains is
+/// the title fragment to match on: "the reminder about the dentist" → "dentist".
+fn scrub_reminder_words(frag: &str) -> String {
+    const NOISE: &[&str] = &[
+        "reminder",
+        "reminders",
+        "remind",
+        "reminding",
+        "me",
+        "us",
+        "my",
+        "our",
+        "the",
+        "that",
+        "a",
+        "an",
+        "about",
+        "for",
+        "to",
+        "on",
+        "of",
+        "please",
+        "any",
+        "more",
+        "anymore",
+        "set",
+        "have",
+        "we",
+        "i",
+    ];
+    frag.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\''))
+        .filter(|w| !w.is_empty() && !NOISE.contains(&w.to_ascii_lowercase().as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn match_shopping(s: &str) -> Option<FastLaneOp> {
@@ -496,6 +694,16 @@ fn find_weekday(s: &str) -> Option<(Weekday, usize)> {
         }
     }
     best.map(|(_, wd, len)| (wd, len))
+}
+
+/// The next occurrence of `wd` on or after `today` — a bare weekday always
+/// points FORWARD. Today counts when it is that weekday ("remind me Monday",
+/// said on a Monday morning, means today), so the resolution matches the
+/// gateway's `resolveUpcomingWeekday` and can never land in the past.
+fn upcoming_weekday(today: NaiveDate, wd: Weekday) -> NaiveDate {
+    let delta = (wd.num_days_from_monday() as i64)
+        - (today.weekday().num_days_from_monday() as i64);
+    today + Duration::days(delta.rem_euclid(7))
 }
 
 /// A relative day word ("today"/"tonight"/"this evening" → today,
@@ -959,7 +1167,9 @@ pub fn report_line(op: &FastLaneOp) -> String {
         FastLaneOp::ShoppingAdd { item } => {
             format!("Done — {item} on the shopping list 🛒")
         }
-        FastLaneOp::ReminderSet { text, day, time } => {
+        FastLaneOp::ReminderSet {
+            text, day, time, ..
+        } => {
             let when = match (day, time) {
                 (Some(d), Some(t)) => format!(" {} at {}", weekday_name(*d), t),
                 (Some(d), None) => format!(" {}", weekday_name(*d)),
@@ -967,6 +1177,14 @@ pub fn report_line(op: &FastLaneOp) -> String {
                 (None, None) => String::new(),
             };
             format!("Done — I'll remind you to {text}{when} ⏰")
+        }
+        FastLaneOp::ReminderCancel { target, day, .. } => {
+            let what = match (target.is_empty(), day) {
+                (false, _) => format!(" about {target}"),
+                (true, Some(d)) => format!(" for {}", weekday_name(*d)),
+                (true, None) => String::new(),
+            };
+            format!("Done — cancelled the reminder{what} ✓")
         }
     }
 }
@@ -1097,7 +1315,9 @@ pub fn apply_to_content_with_calendar_owner(
         }
         FastLaneOp::ShoppingAdd { item } => add_shopping_item(content, item)
             .ok_or_else(|| FastLaneError::NotApplicable("no shopping list to add to".into()))?,
-        FastLaneOp::ReminderSet { text, day, time } => {
+        FastLaneOp::ReminderSet {
+            text, date, time, ..
+        } => {
             let owner = calendar_owner
                 .map(str::trim)
                 .filter(|owner| {
@@ -1108,10 +1328,15 @@ pub fn apply_to_content_with_calendar_owner(
                         "no configured calendar owner for the reminder".into(),
                     )
                 })?;
-            add_reminder_row(content, week_code, text, *day, time.as_deref(), owner).ok_or_else(
-                || FastLaneError::NotApplicable("no calendar to add a reminder to".into()),
-            )?
+            add_reminder_row(content, text, *date, time.as_deref(), owner).ok_or_else(|| {
+                FastLaneError::NotApplicable("no calendar to add a reminder to".into())
+            })?
         }
+        FastLaneOp::ReminderCancel {
+            target,
+            day,
+            not_before,
+        } => remove_reminder_row(week_code, content, target, *day, *not_before)?,
     };
 
     // Round-trip: the edited document MUST parse back to the change we intended.
@@ -1167,6 +1392,23 @@ fn verify_round_trip(
                 return Err(FastLaneError::RoundTrip(format!(
                     "item '{item}' absent from shopping list after re-parse"
                 )));
+            }
+        }
+        FastLaneOp::ReminderCancel {
+            target,
+            day,
+            not_before,
+        } => {
+            // The cancelled row must be GONE after the re-parse — and exactly one
+            // row was ever eligible, so a surviving match means the edit missed.
+            let still_there = doc
+                .calendar
+                .iter()
+                .any(|e| cancel_matches(&e.event, e.date, target, *day, *not_before));
+            if still_there {
+                return Err(FastLaneError::RoundTrip(
+                    "the cancelled reminder is still in the calendar after re-parse".into(),
+                ));
             }
         }
         FastLaneOp::ReminderSet { text, .. } => {
@@ -1331,27 +1573,17 @@ fn add_shopping_item(content: &str, item: &str) -> Option<String> {
     }
 }
 
-/// Append a `⏰ Reminder` row to the calendar table. The day defaults to the
-/// plan's Monday when unspecified; the time defaults to 09:00. Returns `None`
-/// when there is no calendar table.
+/// Append a `⏰ Reminder` row to the calendar table for the already-resolved
+/// `date` (the classifier resolves it forward from today, so this never files a
+/// past day); the time defaults to 09:00. Returns `None` when there is no
+/// calendar table.
 fn add_reminder_row(
     content: &str,
-    week_code: &str,
     text: &str,
-    day: Option<Weekday>,
+    target: NaiveDate,
     time: Option<&str>,
     owner: &str,
 ) -> Option<String> {
-    // Resolve the concrete date for the day cell from the plan week.
-    let doc = PlanDoc::parse(week_code, content);
-    let start = doc.start?;
-    let target = day
-        .map(|wd| {
-            let delta = (wd.num_days_from_monday() as i64)
-                - (start.weekday().num_days_from_monday() as i64);
-            start + Duration::days(delta.rem_euclid(7))
-        })
-        .unwrap_or(start);
     let short = weekday_short(target.weekday());
     let mmdd = format!("{:02}-{:02}", target.month(), target.day());
     let time = time.unwrap_or("09:00");
@@ -1394,6 +1626,116 @@ fn add_reminder_row(
     } else {
         None
     }
+}
+
+/// Remove the ONE pending `⏰ Reminder` row a cancel ask matches.
+///
+/// Fails closed: no match, or more than one, is `NotApplicable` so the turn
+/// falls back and the family is asked which reminder they meant. An elapsed row
+/// (before `not_before`) or a row whose date will not parse is never eligible —
+/// a cancel only touches something still pending.
+fn remove_reminder_row(
+    week_code: &str,
+    content: &str,
+    target: &str,
+    day: Option<Weekday>,
+    not_before: NaiveDate,
+) -> Result<String, FastLaneError> {
+    let year = year_of_week_code(week_code);
+    let mut in_cal = false;
+    let mut hits: Vec<usize> = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(h2) = trimmed.strip_prefix("## ") {
+            in_cal = h2.to_lowercase().contains("calendar");
+            continue;
+        }
+        if !in_cal || !trimmed.starts_with('|') {
+            continue;
+        }
+        let Some(cells) = split_cells(trimmed) else {
+            continue;
+        };
+        if cells.len() < 3 {
+            continue;
+        }
+        let date = calendar_cell_date(&cells[0], year);
+        if cancel_matches(&cells[2], date, target, day, not_before) {
+            hits.push(i);
+        }
+    }
+    match hits.len() {
+        0 => Err(FastLaneError::NotApplicable(
+            "no pending reminder matches that".into(),
+        )),
+        1 => {
+            let drop = hits[0];
+            let kept: Vec<String> = lines
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != drop)
+                .map(|(_, l)| (*l).to_string())
+                .collect();
+            Ok(kept.join("\n") + if content.ends_with('\n') { "\n" } else { "" })
+        }
+        _ => Err(FastLaneError::NotApplicable(
+            "more than one pending reminder matches that".into(),
+        )),
+    }
+}
+
+/// Does this calendar row name the pending reminder a cancel ask points at?
+///
+/// A row qualifies only when it IS a reminder, is still pending, and every
+/// significant word of the ask's title fragment appears in it. With no fragment
+/// the named weekday alone selects it — which is why a dayless, targetless
+/// cancel never reaches here (the classifier falls back instead).
+fn cancel_matches(
+    event: &str,
+    date: Option<NaiveDate>,
+    target: &str,
+    day: Option<Weekday>,
+    not_before: NaiveDate,
+) -> bool {
+    if !super::reminder::is_reminder_event(event) {
+        return false;
+    }
+    let Some(date) = date else {
+        return false; // unknown date — cannot prove it is pending, so never touch it
+    };
+    if date < not_before {
+        return false;
+    }
+    if let Some(wd) = day {
+        if date.weekday() != wd {
+            return false;
+        }
+    }
+    let ev = event.to_lowercase();
+    let mut words = target
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\''))
+        .filter(|w| w.len() > 2)
+        .peekable();
+    if words.peek().is_none() {
+        // No usable fragment — the weekday (checked above) is the whole selector.
+        return day.is_some();
+    }
+    words.all(|w| ev.contains(&w.to_ascii_lowercase()))
+}
+
+/// The 4-digit year of a week code like `2026-W29`.
+fn year_of_week_code(week_code: &str) -> Option<i32> {
+    week_code.split('-').next()?.parse().ok()
+}
+
+/// The date of a calendar day cell (`"Mon 07-20"`) against a plan year.
+fn calendar_cell_date(cell: &str, year: Option<i32>) -> Option<NaiveDate> {
+    let year = year?;
+    let md = cell.split_whitespace().nth(1)?;
+    let (m, d) = md.split_once('-')?;
+    NaiveDate::from_ymd_opt(year, m.trim().parse().ok()?, d.trim().parse().ok()?)
 }
 
 /// Split a markdown table row `| a | b | c |` into its cell strings (trimmed).
@@ -1521,7 +1863,31 @@ pub fn run_fast_lane_with_calendar_owner(
         }
     };
 
-    let (path, week_code, _doc) = match current_plan_file(root, today) {
+    // A cancel may match a reminder the DM path filed in the ad-hoc store rather
+    // than a plan row, so it clears both surfaces.
+    let adhoc_cleared = match &op {
+        FastLaneOp::ReminderCancel {
+            target,
+            day,
+            not_before,
+        } => match cancel_adhoc_reminders(root, target, *day, *not_before) {
+            Ok(n) => n,
+            Err(reason) => return FastLaneResult::Fallback { reason },
+        },
+        _ => 0,
+    };
+
+    // A reminder is filed on its RESOLVED date, which can fall in the next plan
+    // week ("remind me Monday", said on a Sunday). Write it to the plan that
+    // actually covers that date when we have one; otherwise the current plan
+    // still carries the correct, never-past day cell.
+    let located = match &op {
+        FastLaneOp::ReminderSet { date, .. } => {
+            plan_file_covering(root, *date).or_else(|| current_plan_file(root, today))
+        }
+        _ => current_plan_file(root, today),
+    };
+    let (path, week_code, _doc) = match located {
         Some(t) => t,
         None => {
             return FastLaneResult::Fallback {
@@ -1552,10 +1918,54 @@ pub fn run_fast_lane_with_calendar_owner(
                 week_code,
             }
         }
+        // A cancel that found nothing in the plan still succeeded when it cleared
+        // the ad-hoc reminder the family meant.
+        Err(_) if adhoc_cleared > 0 => FastLaneResult::Applied {
+            report: report_line(&op),
+            op,
+            week_code,
+        },
         Err(e) => FastLaneResult::Fallback {
             reason: format!("direct edit refused ({e}) — deferring to full pipeline"),
         },
     }
+}
+
+/// Clear the ad-hoc reminders a cancel ask matches, returning how many went.
+///
+/// `Err(reason)` means AMBIGUOUS — more than one pending ad-hoc reminder matched
+/// — and nothing was removed: the caller falls back so the family is asked which
+/// one they meant. A cancel never touches an already-elapsed reminder.
+fn cancel_adhoc_reminders(
+    root: &Path,
+    target: &str,
+    day: Option<Weekday>,
+    not_before: NaiveDate,
+) -> Result<usize, String> {
+    use super::reminder::{AdHocStore, CancelRequest};
+    let path = AdHocStore::path(root);
+    let mut store = AdHocStore::load(&path);
+    let req = CancelRequest {
+        target: target.to_string(),
+        day,
+    };
+    // Pending as of the START of today, so a reminder due later today is still
+    // cancellable — the same day-granular rule the plan rows use.
+    let since = not_before.and_hms_opt(0, 0, 0).unwrap_or_default();
+    match store.cancel(&req, since) {
+        Ok(None) => Ok(0),
+        Ok(Some(_)) => match store.save(&path) {
+            Ok(()) => Ok(1),
+            Err(e) => Err(format!("could not update the ad-hoc reminders: {e}")),
+        },
+        Err(_) => Err("more than one pending reminder matches that — asking instead".into()),
+    }
+}
+
+/// The plan file whose week covers `date`, when one exists on disk.
+fn plan_file_covering(root: &Path, date: NaiveDate) -> Option<(PathBuf, String, PlanDoc)> {
+    let found = current_plan_file(root, date)?;
+    found.2.covers(date).then_some(found)
 }
 
 /// Record a fast-lane edit as a brief `queued → done` node in the work graph so
@@ -1740,6 +2150,8 @@ mod tests {
             FastLaneOp::ReminderSet {
                 text: "defrost the chicken".into(),
                 day: Some(Weekday::Fri),
+                // today() is Tue 2026-07-14 → the UPCOMING Friday.
+                date: NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
                 time: Some("17:00".into()),
             }
         );
@@ -1748,9 +2160,248 @@ mod tests {
             FastLaneOp::ReminderSet {
                 text: "call the plumber".into(),
                 day: None,
+                date: today(),
                 time: None
             }
         );
+    }
+
+    // ---- date-reminder-fail: the three live-cert P0 preflight phrases ------
+
+    #[test]
+    fn repro_a_remind_me_what_is_a_read_never_a_write() {
+        // (a) "Remind me what was in Monday's risotto" is a MEMORY/READ ask. It
+        // must never classify as a write.
+        assert_eq!(
+            fallback("Remind me what was in Monday's risotto"),
+            FallbackReason::NotASimpleEdit
+        );
+    }
+
+    #[test]
+    fn repro_b_bare_weekday_resolves_forward_never_stale() {
+        // (b) On Tue 2026-07-14 (inside W29 = Jul 13–19), "Monday" must mean the
+        // UPCOMING Monday (Jul 20), never the week's already-elapsed Jul 13.
+        let op = fast("remind me Monday to take the bins out");
+        let edited = apply_to_content_with_calendar_owner("2026-W29", W29, &op, Some("otto"))
+            .expect("reminder row");
+        assert!(
+            edited.contains("Mon 07-20"),
+            "reminder landed on a stale past Monday:\n{edited}"
+        );
+        assert!(
+            !edited.contains("Mon 07-13 | 09:00 | ⏰ Reminder"),
+            "reminder wrote a PAST date:\n{edited}"
+        );
+    }
+
+    #[test]
+    fn repro_c_cancel_phrase_never_creates_another_reminder() {
+        // (c) A cancel phrase must never be classified as a reminder CREATION.
+        match classify("cancel the reminder about the dentist", today()) {
+            Classification::FastLane(FastLaneOp::ReminderSet { .. }) => {
+                panic!("a cancel phrase created another reminder")
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn reminder_read_covers_every_interrogative_after_remind_me() {
+        // Each of these ASKS something; none of them files anything.
+        for msg in [
+            "Remind me what was in Monday's risotto",
+            "remind me what we said about the school run",
+            "remind me how the oven timer works",
+            "remind me when the dentist is",
+            "remind me again what Tuesday's dinner was",
+            "can you remind me who is picking up the kids friday",
+            "remind me why we moved swimming",
+        ] {
+            assert_eq!(
+                classify(msg, today()),
+                Classification::Fallback(FallbackReason::NotASimpleEdit),
+                "{msg:?} should be answered, never written"
+            );
+        }
+        // …while a real reminder request still fast-lanes.
+        assert!(matches!(
+            classify("remind me Friday to defrost the chicken", today()),
+            Classification::FastLane(FastLaneOp::ReminderSet { .. })
+        ));
+    }
+
+    #[test]
+    fn reminder_forward_resolution_crosses_the_week_boundary() {
+        // Sat 2026-07-18: "Monday" is the NEXT week's Monday (Jul 20), and a
+        // dayless ask lands on today — never the plan week's Monday (Jul 13).
+        let sat = NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        let mon = match classify("remind me Monday to take the bins out", sat) {
+            Classification::FastLane(op) => op,
+            other => panic!("expected a reminder, got {other:?}"),
+        };
+        assert_eq!(
+            mon,
+            FastLaneOp::ReminderSet {
+                text: "take the bins out".into(),
+                day: Some(Weekday::Mon),
+                date: NaiveDate::from_ymd_opt(2026, 7, 20).unwrap(),
+                time: None,
+            }
+        );
+        // Said ON a Monday, "Monday" means today (the gateway resolver's rule).
+        let on_monday = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        assert!(matches!(
+            classify("remind me Monday at 6pm to take the bins out", on_monday),
+            Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) if date == on_monday
+        ));
+    }
+
+    #[test]
+    fn reminder_pointing_at_an_elapsed_day_asks_instead_of_writing() {
+        for msg in [
+            "remind me last Monday to take the bins out",
+            "set a reminder for yesterday to call the plumber",
+        ] {
+            assert_eq!(
+                classify(msg, today()),
+                Classification::Fallback(FallbackReason::NotASimpleEdit),
+                "{msg:?} must not file a past-dated reminder"
+            );
+        }
+    }
+
+    // A W29 plan carrying two pending reminder rows (Thu/Fri) plus one already
+    // elapsed (Mon), so cancellation can be tested against real rows.
+    fn w29_with_reminders() -> String {
+        let owner = "harbor";
+        let base = apply_to_content_with_calendar_owner(
+            "2026-W29",
+            W29,
+            &FastLaneOp::ReminderSet {
+                text: "book the dentist".into(),
+                day: Some(Weekday::Thu),
+                date: NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+                time: Some("09:00".into()),
+            },
+            Some(owner),
+        )
+        .expect("dentist row");
+        let base = apply_to_content_with_calendar_owner(
+            "2026-W29",
+            &base,
+            &FastLaneOp::ReminderSet {
+                text: "defrost the trout".into(),
+                day: Some(Weekday::Fri),
+                date: NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+                time: Some("17:00".into()),
+            },
+            Some(owner),
+        )
+        .expect("trout row");
+        apply_to_content_with_calendar_owner(
+            "2026-W29",
+            &base,
+            &FastLaneOp::ReminderSet {
+                text: "pay the deposit".into(),
+                day: Some(Weekday::Mon),
+                date: NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+                time: Some("09:00".into()),
+            },
+            Some(owner),
+        )
+        .expect("elapsed row")
+    }
+
+    #[test]
+    fn reminder_cancel_removes_the_matching_pending_row() {
+        let plan = w29_with_reminders();
+        let op = fast("cancel the reminder about the dentist");
+        assert_eq!(
+            op,
+            FastLaneOp::ReminderCancel {
+                target: "dentist".into(),
+                day: None,
+                not_before: today(),
+            }
+        );
+        let edited = apply_to_content_with_calendar_owner("2026-W29", &plan, &op, Some("harbor"))
+            .expect("cancel applies");
+        assert!(
+            !edited.to_lowercase().contains("book the dentist"),
+            "the dentist reminder survived the cancel:\n{edited}"
+        );
+        // Only that one went.
+        assert!(edited.contains("defrost the trout"));
+        assert!(edited.contains("pay the deposit"));
+        assert_eq!(
+            report_line(&op),
+            "Done — cancelled the reminder about dentist ✓"
+        );
+    }
+
+    #[test]
+    fn reminder_cancel_by_weekday_only_picks_the_pending_day() {
+        let plan = w29_with_reminders();
+        let op = fast("delete my Friday reminder");
+        let edited = apply_to_content_with_calendar_owner("2026-W29", &plan, &op, Some("harbor"))
+            .expect("cancel applies");
+        assert!(!edited.contains("defrost the trout"));
+        assert!(edited.contains("book the dentist"));
+    }
+
+    #[test]
+    fn reminder_cancel_never_touches_an_elapsed_reminder() {
+        // Monday 07-13 is behind today() (Tue 07-14) — a cancel cannot reach it,
+        // so the ask falls back and the family is asked rather than a stale row
+        // being silently deleted.
+        let plan = w29_with_reminders();
+        let op = fast("cancel the reminder about the deposit");
+        assert!(matches!(
+            apply_to_content_with_calendar_owner("2026-W29", &plan, &op, Some("harbor")),
+            Err(FastLaneError::NotApplicable(_))
+        ));
+    }
+
+    #[test]
+    fn ambiguous_cancel_asks_instead_of_deleting() {
+        // Two pending reminders, no fragment that separates them → refuse.
+        let plan = w29_with_reminders();
+        // A cancel that names neither a title nor a day is not a fast-lane op at
+        // all — the composer asks which reminder they meant.
+        for vague in ["cancel the reminder", "cancel my reminders"] {
+            assert_eq!(
+                classify(vague, today()),
+                Classification::Fallback(FallbackReason::NotASimpleEdit),
+                "{vague:?} must ask, not guess"
+            );
+        }
+        // A fragment that matches BOTH pending rows is refused at apply time.
+        let both = FastLaneOp::ReminderCancel {
+            target: "the".into(), // too short to be significant → day-only selector
+            day: None,
+            not_before: today(),
+        };
+        assert!(matches!(
+            apply_to_content_with_calendar_owner("2026-W29", &plan, &both, Some("harbor")),
+            Err(FastLaneError::NotApplicable(_))
+        ));
+    }
+
+    #[test]
+    fn cancel_phrases_all_route_to_cancellation_never_creation() {
+        for msg in [
+            "cancel the reminder about the dentist",
+            "delete the reminder to defrost the trout",
+            "remove my Friday reminder",
+            "stop reminding me about the dentist",
+            "forget the reminder about the dentist",
+        ] {
+            match classify(msg, today()) {
+                Classification::FastLane(FastLaneOp::ReminderCancel { .. }) => {}
+                other => panic!("{msg:?} classified as {other:?}, expected a cancellation"),
+            }
+        }
     }
 
     // ---- fallback classification -----------------------------------------
@@ -2006,6 +2657,7 @@ domains = ["meals"]
         let op = FastLaneOp::ReminderSet {
             text: "defrost the chicken".into(),
             day: Some(Weekday::Fri),
+            date: NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
             time: Some("17:00".into()),
         };
         let edited = apply_to_content_with_calendar_owner("2026-W29", W29, &op, calendar_owner)
@@ -2151,6 +2803,118 @@ domains = ["meals"]
             std::fs::read(&plan_path).unwrap(),
             before,
             "a refused reminder must not mutate the plan"
+        );
+    }
+
+    // ---- date-reminder-fail end-to-end ------------------------------------
+
+    #[test]
+    fn e2e_forward_weekday_writes_the_next_weeks_plan_not_a_stale_row() {
+        // Sat 2026-07-18: "Monday" is Jul 20 — which lives in the NEXT plan file.
+        // The reminder must land there, dated Mon 07-20, and W29 must be untouched.
+        let root = tempfile::tempdir().unwrap();
+        let plans = root.path().join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("2026-W29-family-plan.md"), W29).unwrap();
+        let w30 = W29
+            .replace("2026-07-13", "2026-07-20")
+            .replace("2026-07-19", "2026-07-26")
+            .replace("Mon 07-13", "Mon 07-20")
+            .replace("Tue 07-14", "Tue 07-21")
+            .replace("Wed 07-15", "Wed 07-22")
+            .replace("Thu 07-16", "Thu 07-23")
+            .replace("Fri 07-17", "Fri 07-24")
+            .replace("Sat 07-18", "Sat 07-25")
+            .replace("Sun 07-19", "Sun 07-26");
+        std::fs::write(plans.join("2026-W30-family-plan.md"), &w30).unwrap();
+
+        let result = run_fast_lane_with_calendar_owner(
+            root.path(),
+            "remind me Monday to take the bins out",
+            NaiveDate::from_ymd_opt(2026, 7, 18).unwrap(),
+            Some("harbor"),
+        );
+        match &result {
+            FastLaneResult::Applied { week_code, .. } => assert_eq!(week_code, "2026-W30"),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let after30 = std::fs::read_to_string(plans.join("2026-W30-family-plan.md")).unwrap();
+        assert!(
+            after30.contains("| Mon 07-20 | 09:00 | ⏰ Reminder: take the bins out | harbor |"),
+            "the reminder must be filed on the UPCOMING Monday:\n{after30}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(plans.join("2026-W29-family-plan.md")).unwrap(),
+            W29,
+            "the elapsed week's plan must not be touched"
+        );
+    }
+
+    #[test]
+    fn e2e_cancel_clears_the_adhoc_reminder_the_dm_path_filed() {
+        use crate::notify::reminder::{AdHocStore, Reminder, ReminderSource};
+
+        let root = tempfile::tempdir().unwrap();
+        let plans = root.path().join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("2026-W29-family-plan.md"), W29).unwrap();
+
+        let store_path = AdHocStore::path(root.path());
+        let mut store = AdHocStore::default();
+        store.add(Reminder {
+            id: "adhoc:dentist".into(),
+            due: NaiveDate::from_ymd_opt(2026, 7, 16)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            recipient: "Household Member".into(),
+            bot: "harbor".into(),
+            text: "Book the dentist".into(),
+            source: ReminderSource::AdHoc,
+        });
+        store.save(&store_path).unwrap();
+
+        let result = run_fast_lane_with_calendar_owner(
+            root.path(),
+            "cancel the reminder about the dentist",
+            today(),
+            Some("harbor"),
+        );
+        match &result {
+            FastLaneResult::Applied { report, op, .. } => {
+                assert_eq!(report, "Done — cancelled the reminder about dentist ✓");
+                assert_eq!(op.kind_label(), "reminder-cancel");
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert!(
+            AdHocStore::load(&store_path).reminders.is_empty(),
+            "the ad-hoc reminder should be gone"
+        );
+    }
+
+    #[test]
+    fn e2e_remind_me_what_never_touches_the_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let plans = root.path().join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan_path = plans.join("2026-W29-family-plan.md");
+        std::fs::write(&plan_path, W29).unwrap();
+
+        let result = run_fast_lane_with_calendar_owner(
+            root.path(),
+            "Remind me what was in Monday's risotto",
+            today(),
+            Some("harbor"),
+        );
+        assert!(
+            matches!(result, FastLaneResult::Fallback { .. }),
+            "a memory question belongs to the composer, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&plan_path).unwrap(),
+            W29,
+            "a read must never write a reminder row"
         );
     }
 }
