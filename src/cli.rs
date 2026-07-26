@@ -6948,6 +6948,40 @@ pub enum TelegramCommands {
         mock_send: bool,
     },
 
+    /// What does a SHOPPING-LIST sentence do? (mutation-language test seam)
+    ///
+    /// Runs the exact shopping lane a family message hits
+    /// ([`worksgood::notify::fast_lane::classify`] over the vocabulary in
+    /// [`worksgood::notify::shopping_language`]) and prints the verdict: `add`,
+    /// `remove`, `ask` (an implausible item / a held ask / "which item?"), or
+    /// `none` (the composer answers). Credential-free and, by default, side-effect
+    /// free — nothing is sent and no plan is touched.
+    ///
+    /// `--apply --root <dir>` additionally runs the REAL write against that
+    /// project's `plans/` so a scratch project can prove end-to-end that a removal
+    /// phrasing really removes and an ask writes nothing. Never point `--apply` at
+    /// the live family project.
+    Shopping {
+        /// The family sentence to classify.
+        text: String,
+
+        /// Project root holding `plans/`. Required with `--apply`.
+        #[arg(long)]
+        root: Option<PathBuf>,
+
+        /// Override "today" as `YYYY-MM-DD` for deterministic runs.
+        #[arg(long)]
+        today: Option<String>,
+
+        /// Run the real plan write/removal against `--root` (a scratch project).
+        #[arg(long)]
+        apply: bool,
+
+        /// Classify only — the default. Accepted for symmetry with the other seams.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
     /// Audit whether a composed reply's PROMISE would leave an artifact
     ///
     /// The promise-action parity test seam: runs the exact pattern-based

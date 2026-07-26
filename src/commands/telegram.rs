@@ -1600,13 +1600,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         // the dentist" carries the reminder verb and would otherwise
                         // be filed as a SECOND reminder (date-reminder-fail (c)).
                         let reminder_now = chrono::Local::now().naive_local();
-                        let reminder_reply = try_cancel_reminder(
+                        let short_circuit = try_cancel_reminder(
                             &workgraph_dir,
                             &auth_sender,
                             &msg.sender,
                             &route_body,
                             reminder_now,
                         )
+                        .map(|reply| ("reminder-cancel", reply))
                         .or_else(|| {
                             try_register_reminder(
                                 &workgraph_dir,
@@ -1615,8 +1616,26 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 &route_body,
                                 reminder_now,
                             )
+                            .map(|reply| ("reminder", reply))
+                        })
+                        // SHOPPING-LANGUAGE short-circuit (task
+                        // engine-shopping-language). A list mutation typed into the
+                        // family GROUP used to reach only the composer here — so a
+                        // removal never removed, a nonsense item was confirmed as
+                        // understood, and "don't add it yet" could still be written.
+                        // The closed shopping lane now owns those turns on this path
+                        // too, exactly as it already did for web-inbound and voice
+                        // notes: it writes, or it ASKS, and it never fabricates.
+                        .or_else(|| {
+                            try_shopping_language(
+                                &workgraph_dir,
+                                &auth_sender,
+                                &msg.sender,
+                                &route_body,
+                                reminder_now.date(),
+                            )
                         });
-                        if let Some(confirmation) = reminder_reply {
+                        if let Some((short_circuit_lane, confirmation)) = short_circuit {
                             let owner_map =
                                 ownership::OwnerMap::load(&project_root(&workgraph_dir));
                             let coordination_owner = owner_map
@@ -1646,12 +1665,15 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                     )
                                     .await
                                 {
-                                    eprintln!("Failed to send reminder confirmation: {e}");
+                                    eprintln!(
+                                        "Failed to send {short_circuit_lane} confirmation: {e}"
+                                    );
                                 }
                             }
                             println!(
-                                "[{}] Handled reminder request from {} -> confirmed via {}",
+                                "[{}] Handled {} request from {} -> answered via {}",
                                 chrono::Utc::now().format("%H:%M:%S"),
+                                short_circuit_lane,
                                 msg.sender,
                                 bot_id,
                             );
@@ -1924,6 +1946,64 @@ fn try_register_reminder(
         }
     }
     Some(intent.confirmation)
+}
+
+/// Handle a SHOPPING-LIST turn typed into the family group before it reaches the
+/// composer, returning `(lane, reply)`: either the confirmation for a real list write or
+/// the honest question a safety lane answers with.
+///
+/// THE GAP THIS CLOSES (task engine-shopping-language). The closed shopping lane already
+/// ran on the kiosk/web path (`run_web_fast_lane_occurrence`) and on voice notes, but the
+/// live Telegram TEXT listener never called it — every list mutation typed in the family
+/// group was elected and COMPOSED. Measured before this existed: "Remove AA batteries
+/// again." removed nothing, "Add glorptwax to shopping." was answered by the model, and
+/// only the gateway half of the live-cert P1 fix was in force. Now this path runs the
+/// SAME classifier, over the SAME vocabulary
+/// ([`worksgood::notify::shopping_language`]), so both halves cannot drift.
+///
+/// Returns `None` — leaving the turn to the composer, exactly as before — when the turn
+/// is not a shopping mutation, when the sender is not a confirmed human (onboarding runs
+/// first), or when there is no plan to edit. Meal edits and reminders are untouched: only
+/// `shopping-*` operations and the shopping ASK lanes are short-circuited here.
+fn try_shopping_language(
+    workgraph_dir: &Path,
+    sender: &str,
+    sender_display: &str,
+    body: &str,
+    today: chrono::NaiveDate,
+) -> Option<(&'static str, String)> {
+    use worksgood::agency::TelegramBindingMap;
+    use worksgood::notify::fast_lane::{self, Classification, FastLaneResult};
+
+    // Is this a shopping turn at all? Classify FIRST (pure, no I/O) so a normal
+    // conversational message costs nothing here.
+    match fast_lane::classify(body, today) {
+        Classification::FastLane(op) if op.kind_label().starts_with("shopping-") => {}
+        Classification::Ask { .. } => {}
+        _ => return None,
+    }
+
+    // Same gate as the reminder short-circuits: only a confirmed human may change the
+    // family's list directly.
+    let agency_dir = workgraph_dir.join("agency");
+    let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+    match bindings.find_by_identity(Some(sender), Some(sender_display)) {
+        Some(b) if b.confirmed => {}
+        _ => return None,
+    }
+
+    let root = project_root(workgraph_dir);
+    match fast_lane::run_fast_lane(&root, body, today) {
+        FastLaneResult::Applied { report, op, .. } => match op.kind_label() {
+            "shopping-add" => Some(("shopping-add", report)),
+            "shopping-remove" => Some(("shopping-remove", report)),
+            // A non-shopping op cannot arrive here (the classify gate above), but if it
+            // ever did, the composer — not this lane — owns it.
+            _ => None,
+        },
+        FastLaneResult::Answered { reply, .. } => Some(("shopping-ask", reply)),
+        FastLaneResult::Fallback { .. } => None,
+    }
 }
 
 /// Detect a "cancel the reminder about …" request and drop the ONE pending
@@ -4484,9 +4564,13 @@ async fn run_web_fast_lane_occurrence(
     // Do not create occurrence records for the ordinary conversation pipeline,
     // but always reopen an existing record first. Mutable dispatcher inputs may
     // drift on retry; the durable accepted occurrence still wins.
+    // A safety-lane ASK (an implausible item, a held ask) is OWNED by this path too —
+    // it must be journaled and delivered exactly once, like an applied edit, or the
+    // question would be dropped and the composer would answer in its place with a
+    // confident fabrication (task engine-shopping-language).
     let classified_fast_lane = matches!(
         fast_lane::classify(message, today),
-        Classification::FastLane(_)
+        Classification::FastLane(_) | Classification::Ask { .. }
     );
     let opened = if classified_fast_lane {
         Some(OccurrenceJournal::<WebFastLaneOutcome>::claim(
@@ -4515,6 +4599,22 @@ async fn run_web_fast_lane_occurrence(
                     // decision so a dispatcher refire takes the same normal path.
                     journal.mark_passed_through()?;
                     return Ok(WebFastLaneDispatch::PassedThrough);
+                }
+                // A safety lane owned the turn and wrote NOTHING: the reply is a
+                // question ("I don't know what glorptwax is…") or an honest "that isn't
+                // on the list". Journaled and delivered exactly like an applied edit so
+                // it cannot double-post, but with NO graph node — nothing mutated.
+                FastLaneResult::Answered { reply, lane } => {
+                    let guarded =
+                        worksgood::notify::grounding::enforce_family_voice(&reply, family_roster);
+                    let outcome = WebFastLaneOutcome {
+                        op_kind: format!("ask-{lane}"),
+                        report: guarded,
+                        bot_id: bot_id.to_string(),
+                        chat_id: chat_id.to_string(),
+                    };
+                    journal.mark_applied(&outcome)?;
+                    (outcome, false)
                 }
                 FastLaneResult::Applied { report, op, .. } => {
                     let guarded =
@@ -5933,6 +6033,113 @@ fn resolve_reminder_target(
     resolve_dm_target(config, bindings, &rem.recipient, &rem.bot)
 }
 
+/// What does a shopping sentence DO? — the `wg telegram shopping` seam
+/// (see [`crate::cli::TelegramCommands::Shopping`]).
+///
+/// Prints the verdict of the exact shopping lane a family message hits: `add`,
+/// `remove`, `ask` (with the reason — an implausible item, a held ask, or "which
+/// item?"), or `none`. Pure by default. `--apply --root <scratch>` runs the REAL
+/// write so a scratch project can prove a removal removes and an ask writes nothing.
+pub fn run_shopping_language(
+    text: &str,
+    root: Option<&Path>,
+    today: Option<&str>,
+    apply: bool,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::fast_lane::{self, Classification, FastLaneResult};
+
+    let today = match today {
+        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .with_context(|| format!("--today must be YYYY-MM-DD, got {d:?}"))?,
+        None => chrono::Local::now().date_naive(),
+    };
+
+    let (lane, item, reply, reason) = match fast_lane::classify(text, today) {
+        Classification::FastLane(op) => {
+            let item = match &op {
+                fast_lane::FastLaneOp::ShoppingAdd { item }
+                | fast_lane::FastLaneOp::ShoppingRemove { item } => Some(item.clone()),
+                _ => None,
+            };
+            (
+                op.kind_label().to_string(),
+                item,
+                fast_lane::report_line(&op),
+                None,
+            )
+        }
+        Classification::Ask { reply, reason } => {
+            ("ask".to_string(), None, reply, Some(reason.slug()))
+        }
+        Classification::Fallback(r) => (
+            "none".to_string(),
+            None,
+            String::new(),
+            Some(match r {
+                fast_lane::FallbackReason::Compound => "compound",
+                fast_lane::FallbackReason::NotASimpleEdit => "not-a-simple-edit",
+            }),
+        ),
+    };
+
+    // The real write, against a SCRATCH project — the live proof seam.
+    let applied = if apply {
+        let root = root.ok_or_else(|| anyhow::anyhow!("--apply needs --root <project dir>"))?;
+        match fast_lane::run_fast_lane(root, text, today) {
+            FastLaneResult::Applied {
+                report, week_code, ..
+            } => Some(serde_json::json!({
+                "outcome": "applied",
+                "report": report,
+                "week": week_code,
+            })),
+            FastLaneResult::Answered { reply, lane } => Some(serde_json::json!({
+                "outcome": "answered",
+                "reply": reply,
+                "lane": lane,
+            })),
+            FastLaneResult::Fallback { reason } => Some(serde_json::json!({
+                "outcome": "fallback",
+                "reason": reason,
+            })),
+        }
+    } else {
+        None
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "text": text,
+                "lane": lane,
+                "item": item,
+                "reply": reply,
+                "reason": reason,
+                "today": today.to_string(),
+                "applied": applied,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("lane:   {lane}");
+    if let Some(i) = &item {
+        println!("item:   {i}");
+    }
+    if let Some(r) = reason {
+        println!("reason: {r}");
+    }
+    if !reply.is_empty() {
+        println!("reply:  {reply}");
+    }
+    if let Some(a) = &applied {
+        println!("apply:  {a}");
+    }
+    Ok(())
+}
+
 /// Audit a composed reply for promise-action parity — the `wg telegram parity`
 /// seam (see [`crate::cli::TelegramCommands::Parity`]).
 ///
@@ -7313,6 +7520,9 @@ pub fn run_voice_dryrun(
             let route = match &classification {
                 fast_lane::Classification::FastLane(op) => {
                     format!("fast-lane:{}", op.kind_label())
+                }
+                fast_lane::Classification::Ask { reason, .. } => {
+                    format!("ask:{}", reason.slug())
                 }
                 fast_lane::Classification::Fallback(_) => "composer".to_string(),
             };

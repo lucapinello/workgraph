@@ -3970,6 +3970,19 @@ fn main() -> Result<()> {
                 cli.json,
                 mock_send,
             ),
+            TelegramCommands::Shopping {
+                text,
+                root,
+                today,
+                apply,
+                dry_run: _,
+            } => commands::telegram::run_shopping_language(
+                &text,
+                root.as_deref(),
+                today.as_deref(),
+                apply,
+                cli.json,
+            ),
             TelegramCommands::Parity {
                 reply_text,
                 human,

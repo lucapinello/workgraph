@@ -24,6 +24,7 @@ pub mod ownership;
 pub mod parity;
 pub mod push;
 pub mod reminder;
+pub mod shopping_language;
 pub mod slack;
 pub mod sms;
 pub mod telegram;

@@ -48,6 +48,14 @@ pub enum FastLaneOp {
     MealRemove { day: Weekday, target: String },
     /// Add an item to the shopping list: "add milk to the shopping list".
     ShoppingAdd { item: String },
+    /// Take an item back OFF the shopping list: "remove AA batteries again",
+    /// "take dishwasher tablets back off", "no baking soda needed after all".
+    ///
+    /// The live-cert P1 (task engine-shopping-language): adds persisted while every
+    /// removal phrasing only COMPOSED a reply — the list could be written to but never
+    /// un-written, which is exactly the asymmetry a family notices. Crossing an item
+    /// off (= bought) is deliberately NOT this op: that row stays, struck through.
+    ShoppingRemove { item: String },
     /// Set a reminder: "remind me to defrost the chicken Friday at 5pm".
     ReminderSet {
         text: String,
@@ -83,6 +91,7 @@ impl FastLaneOp {
             FastLaneOp::MealAdd { .. } => "meal-add",
             FastLaneOp::MealRemove { .. } => "meal-remove",
             FastLaneOp::ShoppingAdd { .. } => "shopping-add",
+            FastLaneOp::ShoppingRemove { .. } => "shopping-remove",
             FastLaneOp::ReminderSet { .. } => "reminder-set",
             FastLaneOp::ReminderCancel { .. } => "reminder-cancel",
         }
@@ -102,10 +111,44 @@ pub enum FallbackReason {
     Compound,
 }
 
+/// Why a turn is ANSWERED WITH A QUESTION instead of being applied — the safety lanes
+/// the live-cert P1 demanded (task engine-shopping-language). Every one of these
+/// deliberately writes NOTHING.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskReason {
+    /// The named item is not a thing you can buy ("add glorptwax to shopping") — the
+    /// plausibility check does not recognize it, so we ask rather than write junk onto
+    /// the family's list and confirm it as understood.
+    UnknownItem,
+    /// The ask is real but explicitly HELD ("don't add it yet — ask me first"). The
+    /// write waits for a yes.
+    HeldAsk,
+    /// A mutation that named no item ("remove it", "no more needed") — we never guess
+    /// which row the family meant.
+    WhichItem,
+}
+
+impl AskReason {
+    /// A stable, PII-free label for logs and the JSON seam.
+    pub fn slug(self) -> &'static str {
+        match self {
+            AskReason::UnknownItem => "unknown-item",
+            AskReason::HeldAsk => "held-ask",
+            AskReason::WhichItem => "which-item",
+        }
+    }
+}
+
 /// The outcome of classifying a chat turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Classification {
     FastLane(FastLaneOp),
+    /// A closed-set ask the lane OWNS but refuses to apply: `reply` is the question to
+    /// send the family, and no plan file is touched. This exists because falling back to
+    /// the composer for these shapes is how "Done — glorptwax on the shopping list 🛒"
+    /// happened: the model answers, sounding certain, and either writes junk or claims a
+    /// write that never occurred.
+    Ask { reply: String, reason: AskReason },
     Fallback(FallbackReason),
 }
 
@@ -185,10 +228,159 @@ pub fn classify(message: &str, today: NaiveDate) -> Classification {
         return Classification::Fallback(FallbackReason::NotASimpleEdit);
     }
 
+    // SHOPPING MUTATION LANGUAGE (task engine-shopping-language). Removals, negations
+    // and implausible items are decided here, ahead of the meal ops which share the
+    // "add"/"remove" verbs. Reminders still win — they are checked first, exactly as
+    // before, so "remind me to add milk" is a reminder, not a list write.
+    if !is_reminder_ask(&s) {
+        if let Some(verdict) = shopping_turn(&s, today) {
+            return verdict;
+        }
+    }
+
     match match_single_op(&s, today) {
         Some(op) => Classification::FastLane(op),
         None => Classification::Fallback(FallbackReason::NotASimpleEdit),
     }
+}
+
+/// The shopping-language decision for one turn, or `None` when the turn is not about
+/// the list at all (the caller then tries the meal ops, exactly as before).
+///
+/// This is the ENGINE half of the live-cert P1 "shopping mutation language is not safe
+/// enough" and it mirrors the gateway lanes (`gatewayCore._shoppingSafetyLanes`) rule
+/// for rule, over the shared vocabulary in
+/// [`crate::notify::shopping_language`]:
+///
+/// * a HOLD ("don't add it yet — ask me first") ASKS and writes nothing;
+/// * a CANCEL ("no baking soda needed after all") takes a matching item back off;
+/// * a removal phrasing ("remove AA batteries again") really removes;
+/// * an implausible item ("glorptwax") is ASKED about, never written;
+/// * one SENTENCE yields ONE item ("we are out of olive oil—add olive oil").
+///
+/// Scope rules that keep it out of the meal ops' way:
+/// * when the turn NAMES the list, shopping owns it;
+/// * when it does not, the item must be a plausible good AND not a plan-or-list
+///   ambiguous dish word, and a turn that names a weekday/meal slot is left alone.
+fn shopping_turn(s: &str, today: NaiveDate) -> Option<Classification> {
+    use crate::notify::shopping_language as lang;
+
+    let list_scoped = lang::names_the_list(s);
+    let day_scoped = find_weekday(s).is_some() || relative_day(s, today).is_some();
+
+    // An UNSCOPED turn may only be a list mutation when the item is unmistakably a
+    // purchase: a plausible good, not a dish word, no day named, and no trailing clause
+    // that makes the sentence an ACTION rather than a row ("put the chicken in the
+    // oven", "grab a bottle of wine on the way home" — both wrote junk rows before that
+    // last guard existed).
+    let unscoped_ok = |item: &str| -> bool {
+        !item.is_empty()
+            && !day_scoped
+            && lang::plausible_grocery(item)
+            && !lang::dish_ambiguous(item)
+            && !lang::carries_trailing_clause(item)
+    };
+
+    // ── negation first: a negated ask must never reach a write ─────────────
+    if let Some(neg) = lang::detect_negation(s) {
+        match neg.kind {
+            lang::NegationKind::Hold => {
+                let item = lang::extract_item(s).map(|(i, _)| i).unwrap_or_default();
+                if !list_scoped && !lang::names_supplies(s) {
+                    return None;
+                }
+                if !item.is_empty() && !list_scoped && !unscoped_ok(&item) {
+                    return None;
+                }
+                let reply = if item.is_empty() {
+                    "Holding off — tell me when you want it on the shopping list. 🛒".to_string()
+                } else {
+                    format!(
+                        "Holding off on {item} — say the word and it goes on the shopping list. 🛒"
+                    )
+                };
+                return Some(Classification::Ask {
+                    reply,
+                    reason: AskReason::HeldAsk,
+                });
+            }
+            lang::NegationKind::Cancel => {
+                let item = if neg.item.is_empty() {
+                    lang::extract_item(s).map(|(i, _)| i).unwrap_or_default()
+                } else {
+                    neg.item.clone()
+                };
+                if item.is_empty() {
+                    if list_scoped {
+                        return Some(Classification::Ask {
+                            reply: "Which item should come off the shopping list?".to_string(),
+                            reason: AskReason::WhichItem,
+                        });
+                    }
+                    return None;
+                }
+                if !list_scoped && !unscoped_ok(&item) {
+                    return None;
+                }
+                return Some(Classification::FastLane(FastLaneOp::ShoppingRemove {
+                    item,
+                }));
+            }
+        }
+    }
+
+    // ── an explicit removal phrasing ──────────────────────────────────────
+    if let Some(rem) = lang::detect_remove_intent(s) {
+        if rem.pronoun {
+            if list_scoped {
+                return Some(Classification::Ask {
+                    reply: "Which item should come off the shopping list?".to_string(),
+                    reason: AskReason::WhichItem,
+                });
+            }
+            return None;
+        }
+        if list_scoped && !lang::plausible_grocery(&rem.item) {
+            return Some(Classification::Ask {
+                reply: format!(
+                    "I don't see anything like \"{}\" — which item should come off the shopping list?",
+                    rem.item
+                ),
+                reason: AskReason::WhichItem,
+            });
+        }
+        if list_scoped || unscoped_ok(&rem.item) {
+            return Some(Classification::FastLane(FastLaneOp::ShoppingRemove {
+                item: rem.item,
+            }));
+        }
+        return None;
+    }
+
+    // ── an add ────────────────────────────────────────────────────────────
+    // A question is answered, not applied ("should we add olive oil?").
+    if s.contains('?') {
+        return None;
+    }
+    let (item, unknown) = lang::extract_item(s)?;
+    if unknown {
+        // Plausibility, not certainty: a nonsense word never lands silently. Only an
+        // explicitly list-scoped ask is questioned — an unscoped sentence ("we're out
+        // of ideas") stays with the composer rather than earning an absurd question.
+        if !list_scoped {
+            return None;
+        }
+        return Some(Classification::Ask {
+            reply: format!(
+                "I don't know what \"{item}\" is — want it on the shopping list exactly like that?"
+            ),
+            reason: AskReason::UnknownItem,
+        });
+    }
+    if list_scoped || unscoped_ok(&item) {
+        return Some(Classification::FastLane(FastLaneOp::ShoppingAdd { item }));
+    }
+    None
 }
 
 /// True for an interrogative that should be answered, not applied.
@@ -357,9 +549,9 @@ fn match_single_op(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
     if let Some(op) = match_reminder(s, today) {
         return Some(op);
     }
-    if let Some(op) = match_shopping(s) {
-        return Some(op);
-    }
+    // NB shopping is NOT matched here any more: `classify` decides the whole shopping
+    // lane (add / remove / ask) in `shopping_turn` before reaching this point, because a
+    // safe answer is sometimes a QUESTION and this function can only return an op.
     if let Some(op) = match_meal_remove(s, today) {
         return Some(op);
     }
@@ -475,54 +667,6 @@ fn scrub_reminder_words(frag: &str) -> String {
         .filter(|w| !w.is_empty() && !NOISE.contains(&w.to_ascii_lowercase().as_str()))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn match_shopping(s: &str) -> Option<FastLaneOp> {
-    let list_scoped = s.contains("shopping list")
-        || s.contains("grocery list")
-        || s.contains("groceries")
-        || s.contains("shopping")
-        || s.contains(" list");
-    if !list_scoped {
-        return None;
-    }
-    let verbs = ["add ", "put ", "buy ", "need ", "get ", "grab ", "pick up "];
-    let (_, tail) = verbs
-        .iter()
-        .find_map(|v| s.split_once(v).map(|p| (v, p.1)))?;
-
-    // Cut the trailing "… to/on the (shopping) list" phrase off the item.
-    let cuts = [
-        " to the shopping",
-        " to the grocery",
-        " on the shopping",
-        " on the grocery",
-        " to the list",
-        " on the list",
-        " to my list",
-        " on my list",
-        " to shopping",
-        " to groceries",
-        " to the fridge list",
-        " onto the",
-        " to the",
-        " on the",
-        " to my",
-        " on my",
-    ];
-    let mut item = tail.to_string();
-    for c in cuts {
-        if let Some(idx) = item.find(c) {
-            item.truncate(idx);
-            break;
-        }
-    }
-    let item = scrub_fillers(&item);
-    // Guard against "add it to the shopping list" with no real noun.
-    if item.is_empty() || item == "list" || item == "it" || item == "them" {
-        return None;
-    }
-    Some(FastLaneOp::ShoppingAdd { item })
 }
 
 fn match_meal_remove(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
@@ -1167,6 +1311,9 @@ pub fn report_line(op: &FastLaneOp) -> String {
         FastLaneOp::ShoppingAdd { item } => {
             format!("Done — {item} on the shopping list 🛒")
         }
+        FastLaneOp::ShoppingRemove { item } => {
+            format!("Done — took {item} off the shopping list ✂️")
+        }
         FastLaneOp::ReminderSet {
             text, day, time, ..
         } => {
@@ -1315,6 +1462,11 @@ pub fn apply_to_content_with_calendar_owner(
         }
         FastLaneOp::ShoppingAdd { item } => add_shopping_item(content, item)
             .ok_or_else(|| FastLaneError::NotApplicable("no shopping list to add to".into()))?,
+        FastLaneOp::ShoppingRemove { item } => {
+            remove_shopping_item(content, item).ok_or_else(|| {
+                FastLaneError::NotApplicable(format!("'{item}' is not on the shopping list"))
+            })?
+        }
         FastLaneOp::ReminderSet {
             text, date, time, ..
         } => {
@@ -1391,6 +1543,21 @@ fn verify_round_trip(
             if !present {
                 return Err(FastLaneError::RoundTrip(format!(
                     "item '{item}' absent from shopping list after re-parse"
+                )));
+            }
+        }
+        FastLaneOp::ShoppingRemove { item } => {
+            // The removed row must be GONE after the re-parse — matched exactly the way
+            // the removal found it (fuzzy, so "batteries" clears "AA batteries ×4"),
+            // never a bare substring that would call a miss a success.
+            let still_there = doc
+                .shopping
+                .iter()
+                .flat_map(|sec| sec.items.iter())
+                .any(|it| crate::notify::shopping_language::same_item(it, item));
+            if still_there {
+                return Err(FastLaneError::RoundTrip(format!(
+                    "'{item}' is still on the shopping list after re-parse"
                 )));
             }
         }
@@ -1567,6 +1734,44 @@ fn add_shopping_item(content: &str, item: &str) -> Option<String> {
         inserted = true;
     }
     if inserted {
+        Some(out.join("\n") + if content.ends_with('\n') { "\n" } else { "" })
+    } else {
+        None
+    }
+}
+
+/// Drop the bullet naming `item` from the shopping list. Returns `None` when no row
+/// matches — the caller then answers honestly ("I don't see X on the list") instead of
+/// claiming a removal that never happened.
+///
+/// Matching is the SAME fuzzy item match the gateway's remove path uses
+/// ([`crate::notify::shopping_language::same_item`]), so a conversational "take the
+/// batteries off" clears the plan's "AA batteries ×4 (Sat)" row. Only ONE row comes off
+/// per ask — the first match — so a plural noun cannot quietly empty a section.
+fn remove_shopping_item(content: &str, item: &str) -> Option<String> {
+    use crate::notify::shopping_language::same_item;
+
+    let mut in_shopping = false;
+    let mut removed = false;
+    let mut out: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(h2) = trimmed.strip_prefix("## ") {
+            in_shopping = h2.to_lowercase().contains("shopping");
+            out.push(line.to_string());
+            continue;
+        }
+        if !removed && in_shopping {
+            if let Some(bullet) = trimmed.strip_prefix("- ") {
+                if same_item(bullet, item) {
+                    removed = true;
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    if removed {
         Some(out.join("\n") + if content.ends_with('\n') { "\n" } else { "" })
     } else {
         None
@@ -1765,6 +1970,11 @@ pub enum FastLaneResult {
         op: FastLaneOp,
         week_code: String,
     },
+    /// The lane OWNED the turn and deliberately wrote NOTHING: an implausible item, a
+    /// held ask, or a removal that matched no row. `reply` is the honest question/line to
+    /// send; the plan file was not touched. The caller must NOT also run the composer —
+    /// that is precisely how a refusal turned back into a confident fabrication.
+    Answered { reply: String, lane: String },
     /// Not a fast-lane ask (or the direct edit could not be applied) — the caller
     /// runs the full task pipeline as today. `reason` is for logging only.
     Fallback { reason: String },
@@ -1856,6 +2066,13 @@ pub fn run_fast_lane_with_calendar_owner(
 ) -> FastLaneResult {
     let op = match classify(message, today) {
         Classification::FastLane(op) => op,
+        // A safety lane owns the turn and writes nothing (task engine-shopping-language).
+        Classification::Ask { reply, reason } => {
+            return FastLaneResult::Answered {
+                reply,
+                lane: reason.slug().to_string(),
+            };
+        }
         Classification::Fallback(reason) => {
             return FastLaneResult::Fallback {
                 reason: format!("{reason:?}"),
@@ -1924,6 +2141,20 @@ pub fn run_fast_lane_with_calendar_owner(
             report: report_line(&op),
             op,
             week_code,
+        },
+        // A removal that matched no row is ANSWERED honestly, not handed to the
+        // composer: "took it off" for a row that was never there is the same lie in the
+        // other direction (task engine-shopping-language).
+        Err(FastLaneError::NotApplicable(_)) => match &op {
+            FastLaneOp::ShoppingRemove { item } => FastLaneResult::Answered {
+                reply: format!(
+                    "I don't see {item} on the shopping list — nothing to take off. Want me to add it instead?"
+                ),
+                lane: "nothing-to-remove".to_string(),
+            },
+            _ => FastLaneResult::Fallback {
+                reason: "direct edit not applicable — deferring to full pipeline".to_string(),
+            },
         },
         Err(e) => FastLaneResult::Fallback {
             reason: format!("direct edit refused ({e}) — deferring to full pipeline"),
@@ -2720,6 +2951,324 @@ domains = ["meals"]
             }),
             "Done — dropped side salad from Monday ✂️"
         );
+    }
+
+    // ---- live-cert shopping mutation language (task engine-shopping-language) ----
+    // Every phrase below is VERBATIM from docs/reviews/LIVE-CONVO-CERT-2026-07-26.md
+    // (C056–C064), including the corpus's mangled "Don not". Measured on this engine
+    // before the fix: the removals reached nothing, "glorptwax" was WRITTEN and
+    // confirmed, the held ask was WRITTEN, and the out-of sentence was unrecognized.
+
+    fn ask_reason(msg: &str) -> AskReason {
+        match classify(msg, today()) {
+            Classification::Ask { reason, .. } => reason,
+            other => panic!("expected an ASK for {msg:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c056_c057_removal_phrasings_reach_a_real_removal_op() {
+        assert_eq!(
+            fast("Remove AA batteries again."),
+            FastLaneOp::ShoppingRemove {
+                item: "aa batteries".into()
+            }
+        );
+        assert_eq!(
+            fast("Take dishwasher tablets back off."),
+            FastLaneOp::ShoppingRemove {
+                item: "dishwasher tablets".into()
+            }
+        );
+        assert_eq!(
+            fast("remove the AA batteries from the shopping list"),
+            FastLaneOp::ShoppingRemove {
+                item: "aa batteries".into()
+            }
+        );
+        assert_eq!(
+            fast("scratch the olive oil off the shopping list"),
+            FastLaneOp::ShoppingRemove {
+                item: "olive oil".into()
+            }
+        );
+    }
+
+    #[test]
+    fn c058_a_nonsense_item_is_asked_about_never_written() {
+        for phrase in ["Add glorptwax to shopping.", "Add glorptwax to the shopping list."] {
+            assert_eq!(ask_reason(phrase), AskReason::UnknownItem);
+            // And emphatically NOT a write.
+            assert!(
+                !matches!(
+                    classify(phrase, today()),
+                    Classification::FastLane(FastLaneOp::ShoppingAdd { .. })
+                ),
+                "{phrase:?} must never classify as a shopping ADD"
+            );
+        }
+        // A real good the aisle taxonomy has no entry for still lands normally.
+        assert_eq!(
+            fast("add freezer bags to the shopping list"),
+            FastLaneOp::ShoppingAdd {
+                item: "freezer bags".into()
+            }
+        );
+    }
+
+    #[test]
+    fn c059_a_held_ask_asks_and_never_writes() {
+        // The corpus phrase verbatim, "Don not" and all.
+        assert_eq!(
+            ask_reason("We are low on baking soda. Don not add it yet—ask me first."),
+            AskReason::HeldAsk
+        );
+        assert_eq!(
+            ask_reason("Don't add olive oil to the shopping list yet—ask me first."),
+            AskReason::HeldAsk
+        );
+        assert_eq!(
+            ask_reason("We're low on baking soda. Don't add it to the list yet—ask me first."),
+            AskReason::HeldAsk
+        );
+    }
+
+    #[test]
+    fn c060_a_cancel_takes_the_item_back_off() {
+        assert_eq!(
+            fast("no baking soda needed after all"),
+            FastLaneOp::ShoppingRemove {
+                item: "baking soda".into()
+            }
+        );
+        assert_eq!(
+            fast("we don't need the batteries anymore"),
+            FastLaneOp::ShoppingRemove {
+                item: "batteries".into()
+            }
+        );
+    }
+
+    #[test]
+    fn c064_the_out_of_sentence_yields_exactly_one_item() {
+        // The misparse the report caught: one SENTENCE, one item — never the
+        // duplicated literal "olive oil—add olive oil".
+        assert_eq!(
+            fast("We are out of olive oil—add olive oil."),
+            FastLaneOp::ShoppingAdd {
+                item: "olive oil".into()
+            }
+        );
+        assert_eq!(
+            fast("We are out of olive oil—add olive oil to the shopping list."),
+            FastLaneOp::ShoppingAdd {
+                item: "olive oil".into()
+            }
+        );
+    }
+
+    #[test]
+    fn crossing_an_item_off_is_never_a_removal_op() {
+        // Bought ≠ deleted: the row stays, struck through. Never a fast-lane write.
+        assert_eq!(
+            fallback("cross the milk off the list"),
+            FallbackReason::NotASimpleEdit
+        );
+        assert_eq!(
+            fallback("checked off the eggs on the shopping list"),
+            FallbackReason::NotASimpleEdit
+        );
+    }
+
+    #[test]
+    fn a_meal_edit_is_not_hijacked_by_the_shopping_lane() {
+        // The shopping lane shares the "add"/"remove" verbs with the meal ops. A turn
+        // that names a day and no list is still a MENU change.
+        assert_eq!(
+            fast("drop Monday's side salad"),
+            FastLaneOp::MealRemove {
+                day: Weekday::Mon,
+                target: "side salad".into()
+            }
+        );
+        assert_eq!(
+            fast("add a dessert on Tuesday"),
+            FastLaneOp::MealAdd {
+                day: Weekday::Tue,
+                addition: "dessert".into()
+            }
+        );
+        assert_eq!(
+            fast("swap Friday to tacos"),
+            FastLaneOp::MealSwap {
+                day: Weekday::Fri,
+                dish: "tacos".into()
+            }
+        );
+        // An unscoped dish word is plan-OR-list: left to the composer, not applied.
+        assert_eq!(
+            fallback("remove the pasta"),
+            FallbackReason::NotASimpleEdit
+        );
+    }
+
+    #[test]
+    fn an_action_sentence_is_never_a_silent_list_write() {
+        // Found by probing the finished lane through `wg telegram shopping`
+        // (task shopping-engine-half). Each of these named NO list, yet each wrote a
+        // junk row and confirmed it: "chicken in the oven", "to talk about the milk",
+        // "to get milk", "bottle of wine on the way home". An unscoped turn that is
+        // about DOING something belongs to the composer.
+        for phrase in [
+            "put the chicken in the oven",
+            "we need to talk about the milk",
+            "grab a bottle of wine on the way home",
+            "we need to buy a gift for the party",
+        ] {
+            assert_eq!(
+                classify(phrase, today()),
+                Classification::Fallback(FallbackReason::NotASimpleEdit),
+                "{phrase:?} must reach the composer, not the shopping list"
+            );
+        }
+        // The real buy asks still land, and the verb never survives into the row.
+        assert_eq!(
+            fast("we need to get milk"),
+            FastLaneOp::ShoppingAdd {
+                item: "milk".into()
+            }
+        );
+        assert_eq!(
+            fast("add a gift for the party to the shopping list"),
+            FastLaneOp::ShoppingAdd {
+                item: "gift for the party".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_reminder_about_the_list_is_still_a_reminder() {
+        // Reminders keep priority over the shopping lane.
+        assert!(matches!(
+            fast("remind me to add milk to the shopping list on Friday"),
+            FastLaneOp::ReminderSet { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_shopping_remove_really_removes_and_round_trips() {
+        let op = FastLaneOp::ShoppingRemove {
+            item: "spinach".into(),
+        };
+        let before = PlanDoc::parse("2026-W29", W29);
+        assert!(
+            before
+                .shopping
+                .iter()
+                .flat_map(|s| s.items.iter())
+                .any(|i| i.to_lowercase().contains("spinach")),
+            "fixture precondition: spinach is on the list"
+        );
+        let edited = apply_to_content("2026-W29", W29, &op).expect("removal applies");
+        let after = PlanDoc::parse("2026-W29", &edited);
+        assert!(
+            !after
+                .shopping
+                .iter()
+                .flat_map(|s| s.items.iter())
+                .any(|i| i.to_lowercase().contains("spinach")),
+            "the row is gone after the real parser re-reads the file"
+        );
+        // Exactly ONE row came off — a plural noun cannot empty a section.
+        let before_count: usize = before.shopping.iter().map(|s| s.items.len()).sum();
+        let after_count: usize = after.shopping.iter().map(|s| s.items.len()).sum();
+        assert_eq!(after_count, before_count - 1);
+    }
+
+    #[test]
+    fn apply_shopping_remove_of_an_absent_item_is_refused() {
+        let op = FastLaneOp::ShoppingRemove {
+            item: "glorptwax".into(),
+        };
+        let err = apply_to_content("2026-W29", W29, &op).expect_err("nothing to remove");
+        assert!(matches!(err, FastLaneError::NotApplicable(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn e2e_a_nonsense_item_and_a_held_ask_leave_the_plan_byte_identical() {
+        let dir = std::env::temp_dir().join(format!("fastlane-shop-ask-{}", std::process::id()));
+        let plans = dir.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan_path = plans.join("2026-W29-family-plan.md");
+        std::fs::write(&plan_path, W29).unwrap();
+
+        for (phrase, want_lane) in [
+            ("Add glorptwax to the shopping list.", "unknown-item"),
+            (
+                "Don't add olive oil to the shopping list yet—ask me first.",
+                "held-ask",
+            ),
+            // A removal that matches no row is answered honestly, not "done".
+            ("remove the pineapple from the shopping list", "nothing-to-remove"),
+        ] {
+            match run_fast_lane(&dir, phrase, today()) {
+                FastLaneResult::Answered { reply, lane } => {
+                    assert_eq!(lane, want_lane, "lane for {phrase:?}");
+                    assert!(!reply.is_empty());
+                    // The answer must not claim a write.
+                    let low = reply.to_lowercase();
+                    assert!(
+                        !low.starts_with("done"),
+                        "an ask must never open like an applied edit: {reply:?}"
+                    );
+                }
+                other => panic!("expected Answered for {phrase:?}, got {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(&plan_path).unwrap(),
+                W29,
+                "the plan file must be untouched after {phrase:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn e2e_a_conversational_removal_reaches_the_plan_file() {
+        let dir = std::env::temp_dir().join(format!("fastlane-shop-rm-{}", std::process::id()));
+        let plans = dir.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan_path = plans.join("2026-W29-family-plan.md");
+        std::fs::write(&plan_path, W29).unwrap();
+
+        // First put a jotted item on the list the conversational way…
+        match run_fast_lane(&dir, "add AA batteries to the shopping list", today()) {
+            FastLaneResult::Applied { .. } => {}
+            other => panic!("expected the add to apply, got {other:?}"),
+        }
+        let mid = std::fs::read_to_string(&plan_path).unwrap();
+        assert!(mid.to_lowercase().contains("aa batteries"));
+
+        // …then take it back off with the report's own phrasing. THIS is the
+        // asymmetry the live-cert found: the add persisted, the removal did not.
+        match run_fast_lane(&dir, "Remove AA batteries again.", today()) {
+            FastLaneResult::Applied { report, op, .. } => {
+                assert!(matches!(op, FastLaneOp::ShoppingRemove { .. }));
+                assert!(report.contains("off the shopping list"), "got {report:?}");
+            }
+            other => panic!("expected the removal to apply, got {other:?}"),
+        }
+        let after = std::fs::read_to_string(&plan_path).unwrap();
+        assert!(
+            !after.to_lowercase().contains("aa batteries"),
+            "the removal must reach the plan file the /week and kiosk surfaces read"
+        );
+        // Nothing else was disturbed.
+        let doc = PlanDoc::parse("2026-W29", &after);
+        assert!(doc.meals.len() >= 5, "the meal table survived the edit");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- end-to-end orchestrator against a temp plan dir -----------------
