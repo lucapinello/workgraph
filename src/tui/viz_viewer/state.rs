@@ -157,7 +157,18 @@ mod large_graph_snapshot_tests {
     #[test]
     fn snapshot_accept_is_constant_work_and_preserves_interaction_state() {
         let mut app = shell();
-        app.snapshot_engine = Some(super::super::snapshot_engine::SnapshotEngine::new());
+        let mut engine = super::super::snapshot_engine::SnapshotEngine::new();
+        let (build_started_tx, build_started_rx) = mpsc::sync_channel(0);
+        let (release_build_tx, release_build_rx) = mpsc::sync_channel(0);
+        engine.request(Box::new(move |_| {
+            build_started_tx.send(()).unwrap();
+            release_build_rx.recv().unwrap();
+            Err("blocked fixture build".to_string())
+        }));
+        build_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot worker did not enter the fixture build");
+        app.snapshot_engine = Some(engine);
         app.install_graph_snapshot(synthetic_snapshot(10_000, 5_000, 1));
 
         app.scroll.viewport_height = 40;
@@ -180,9 +191,29 @@ mod large_graph_snapshot_tests {
 
         let replacement = synthetic_snapshot(10_001, 5_000, 2);
         let replacement_storage = replacement.lines.as_ptr();
+        let (publication_done_tx, publication_done_rx) = mpsc::channel();
+        let release_worker = std::thread::spawn(move || {
+            let published_without_worker = publication_done_rx
+                .recv_timeout(Duration::from_millis(250))
+                .is_ok();
+            release_build_tx
+                .send(())
+                .expect("snapshot worker stopped before retirement");
+            published_without_worker
+        });
         let started = Instant::now();
         app.install_graph_snapshot(replacement);
         let accepted_in = started.elapsed();
+        assert!(
+            retired_generation.upgrade().is_some(),
+            "fixture must keep the retired generation worker-owned until release"
+        );
+        publication_done_tx
+            .send(())
+            .expect("publication watchdog stopped");
+        let published_without_worker = release_worker
+            .join()
+            .expect("publication watchdog should not panic");
 
         assert_ne!(old_line_storage, app.lines.as_ptr());
         assert_eq!(replacement_storage, app.lines.as_ptr());
@@ -200,6 +231,10 @@ mod large_graph_snapshot_tests {
         assert_eq!(
             app.hud_pin.as_ref().map(|pin| pin.dot_task_id.as_str()),
             Some(".evaluate-task-05000")
+        );
+        assert!(
+            published_without_worker,
+            "snapshot publication waited for the CPU worker"
         );
         assert!(
             accepted_in < Duration::from_millis(5),
