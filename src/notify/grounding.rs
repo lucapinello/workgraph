@@ -2401,6 +2401,9 @@ pub fn week_grounding_rewrite(days: &[(String, String)]) -> String {
 //     eating leftovers, not about where the plan puts the meal;
 //   * an AMBIGUOUS mention — the matched words fit two different days' dishes, so
 //     no single truth can be named;
+//   * a PROPOSAL or a QUESTION — "want me to put the frittata on Wednesday?", "we
+//     could do it again next week" — which asserts nothing about this week's table,
+//     so "correcting" it would clobber the cook's own offer;
 //   * generic prep/filler overlap ("keep Wednesday warm and easy" against a dish
 //     with "warm" in it) — filler words never identify a dish.
 // ---------------------------------------------------------------------------
@@ -2482,6 +2485,46 @@ const NON_DINNER_SLOT_STEMS: &[(&str, &str)] = &[
 /// not be rewritten.
 const LEFTOVER_CUES: &[&str] = &["leftover", "leftovers", "left over", "reheat", "reheated"];
 
+/// Cues that a sentence PROPOSES or supposes a placement rather than ASSERTING one.
+/// A cook offering "want me to put the frittata on Wednesday?" or "we could do the
+/// frittata again next week" states no fact about this week's table, so correcting it
+/// would clobber the offer. Only assertive sentences are claims. (A question mark is
+/// handled separately — see `SpannedSentence::asks`.)
+const PLACEMENT_PROPOSAL_PHRASES: &[&str] = &[
+    "want me to",
+    "want to",
+    "should i",
+    "should we",
+    "shall i",
+    "shall we",
+    "how about",
+    "what about",
+    "we could",
+    "i could",
+    "we can",
+    "i can",
+    "we might",
+    "let me",
+    "next week",
+    "if you",
+];
+
+/// Single-word proposal cues, matched as WHOLE words (not substrings) so a dish like
+/// "pork cutlets" cannot exempt itself by containing "lets".
+const PLACEMENT_PROPOSAL_WORDS: &[&str] = &[
+    "maybe",
+    "lets",
+    "instead",
+    "moving",
+    "move",
+    "swap",
+    "swapping",
+    "again",
+    "could",
+    "might",
+    "would",
+];
+
 /// A misplaced-placement claim: the dish, where the plan REALLY puts it, what the
 /// draft claimed instead, and the byte span of the offending sentence in the draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2502,6 +2545,9 @@ pub struct MisplacedWeekClaim {
 /// and leave the rest of the reply byte-identical.
 struct SpannedSentence {
     norm: String,
+    /// The sentence asks rather than asserts (it carries a question mark), so it
+    /// cannot be a false placement CLAIM.
+    asks: bool,
     start: usize,
     end: usize,
 }
@@ -2538,9 +2584,10 @@ fn split_sentences_with_spans(draft: &str) -> Vec<SpannedSentence> {
                 end = chars[j].0 + chars[j].1.len_utf8();
                 j += 1;
             }
-            let norm = normalize(&draft[start..end]);
+            let raw = &draft[start..end];
+            let norm = normalize(raw);
             if !norm.is_empty() {
-                out.push(SpannedSentence { norm, start, end });
+                out.push(SpannedSentence { norm, asks: raw.contains('?'), start, end });
             }
             seg_start = None;
             idx = j;
@@ -2552,9 +2599,10 @@ fn split_sentences_with_spans(draft: &str) -> Vec<SpannedSentence> {
         // A final sentence with no terminator: the span stops at the last
         // non-whitespace byte so trailing space stays outside any splice.
         let end = start + draft[start..].trim_end().len();
-        let norm = normalize(&draft[start..end]);
+        let raw = &draft[start..end];
+        let norm = normalize(raw);
         if !norm.is_empty() {
-            out.push(SpannedSentence { norm, start, end });
+            out.push(SpannedSentence { norm, asks: raw.contains('?'), start, end });
         }
     }
     out
@@ -2652,6 +2700,18 @@ pub fn misplaced_week_claims(draft: &str, wc: &WeekContext) -> Vec<MisplacedWeek
     }
     let mut out: Vec<MisplacedWeekClaim> = Vec::new();
     for sentence in split_sentences_with_spans(draft) {
+        // A question or a proposal asserts nothing about this week's table — a cook
+        // offering "want me to put the frittata on Wednesday?" must keep the offer.
+        if sentence.asks
+            || PLACEMENT_PROPOSAL_PHRASES
+                .iter()
+                .any(|cue| sentence.norm.contains(cue))
+            || PLACEMENT_PROPOSAL_WORDS
+                .iter()
+                .any(|w| norm_has_word(&sentence.norm, w))
+        {
+            continue;
+        }
         // Which planned dishes does this sentence name? Exactly one, or we cannot
         // name a single truth (two days' dishes sharing a word ⇒ leave it alone).
         let named: Vec<(&String, &String)> = wc
@@ -4325,6 +4385,32 @@ label = "Fallback Member"
                 "filler-word overlap must never trip the guard: {draft}"
             );
         }
+    }
+
+    /// A PROPOSAL or a QUESTION asserts nothing about this week's table — the cook's
+    /// own offer to move or repeat a dish must survive verbatim.
+    #[test]
+    fn a_proposal_or_question_is_not_a_placement_claim() {
+        let wc = parse_week_context(&c004_week_context());
+        for draft in [
+            "Want me to put the frittata on Wednesday next week?",
+            "We could do that frittata again next week, maybe Tuesday.",
+            "Should I move the frittata to Saturday lunch?",
+            "How about the frittata for Monday instead?",
+        ] {
+            assert!(
+                misplaced_week_claims(draft, &wc).is_empty(),
+                "a proposal must not be rewritten: {draft}"
+            );
+        }
+        // TEETH: the SAME dish and day asserted flatly IS still corrected, so the
+        // proposal carve-out is not a blanket amnesty.
+        let flat = "The frittata is on Wednesday.";
+        assert_eq!(
+            misplaced_week_claims(flat, &wc).len(),
+            1,
+            "an assertive wrong-day line must still be caught"
+        );
     }
 
     /// AMBIGUITY is left alone: when the named words fit TWO days' dishes there is
