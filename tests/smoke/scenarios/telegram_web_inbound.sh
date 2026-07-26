@@ -176,11 +176,23 @@ turn_fingerprint() {
 }
 
 # --- Collective ask → the whole roster answers (the headline fix) -----------
-out="$(web "$HUMAN_NAME" "hey all, are you around?")"
+# The ask KEEPS its greeting opener on purpose. `social-closers-single`
+# (1360b2a6) made a line that reduces to PURE courtesy elect one voice, and the
+# old fixture here ("hey all, are you around?") is exactly that shape — so this
+# leg started failing silently and took every later leg down with it (the file
+# was last touched at 0c34c3a5, before that fix). The boundary the roster fan-out
+# actually needs is "greeting + real content", which is what this asks; the pure
+# courtesy side is pinned right below so neither can drift again unnoticed.
+out="$(web "$HUMAN_NAME" "hey everyone, can you all take a look at the front door today?")"
 expect_grep "collective ask elects the roster" "$out" '"category": "collective"'
 for voice in "${ROSTER[@]}"; do
     expect_grep "collective includes the configured voice $voice" "$out" "$voice"
 done
+
+# --- The other side of that boundary: pure courtesy never fans out ----------
+out="$(web "$HUMAN_NAME" "hey all, are you around?")"
+expect_grep "a purely social collective line stays one voice" "$out" '"category": "single-voice"'
+expect_grep "…the configured coordination voice, not the roster" "$out" "\"who\": \"$COORD_ID\""
 
 # --- Discussion ask → a multi-voice round -----------------------------------
 out="$(web "$HUMAN_NAME" "can you guys discuss dinner and find consensus?")"
@@ -272,7 +284,11 @@ expect_grep "named voice outranks no-default" "$out" "\"who\": \"$MEALS_ID\""
 out="$(web_choice --no-default-owner --sender "$HUMAN_NAME" --message "what should we eat for dinner tonight?" 2>&1)"
 expect_grep "domain owner outranks no-default" "$out" "\"who\": \"$MEALS_ID\""
 
-out="$(web_choice --no-default-owner --sender "$HUMAN_NAME" --message "hey all, are you around?" 2>&1)"
+# Same stale-fixture correction as the headline leg above: a line that reduces to
+# pure courtesy is one voice now, and one voice with no designated contact is
+# needs-contact — which would have "proved" the opposite of what this leg means.
+out="$(web_choice --no-default-owner --sender "$HUMAN_NAME" \
+    --message "hey everyone, can you all take a look at the front door today?" 2>&1)"
 expect_grep "collective ask outranks no-default" "$out" '"category": "collective"'
 
 out="$(
