@@ -157,7 +157,18 @@ mod large_graph_snapshot_tests {
     #[test]
     fn snapshot_accept_is_constant_work_and_preserves_interaction_state() {
         let mut app = shell();
-        app.snapshot_engine = Some(super::super::snapshot_engine::SnapshotEngine::new());
+        let mut engine = super::super::snapshot_engine::SnapshotEngine::new();
+        let (build_started_tx, build_started_rx) = mpsc::sync_channel(0);
+        let (release_build_tx, release_build_rx) = mpsc::sync_channel(0);
+        engine.request(Box::new(move |_| {
+            build_started_tx.send(()).unwrap();
+            release_build_rx.recv().unwrap();
+            Err("blocked fixture build".to_string())
+        }));
+        build_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot worker did not enter the fixture build");
+        app.snapshot_engine = Some(engine);
         app.install_graph_snapshot(synthetic_snapshot(10_000, 5_000, 1));
 
         app.scroll.viewport_height = 40;
@@ -180,9 +191,29 @@ mod large_graph_snapshot_tests {
 
         let replacement = synthetic_snapshot(10_001, 5_000, 2);
         let replacement_storage = replacement.lines.as_ptr();
+        let (publication_done_tx, publication_done_rx) = mpsc::channel();
+        let release_worker = std::thread::spawn(move || {
+            let published_without_worker = publication_done_rx
+                .recv_timeout(Duration::from_millis(250))
+                .is_ok();
+            release_build_tx
+                .send(())
+                .expect("snapshot worker stopped before retirement");
+            published_without_worker
+        });
         let started = Instant::now();
         app.install_graph_snapshot(replacement);
         let accepted_in = started.elapsed();
+        assert!(
+            retired_generation.upgrade().is_some(),
+            "fixture must keep the retired generation worker-owned until release"
+        );
+        publication_done_tx
+            .send(())
+            .expect("publication watchdog stopped");
+        let published_without_worker = release_worker
+            .join()
+            .expect("publication watchdog should not panic");
 
         assert_ne!(old_line_storage, app.lines.as_ptr());
         assert_eq!(replacement_storage, app.lines.as_ptr());
@@ -200,6 +231,10 @@ mod large_graph_snapshot_tests {
         assert_eq!(
             app.hud_pin.as_ref().map(|pin| pin.dot_task_id.as_str()),
             Some(".evaluate-task-05000")
+        );
+        assert!(
+            published_without_worker,
+            "snapshot publication waited for the CPU worker"
         );
         assert!(
             accepted_in < Duration::from_millis(5),
@@ -17148,10 +17183,7 @@ impl VizApp {
         }
 
         // Generate a request ID for correlating the response.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let request_id = format!("tui-{}-{}", now.as_millis(), now.subsec_nanos() % 100_000);
+        let request_id = worksgood::chat::generate_request_id("tui");
 
         // Collect attachment display names for the local message.
         let att_names: Vec<String> = self
@@ -28356,6 +28388,46 @@ mod tui_chat_tests {
             read_at: None,
             msg_queue_id: None,
         }
+    }
+
+    #[test]
+    fn tui_send_uses_shared_uuid_v7_request_id() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0]);
+        let mut app = build_test_app(&viz, &wg_dir);
+
+        // The PTY-owner fast path appends synchronously, so this exercises the
+        // production TUI send seam without starting a daemon or command. Keep
+        // an older-page projection active so send deliberately skips the
+        // history-config seam and remains independent of machine-global state.
+        app.chat_pty_mode = true;
+        app.chat_pty_observer = false;
+        app.chat.total_history_count = 2;
+        app.chat.has_more_history = true;
+        app.send_chat_message("opaque request".to_string());
+
+        let request_id = app
+            .chat
+            .pending_request_ids
+            .iter()
+            .next()
+            .expect("TUI send should track its request ID");
+        assert!(
+            request_id.starts_with("tui-"),
+            "TUI request ID should retain its namespace: {request_id}"
+        );
+        let uuid = uuid::Uuid::parse_str(&request_id[request_id.len() - 36..])
+            .expect("TUI request ID should end with a parseable UUID");
+        assert_eq!(
+            uuid.get_version(),
+            Some(uuid::Version::SortRand),
+            "TUI send must use the shared UUID-v7 generator: {request_id}"
+        );
+
+        let inbox =
+            worksgood::chat::read_inbox_for(&wg_dir, 0).expect("TUI send should append its inbox");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].request_id, *request_id);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -7,14 +7,15 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
 use std::time::Duration;
 
 use super::state::GraphViewSnapshot;
 
 const REQUEST_CAPACITY: usize = 1;
 const RESULT_CAPACITY: usize = 1;
-const RETIRE_CAPACITY: usize = 1;
 
 /// Cooperative generation token checked between the derivation phases that
 /// WG controls.  A monolithic third-party layout call may still finish late;
@@ -51,15 +52,17 @@ struct Response {
 ///
 /// There is one running build, one channel slot, and one newest pending build.
 /// Replaced pending closures are dropped immediately, so a watcher storm can
-/// never create an unbounded graph-work backlog.  Retired generations are
-/// dropped on the worker before the next build, keeping destruction of large
-/// maps and strings off the terminal thread as well.
+/// never create an unbounded graph-work backlog. Retired generations are
+/// handed off without UI backpressure and eventually destroyed by the worker,
+/// including while it is otherwise idle. The retirement channel itself is
+/// unbounded; current production volume stays bounded because accepted views
+/// originate from this single worker through the one-slot result channel.
+/// Future direct publication paths must preserve that rate invariant.
 pub(super) struct SnapshotEngine {
     request_tx: SyncSender<Request>,
     result_rx: Receiver<Response>,
-    retire_tx: SyncSender<GraphViewSnapshot>,
+    retire_tx: Sender<GraphViewSnapshot>,
     pending: Option<Request>,
-    pending_retire: Option<GraphViewSnapshot>,
     desired: Arc<AtomicU64>,
     next_generation: u64,
     cancelled: Arc<AtomicBool>,
@@ -69,7 +72,13 @@ impl SnapshotEngine {
     pub(super) fn new() -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel(REQUEST_CAPACITY);
         let (result_tx, result_rx) = mpsc::sync_channel(RESULT_CAPACITY);
-        let (retire_tx, retire_rx) = mpsc::sync_channel(RETIRE_CAPACITY);
+        // The handoff itself must never block or leave a graph-sized value
+        // parked in the UI. This channel is not structurally bounded. Current
+        // production callers only retire accepted snapshots emitted by this
+        // single worker through the one-slot result channel, and the idle loop
+        // eventually drains them. Future direct callers must preserve that
+        // production-rate invariant or provide another non-UI-thread bound.
+        let (retire_tx, retire_rx) = mpsc::channel();
         let desired = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_desired = desired.clone();
@@ -90,7 +99,6 @@ impl SnapshotEngine {
             result_rx,
             retire_tx,
             pending: None,
-            pending_retire: None,
             desired,
             next_generation: 0,
             cancelled,
@@ -136,19 +144,13 @@ impl SnapshotEngine {
         }
     }
 
-    /// Transfer ownership of a replaced generation to the CPU worker.  The
-    /// queue has one slot; if it is momentarily occupied we retain exactly one
-    /// local retirement and stop submitting builds until it moves.
+    /// Transfer ownership of a replaced generation to the CPU worker without
+    /// waiting or running its graph-sized destructor on the terminal thread.
     pub(super) fn retire(&mut self, snapshot: GraphViewSnapshot) {
-        debug_assert!(self.pending_retire.is_none());
-        match self.retire_tx.try_send(snapshot) {
-            Ok(()) => {}
-            Err(TrySendError::Full(snapshot)) => self.pending_retire = Some(snapshot),
-            Err(TrySendError::Disconnected(snapshot)) => {
-                // Worker teardown is only expected during app teardown.  Drop
-                // here rather than leak the generation.
-                drop(snapshot);
-            }
+        if let Err(error) = self.retire_tx.send(snapshot) {
+            // Worker teardown is only expected during app teardown. Drop here
+            // rather than leak the generation.
+            drop(error.0);
         }
     }
 
@@ -163,16 +165,6 @@ impl SnapshotEngine {
     }
 
     fn pump(&mut self) {
-        if let Some(retired) = self.pending_retire.take() {
-            match self.retire_tx.try_send(retired) {
-                Ok(()) => {}
-                Err(TrySendError::Full(retired)) => {
-                    self.pending_retire = Some(retired);
-                    return;
-                }
-                Err(TrySendError::Disconnected(retired)) => drop(retired),
-            }
-        }
         let Some(request) = self.pending.take() else {
             return;
         };

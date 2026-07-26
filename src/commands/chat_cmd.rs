@@ -549,7 +549,7 @@ pub fn run_send(dir: &Path, reference: &str, message: &str, json: bool) -> Resul
 
     // Make sure the chat dir exists (chat::append_inbox_for creates parent
     // dirs, but we want a stable filesystem location for non-running chats).
-    let request_id = format!("wg-chat-send-{}", chrono::Utc::now().timestamp_millis());
+    let request_id = worksgood::chat::generate_request_id("wg-chat-send");
     let inbox_id = worksgood::chat::append_inbox_for(dir, cid, message, &request_id)
         .with_context(|| format!("Failed to append to chat {} inbox", cid))?;
 
@@ -1280,26 +1280,35 @@ mod tests {
     fn send_to_dormant_chat_appends_inbox() {
         let td = mk_workgraph_dir();
         let dir = td.path();
-        run_create_direct(dir, Some("bot"), None, None, None, None, true).unwrap();
-
-        // Find the chat id we just created
-        let g = worksgood::parser::load_graph(&graph_path(dir)).unwrap();
-        let chat = g
-            .tasks()
-            .find(|t| t.tags.iter().any(|x| chat_id::is_chat_loop_tag(x)))
-            .expect("chat task exists");
-        let cid = chat_id::parse_chat_task_id(&chat.id).unwrap();
+        let cid = 0;
+        let mut graph = worksgood::graph::WorkGraph::new();
+        graph.add_node(worksgood::graph::Node::Task(worksgood::graph::Task {
+            id: chat_id::format_chat_task_id(cid),
+            title: "Chat session".to_string(),
+            status: worksgood::graph::Status::InProgress,
+            tags: vec![chat_id::CHAT_LOOP_TAG.to_string()],
+            ..Default::default()
+        }));
+        worksgood::parser::save_graph(&graph, &graph_path(dir)).unwrap();
 
         // Send
         run_send(dir, &cid.to_string(), "hi from test", true).unwrap();
 
-        // Inbox file exists and has one message
-        let inbox = worksgood::chat::chat_dir_for_ref(dir, &cid.to_string()).join("inbox.jsonl");
-        let contents = std::fs::read_to_string(&inbox).expect("inbox file written");
+        let inbox = worksgood::chat::read_inbox_for(dir, cid).expect("inbox should be readable");
+        assert_eq!(inbox.len(), 1, "send should append exactly one message");
+        assert_eq!(inbox[0].content, "hi from test");
+
+        let request_id = &inbox[0].request_id;
         assert!(
-            contents.contains("hi from test"),
-            "inbox.jsonl should contain the message: {}",
-            contents
+            request_id.starts_with("wg-chat-send-"),
+            "chat-send request ID should retain its namespace: {request_id}"
+        );
+        let uuid = uuid::Uuid::parse_str(&request_id[request_id.len() - 36..])
+            .expect("chat-send request ID should end with a parseable UUID");
+        assert_eq!(
+            uuid.get_version(),
+            Some(uuid::Version::SortRand),
+            "chat-send must use the shared UUID-v7 generator: {request_id}"
         );
     }
 

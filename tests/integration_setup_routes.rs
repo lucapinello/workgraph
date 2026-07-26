@@ -41,6 +41,7 @@ fn run_wg_in_isolation_with_env(
     let mut cmd = Command::new(wg_binary());
     cmd.args(args);
     cmd.env("HOME", fake_home);
+    cmd.env_remove("WG_GLOBAL_DIR");
     cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
     cmd.env_remove("OPENAI_API_KEY");
@@ -65,6 +66,7 @@ fn run_wg_in_isolation_with_stdin(
     let mut cmd = Command::new(wg_binary());
     cmd.args(args);
     cmd.env("HOME", fake_home);
+    cmd.env_remove("WG_GLOBAL_DIR");
     cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("OPENROUTER_API_KEY");
     cmd.env_remove("OPENAI_API_KEY");
@@ -87,6 +89,129 @@ fn run_wg_in_isolation_with_stdin(
     child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("Failed waiting for wg stdin run: {}", e))
+}
+
+const SCOPE_GLOBAL_ORIGINAL: &[u8] =
+    b"# exact global sentinel\n[agent]\nexecutor = \"claude\"\nmodel = \"claude:sonnet\"\n";
+const SCOPE_LOCAL_ORIGINAL: &[u8] =
+    b"# exact local sentinel\n[agent]\nexecutor = \"codex\"\nmodel = \"codex:gpt-5\"\n";
+
+struct SetupScopeFixture {
+    _tmp: TempDir,
+    global_path: PathBuf,
+    local_path: PathBuf,
+}
+
+fn run_setup_scope_child(scope: &str) -> SetupScopeFixture {
+    let tmp = TempDir::new().unwrap();
+    let global_dir = tmp.path().join("machine-global");
+    let project = tmp.path().join("project");
+    let global_path = global_dir.join("config.toml");
+    let local_path = project.join(".wg").join("config.toml");
+    fs::create_dir_all(&global_dir).unwrap();
+    fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+    fs::write(&global_path, SCOPE_GLOBAL_ORIGINAL).unwrap();
+    fs::write(&local_path, SCOPE_LOCAL_ORIGINAL).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wg"))
+        .current_dir(&project)
+        .env("WG_GLOBAL_DIR", &global_dir)
+        .env_remove("WG_DIR")
+        .env_remove("WG_TASK_ID")
+        .env_remove("WG_AGENT_ID")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .args(["setup", "--route", "claude-cli", "--scope", scope, "--yes"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wg setup --scope {scope} failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    SetupScopeFixture {
+        _tmp: tmp,
+        global_path,
+        local_path,
+    }
+}
+
+fn sibling_config_backups(config_path: &Path) -> Vec<PathBuf> {
+    let mut backups: Vec<_> = fs::read_dir(config_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("config.toml.bak-"))
+        })
+        .collect();
+    backups.sort();
+    backups
+}
+
+fn assert_scope_replaced_with_exact_backup(config_path: &Path, original: &[u8]) {
+    assert_ne!(
+        fs::read(config_path).unwrap(),
+        original,
+        "requested config must be replaced"
+    );
+    let backups = sibling_config_backups(config_path);
+    assert_eq!(
+        backups.len(),
+        1,
+        "requested config must have exactly one sibling backup"
+    );
+    let metadata = fs::symlink_metadata(&backups[0]).unwrap();
+    assert!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "backup must be a regular file: {}",
+        backups[0].display()
+    );
+    assert_eq!(
+        fs::read(&backups[0]).unwrap(),
+        original,
+        "backup must preserve the exact original bytes"
+    );
+}
+
+fn assert_scope_untouched_without_backup(config_path: &Path, original: &[u8]) {
+    assert_eq!(
+        fs::read(config_path).unwrap(),
+        original,
+        "unrequested config bytes must remain exact"
+    );
+    assert!(
+        sibling_config_backups(config_path).is_empty(),
+        "unrequested config must not gain a backup"
+    );
+}
+
+#[test]
+fn test_setup_scope_global_child_replaces_only_global_config() {
+    let fixture = run_setup_scope_child("global");
+    assert_scope_replaced_with_exact_backup(&fixture.global_path, SCOPE_GLOBAL_ORIGINAL);
+    assert_scope_untouched_without_backup(&fixture.local_path, SCOPE_LOCAL_ORIGINAL);
+}
+
+#[test]
+fn test_setup_scope_local_child_replaces_only_local_config() {
+    let fixture = run_setup_scope_child("local");
+    assert_scope_untouched_without_backup(&fixture.global_path, SCOPE_GLOBAL_ORIGINAL);
+    assert_scope_replaced_with_exact_backup(&fixture.local_path, SCOPE_LOCAL_ORIGINAL);
+}
+
+#[test]
+fn test_setup_scope_both_child_replaces_and_backs_up_both_configs() {
+    let fixture = run_setup_scope_child("both");
+    assert_scope_replaced_with_exact_backup(&fixture.global_path, SCOPE_GLOBAL_ORIGINAL);
+    assert_scope_replaced_with_exact_backup(&fixture.local_path, SCOPE_LOCAL_ORIGINAL);
 }
 
 #[derive(Clone)]
@@ -602,6 +727,7 @@ fn test_init_dry_run_no_write() {
         .arg(&wg_dir)
         .args(["init", "--route", "claude-cli", "--dry-run"])
         .env("HOME", &fake_home)
+        .env_remove("WG_GLOBAL_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -649,6 +775,7 @@ fn test_init_with_executor_only_populates_tiers() {
         .arg(&wg_dir)
         .args(["init", "-x", "claude", "--no-agency"])
         .env("HOME", &fake_home)
+        .env_remove("WG_GLOBAL_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -689,6 +816,7 @@ fn test_init_route_openrouter_prints_login_handoff() {
         .arg(&wg_dir)
         .args(["init", "--route", "openrouter", "--no-agency"])
         .env("HOME", &fake_home)
+        .env_remove("WG_GLOBAL_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -880,6 +1008,7 @@ fn test_setup_route_openrouter_from_stdin_writes_secret_ref_not_embedded_key() {
     let output = Command::new(wg_binary())
         .current_dir(&project)
         .env("HOME", &fake_home)
+        .env_remove("WG_GLOBAL_DIR")
         .args([
             "setup",
             "--route",
@@ -941,6 +1070,7 @@ is_default = true
     let output = Command::new(wg_binary())
         .current_dir(&project)
         .env("HOME", &fake_home)
+        .env_remove("WG_GLOBAL_DIR")
         .env("OPENROUTER_API_KEY", "sk-or-global-reuse")
         .args([
             "setup",
@@ -1009,6 +1139,7 @@ is_default = true
     let output = Command::new(wg_binary())
         .current_dir(&project)
         .env("HOME", &fake_home)
+        .env_remove("WG_GLOBAL_DIR")
         .env("OPENROUTER_API_KEY", "sk-or-global-reuse")
         .args(["setup", "--route", "pi", "--scope", "local", "--yes"])
         .stdin(Stdio::null())

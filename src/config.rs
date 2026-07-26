@@ -11,6 +11,22 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_GLOBAL_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_global_dir_override() -> Option<PathBuf> {
+    TEST_GLOBAL_DIR.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(not(test))]
+fn test_global_dir_override() -> Option<PathBuf> {
+    None
+}
+
 /// Bare Claude tier aliases passed to the claude CLI.
 /// The CLI resolves these to the current production model — we do not track dated IDs.
 pub const CLAUDE_HAIKU_MODEL_ID: &str = "haiku";
@@ -5164,6 +5180,25 @@ fn record_sources(
     }
 }
 
+fn select_global_config_read_path<F>(
+    canonical: PathBuf,
+    explicit_global_dir: bool,
+    legacy_path: F,
+) -> anyhow::Result<PathBuf>
+where
+    F: FnOnce() -> anyhow::Result<PathBuf>,
+{
+    if canonical.exists() || explicit_global_dir {
+        return Ok(canonical);
+    }
+    let legacy = legacy_path()?;
+    if legacy.exists() {
+        Ok(legacy)
+    } else {
+        Ok(canonical)
+    }
+}
+
 impl Config {
     /// Return the global WG directory.
     ///
@@ -5182,6 +5217,9 @@ impl Config {
     /// [`Config::global_config_read_path`], so a compatibility read can never
     /// silently turn into another write at the retired location.
     pub fn global_dir() -> anyhow::Result<PathBuf> {
+        if let Some(dir) = test_global_dir_override() {
+            return Ok(dir);
+        }
         if let Some(dir) = std::env::var_os("WG_GLOBAL_DIR") {
             let dir = PathBuf::from(dir);
             if !dir.as_os_str().is_empty() {
@@ -5195,32 +5233,48 @@ impl Config {
 
     fn global_config_read_path() -> anyhow::Result<PathBuf> {
         let canonical = Self::global_config_path()?;
-        // An explicit test/operator override is authoritative. Never escape it
-        // to a legacy file under the ambient HOME.
-        if canonical.exists() || std::env::var_os("WG_GLOBAL_DIR").is_some() {
-            return Ok(canonical);
-        }
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-        let legacy = home.join(".workgraph").join("config.toml");
-        if legacy.exists() {
+        let explicit_global_dir = test_global_dir_override().is_some()
+            || std::env::var_os("WG_GLOBAL_DIR").is_some_and(|dir| !dir.is_empty());
+        let selected =
+            select_global_config_read_path(canonical.clone(), explicit_global_dir, || {
+                let home = dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+                Ok(home.join(".workgraph").join("config.toml"))
+            })?;
+        if selected != canonical {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
                     "warning: reading legacy WorksGood global config at {}; migrate it to {} (for example, stop wg services and move the file)",
-                    legacy.display(),
+                    selected.display(),
                     canonical.display()
                 );
             }
-            return Ok(legacy);
         }
-        Ok(canonical)
+        Ok(selected)
     }
 
     /// Return the global config file path.
     pub fn global_config_path() -> anyhow::Result<PathBuf> {
         Ok(Self::global_dir()?.join("config.toml"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_global_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        struct RestoreTestGlobalDir(Option<PathBuf>);
+
+        impl Drop for RestoreTestGlobalDir {
+            fn drop(&mut self) {
+                TEST_GLOBAL_DIR.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+
+        let previous = TEST_GLOBAL_DIR.with(|slot| slot.replace(Some(dir.to_path_buf())));
+        let _restore = RestoreTestGlobalDir(previous);
+        f()
     }
 
     /// Load global configuration from ~/.wg/config.toml.
@@ -7144,12 +7198,32 @@ model = "claude:haiku"
     }
 
     #[test]
-    fn test_global_config_path() {
-        let path = Config::global_config_path().unwrap();
-        let s = path.to_string_lossy();
+    fn explicit_global_config_path_never_falls_back_to_hostile_legacy_file() {
+        let tmp = TempDir::new().unwrap();
+        let canonical = tmp.path().join("explicit").join("config.toml");
+        let legacy = tmp
+            .path()
+            .join("hostile-legacy-home")
+            .join(".workgraph")
+            .join("config.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"[agent]\nmodel = \"hostile:legacy\"\n").unwrap();
+
         assert!(
-            s.ends_with(".wg/config.toml"),
-            "expected canonical .wg/config.toml, got {s}"
+            !canonical.exists(),
+            "canonical config must be absent so fallback is exercised"
+        );
+        assert!(legacy.exists(), "hostile legacy control must exist");
+        assert_eq!(
+            select_global_config_read_path(canonical.clone(), false, || Ok(legacy.clone()))
+                .unwrap(),
+            legacy,
+            "negative control must select an existing legacy config without an explicit root"
+        );
+        assert_eq!(
+            select_global_config_read_path(canonical.clone(), true, || Ok(legacy.clone())).unwrap(),
+            canonical,
+            "an explicit global root must remain authoritative even when its config is absent"
         );
     }
 
