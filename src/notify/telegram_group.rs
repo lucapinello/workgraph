@@ -1246,6 +1246,9 @@ pub fn is_social_courtesy(text: &str) -> bool {
     if tokens.is_empty() || tokens.len() > 12 {
         return false;
     }
+    if !tokens.iter().any(|w| is_social_marker_token(w)) {
+        return false;
+    }
     // Fuzzy at 5+ chars only: a 3-letter content word must never be swallowed by a
     // one-character neighbour ("add" vs the filler "and").
     let filler_matches = |w: &str| {
@@ -1262,15 +1265,8 @@ pub fn is_social_courtesy(text: &str) -> bool {
             *t == w || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
         })
     };
-    let mut saw_marker = false;
     for w in &tokens {
-        let is_marker = GREETING_TOKENS.iter().any(|t| fuzzy_token_matches(w, t))
-            || TIME_OF_DAY_WORDS.iter().any(|t| fuzzy_token_matches(w, t))
-            || farewell_matches(w)
-            || WELLWISH_TOKENS.iter().any(|t| fuzzy_token_matches(w, t))
-            || GRATITUDE_OPENERS.iter().any(|t| fuzzy_token_matches(w, t));
-        if is_marker {
-            saw_marker = true;
+        if is_social_marker_token(w) {
             continue;
         }
         let is_collective_noun = BROAD_ADDRESS_TOKENS
@@ -1284,7 +1280,37 @@ pub fn is_social_courtesy(text: &str) -> bool {
         }
         return false;
     }
-    saw_marker
+    true
+}
+
+/// One token of social courtesy — a greeting, a time-of-day word, a sign-off, a
+/// well-wish or a thank-you. Shared by [`is_social_courtesy`] (which additionally
+/// demands the WHOLE message reduce) and [`has_social_marker`].
+///
+/// The farewell and filler sets hold short everyday words ("see", "care", "bed"), so
+/// they match on a SYMMETRIC 5+-char fuzz rather than the module's usual 4+: "are" is
+/// one edit from "care", which would otherwise make "are you all good" a sign-off.
+fn is_social_marker_token(w: &str) -> bool {
+    GREETING_TOKENS.iter().any(|t| fuzzy_token_matches(w, t))
+        || TIME_OF_DAY_WORDS.iter().any(|t| fuzzy_token_matches(w, t))
+        || FAREWELL_TOKENS.iter().any(|t| {
+            *t == w || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
+        })
+        || WELLWISH_TOKENS.iter().any(|t| fuzzy_token_matches(w, t))
+        || GRATITUDE_OPENERS.iter().any(|t| fuzzy_token_matches(w, t))
+}
+
+/// True if `text` CARRIES social courtesy anywhere — a hello, a sign-off, a
+/// well-wish, a thank-you — regardless of what else it carries.
+///
+/// Weaker than [`is_social_courtesy`] on purpose: that predicate asks "is this line
+/// ONLY courtesy?", this one asks "is this line WEARING courtesy?". Rule d uses it to
+/// decide whether a collective trigger is a genuine address-all or just a family-wide
+/// pleasantry attached to a real ask — "good night everyone, and add milk to the list"
+/// is a shopping ask for ONE owner, not a five-way broadcast (task
+/// social-closers-single-voice).
+pub fn has_social_marker(text: &str) -> bool {
+    word_list(text).iter().any(|w| is_social_marker_token(w))
 }
 
 /// True if `text` collectively addresses the family (see [`COLLECTIVE_TRIGGERS`]).
@@ -1955,6 +1981,39 @@ pub fn elect_responders_with_owner_map(
             // broadcast ask leaves content words behind and still fans out below.
             if let Some(single) = social_single_voice(text, &reply_chat, config, owner_map) {
                 return single;
+            }
+            // A COLLECTIVE ADDRESS WEARING COURTESY IS NEVER A FAN-OUT. The pure case
+            // is handled above; this is the same line with an ask attached. "good
+            // night everyone, and add milk to the list" is a SHOPPING ASK wearing a
+            // sign-off — `everyone` made it an explicit broadcast, so FIVE helpers
+            // answered one shopping line, the C004 duplicate class with content on
+            // it. One voice answers: the content's DOMAIN owner when there is one,
+            // otherwise the point of contact (a concierge-owned domain like shopping
+            // resolves to `None` from [`domain_voice`] by design, and must land on the
+            // concierge rather than fall through to a broadcast).
+            //
+            // `Election::All` survives here only for a collective address with NO
+            // courtesy in it at all — "team, quick update", "everyone: the car is
+            // booked" — plus the genuine broadcast ASKS that rules d-plural and
+            // d-discussion already claimed above this.
+            if has_social_marker(text) {
+                if let Some((bot, domain)) = domain_voice(text, config, owner_map) {
+                    return Election::One {
+                        bot,
+                        reply_chat,
+                        body: text.to_string(),
+                        addressed_by: AddressedBy::Domain(domain),
+                    };
+                }
+                return match concierge_bot(config, owner_map) {
+                    Some(bot) => Election::One {
+                        bot,
+                        reply_chat,
+                        body: text.to_string(),
+                        addressed_by: AddressedBy::Concierge,
+                    },
+                    None => Election::Silence(SilenceReason::NoVoicesConfigured),
+                };
             }
             return Election::All {
                 reply_chat,
@@ -3692,14 +3751,15 @@ domains = ["coordination", "calendar"]
     fn elect_name_about_a_human_does_not_summon() {
         // "nora from work said hi" talks ABOUT a person named Nora — the bot
         // must not be summoned. Documented cheap-heuristic case.
-        assert_eq!(
-            elect("nora from work said hi to everyone", &[], None),
-            // NB: "everyone" makes this collective — but the point being tested
-            // is that the leading "nora" did NOT route to the Nora bot.
-            Election::All {
-                reply_chat: "-100999".to_string(),
-                body: "nora from work said hi to everyone".to_string(),
-            }
+        // NB: "everyone" makes this collectively ADDRESSED — but the point being
+        // tested is that the leading "nora" did NOT route to the Nora bot. Since task
+        // social-closers-single-voice, a collective address carrying courtesy ("hi")
+        // is one point-of-contact voice rather than a roster fan-out; the leading
+        // name still loses either way, which is what this test is for.
+        assert_one(
+            &elect("nora from work said hi to everyone", &[], None),
+            "otto",
+            AddressedBy::Concierge,
         );
         // Without the collective word it is plain small talk → silence, and
         // still does not summon Nora.
@@ -4053,6 +4113,29 @@ domains = ["coordination", "calendar"]
         // A REAL broadcast ask still fans out — All is kept for exactly this.
         assert!(matches!(
             elect("can you guys discuss this and find consensus", &[], None),
+            Election::All { .. }
+        ));
+        // …and a sign-off carrying an ask reaches its DOMAIN OWNER as ONE voice.
+        // This was the second fan-out the deployed-binary probe caught: `everyone`
+        // made "good night everyone and add milk to the list" an explicit broadcast,
+        // so FIVE helpers answered one shopping line — the C004 duplicate class with
+        // content attached. Courtesy never outranks domain content.
+        // Shopping is a CONCIERGE-owned domain in this fixture, so `domain_voice`
+        // returns None by design — the courtesy-wearing ask must land on the point of
+        // contact, NOT fall through to a broadcast.
+        assert_one(
+            &elect("good night everyone and add milk to the shopping list", &[], None),
+            "otto",
+            AddressedBy::Concierge,
+        );
+        assert_one(
+            &elect_solo("night guys, can you move my workout to friday", &[], None),
+            "mira",
+            AddressedBy::Domain(crate::notify::ownership::Domain::Workouts),
+        );
+        // A broadcast with NO courtesy marker is still a genuine address-all.
+        assert!(matches!(
+            elect("team, quick update", &[], None),
             Election::All { .. }
         ));
     }
