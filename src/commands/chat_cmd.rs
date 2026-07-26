@@ -1280,15 +1280,16 @@ mod tests {
     fn send_to_dormant_chat_appends_inbox() {
         let td = mk_workgraph_dir();
         let dir = td.path();
-        run_create_direct(dir, Some("bot"), None, None, None, None, true).unwrap();
-
-        // Find the chat id we just created
-        let g = worksgood::parser::load_graph(&graph_path(dir)).unwrap();
-        let chat = g
-            .tasks()
-            .find(|t| t.tags.iter().any(|x| chat_id::is_chat_loop_tag(x)))
-            .expect("chat task exists");
-        let cid = chat_id::parse_chat_task_id(&chat.id).unwrap();
+        let cid = 0;
+        let mut graph = worksgood::graph::WorkGraph::new();
+        graph.add_node(worksgood::graph::Node::Task(worksgood::graph::Task {
+            id: chat_id::format_chat_task_id(cid),
+            title: "Chat session".to_string(),
+            status: worksgood::graph::Status::InProgress,
+            tags: vec![chat_id::CHAT_LOOP_TAG.to_string()],
+            ..Default::default()
+        }));
+        worksgood::parser::save_graph(&graph, &graph_path(dir)).unwrap();
 
         // Send
         run_send(dir, &cid.to_string(), "hi from test", true).unwrap();

@@ -28362,9 +28362,13 @@ mod tui_chat_tests {
         let mut app = build_test_app(&viz, &wg_dir);
 
         // The PTY-owner fast path appends synchronously, so this exercises the
-        // production TUI send seam without starting a daemon or command.
+        // production TUI send seam without starting a daemon or command. Keep
+        // an older-page projection active so send deliberately skips the
+        // history-config seam and remains independent of machine-global state.
         app.chat_pty_mode = true;
         app.chat_pty_observer = false;
+        app.chat.total_history_count = 2;
+        app.chat.has_more_history = true;
         app.send_chat_message("opaque request".to_string());
 
         let request_id = app
