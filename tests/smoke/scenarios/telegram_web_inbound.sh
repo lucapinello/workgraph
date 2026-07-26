@@ -190,9 +190,13 @@ for voice in "${ROSTER[@]}"; do
 done
 
 # --- The other side of that boundary: pure courtesy never fans out ----------
+# `category` carries the whole claim. The `who` check below is a sanity check
+# only: `web()` declares $COORD_ID as the default contact and $COORD_ID is also
+# the coordination-marked helper, so it cannot tell those two chains apart — the
+# listener-seam derivation is pinned separately (task engine-honour-household).
 out="$(web "$HUMAN_NAME" "hey all, are you around?")"
 expect_grep "a purely social collective line stays one voice" "$out" '"category": "single-voice"'
-expect_grep "…the configured coordination voice, not the roster" "$out" "\"who\": \"$COORD_ID\""
+expect_grep "…and that voice is the household default contact" "$out" "\"who\": \"$COORD_ID\""
 
 # --- Discussion ask → a multi-voice round -----------------------------------
 out="$(web "$HUMAN_NAME" "can you guys discuss dinner and find consensus?")"
