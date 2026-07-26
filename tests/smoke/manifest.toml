@@ -2639,3 +2639,12 @@ owners = [
 ]
 description = "Credential-free scratch-project proof that a configured opaque household alias resolves one bound full \"agent_id\", remains stable when mutable \"name\" metadata changes, and exposes the binding through session-list JSON. The real candidate binary plans two ordinary conversation turns and writes both to the same persistent session without contacting Telegram or an LLM."
 timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_shopping_language"
+script = "scenarios/telegram_shopping_language.sh"
+owners = [
+    "shopping-engine-half",
+]
+description = "Pins the engine half of the live-cert P1 shopping mutation-language contract (C056–C064) through the deployed binary's credential-free `wg --json telegram shopping` seam over an opaque scratch plan. A nonsense item and a held ask are ANSWERED with a question and leave the plan byte-identical; the conversational removal and cancel phrasings really take the row off the file the family reads, while crossing an item off (= bought) never deletes anything; one sentence yields exactly one item; an unscoped action sentence (\"put the chicken in the oven\") is left to the composer instead of writing a junk row; a removal matching no row answers honestly instead of claiming success; and the meal ops keep the shared add/remove verbs. A binary without the seam FAILS rather than skipping, because a stale install is the exact state this pins. No token, network, bot, or live plan is used."
+timeout_seconds = 30
