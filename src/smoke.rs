@@ -18,9 +18,11 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 /// Default smoke fixture root. Bash-side `wg_smoke_root` in `_helpers.sh`
 /// and the Rust-side sweeper agree on this path so a leak left by either
@@ -35,6 +37,19 @@ pub const SKIP_EXIT_CODE: i32 = 77;
 
 /// Default per-scenario timeout when not specified in the manifest.
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
+
+/// Keep the hard-timeout poll responsive without busy-spinning.
+const SCENARIO_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// A scenario's direct process has exited and its process group has been
+/// killed before this grace period begins. If stderr still has no EOF after
+/// the grace period, a detached descendant escaped the group while retaining
+/// the descriptor. Report that explicitly instead of hanging `wg done`.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// Match the conventional `timeout(1)` exit code while enforcing the deadline
+/// locally on every platform.
+const TIMEOUT_EXIT_CODE: i32 = 124;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Manifest {
@@ -183,25 +198,21 @@ pub fn run_scenario(scenario: &Scenario, manifest_dir: &Path) -> ScenarioResult 
 
     let timeout = Duration::from_secs(scenario.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
-    // Use `timeout` if available so a hung scenario can't deadlock `wg done`.
-    let mut cmd = if which_timeout() {
-        let mut c = Command::new("timeout");
-        c.arg("--preserve-status")
-            .arg(format!("{}", timeout.as_secs()))
-            .arg("bash")
-            .arg(&script_path);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg(&script_path);
-        c
-    };
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script_path)
+        .env("WG_SMOKE_SCENARIO", &scenario.name)
+        .env("WG_SMOKE_TIMEOUT_SECS", timeout.as_secs().to_string())
+        // `Command::output` used pipes for both streams and then waited for
+        // EOF after the direct scenario process exited. A leaked background
+        // fixture could retain either write end forever. Scenario stdout is
+        // not consumed by the gate, so send it directly to the null device.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    configure_scenario_process_group(&mut cmd);
 
-    cmd.env("WG_SMOKE_SCENARIO", &scenario.name);
-    cmd.env("WG_SMOKE_TIMEOUT_SECS", timeout.as_secs().to_string());
-
-    let output = match cmd.output() {
-        Ok(o) => o,
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             return ScenarioResult {
                 name: scenario.name.clone(),
@@ -212,13 +223,116 @@ pub fn run_scenario(scenario: &Scenario, manifest_dir: &Path) -> ScenarioResult 
         }
     };
 
-    match output.status.code() {
+    let scenario_pid = child.id();
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_scenario_group(scenario_pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return ScenarioResult {
+                name: scenario.name.clone(),
+                outcome: ScenarioOutcome::Error {
+                    message: "failed to capture scenario stderr".to_string(),
+                },
+            };
+        }
+    };
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut bytes = Vec::new();
+        let result = stderr.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = stderr_tx.send(result);
+    });
+
+    let (status, timed_out) = match wait_for_scenario(&mut child, timeout) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            terminate_scenario_group(scenario_pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return ScenarioResult {
+                name: scenario.name.clone(),
+                outcome: ScenarioOutcome::Error {
+                    message: format!("failed while waiting for script: {}", e),
+                },
+            };
+        }
+    };
+
+    // A successful shell exit does not imply all fixtures are gone: a
+    // background grandchild can outlive bash and keep inherited descriptors
+    // open. Kill the scenario-owned group on every exit path before waiting
+    // for the stderr reader.
+    terminate_scenario_group(scenario_pid);
+
+    let stderr = match stderr_rx.recv_timeout(STDERR_DRAIN_GRACE) {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) if timed_out => {
+            return timed_out_result(
+                scenario,
+                timeout,
+                format!("failed to drain scenario stderr: {}", e),
+            );
+        }
+        Ok(Err(e)) => {
+            return ScenarioResult {
+                name: scenario.name.clone(),
+                outcome: ScenarioOutcome::Error {
+                    message: format!("failed to drain scenario stderr: {}", e),
+                },
+            };
+        }
+        Err(RecvTimeoutError::Timeout) if timed_out => {
+            return timed_out_result(
+                scenario,
+                timeout,
+                format!(
+                    "a detached descendant retained stderr for more than {:?}",
+                    STDERR_DRAIN_GRACE
+                ),
+            );
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            return ScenarioResult {
+                name: scenario.name.clone(),
+                outcome: ScenarioOutcome::Error {
+                    message: format!(
+                        "scenario exited but a detached descendant retained stderr for more than {:?}",
+                        STDERR_DRAIN_GRACE
+                    ),
+                },
+            };
+        }
+        Err(RecvTimeoutError::Disconnected) if timed_out => {
+            return timed_out_result(
+                scenario,
+                timeout,
+                "scenario stderr reader disconnected".to_string(),
+            );
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            return ScenarioResult {
+                name: scenario.name.clone(),
+                outcome: ScenarioOutcome::Error {
+                    message: "scenario stderr reader disconnected".to_string(),
+                },
+            };
+        }
+    };
+
+    if timed_out {
+        return timed_out_result(scenario, timeout, stderr_tail(&stderr, 12));
+    }
+
+    match status.code() {
         Some(0) => ScenarioResult {
             name: scenario.name.clone(),
             outcome: ScenarioOutcome::Pass,
         },
         Some(code) if code == SKIP_EXIT_CODE => {
-            let reason = stderr_tail(&output.stderr, 4);
+            let reason = stderr_tail(&stderr, 4);
             ScenarioResult {
                 name: scenario.name.clone(),
                 outcome: ScenarioOutcome::Skip {
@@ -234,26 +348,100 @@ pub fn run_scenario(scenario: &Scenario, manifest_dir: &Path) -> ScenarioResult 
             name: scenario.name.clone(),
             outcome: ScenarioOutcome::Fail {
                 exit_code: code,
-                stderr_tail: stderr_tail(&output.stderr, 12),
+                stderr_tail: stderr_tail(&stderr, 12),
             },
         },
         None => ScenarioResult {
             name: scenario.name.clone(),
             outcome: ScenarioOutcome::Fail {
                 exit_code: -1,
-                stderr_tail: stderr_tail(&output.stderr, 12),
+                stderr_tail: stderr_tail(&stderr, 12),
             },
         },
     }
 }
 
-fn which_timeout() -> bool {
-    Command::new("timeout")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Wait for the direct scenario process without ever delegating the deadline
+/// to an external wrapper. `timeout(1)` exits as soon as bash exits, so it
+/// cannot enforce a deadline while an orphan retains one of bash's pipes.
+fn wait_for_scenario(child: &mut Child, timeout: Duration) -> std::io::Result<(ExitStatus, bool)> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status, false)),
+            Ok(None) if started.elapsed() >= timeout => {
+                terminate_scenario_group(child.id());
+                // The group signal is the tree cleanup; this direct kill is a
+                // fallback for platforms without Unix process groups.
+                let _ = child.kill();
+                return child.wait().map(|status| (status, true));
+            }
+            Ok(None) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                std::thread::sleep(SCENARIO_POLL_INTERVAL.min(remaining));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
+
+fn timed_out_result(scenario: &Scenario, timeout: Duration, detail: String) -> ScenarioResult {
+    let timeout_message = format!("timed out after {}s", timeout.as_secs());
+    let stderr_tail = if detail.is_empty() {
+        timeout_message
+    } else {
+        format!("{}\n{}", detail, timeout_message)
+    };
+    ScenarioResult {
+        name: scenario.name.clone(),
+        outcome: ScenarioOutcome::Fail {
+            exit_code: TIMEOUT_EXIT_CODE,
+            stderr_tail,
+        },
+    }
+}
+
+/// Give each scenario an isolated process group. Bash pipelines and background
+/// jobs inherit this group unless they explicitly daemonize into another
+/// session, allowing one group signal to clean up the normal fixture tree.
+#[cfg(unix)]
+fn configure_scenario_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_scenario_process_group(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NEW_PROCESS_GROUP. `taskkill /T` below provides best-effort tree
+    // cleanup; the bounded stderr drain remains the hard no-hang backstop.
+    cmd.creation_flags(0x0000_0200);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_scenario_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_scenario_group(pid: u32) {
+    // SAFETY: `kill(2)` validates both the process-group id and signal. Errors
+    // are intentionally ignored because the group commonly vanished already.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_scenario_group(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_scenario_group(_pid: u32) {}
 
 fn stderr_tail(bytes: &[u8], n: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
@@ -548,6 +736,99 @@ mod tests {
         };
         let r = run_scenario(&scenario, td.path());
         assert_eq!(r.outcome, ScenarioOutcome::Pass);
+    }
+
+    /// `Command::output()` used to wait for pipe EOF after bash exited. A
+    /// background fixture inherited stderr, so the scenario reported exit 0
+    /// immediately but `wg done` remained blocked until that fixture stopped.
+    /// The runner must both return promptly and clean up the owned process
+    /// group; checking the PID prevents a superficial "just ignore stdout"
+    /// fix from leaving the descendant alive.
+    #[cfg(unix)]
+    #[test]
+    fn background_descendant_cannot_hold_runner_or_survive() {
+        let td = TempDir::new().unwrap();
+        let script = write_script(
+            td.path(),
+            "background.sh",
+            r#"#!/usr/bin/env bash
+sleep 3 &
+printf '%s\n' "$!" > "$0.pid"
+exit 0
+"#,
+        );
+        let pid_path = PathBuf::from(format!("{}.pid", script.display()));
+        let scenario = Scenario {
+            name: "background".to_string(),
+            script: "background.sh".to_string(),
+            owners: vec!["task-a".to_string()],
+            description: String::new(),
+            timeout_seconds: Some(1),
+        };
+
+        let started = Instant::now();
+        let result = run_scenario(&scenario, td.path());
+        let elapsed = started.elapsed();
+        let pid: libc::pid_t = fs::read_to_string(&pid_path)
+            .expect("scenario should record its background child")
+            .trim()
+            .parse()
+            .expect("background child pid should be numeric");
+
+        // Allow the OS a short window to reap a just-killed orphan before
+        // probing it. Clean up explicitly before asserting if the runner
+        // regresses, so a failed unit test never leaks its own fixture.
+        let mut survived = false;
+        for _ in 0..50 {
+            survived = unsafe { libc::kill(pid, 0) == 0 };
+            if !survived {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if survived {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+
+        assert_eq!(result.outcome, ScenarioOutcome::Pass);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "runner waited {elapsed:?} for a descendant-owned pipe"
+        );
+        assert!(!survived, "background descendant {pid} survived the gate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_timeout_is_reported_as_exit_124() {
+        let td = TempDir::new().unwrap();
+        write_script(td.path(), "timeout.sh", "#!/usr/bin/env bash\nsleep 5\n");
+        let scenario = Scenario {
+            name: "timeout".to_string(),
+            script: "timeout.sh".to_string(),
+            owners: vec!["task-a".to_string()],
+            description: String::new(),
+            timeout_seconds: Some(1),
+        };
+
+        let started = Instant::now();
+        let result = run_scenario(&scenario, td.path());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "local hard timeout did not fire promptly"
+        );
+        match result.outcome {
+            ScenarioOutcome::Fail {
+                exit_code,
+                stderr_tail,
+            } => {
+                assert_eq!(exit_code, TIMEOUT_EXIT_CODE);
+                assert!(stderr_tail.contains("timed out after 1s"));
+            }
+            other => panic!("expected explicit timeout failure, got {other:?}"),
+        }
     }
 
     #[test]

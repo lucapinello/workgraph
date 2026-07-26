@@ -181,6 +181,7 @@ run_turn() {
         WG_TURN_ID="$occurrence" \
         WG_TELEGRAM_API_BASE="$api_base" \
             "$wg_bin" --json telegram web-inbound \
+                --default-owner "$helper_id" \
                 --sender "$human_handle" \
                 --message "$message"
     )

@@ -4034,15 +4034,17 @@ fn main() -> Result<()> {
                 sender,
                 message,
                 chat_id,
+                default_owner,
+                no_default_owner,
                 owner,
                 dry_run,
             } => {
-                // The pin arrives as the `--owner` flag OR, from the gateway's
-                // shell-out, the `WG_OWNER_PIN` env var (task owner-pin-engine).
-                // The env var is the forward-compatible transport (an older
-                // binary ignores it rather than erroring on an unknown flag);
-                // an explicit flag wins for the CLI/dry-run proof.
-                let owner_pin = owner.filter(|s| !s.trim().is_empty()).or_else(|| {
+                // The gateway sends the pin as the explicit `--owner` flag so
+                // older engines reject the new default-contact CLI contract
+                // instead of silently misrouting it. `WG_OWNER_PIN` remains the
+                // transition/manual compatibility transport; the explicit flag
+                // wins when both are present (task owner-pin-engine).
+                let owner_pin = owner.or_else(|| {
                     std::env::var("WG_OWNER_PIN")
                         .ok()
                         .filter(|s| !s.trim().is_empty())
@@ -4053,11 +4055,19 @@ fn main() -> Result<()> {
                 let turn_id = std::env::var("WG_TURN_ID")
                     .ok()
                     .filter(|s| !s.trim().is_empty());
+                // Clap requires exactly one side of this choice. Keep the
+                // command-layer API unrepresentable in an ambiguous state.
+                let default_owner = match (default_owner.as_deref(), no_default_owner) {
+                    (Some(owner), false) => commands::telegram::WebDefaultOwner::Designated(owner),
+                    (None, true) => commands::telegram::WebDefaultOwner::NoneDesignated,
+                    _ => unreachable!("clap enforces the web-inbound default-owner choice"),
+                };
                 commands::telegram::run_web_inbound(
                     &workgraph_dir,
                     &sender,
                     &message,
                     chat_id.as_deref(),
+                    default_owner,
                     owner_pin.as_deref(),
                     turn_id.as_deref(),
                     dry_run,
