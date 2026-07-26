@@ -2600,13 +2600,19 @@ fn sentence_names_dish(sentence: &str, dish: &str) -> bool {
 /// not resolve is skipped (we cannot know which day it meant).
 fn claimed_days_in(sentence: &str, wc: &WeekContext) -> Vec<String> {
     let mut days: Vec<String> = Vec::new();
-    for tok in sentence.split(' ') {
-        let resolved = match tok {
-            "today" | "tonight" => wc.today.clone(),
-            "tomorrow" => wc.tomorrow.clone(),
+    for raw in sentence.split(' ') {
+        // Normalisation drops apostrophes, so the family's own phrasing arrives
+        // possessive-glued: "Saturday's dinner" → "saturdays", "tomorrow's" →
+        // "tomorrows". Try the bare token, then the de-pluralised form.
+        let stripped = raw.strip_suffix('s').unwrap_or(raw);
+        let resolved = match (raw, stripped) {
+            ("today" | "tonight", _) | (_, "today" | "tonight") => wc.today.clone(),
+            ("tomorrow", _) | (_, "tomorrow") => wc.tomorrow.clone(),
             // Canonicalise to the FULL lowercase name so an abbreviation ("Sat")
             // compares equal to the table's key ("saturday").
-            _ => weekday_token(tok).map(|wd| weekday_full_name(wd).to_string()),
+            _ => weekday_token(raw)
+                .or_else(|| weekday_token(stripped))
+                .map(|wd| weekday_full_name(wd).to_string()),
         };
         if let Some(day) = resolved {
             if !days.contains(&day) {
