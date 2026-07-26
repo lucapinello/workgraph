@@ -11,6 +11,22 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_GLOBAL_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_global_dir_override() -> Option<PathBuf> {
+    TEST_GLOBAL_DIR.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(not(test))]
+fn test_global_dir_override() -> Option<PathBuf> {
+    None
+}
+
 /// Bare Claude tier aliases passed to the claude CLI.
 /// The CLI resolves these to the current production model — we do not track dated IDs.
 pub const CLAUDE_HAIKU_MODEL_ID: &str = "haiku";
@@ -5201,6 +5217,9 @@ impl Config {
     /// [`Config::global_config_read_path`], so a compatibility read can never
     /// silently turn into another write at the retired location.
     pub fn global_dir() -> anyhow::Result<PathBuf> {
+        if let Some(dir) = test_global_dir_override() {
+            return Ok(dir);
+        }
         if let Some(dir) = std::env::var_os("WG_GLOBAL_DIR") {
             let dir = PathBuf::from(dir);
             if !dir.as_os_str().is_empty() {
@@ -5214,8 +5233,8 @@ impl Config {
 
     fn global_config_read_path() -> anyhow::Result<PathBuf> {
         let canonical = Self::global_config_path()?;
-        let explicit_global_dir =
-            std::env::var_os("WG_GLOBAL_DIR").is_some_and(|dir| !dir.is_empty());
+        let explicit_global_dir = test_global_dir_override().is_some()
+            || std::env::var_os("WG_GLOBAL_DIR").is_some_and(|dir| !dir.is_empty());
         let selected =
             select_global_config_read_path(canonical.clone(), explicit_global_dir, || {
                 let home = dirs::home_dir()
@@ -5239,6 +5258,23 @@ impl Config {
     /// Return the global config file path.
     pub fn global_config_path() -> anyhow::Result<PathBuf> {
         Ok(Self::global_dir()?.join("config.toml"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_global_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        struct RestoreTestGlobalDir(Option<PathBuf>);
+
+        impl Drop for RestoreTestGlobalDir {
+            fn drop(&mut self) {
+                TEST_GLOBAL_DIR.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+
+        let previous = TEST_GLOBAL_DIR.with(|slot| slot.replace(Some(dir.to_path_buf())));
+        let _restore = RestoreTestGlobalDir(previous);
+        f()
     }
 
     /// Load global configuration from ~/.wg/config.toml.

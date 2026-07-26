@@ -998,10 +998,8 @@ pub struct RoleModelOverrideOutcome {
 /// Apply a per-role model override (`models.<role>.model`) to a named profile.
 ///
 /// This is the durable, testable core of `wg profile set-model <profile> <role>
-/// <model>`. It lives in the lib (not the bin) so its HOME-mutating tests run
-/// in the lib's single test process alongside the other `with_home` tests,
-/// avoiding the cross-binary `HOME` race that two parallel test binaries
-/// (lib unit tests + bin unit tests) would otherwise hit.
+/// <model>`. It lives in the lib (not the bin) so its profile fixtures can use
+/// the library's thread-local, disposable global-root seam.
 ///
 /// Validates the role parses as a [`crate::config::DispatchRole`] and the model
 /// spec is handler-first ([`crate::config::parse_model_spec_strict`]), then —
@@ -1094,21 +1092,11 @@ pub fn set_role_model_override(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    // Serialize HOME-mutating tests to avoid cross-test interference.
-    static HOME_MUTEX: Mutex<()> = Mutex::new(());
-
-    fn with_home<F: FnOnce()>(f: F) -> TempDir {
-        let _guard = HOME_MUTEX.lock().unwrap();
+    fn with_global_dir<F: FnOnce()>(f: F) -> TempDir {
         let tmp = TempDir::new().unwrap();
-        // Ensure the .wg dir exists so Config::global_dir() is stable.
-        let wg_dir = tmp.path().join(".wg");
-        std::fs::create_dir_all(&wg_dir).unwrap();
-        // SAFETY: HOME_MUTEX serializes all callers; single-threaded at this point.
-        unsafe { std::env::set_var("HOME", tmp.path()) };
-        f();
+        Config::with_test_global_dir(tmp.path(), f);
         tmp
     }
 
@@ -1439,8 +1427,8 @@ is_default = true
 
     #[test]
     fn test_apply_profile_overlays_routing_keys_canonically() {
-        let _tmp = with_home(|| {
-            // Install the codex starter into the temp HOME's profiles dir.
+        let _tmp = with_global_dir(|| {
+            // Install the codex starter into the disposable profiles dir.
             save_raw("codex", STARTER_CODEX).unwrap();
             let dst = apply_profile_as_global_config("codex").unwrap();
             assert!(dst.exists(), "global config must exist after apply");
@@ -1490,7 +1478,7 @@ is_default = true
         // The bug: `wg profile use pi` overwrote `~/.wg/config.toml` byte-for-byte,
         // dropping a configured OpenRouter endpoint. With profile-as-overlay the
         // endpoint must survive a `pi` swap (the pi starter has no `llm_endpoints`).
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             save_raw("pi", STARTER_PI).unwrap();
             // Pre-seed the global config with an OpenRouter endpoint + the
             // deprecated keys `wg login openrouter --global`'s `save_global`
@@ -1575,7 +1563,7 @@ is_default = true
 
     #[test]
     fn test_apply_profile_backs_up_existing_global_config() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             save_raw("codex", STARTER_CODEX).unwrap();
             let dst = Config::global_config_path().unwrap();
             std::fs::write(
@@ -1604,7 +1592,7 @@ is_default = true
         // The original bug: activating codex profile left agent.model at
         // claude:opus. With profile-as-swap, the new config.toml must reflect
         // codex everywhere — verified by re-loading Config from disk.
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             save_raw("codex", STARTER_CODEX).unwrap();
             // Pre-seed global config with claude (simulates a user previously
             // on the claude profile).
@@ -1624,7 +1612,7 @@ is_default = true
 
     #[test]
     fn test_clear_local_profile_routing_overrides_preserves_unrelated_settings() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             save_raw("codex", STARTER_CODEX).unwrap();
             apply_profile_as_global_config("codex").unwrap();
 
@@ -1743,7 +1731,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_set_and_read_active() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             set_active(Some("codex")).unwrap();
             let name = active().unwrap();
             assert_eq!(name.as_deref(), Some("codex"));
@@ -1756,7 +1744,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_save_and_load_profile() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let content = "description = \"test profile\"\n\n[agent]\nmodel = \"claude:opus\"\n";
             save_raw("testprof", content).unwrap();
             let loaded = load("testprof").unwrap();
@@ -1767,7 +1755,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_list_installed() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             save_raw("alpha", "[agent]\nmodel = \"claude:opus\"\n").unwrap();
             save_raw("beta", "[agent]\nmodel = \"claude:sonnet\"\n").unwrap();
             let names = list_installed().unwrap();
@@ -1820,7 +1808,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_load_legacy_wgnext_profile_still_works() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             // Simulate a user who ran `wg profile init-starters` on an older
             // build that wrote `wgnext.toml` and never re-ran init-starters.
             save_raw(
@@ -1836,26 +1824,51 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_load_wgnext_falls_back_to_nex_when_legacy_file_absent() {
-        let _tmp = with_home(|| {
-            save_raw(
-                "nex",
-                "description = \"canonical-nex\"\n[agent]\nmodel = \"nex:qwen3-coder-30b\"\n",
-            )
-            .unwrap();
-            assert!(!profile_path(LEGACY_NEX_NAME).unwrap().exists());
+        const PRIOR_BYTES: &[u8] =
+            b"description = \"hostile prior fixture\"\n[agent]\nmodel = \"nex:wrong\"\n";
+        let prior_root = TempDir::new().unwrap();
+        let fresh_root = TempDir::new().unwrap();
 
-            let loaded = load(LEGACY_NEX_NAME).unwrap();
+        Config::with_test_global_dir(prior_root.path(), || {
+            assert_eq!(Config::global_dir().unwrap(), prior_root.path());
+            let prior_legacy = profile_path(LEGACY_NEX_NAME).unwrap();
+            std::fs::create_dir_all(prior_legacy.parent().unwrap()).unwrap();
+            std::fs::write(&prior_legacy, PRIOR_BYTES).unwrap();
+            assert_eq!(std::fs::read(&prior_legacy).unwrap(), PRIOR_BYTES);
+
+            Config::with_test_global_dir(fresh_root.path(), || {
+                assert_eq!(Config::global_dir().unwrap(), fresh_root.path());
+                save_raw(
+                    "nex",
+                    "description = \"canonical-nex\"\n[agent]\nmodel = \"nex:qwen3-coder-30b\"\n",
+                )
+                .unwrap();
+                assert!(!profile_path(LEGACY_NEX_NAME).unwrap().exists());
+
+                let loaded = load(LEGACY_NEX_NAME).unwrap();
+                assert_eq!(
+                    loaded.description.as_deref(),
+                    Some("canonical-nex"),
+                    "load(\"wgnext\") must fall back to nex.toml when wgnext.toml is absent"
+                );
+            });
+
             assert_eq!(
-                loaded.description.as_deref(),
-                Some("canonical-nex"),
-                "load(\"wgnext\") must fall back to nex.toml when wgnext.toml is absent"
+                Config::global_dir().unwrap(),
+                prior_root.path(),
+                "nested fixture must restore the exact prior global root"
+            );
+            assert_eq!(
+                std::fs::read(&prior_legacy).unwrap(),
+                PRIOR_BYTES,
+                "nested fixture must restore access to the prior bytes unchanged"
             );
         });
     }
 
     #[test]
     fn test_migrate_stale_description_rewrites_wg_next_to_wg_nex() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let stale = "description = \"wg-next: in-process nex handler at a localhost endpoint (edit URL per machine)\"\n\n[agent]\nmodel = \"nex:qwen3-coder-30b\"\n\n# user comment that must be preserved\n";
             let path = profile_path("nex").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1889,7 +1902,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_migrate_stale_description_leaves_clean_files_alone() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let clean = STARTER_NEX;
             let path = profile_path("nex").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1910,7 +1923,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_migrate_stale_description_only_touches_description_line() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let mixed = "description = \"my custom\"\n\n[agent]\nmodel = \"nex:custom-wg-next-model\"\n# wg-next: legacy reference in a comment\n";
             let path = profile_path("nex").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1982,7 +1995,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_patch_pi_tiers_seeds_from_template_and_writes_both_tiers() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             // pi.toml absent → seeds from the baked-in starter, then patches.
             let path = patch_pi_tiers(
                 "pi",
@@ -2017,7 +2030,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_patch_pi_tiers_partial_leaves_other_tier_intact() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             // Seed by setting both, then patch only weak; strong must persist.
             patch_pi_tiers("pi", Some("strong:v1"), Some("weak:v1")).unwrap();
             let path = patch_pi_tiers("pi", None, Some("weak:v2")).unwrap();
@@ -2030,7 +2043,7 @@ assigner_agent = "local-agent"
 
     #[test]
     fn test_patch_custom_two_tier_profile_preserves_handler_routes_and_reasoning() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let path = profile_path("pi-codex-56").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(
@@ -2096,7 +2109,7 @@ reasoning = "high"
 
     #[test]
     fn test_patch_custom_two_tier_reasoning_does_not_alter_models() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let path = profile_path("pi-codex-56").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(
@@ -2142,7 +2155,7 @@ reasoning = "high"
         // The motivating case for `wg profile set-model`: keep default on GLM
         // while routing task_agent through a different pi: model. The pi:
         // handler-first spec is written verbatim (no strong-tier normalization).
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             // pi.toml absent → seeds from the baked-in starter.
             let path = patch_role_model(
                 "pi",
@@ -2178,7 +2191,7 @@ reasoning = "high"
     fn test_patch_role_model_writes_native_openrouter_route_verbatim() {
         // A weak-tier agency role override keeps its native openrouter: route
         // (no pi: normalization) — the loud keyless-native fallback stays armed.
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let path = patch_role_model(
                 "pi",
                 "models.evaluator.model",
@@ -2200,7 +2213,7 @@ reasoning = "high"
     fn test_patch_role_model_creates_missing_role_table() {
         // Setting a role whose [models.<role>] section is absent appends a new
         // table at EOF rather than corrupting an existing one.
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             // claude starter has no [models.triage]; patching it must add one.
             let path = patch_role_model("claude", "models.triage.model", "claude:haiku").unwrap();
             let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -2222,7 +2235,7 @@ reasoning = "high"
     fn test_set_role_model_override_writes_pi_task_agent_verbatim() {
         // The motivating case: default stays on GLM, task_agent moves to a
         // different pi: model — written to ~/.wg/profiles/pi.toml verbatim.
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let out = set_role_model_override(
                 "pi",
                 "task_agent",
@@ -2257,7 +2270,7 @@ reasoning = "high"
 
     #[test]
     fn test_set_role_model_override_dry_run_writes_nothing() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let out = set_role_model_override(
                 "pi",
                 "task_agent",
@@ -2277,7 +2290,7 @@ reasoning = "high"
 
     #[test]
     fn test_set_role_model_override_rejects_invalid_role() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let err =
                 set_role_model_override("pi", "not_a_role", "claude:opus", false).unwrap_err();
             assert!(err.to_string().contains("Unknown role"));
@@ -2288,7 +2301,7 @@ reasoning = "high"
     fn test_set_role_model_override_rejects_bare_model_name() {
         // A bare model name (no handler prefix) is rejected by the strict
         // parser — handler-first form is required.
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             let err = set_role_model_override("pi", "task_agent", "opus", false).unwrap_err();
             assert!(err.to_string().contains("Invalid model spec"));
         });
@@ -2298,7 +2311,7 @@ reasoning = "high"
     fn test_set_role_model_override_reapplies_when_active() {
         // When the edited profile is active, the override must land in the
         // materialized ~/.wg/config.toml too (so `wg config --models` shows it).
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             apply_profile_as_global_config("pi").unwrap();
             set_active(Some("pi")).unwrap();
 
@@ -2335,7 +2348,7 @@ reasoning = "high"
 
     #[test]
     fn test_set_role_model_override_does_not_reapply_when_inactive() {
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             // pi not active (no active-pointer file).
             let out = set_role_model_override(
                 "pi",
@@ -2356,7 +2369,7 @@ reasoning = "high"
         // Validation criterion: switching away (codex) and back (pi) preserves
         // the Pi profile override. The override lives in the profile FILE, so a
         // round-trip through `apply_profile_as_global_config` must restore it.
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             set_role_model_override(
                 "pi",
                 "task_agent",
@@ -2414,7 +2427,7 @@ reasoning = "high"
     fn test_set_role_model_override_preserves_native_openrouter_route() {
         // A weak-tier agency role override keeps its native openrouter: route
         // (no pi: normalization) — the loud keyless-native fallback stays armed.
-        let _tmp = with_home(|| {
+        let _tmp = with_global_dir(|| {
             set_role_model_override(
                 "pi",
                 "evaluator",
