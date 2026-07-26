@@ -343,19 +343,22 @@ impl TelegramChannel {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        // NOT `.context(...)`: the request URL embeds the bot token, and a
+        // `.context()`-wrapped reqwest error keeps that URL printable through
+        // the anyhow source chain. See [`redacted_api_error`].
         let resp = self
             .client
             .post(self.api_url(method))
             .json(body)
             .send()
             .await
-            .context("Telegram API request failed")?;
+            .map_err(|e| redacted_api_error("Telegram API request failed", e))?;
 
         let status = resp.status();
         let json: serde_json::Value = resp
             .json()
             .await
-            .context("failed to parse Telegram API response")?;
+            .map_err(|e| redacted_api_error("failed to parse Telegram API response", e))?;
 
         if !status.is_success() || json.get("ok") != Some(&serde_json::Value::Bool(true)) {
             let desc = json
@@ -462,10 +465,10 @@ impl TelegramChannel {
             .get(&file_url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!(redact_bot_token(&format!("{e:#}"))))?
+            .map_err(|e| redacted_api_error("photo download request failed", e))?
             .bytes()
             .await
-            .map_err(|e| anyhow::anyhow!(redact_bot_token(&format!("{e:#}"))))?;
+            .map_err(|e| redacted_api_error("reading photo bytes failed", e))?;
 
         if bytes.len() as u64 > max_file_size {
             anyhow::bail!(
@@ -515,10 +518,10 @@ impl TelegramChannel {
             .get(&file_url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!(redact_bot_token(&format!("{e:#}"))))?
+            .map_err(|e| redacted_api_error("recording download request failed", e))?
             .bytes()
             .await
-            .map_err(|e| anyhow::anyhow!(redact_bot_token(&format!("{e:#}"))))?;
+            .map_err(|e| redacted_api_error("reading recording bytes failed", e))?;
 
         if bytes.len() as u64 > max_file_size {
             anyhow::bail!(
@@ -907,6 +910,53 @@ pub fn redact_bot_token(s: &str) -> String {
     re.replace_all(s, "bot<redacted>").into_owned()
 }
 
+/// Turn an error whose text can embed a Bot API URL into a FLAT, token-free
+/// `anyhow::Error` — the write-time choke point for every token-bearing call.
+///
+/// [`redact_bot_token`] only helps where a log site remembers to call it. The
+/// other half of the leak is `.context("…")?` on a raw `reqwest::Error`: the
+/// context wraps but does not *consume* the error, so the raw URL stays live
+/// as an anyhow **source**. Anyhow's `{:?}` renderer — which is what `main`
+/// prints for a returned `Err` — walks that chain and prints it under
+/// `Caused by:`. That is how two `sendMessage` lines carrying a full bot token
+/// reached `.casa/telegram.log` on 2026-07-26 while all 3003 poll lines in the
+/// same file were correctly redacted: the poll loop logs through
+/// `redact_bot_token`, the send path returned its error to `main`.
+///
+/// This flattens the error and its entire `source` chain into ONE redacted
+/// string and returns a **leaf** error (`source() == None`), so every renderer
+/// — `{}`, `{:#}`, `{:?}`, `Caused by:` — is token-free by construction rather
+/// than by the caller's discipline. Diagnostic detail is kept: chain messages
+/// are joined with `": "`, so `client error (Connect): tls handshake eof` still
+/// reaches the log, and the URL shape survives as `/bot<redacted>/sendMessage`
+/// so an operator can still tell WHICH call failed.
+///
+/// Use this — never `.context()` — on any fallible call whose URL contains a
+/// bot token: send/`api_call`, `getUpdates`, `getFile`, file downloads.
+///
+/// Numeric chat ids are deliberately NOT redacted: they are household
+/// identifiers, not credentials (they appear in `notify.toml`, in `wg telegram
+/// status` output, and in the routing logs an operator reads to tell WHICH chat
+/// went quiet). Scrubbing them would blind the diagnostics without protecting a
+/// secret — a token grants send access to every chat, a chat id grants nothing.
+pub fn redacted_api_error<E>(context: &str, err: E) -> anyhow::Error
+where
+    E: std::error::Error,
+{
+    let mut chain = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(e) = source {
+        let msg = e.to_string();
+        // reqwest and hyper often repeat the same text at two levels; keep the
+        // line readable without dropping genuinely new detail.
+        if chain.last().map(|prev| prev != &msg).unwrap_or(true) {
+            chain.push(msg);
+        }
+        source = e.source();
+    }
+    anyhow::anyhow!("{}: {}", context, redact_bot_token(&chain.join(": ")))
+}
+
 /// Perform ONE `getUpdates` long-poll round-trip against `api_base`, returning
 /// the decoded `result` array (empty when the response carries no updates).
 /// Transport errors and non-JSON bodies propagate so the caller can apply
@@ -933,11 +983,13 @@ async fn get_updates_once(
         .json(&body)
         .send()
         .await
-        .context("getUpdates request failed")?;
+        // NOT `.context(...)`: `url` carries the bot token, so the raw reqwest
+        // error must be consumed here rather than kept as a printable source.
+        .map_err(|e| redacted_api_error("getUpdates request failed", e))?;
     let json: serde_json::Value = resp
         .json()
         .await
-        .context("getUpdates response was not valid JSON")?;
+        .map_err(|e| redacted_api_error("getUpdates response was not valid JSON", e))?;
     Ok(json
         .get("result")
         .and_then(|r| r.as_array())
@@ -1296,6 +1348,148 @@ mod tests {
         let two = "bot111:AAAAAAAAAAAA and again bot222:BBBBBBBBBBBB";
         let redacted = redact_bot_token(two);
         assert_eq!(redacted, "bot<redacted> and again bot<redacted>");
+    }
+
+    /// A never-real token shaped exactly like a Telegram one (`<digits>:<35+
+    /// url-safe chars>`), used by the leak tests below. It is a test literal,
+    /// NOT a credential — the point is that it must never survive into any
+    /// rendering of an error.
+    const FAKE_TOKEN: &str = "123456789:AAFakeSecretForTestsOnly-xyz_0123456789";
+    /// The secret half — what a log line must never contain.
+    const FAKE_SECRET: &str = "AAFakeSecretForTestsOnly-xyz_0123456789";
+
+    /// Assert an error is token-free under EVERY renderer a caller might use.
+    ///
+    /// This is the whole point of the fix: `redact_bot_token` at ONE log site
+    /// is not enough, because `.context()` keeps the raw error as an anyhow
+    /// *source*. `main` prints a returned `Err` with `{:?}` (anyhow's
+    /// `Caused by:` chain walk), which resurrects the raw URL from that
+    /// source — exactly how two `sendMessage` lines with a live token landed
+    /// in `.casa/telegram.log` on 2026-07-26.
+    fn assert_no_token_in_any_rendering(err: &anyhow::Error, label: &str) {
+        let display = format!("{err}");
+        let alternate = format!("{err:#}");
+        let debug = format!("{err:?}"); // anyhow's `Caused by:` chain print
+        for (shape, rendered) in [
+            ("{}", &display),
+            ("{:#}", &alternate),
+            ("{:?}", &debug),
+        ] {
+            assert!(
+                !rendered.contains(FAKE_SECRET),
+                "{label}: token leaked through `{shape}`: {rendered}"
+            );
+        }
+        // Non-vacuity: the error must actually be about the API call (an empty
+        // or unrelated message would pass the assertions above for free).
+        assert!(
+            debug.to_lowercase().contains("request")
+                || debug.to_lowercase().contains("connect")
+                || debug.to_lowercase().contains("error"),
+            "{label}: rendering does not look like a transport error: {debug}"
+        );
+    }
+
+    /// SEND path: a real transport failure against a fake token must not put
+    /// the secret into any rendering of the returned error.
+    ///
+    /// Uses the 127.0.0.1-only api-base override and port 1 (nothing listens
+    /// → immediate ECONNREFUSED), so the test is hermetic: no network, no
+    /// Telegram, no sleep.
+    #[tokio::test]
+    #[serial_test::serial(wg_telegram_api_base)]
+    async fn send_transport_error_never_contains_the_token() {
+        // SAFETY: serialized against every other test that reads or writes
+        // WG_TELEGRAM_API_BASE via the `wg_telegram_api_base` serial key.
+        unsafe { std::env::set_var(TELEGRAM_API_BASE_OVERRIDE, "http://127.0.0.1:1") };
+        let channel = TelegramChannel::new(legacy_config(FAKE_TOKEN, "-1001"));
+        let err = channel
+            .api_call("sendMessage", &serde_json::json!({ "text": "hi" }))
+            .await
+            .expect_err("posting to 127.0.0.1:1 must fail");
+        unsafe { std::env::remove_var(TELEGRAM_API_BASE_OVERRIDE) };
+        assert_no_token_in_any_rendering(&err, "api_call sendMessage");
+    }
+
+    /// POLL path: same contract for `getUpdates`. Hermetic without touching
+    /// the environment — `get_updates_once` takes `api_base` as a parameter.
+    #[tokio::test]
+    async fn poll_transport_error_never_contains_the_token() {
+        let err = get_updates_once(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            FAKE_TOKEN,
+            0,
+            1,
+        )
+        .await
+        .expect_err("polling 127.0.0.1:1 must fail");
+        assert_no_token_in_any_rendering(&err, "get_updates_once");
+        // The failure must still be *diagnosable*: the URL shape survives with
+        // only the token replaced, so an operator can tell which call failed.
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("bot<redacted>"),
+            "redacted URL shape should stay in the line: {debug}"
+        );
+    }
+
+    /// `redacted_api_error` must ABSORB the source chain, not merely prefix
+    /// it: an error kept as an anyhow source is still printable, so the only
+    /// safe shape is a leaf error whose message is already scrubbed.
+    #[test]
+    fn redacted_api_error_absorbs_the_source_chain() {
+        #[derive(Debug)]
+        struct Inner(String);
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer {
+            msg: String,
+            source: Inner,
+        }
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.msg)
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+
+        let err = redacted_api_error(
+            "Telegram API request failed",
+            Outer {
+                msg: format!(
+                    "error sending request for url (https://api.telegram.org/bot{FAKE_TOKEN}/sendMessage)"
+                ),
+                source: Inner("tls handshake eof".to_string()),
+            },
+        );
+        assert_no_token_in_any_rendering(&err, "redacted_api_error");
+        let debug = format!("{err:?}");
+        // The chain's detail is preserved (flattened), not thrown away.
+        assert!(
+            debug.contains("Telegram API request failed"),
+            "context lost: {debug}"
+        );
+        assert!(debug.contains("bot<redacted>"), "URL shape lost: {debug}");
+        assert!(
+            debug.contains("tls handshake eof"),
+            "source detail lost: {debug}"
+        );
+        // Leaf error: nothing left for a `Caused by:` walk to re-print.
+        assert!(
+            err.source().is_none(),
+            "a surviving source can be re-printed with the raw token: {debug}"
+        );
     }
 
     #[test]

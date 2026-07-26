@@ -704,8 +704,11 @@ impl PhotoDownloader for TelegramPhotoDownloader {
             .json(&serde_json::json!({ "file_id": file_id }))
             .send()
             .await
-            .map_err(|e| scrub(e.to_string()))?;
-        let json: serde_json::Value = resp.json().await.map_err(|e| scrub(e.to_string()))?;
+            .map_err(|e| scrub("getFile request failed", e))?;
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| scrub("getFile response was not valid JSON", e))?;
         let file_path = json
             .get("result")
             .and_then(|r| r.get("file_path"))
@@ -722,10 +725,10 @@ impl PhotoDownloader for TelegramPhotoDownloader {
             .get(&file_url)
             .send()
             .await
-            .map_err(|e| scrub(e.to_string()))?
+            .map_err(|e| scrub("photo download request failed", e))?
             .bytes()
             .await
-            .map_err(|e| scrub(e.to_string()))?;
+            .map_err(|e| scrub("reading photo bytes failed", e))?;
 
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -736,10 +739,12 @@ impl PhotoDownloader for TelegramPhotoDownloader {
     }
 }
 
-/// Redact any bot token that leaked into an error string before it becomes an
-/// `anyhow::Error` (so it never reaches a log).
-fn scrub(msg: String) -> anyhow::Error {
-    anyhow::anyhow!(super::telegram::redact_bot_token(&msg))
+/// Consume a transport error from a token-bearing URL into a flat, redacted
+/// `anyhow::Error` so no renderer — including anyhow's `Caused by:` chain walk
+/// — can reprint the token. Thin alias over the shared choke point
+/// [`crate::notify::telegram::redacted_api_error`].
+fn scrub<E: std::error::Error>(context: &str, err: E) -> anyhow::Error {
+    super::telegram::redacted_api_error(context, err)
 }
 
 // ---------------------------------------------------------------------------
