@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use worksgood::chat::{self, Attachment};
 
@@ -17,17 +17,8 @@ const MAX_MESSAGE_SIZE: usize = 100 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 /// Generate a unique request ID for correlating requests with responses.
-///
-/// Format: `chat-{unix_millis}-{pid}{nanos_suffix}`
-/// The timestamp prefix makes IDs naturally sortable and debuggable.
 fn generate_request_id() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let millis = now.as_millis();
-    let nanos_suffix = now.subsec_nanos() % 100_000;
-    let pid = std::process::id();
-    format!("chat-{}-{}{:05}", millis, pid, nanos_suffix)
+    chat::generate_request_id("chat")
 }
 
 /// Process --attachment flags: validate each file, copy to .wg/attachments/,
@@ -508,17 +499,30 @@ mod tests {
             "ID should start with 'chat-': {}",
             id
         );
-        // Should contain the timestamp portion
-        assert!(id.len() > 10, "ID should be non-trivial length: {}", id);
+        let uuid = uuid::Uuid::parse_str(&id[id.len() - 36..])
+            .expect("CLI request ID should end with a parseable UUID");
+        assert_eq!(
+            uuid.get_version(),
+            Some(uuid::Version::SortRand),
+            "CLI request ID must use the shared UUID-v7 generator: {id}"
+        );
     }
 
     #[test]
     fn test_generate_request_id_unique() {
-        let ids: Vec<String> = (0..100).map(|_| generate_request_id()).collect();
+        let ids: Vec<String> = (0..1_000).map(|_| generate_request_id()).collect();
         let mut deduped = ids.clone();
         deduped.sort();
         deduped.dedup();
-        assert_eq!(ids.len(), deduped.len(), "Request IDs should be unique");
+        assert_eq!(
+            ids.len(),
+            deduped.len(),
+            "CLI request IDs should remain unique through the shared seam"
+        );
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "CLI request IDs should retain generation order"
+        );
     }
 
     #[test]

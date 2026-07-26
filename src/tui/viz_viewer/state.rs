@@ -17148,10 +17148,7 @@ impl VizApp {
         }
 
         // Generate a request ID for correlating the response.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let request_id = format!("tui-{}-{}", now.as_millis(), now.subsec_nanos() % 100_000);
+        let request_id = worksgood::chat::generate_request_id("tui");
 
         // Collect attachment display names for the local message.
         let att_names: Vec<String> = self
@@ -28356,6 +28353,42 @@ mod tui_chat_tests {
             read_at: None,
             msg_queue_id: None,
         }
+    }
+
+    #[test]
+    fn tui_send_uses_shared_uuid_v7_request_id() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0]);
+        let mut app = build_test_app(&viz, &wg_dir);
+
+        // The PTY-owner fast path appends synchronously, so this exercises the
+        // production TUI send seam without starting a daemon or command.
+        app.chat_pty_mode = true;
+        app.chat_pty_observer = false;
+        app.send_chat_message("opaque request".to_string());
+
+        let request_id = app
+            .chat
+            .pending_request_ids
+            .iter()
+            .next()
+            .expect("TUI send should track its request ID");
+        assert!(
+            request_id.starts_with("tui-"),
+            "TUI request ID should retain its namespace: {request_id}"
+        );
+        let uuid = uuid::Uuid::parse_str(&request_id[request_id.len() - 36..])
+            .expect("TUI request ID should end with a parseable UUID");
+        assert_eq!(
+            uuid.get_version(),
+            Some(uuid::Version::SortRand),
+            "TUI send must use the shared UUID-v7 generator: {request_id}"
+        );
+
+        let inbox =
+            worksgood::chat::read_inbox_for(&wg_dir, 0).expect("TUI send should append its inbox");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].request_id, *request_id);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
