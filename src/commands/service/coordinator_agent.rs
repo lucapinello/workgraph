@@ -1595,7 +1595,6 @@ mod tests {
     #[test]
     fn test_event_log_record_and_drain() {
         let mut log = EventLog::new();
-        let before = Utc::now();
 
         log.record(Event::TaskCompleted {
             task_id: "task-1".to_string(),
@@ -1606,11 +1605,22 @@ mod tests {
             reason: "test failure".to_string(),
         });
 
+        let first_timestamp = log.entries.front().unwrap().timestamp;
+        let before = first_timestamp - chrono::Duration::nanoseconds(1);
+
         assert_eq!(log.len(), 2);
 
         let events = log.drain_since(&before);
         assert_eq!(events.len(), 2);
         assert_eq!(log.len(), 0);
+
+        log.record(Event::TaskAdded {
+            task_id: "task-3".to_string(),
+            title: "Equal-bound event".to_string(),
+            added_by: None,
+        });
+        let equal_bound = log.entries.front().unwrap().timestamp;
+        assert!(log.drain_since(&equal_bound).is_empty());
     }
 
     #[test]
