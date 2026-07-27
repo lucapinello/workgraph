@@ -29,6 +29,10 @@
 #     disk" it would rewrite a dinner the family already ate);
 #   · the SAME turn id replays the stored outcome instead of drafting twice, and
 #     a second acceptance answers honestly and overwrites nothing;
+#   · dedupe keys on (turn, ATTEMPT): the same pair is a refire and replays, a
+#     NEW attempt on the same turn is the gateway self-healing a delivery that
+#     died before the family got an answer and must NOT be suppressed — while
+#     still overwriting nothing when the week is already there;
 #   · NEGATIVE — a carried request the closed set cannot express drafts NO week
 #     at all, rather than a week that silently dropped what was asked for;
 #   · NEGATIVE — a QUESTION about the week ("did you start the week?") is a read
@@ -404,5 +408,164 @@ printf '%s' "$out" | python3 "$scratch/assert_applied.py" applied "$this_code" "
     || loud_fail "a second project replayed the first project's outcome"
 [[ -f "$twin/plans/$this_code-family-plan.md" ]] \
     || loud_fail "a second project inherited another project's turn ledger and got no week"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ATTEMPT KEYING — a refire is suppressed, a SELF-HEAL RETRY is not
+# (task week-start-attempt)
+#
+# The gateway keeps the occurrence id STABLE across a retry of the same accepted
+# turn: that is what makes a dispatcher redelivery suppressible. It also retries
+# a turn whose first delivery died before the family got an answer — and under a
+# turn-only key that retry matches the dead attempt's ledger entry and is dropped
+# as "already answered", so the self-heal heals nothing. The canonical ATTEMPT id
+# separates the two: the same (turn, attempt) is one physical delivery, a new
+# attempt on the same turn is a fresh chance to answer it.
+#
+# Every leg below drives the same deployed seam and asserts the PLAN BYTES, not
+# the verdict alone — a re-key that quietly redrafts over a week the family
+# already has is the failure this section is here to prevent as much as the
+# suppression is.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# One JSON field out of the last run, so a leg can compare the KEYS the dedupe
+# actually uses and not only the verdict it printed.
+cat >"$scratch/field.py" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+for key in sys.argv[2].split("."):
+    value = (value or {}).get(key)
+print("" if value is None else value if isinstance(value, str) else json.dumps(value))
+PY
+
+att_run() { # att_run <root> <flag...>  — the accepted ask, once, JSON to last.json
+    local root="$1"
+    shift
+    if ! "$wg_bin" --json telegram week-start "$dispatched" --root "$root" --now "$now" \
+        --apply "$@" >"$scratch/last.json" 2>/dev/null; then
+        loud_fail "the week-start seam exited nonzero for: $* (does the installed binary carry --attempt-id?)"
+    fi
+}
+att_field() { python3 "$scratch/field.py" "$scratch/last.json" "$1"; }
+att_outcome_is() {
+    python3 "$scratch/assert_applied.py" "$@" <"$scratch/last.json" \
+        || loud_fail "wrong week-start apply outcome for attempt leg: $*"
+}
+
+att="$(make_scratch)"
+mkdir -p "$att/plans" "$att/.wg"
+cp "$ended" "$att/plans/$ended_code-family-plan.md"
+att_drafted="$att/plans/$this_code-family-plan.md"
+
+# ── the first attempt of an accepted turn drafts the week ────────────────────
+att_run "$att" --turn-id turn-attempt-1 --attempt-id attempt-1
+att_outcome_is applied "$this_code" "Tue" "homemade pizza"
+[[ "$(att_field attempt_id)" == "attempt-1" ]] \
+    || loud_fail "--attempt-id never reached the seam: $(att_field attempt_id)"
+[[ -f "$att_drafted" ]] || loud_fail "the first attempt reported success with no plan file"
+att_key_first="$(att_field turn_key)"
+att_sum="$(sha_of "$att_drafted")"
+# The correlation fingerprint stays OPAQUE: it is written into a durable ledger
+# whose directory listing must not spell out a household's turn or attempt ids.
+case "$att_key_first" in
+    *attempt-1* | *turn-attempt-1*)
+        loud_fail "the turn fingerprint leaked the gateway's ids: $att_key_first"
+        ;;
+esac
+
+# ── a TRUE refire — same turn, SAME attempt — replays and drafts nothing ─────
+att_run "$att" --turn-id turn-attempt-1 --attempt-id attempt-1
+att_outcome_is replayed
+[[ "$(att_field turn_key)" == "$att_key_first" ]] \
+    || loud_fail "one physical delivery produced two different keys"
+[[ "$(sha_of "$att_drafted")" == "$att_sum" ]] \
+    || loud_fail "a refire of the same (turn, attempt) rewrote the week"
+
+# ── WG_ATTEMPT_ID is the same transport as the flag, and the flag wins ───────
+# Same shape as WG_TURN_ID / WG_OWNER_PIN: the gateway may pass either, and an
+# explicit flag beats the ambient environment.
+if ! env WG_ATTEMPT_ID=attempt-1 "$wg_bin" --json telegram week-start "$dispatched" \
+    --root "$att" --now "$now" --apply --turn-id turn-attempt-1 >"$scratch/last.json" 2>/dev/null; then
+    loud_fail "the week-start seam exited nonzero with WG_ATTEMPT_ID set"
+fi
+att_outcome_is replayed
+[[ "$(att_field turn_key)" == "$att_key_first" ]] \
+    || loud_fail "WG_ATTEMPT_ID keyed a different occurrence than --attempt-id"
+if ! env WG_ATTEMPT_ID=attempt-from-the-environment "$wg_bin" --json telegram week-start \
+    "$dispatched" --root "$att" --now "$now" --apply --turn-id turn-attempt-1 \
+    --attempt-id attempt-1 >"$scratch/last.json" 2>/dev/null; then
+    loud_fail "the week-start seam exited nonzero with both attempt transports set"
+fi
+[[ "$(att_field turn_key)" == "$att_key_first" ]] \
+    || loud_fail "the ambient WG_ATTEMPT_ID overrode the explicit --attempt-id"
+
+# ── a NEW attempt on the same turn is NOT suppressed — and overwrites nothing ─
+att_run "$att" --turn-id turn-attempt-1 --attempt-id attempt-2
+att_key_retry="$(att_field turn_key)"
+[[ "$att_key_retry" != "$att_key_first" ]] \
+    || loud_fail "a new attempt on the same turn reused the first attempt's key"
+[[ "$(att_field applied.already_delivered)" == "false" ]] \
+    || loud_fail "a self-heal retry was suppressed as already-answered: $(att_field applied)"
+# Not suppressed does NOT mean drafted twice: the artifact layer answers honestly
+# about the week that is already there. (This is the idempotence that had to
+# survive the re-key — the dedupe layer is no longer what protects the file.)
+att_outcome_is answered
+[[ "$(sha_of "$att_drafted")" == "$att_sum" ]] \
+    || loud_fail "a self-heal retry redrafted over the week the family already has"
+grep -qi "homemade pizza" "$att_drafted" \
+    || loud_fail "the retry lost the request the first attempt had honoured"
+
+# ── the LEGACY turn-only key is untouched ────────────────────────────────────
+# An older gateway sends no attempt id at all. Its key must stay exactly what it
+# was — its own occurrence, still replaying against itself — or every ledger
+# entry a running gateway already wrote is orphaned by this change.
+att_run "$att" --turn-id turn-attempt-1
+[[ "$(att_field attempt_id)" == "" ]] || loud_fail "an attempt id was invented for a legacy caller"
+att_key_legacy="$(att_field turn_key)"
+[[ "$att_key_legacy" != "$att_key_first" && "$att_key_legacy" != "$att_key_retry" ]] \
+    || loud_fail "a legacy turn-only call collided with an attempt-bearing occurrence"
+att_outcome_is answered
+att_run "$att" --turn-id turn-attempt-1
+att_outcome_is replayed
+[[ "$(sha_of "$att_drafted")" == "$att_sum" ]] \
+    || loud_fail "the legacy turn-only path rewrote the week"
+
+# ── THE WEDGE: a delivery that DIED before the week landed ───────────────────
+# This is what the attempt id is for. The first delivery of the accepted turn
+# cannot write (here: an unwritable `plans/` — a full disk, a permission change,
+# a killed process mid-flight all land in the same place), so the turn is
+# journaled with an outcome that is NOT a drafted week. Under a turn-only key
+# every later retry of that turn reads that entry back and writes nothing: the
+# family accepted the offer, the gateway retried, and the week never exists.
+if [[ "$(id -u)" == "0" ]]; then
+    echo "note: running as root — the unwritable-plans wedge cannot be staged, skipping that leg"
+else
+    heal="$(make_scratch)"
+    mkdir -p "$heal/plans" "$heal/.wg"
+    cp "$ended" "$heal/plans/$ended_code-family-plan.md"
+    heal_drafted="$heal/plans/$this_code-family-plan.md"
+    chmod 500 "$heal/plans"
+    # The dying attempt: exit status is not the assertion, the ARTIFACT is.
+    "$wg_bin" --json telegram week-start "$dispatched" --root "$heal" --now "$now" \
+        --apply --turn-id turn-heal --attempt-id attempt-1 >/dev/null 2>&1 || true
+    chmod 755 "$heal/plans"
+    [[ ! -e "$heal_drafted" ]] \
+        || loud_fail "fixture precondition: the first attempt was supposed to fail to write"
+    # The SAME (turn, attempt) arriving again still writes nothing — that record
+    # is about THIS delivery, and re-running a mutation whose fate is unknown is
+    # exactly what the journal exists to prevent.
+    att_run "$heal" --turn-id turn-heal --attempt-id attempt-1
+    [[ "$(att_field applied.outcome)" != "applied" ]] \
+        || loud_fail "a refire of the dead attempt re-ran the mutation"
+    [[ ! -e "$heal_drafted" ]] \
+        || loud_fail "a refire of the dead attempt drafted the week behind the journal"
+    # …and the gateway's NEW attempt on that same turn finally produces the week.
+    att_run "$heal" --turn-id turn-heal --attempt-id attempt-2
+    att_outcome_is applied "$this_code" "Tue" "homemade pizza"
+    [[ -f "$heal_drafted" ]] \
+        || loud_fail "the self-heal retry of a turn whose delivery died produced NO week"
+    grep -qi "homemade pizza" "$heal_drafted" \
+        || loud_fail "the healed week dropped the request the family carried into it"
+    grep -q "2026-07-27" "$heal_drafted" || loud_fail "the healed week is not dated to this week"
+fi
 
 echo "PASS: telegram_week_start"

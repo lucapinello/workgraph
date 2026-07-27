@@ -7001,6 +7001,15 @@ pub enum TelegramCommands {
         #[arg(long = "turn-id")]
         turn_id: Option<String>,
 
+        /// The gateway's canonical ATTEMPT id for this delivery of that
+        /// occurrence. The draft is journaled against `(turn, attempt)`: the
+        /// same pair arriving again is a refire and replays, while a NEW attempt
+        /// on the same turn is the gateway self-healing a delivery that never
+        /// reached the family and is answered rather than suppressed. Falls back
+        /// to `WG_ATTEMPT_ID`; omitting it keeps the turn-only legacy key.
+        #[arg(long = "attempt-id")]
+        attempt_id: Option<String>,
+
         /// Recognize only — the default. Accepted for symmetry with the other
         /// seams.
         #[arg(long = "dry-run")]

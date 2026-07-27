@@ -4576,17 +4576,50 @@ fn telegram_photo_turn_key(message: &worksgood::notify::IncomingMessage) -> Stri
 /// A supplied opaque occurrence id distinguishes two later turns with identical
 /// words. Missing ids retain the legacy chat + trimmed-body fallback so older
 /// gateways remain compatible. The returned fingerprint never exposes the
-/// occurrence id or message body.
-fn web_physical_turn_key(reply_chat: &str, body: &str, turn_id: Option<&str>) -> String {
+/// occurrence id, the attempt id, or the message body.
+///
+/// `attempt_id` is the gateway's canonical ATTEMPT id for this delivery of that
+/// occurrence, and it is why the key is `(turn, attempt)` rather than `turn`
+/// alone. The two ids answer different questions:
+///
+///   · the same `(turn, attempt)` arriving twice is one physical delivery
+///     redelivered — a dispatcher refire — and the stored outcome must win;
+///   · a NEW attempt on the same turn is the gateway SELF-HEALING a delivery
+///     that died before the family got an answer. Under a turn-only key that
+///     retry matches the dead attempt's ledger entry and is dropped as
+///     "already answered", so the self-heal heals nothing and the household is
+///     left with the silence it was retrying.
+///
+/// An absent or blank attempt id keeps the pre-attempt digest material byte for
+/// byte, so ledger entries an older gateway already wrote keep replaying.
+///
+/// One contract, three layers, all keyed the same way from `WG_ATTEMPT_ID`:
+/// this key (compose dedupe + the fast-lane/week-start mutation journal),
+/// [`worksgood::notify::relay_receipt::attempt_key`] (the delivery receipt
+/// ledger), and — deliberately turn-only — the final-answer reservation in
+/// [`worksgood::notify::telegram_conversation`], where a late original and a
+/// self-heal retry must still produce exactly ONE final message. Admitting the
+/// retry here and holding the line there is the point: the retry gets to answer,
+/// the family does not get answered twice.
+fn web_physical_turn_key(
+    reply_chat: &str,
+    body: &str,
+    turn_id: Option<&str>,
+    attempt_id: Option<&str>,
+) -> String {
     let (kind, occurrence) = turn_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(|id| ("id", id))
         .unwrap_or_else(|| ("body", body.trim()));
-    format!(
-        "web-turn-{}",
-        durable_telegram_digest_v1("web-physical-turn", &[reply_chat, kind, occurrence],),
-    )
+    let digest = match attempt_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(attempt) => durable_telegram_digest_v1(
+            "web-physical-turn",
+            &[reply_chat, kind, occurrence, "attempt", attempt],
+        ),
+        None => durable_telegram_digest_v1("web-physical-turn", &[reply_chat, kind, occurrence]),
+    };
+    format!("web-turn-{digest}")
 }
 
 /// Request id stored for one persona's reply to a Telegram group turn.
@@ -5083,6 +5116,7 @@ pub fn run_web_inbound(
     default_owner: WebDefaultOwner<'_>,
     owner_pin: Option<&str>,
     turn_id: Option<&str>,
+    attempt_id: Option<&str>,
     dry_run: bool,
     json: bool,
 ) -> Result<()> {
@@ -5246,12 +5280,14 @@ pub fn run_web_inbound(
 
     // One physical-turn key is shared by every elected voice and both delivery
     // shapes. A gateway occurrence id wins; older callers fall back to the
-    // election body fingerprint.
+    // election body fingerprint. The attempt id rides alongside it so a
+    // self-heal retry of a turn whose first attempt never reached the family is
+    // answered instead of suppressed as a refire of that dead attempt.
     let turn_body = match &election {
         Election::All { body, .. } | Election::One { body, .. } => body.as_str(),
         _ => message.trim(),
     };
-    let physical_turn_key = web_physical_turn_key(&target, turn_body, turn_id);
+    let physical_turn_key = web_physical_turn_key(&target, turn_body, turn_id, attempt_id);
 
     let category = match &election {
         Election::Silence(_) => "silence",
@@ -6332,9 +6368,11 @@ fn resolve_reminder_target(
 /// re-read from disk before this command reports success — so a dead pipeline
 /// cannot claim a week it never wrote.
 ///
-/// The draft is journaled against the turn id exactly as the live web turn is,
-/// so a dispatcher refire carrying the SAME occurrence id replays the stored
-/// outcome instead of drafting twice. Credential-free throughout.
+/// The draft is journaled against `(turn, attempt)` exactly as the live web turn
+/// is, so a dispatcher refire carrying the SAME occurrence AND attempt replays
+/// the stored outcome instead of drafting twice, while a gateway self-heal retry
+/// — same occurrence, NEW attempt — is answered rather than suppressed.
+/// Credential-free throughout.
 pub fn run_week_start(
     workgraph_dir: &Path,
     message: &str,
@@ -6342,6 +6380,7 @@ pub fn run_week_start(
     now: Option<&str>,
     apply: bool,
     turn_id: Option<&str>,
+    attempt_id: Option<&str>,
     json: bool,
 ) -> Result<()> {
     use worksgood::notify::fast_lane::{self, FastLaneResult};
@@ -6362,10 +6401,14 @@ pub fn run_week_start(
     let ask = week_start::detect(message);
     let (week_code, monday, sunday) = week_start::iso_week_of(today);
 
-    // The correlation key the live turn builds. `--turn-id` (or WG_TURN_ID) is
-    // the gateway's opaque occurrence id; without one the words are the key, the
-    // same legacy fallback `web-inbound` keeps for older callers.
-    let physical_turn_key = web_physical_turn_key("web", message, turn_id);
+    // The correlation key the live turn builds — the SAME derivation, so what
+    // this seam proves about dedupe is true of the live turn. `--turn-id` (or
+    // WG_TURN_ID) is the gateway's opaque occurrence id; without one the words
+    // are the key, the same legacy fallback `web-inbound` keeps for older
+    // callers. `--attempt-id` (or WG_ATTEMPT_ID) is the canonical attempt id for
+    // this delivery of that occurrence: same (turn, attempt) is a refire and
+    // replays, a new attempt on the same turn is a self-heal and is answered.
+    let physical_turn_key = web_physical_turn_key("web", message, turn_id, attempt_id);
 
     let mut applied: Option<serde_json::Value> = None;
     if apply {
@@ -6522,6 +6565,7 @@ pub fn run_week_start(
                 "week_start": monday.to_string(),
                 "week_end": sunday.to_string(),
                 "turn_id": turn_id,
+                "attempt_id": attempt_id,
                 "turn_key": physical_turn_key,
                 "applied": applied,
             }))?
@@ -11235,19 +11279,21 @@ domains = ["calendar"]
         );
 
         // Web collective callers share the explicit occurrence id across voices.
-        let web_first = web_physical_turn_key("-100700", "hello household", Some("turn-fixture-a"));
+        let web_first =
+            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-a"), None);
         assert_eq!(
             web_first,
             web_physical_turn_key(
                 "-100700",
                 "body changes do not matter on a true refire",
                 Some("turn-fixture-a"),
+                None,
             ),
             "web refires retain the explicit occurrence fingerprint",
         );
         assert_ne!(
             web_first,
-            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-b"),),
+            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-b"), None),
             "a later web occurrence gets a fresh collective key even with identical words",
         );
     }
@@ -11269,14 +11315,27 @@ domains = ["calendar"]
             "telegram-turn-b3-v1-5c81580a6d5538a35b1233961550e48f16c2f8633615ecb2501491deb9673a83",
         );
 
-        let web_turn = web_physical_turn_key("-100700", "hello household", Some("opaque-turn-a7"));
+        let web_turn =
+            web_physical_turn_key("-100700", "hello household", Some("opaque-turn-a7"), None);
         assert_eq!(
             web_turn,
             "web-turn-b3-v1-62753b68ec0fbd6e844d7728ecd3ce10560f707a7ef63f394b400dc60eeaa930",
         );
         assert_eq!(
-            web_physical_turn_key("-100700", "hello household", None),
+            web_physical_turn_key("-100700", "hello household", None, None),
             "web-turn-b3-v1-6debece65596fe4ed96650f648c8ee482b351c65978c3dfd5bb9652ad7168fab",
+        );
+        // The attempt-bearing key is its own durable vector: the turn ledger it
+        // keys lives on disk across restarts and upgrades, so changing this
+        // digest silently orphans every entry a running gateway already wrote.
+        assert_eq!(
+            web_physical_turn_key(
+                "-100700",
+                "hello household",
+                Some("opaque-turn-a7"),
+                Some("opaque-attempt-1"),
+            ),
+            "web-turn-b3-v1-336cad0496508ff72bb5c0b445d21df2846c2f97588b92cd94a093843e58168f",
         );
         assert_eq!(
             collective_request_id("-100700", "voice-7", &telegram_turn),
@@ -11539,7 +11598,7 @@ domains = ["calendar"]
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 22).unwrap();
         let words = "add oat milk to the shopping list";
-        let first_key = web_physical_turn_key("-100700", words, Some("turn-a"));
+        let first_key = web_physical_turn_key("-100700", words, Some("turn-a"), None);
 
         // First invocation applies once and retains canonical bytes when the
         // transport fails.
@@ -11637,7 +11696,7 @@ domains = ["calendar"]
 
         // Identical words with a later occurrence id remain a new household
         // turn and therefore apply + deliver once of their own.
-        let later_key = web_physical_turn_key("-100700", words, Some("turn-b"));
+        let later_key = web_physical_turn_key("-100700", words, Some("turn-b"), None);
         run_web_fast_lane_occurrence(
             &workgraph_dir,
             root,
@@ -11971,14 +12030,83 @@ domains = ["calendar"]
         );
     }
 
+    /// A SELF-HEAL retry is not a refire.
+    ///
+    /// The gateway keeps the occurrence id stable across a retry of the same
+    /// accepted turn — that is what makes a dispatcher redelivery suppressible.
+    /// But the gateway ALSO retries a turn whose first attempt died before the
+    /// family got an answer, and under a turn-only key that retry matches the
+    /// dead attempt's ledger entry and is dropped as "already answered": the
+    /// self-heal heals nothing. The canonical attempt id separates the two —
+    /// same `(turn, attempt)` is the same physical delivery, a new attempt on
+    /// the same turn is a fresh chance to answer it.
+    #[test]
+    fn web_turn_key_admits_a_self_heal_retry_and_suppresses_a_true_refire() {
+        let chat = "web";
+        let voice = "voice-3";
+        let words = "start the week";
+
+        let first = web_physical_turn_key(chat, words, Some("turn-a7"), Some("attempt-1"));
+        assert_eq!(
+            first,
+            web_physical_turn_key(chat, words, Some("turn-a7"), Some("attempt-1")),
+            "a true refire — same turn, same attempt — must stay one occurrence",
+        );
+        let retry = web_physical_turn_key(chat, words, Some("turn-a7"), Some("attempt-2"));
+        assert_ne!(
+            first, retry,
+            "a new attempt on the same turn must not be suppressed as already-answered",
+        );
+        assert_ne!(
+            first,
+            web_physical_turn_key(chat, words, Some("turn-b9"), Some("attempt-1")),
+            "a later turn stays distinct even when the attempt counter repeats",
+        );
+
+        // An absent — or blank — attempt is the LEGACY key, byte for byte, so an
+        // older gateway's live ledger entries keep replaying after this change.
+        let legacy = web_physical_turn_key(chat, words, Some("turn-a7"), None);
+        assert_eq!(
+            legacy,
+            web_physical_turn_key(chat, words, Some("turn-a7"), Some("   ")),
+            "a blank attempt id is no attempt id",
+        );
+        assert_ne!(
+            legacy, first,
+            "an attempt-bearing turn is its own occurrence, not the legacy one",
+        );
+
+        // The fingerprint is still opaque: neither identifier survives into it.
+        assert!(
+            !first.contains("turn-a7") && !first.contains("attempt-1"),
+            "the turn fingerprint leaked an identifier: {first}",
+        );
+
+        // …and the request id the one-reply-per-turn guard keys on inherits all
+        // of it, which is where the suppression actually happens.
+        assert_eq!(
+            web_inbound_request_id(chat, voice, &first),
+            web_inbound_request_id(
+                chat,
+                voice,
+                &web_physical_turn_key(chat, words, Some("turn-a7"), Some("attempt-1")),
+            ),
+        );
+        assert_ne!(
+            web_inbound_request_id(chat, voice, &first),
+            web_inbound_request_id(chat, voice, &retry),
+            "the retry must reach compose+send instead of matching the dead attempt",
+        );
+    }
+
     #[test]
     fn web_inbound_request_id_distinguishes_identical_later_turns() {
         let chat = "-100777";
         let voice = "voice-3";
         let words = "please help with the weekend";
-        let first_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"));
-        let refire_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"));
-        let later_key = web_physical_turn_key(chat, words, Some("opaque-turn-b9"));
+        let first_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"), None);
+        let refire_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"), None);
+        let later_key = web_physical_turn_key(chat, words, Some("opaque-turn-b9"), None);
 
         let first = web_inbound_request_id(chat, voice, &first_key);
         let refire = web_inbound_request_id(chat, voice, &refire_key);
@@ -11994,14 +12122,14 @@ domains = ["calendar"]
 
         // Missing WG_TURN_ID retains the legacy trimmed-body fallback for an
         // older gateway, including its original refire behavior.
-        let fallback = web_physical_turn_key(chat, words, None);
+        let fallback = web_physical_turn_key(chat, words, None, None);
         assert_eq!(
             fallback,
-            web_physical_turn_key(chat, "  please help with the weekend  ", None),
+            web_physical_turn_key(chat, "  please help with the weekend  ", None, None),
         );
         assert_ne!(
             fallback,
-            web_physical_turn_key(chat, "a different legacy message", None),
+            web_physical_turn_key(chat, "a different legacy message", None, None),
         );
         assert_ne!(first, web_inbound_request_id("-100888", voice, &first_key),);
         assert_ne!(first, web_inbound_request_id(chat, "voice-8", &first_key),);

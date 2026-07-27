@@ -3980,12 +3980,21 @@ fn main() -> Result<()> {
                 now,
                 apply,
                 turn_id,
+                attempt_id,
                 dry_run: _,
             } => {
                 // Same transport as the live web turn: the gateway's occurrence
-                // id arrives on WG_TURN_ID unless the caller passed it here.
+                // id arrives on WG_TURN_ID unless the caller passed it here, and
+                // the canonical attempt id for this delivery of that occurrence
+                // rides alongside it on WG_ATTEMPT_ID. Both are opaque to the
+                // engine; only their equality matters.
                 let turn_id = turn_id.or_else(|| {
                     std::env::var("WG_TURN_ID")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                });
+                let attempt_id = attempt_id.or_else(|| {
+                    std::env::var("WG_ATTEMPT_ID")
                         .ok()
                         .filter(|s| !s.trim().is_empty())
                 });
@@ -3996,6 +4005,7 @@ fn main() -> Result<()> {
                     now.as_deref(),
                     apply,
                     turn_id.as_deref(),
+                    attempt_id.as_deref(),
                     cli.json,
                 )
             }
@@ -4102,6 +4112,13 @@ fn main() -> Result<()> {
                 let turn_id = std::env::var("WG_TURN_ID")
                     .ok()
                     .filter(|s| !s.trim().is_empty());
+                // …and one canonical attempt id per DELIVERY of that occurrence.
+                // Dedupe keys on the pair, so a refire (same attempt) is
+                // suppressed while a gateway self-heal retry (new attempt on the
+                // same turn) is answered instead of dropped as already-answered.
+                let attempt_id = std::env::var("WG_ATTEMPT_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty());
                 // Clap requires exactly one side of this choice. Keep the
                 // command-layer API unrepresentable in an ambiguous state.
                 let default_owner = match (default_owner.as_deref(), no_default_owner) {
@@ -4117,6 +4134,7 @@ fn main() -> Result<()> {
                     default_owner,
                     owner_pin.as_deref(),
                     turn_id.as_deref(),
+                    attempt_id.as_deref(),
                     dry_run,
                     cli.json,
                 )
