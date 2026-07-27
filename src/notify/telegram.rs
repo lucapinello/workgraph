@@ -418,14 +418,36 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Extract the message_id from a sendMessage response.
-    fn extract_message_id(json: &serde_json::Value) -> MessageId {
+    /// Extract the message_id from a send/edit response — and FAIL if there
+    /// isn't one.
+    ///
+    /// This used to be `.unwrap_or(0)`, so a response with no readable
+    /// `message_id` — an API shape change, a truncated body, a proxy that ate the
+    /// result object — returned `Ok(MessageId("0"))`: a SUCCESS, carrying an id
+    /// that identifies no message. Everything downstream believes it. A receipt
+    /// is written for a delivery that may never have happened, a feed row is
+    /// mirrored as delivered, and the family's reply is recorded as sent with an
+    /// id no one can ever look up or edit. There is no honest reading of "0": if
+    /// the API did not say which message this is, the send is not known to have
+    /// landed, and the caller must be told so rather than handed a zero.
+    ///
+    /// Telegram message ids are positive integers, so a zero or negative id is
+    /// rejected on the same rule.
+    fn extract_message_id(json: &serde_json::Value) -> Result<MessageId> {
         let mid = json
             .get("result")
             .and_then(|r| r.get("message_id"))
-            .and_then(|m| m.as_i64())
-            .unwrap_or(0);
-        MessageId(mid.to_string())
+            .and_then(|m| m.as_i64());
+        match mid {
+            Some(id) if id > 0 => Ok(MessageId(id.to_string())),
+            Some(id) => anyhow::bail!(
+                "telegram accepted the call but returned a non-positive message_id ({id}) — \
+                 the send cannot be confirmed"
+            ),
+            None => anyhow::bail!(
+                "telegram response carried no readable message_id — the send cannot be confirmed"
+            ),
+        }
     }
 
     /// Download a photo this bot received (`getFile` → GET the file URL) to
@@ -561,7 +583,7 @@ impl NotificationChannel for TelegramChannel {
             "text": message,
         });
         let resp = self.api_call("sendMessage", &body).await?;
-        Ok(Self::extract_message_id(&resp))
+        Self::extract_message_id(&resp)
     }
 
     async fn send_rich(&self, target: &str, message: &RichMessage) -> Result<MessageId> {
@@ -583,7 +605,7 @@ impl NotificationChannel for TelegramChannel {
         }
 
         let resp = self.api_call("sendMessage", &body).await?;
-        Ok(Self::extract_message_id(&resp))
+        Self::extract_message_id(&resp)
     }
 
     async fn send_with_actions(
@@ -612,7 +634,7 @@ impl NotificationChannel for TelegramChannel {
         });
 
         let resp = self.api_call("sendMessage", &body).await?;
-        Ok(Self::extract_message_id(&resp))
+        Self::extract_message_id(&resp)
     }
 
     fn supports_receive(&self) -> bool {
@@ -1865,15 +1887,46 @@ agent_id = "nora"
                 "text": "hello"
             }
         });
-        let mid = TelegramChannel::extract_message_id(&json);
+        let mid = TelegramChannel::extract_message_id(&json).expect("a real send must succeed");
         assert_eq!(mid.0, "42");
     }
 
+    /// A SEND WITHOUT AN ID IS A FAILED SEND. This test previously asserted the
+    /// opposite — that a response with no `message_id` yields `MessageId("0")` —
+    /// which made an unconfirmable delivery indistinguishable from a confirmed
+    /// one. Everything downstream reads a returned id as proof the message
+    /// landed: receipts are written against it, feed rows are mirrored as
+    /// delivered, edits are aimed at it. `0` identifies no message, so every one
+    /// of those is a claim about something that may not exist.
     #[test]
-    fn extract_message_id_missing_returns_zero() {
-        let json = serde_json::json!({"ok": true});
-        let mid = TelegramChannel::extract_message_id(&json);
-        assert_eq!(mid.0, "0");
+    fn a_response_without_a_message_id_is_an_error_not_a_zero() {
+        for json in [
+            serde_json::json!({"ok": true}),
+            serde_json::json!({"ok": true, "result": {}}),
+            serde_json::json!({"ok": true, "result": {"message_id": null}}),
+            // A string id is not readable as the integer the API documents.
+            serde_json::json!({"ok": true, "result": {"message_id": "42"}}),
+        ] {
+            let err = TelegramChannel::extract_message_id(&json)
+                .expect_err("an unconfirmable send was reported as a success");
+            assert!(
+                err.to_string().contains("cannot be confirmed"),
+                "unhelpful error: {err}",
+            );
+        }
+    }
+
+    /// Telegram message ids are positive. A zero or negative one is the same
+    /// unconfirmable delivery wearing a plausible number.
+    #[test]
+    fn a_non_positive_message_id_is_never_a_successful_send() {
+        for id in [0, -1] {
+            let json = serde_json::json!({"ok": true, "result": {"message_id": id}});
+            assert!(
+                TelegramChannel::extract_message_id(&json).is_err(),
+                "message_id {id} was accepted as a delivered message",
+            );
+        }
     }
 
     // ---- multi-poll dispatch ----------------------------------------------
