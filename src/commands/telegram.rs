@@ -16,6 +16,7 @@ use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
 use worksgood::notify::fast_lane;
 use worksgood::notify::ownership;
+use worksgood::notify::relay_receipt;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramChannel, TelegramConfig};
 use worksgood::notify::telegram_conversation::durable_telegram_digest_v1;
 use worksgood::notify::telegram_dedupe::{DedupeKey, DedupeSet};
@@ -784,14 +785,19 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // Telegram id a username-less person decodes to — task
                 // mirrored-telegram-sender). Unbound bare id → the neutral label.
                 let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
+                // WRITER-STAMPED as an inbound: this row was never relayed
+                // anywhere, so no delivery receipt could ever prove it. Saying so
+                // in machine-readable form is what keeps a human's own message
+                // from reading as an unbound row that nothing certifies.
                 let entry = casa_feed::group_entry(
                     &family_delivery.personas,
                     &feed_sender,
                     &msg.body,
                     casa_feed::now_ms(),
                     src_id,
-                );
-                if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
+                )
+                .with_non_relay_type(casa_feed::NON_RELAY_TELEGRAM_INBOUND);
+                if let Err(e) = casa_feed::append_entry_allocating(&feed_path, &entry) {
                     eprintln!(
                         "[{}] casa feed: failed to mirror inbound group message: {e}",
                         chrono::Utc::now().format("%H:%M:%S"),
@@ -965,14 +971,18 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             // spoken line must also show the human's NAME, never the
                             // raw numeric id (task mirrored-telegram-sender).
                             let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
+                            // Same inbound stamp as the text mirror: a spoken
+                            // message is still a human speaking into the group,
+                            // and it was still never relayed anywhere.
                             let entry = casa_feed::group_entry(
                                 &family_delivery.personas,
                                 &feed_sender,
                                 &spoken,
                                 casa_feed::now_ms(),
                                 src_id,
-                            );
-                            if let Err(e) = casa_feed::append_entry(&feed_path, &entry) {
+                            )
+                            .with_non_relay_type(casa_feed::NON_RELAY_TELEGRAM_INBOUND);
+                            if let Err(e) = casa_feed::append_entry_allocating(&feed_path, &entry) {
                                 eprintln!(
                                     "[{}] casa feed: failed to mirror spoken message: {e}",
                                     chrono::Utc::now().format("%H:%M:%S"),
@@ -4230,6 +4240,15 @@ struct FamilyReplyDelivery {
     config: TelegramConfig,
     personas: casa_feed::PersonaCatalog,
     family_roster: worksgood::notify::grounding::FamilyVoiceRoster,
+    /// The accepted turn, when a test supplies it directly instead of through
+    /// the environment. Production ALWAYS resolves the turn from `WG_TURN_ID`
+    /// (the gateway dispatches one process per accepted turn), but `WG_TURN_ID`
+    /// is process-global: a test that sets it re-keys the turn reservation for
+    /// every other test running at that instant, which silently suppresses their
+    /// second reply. This seam lets the receipt tests name their own turn
+    /// without touching the environment other tests are reading.
+    #[cfg(test)]
+    turn_override: Option<String>,
 }
 
 impl FamilyReplyDelivery {
@@ -4248,6 +4267,8 @@ impl FamilyReplyDelivery {
                 &root,
                 workgraph_dir,
             ),
+            #[cfg(test)]
+            turn_override: None,
         }
     }
 
@@ -4263,7 +4284,30 @@ impl FamilyReplyDelivery {
             config,
             personas,
             family_roster,
+            turn_override: None,
         }
+    }
+
+    /// Name the accepted turn directly, instead of through the process-global
+    /// `WG_TURN_ID` every other test is also reading.
+    #[cfg(test)]
+    fn with_turn_override(mut self, turn: &str) -> Self {
+        self.turn_override = Some(turn.to_string());
+        self
+    }
+
+    /// The canonical turn this delivery belongs to, RAW and verbatim.
+    ///
+    /// Only `web-turn-<uuid v4>` qualifies: a request id, a digest or the
+    /// engine's own hashed idempotency key is not the turn, and stamping one in
+    /// the causal position writes a row no receipt could ever join.
+    fn canonical_turn(&self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(turn) = self.turn_override.as_deref() {
+            return worksgood::notify::relay_receipt::is_valid_turn_id(turn)
+                .then(|| turn.to_string());
+        }
+        worksgood::notify::telegram_conversation::canonical_turn_id("")
     }
 
     fn wrap<S>(&self, inner: S, scope: ReplyScope, guard: GuardPolicy) -> ScopedFamilyReplySink<S> {
@@ -4291,22 +4335,152 @@ impl FamilyReplyDelivery {
         convo::ReplySink::send(&sink, bot_id, chat_id, text).await
     }
 
+    /// The project root that owns this feed — `<root>/.casa/group-feed.jsonl`.
+    /// The receipt ledger and the transport-scope key live beside the feed, so
+    /// they are resolved from the SAME path the rows are written to and cannot
+    /// drift into a different project than the row they prove.
+    fn project_root(&self) -> PathBuf {
+        self.feed_path
+            .parent()
+            .and_then(|casa| casa.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Mirror the exact guarded bytes that Telegram accepted, excluding the
-    /// transient latency acknowledgement that a later edit replaces.
-    fn mirror(&self, scope: ReplyScope, bot_id: &str, text: &str) {
+    /// transient latency acknowledgement that a later edit replaces — and write
+    /// the ENGINE's OWN RECEIPT for the delivery that produced them.
+    ///
+    /// The receipt is written HERE, at the one point where all four facts are in
+    /// hand at once: the accepted turn, the row's global feed id, the bot that
+    /// physically sent it, and the transport's own answer (`message_id`). It is
+    /// an INDEPENDENT record, not an inference: the gateway used to reconstruct
+    /// "the helper replied" from the row the writer itself wrote, which is a
+    /// claim the writer made about itself.
+    ///
+    /// A reply with no canonical turn (a legacy or listener-initiated path) is
+    /// mirrored as before and gets NO receipt — a receipt needs a turn to join
+    /// on, and inventing one would forge the very link it exists to prove. Such
+    /// a row is unbound, which is precisely what a sealed run refuses.
+    fn mirror(
+        &self,
+        scope: ReplyScope,
+        bot_id: &str,
+        text: &str,
+        message_id: Option<&str>,
+        outcome: relay_receipt::RelayOutcome,
+    ) {
         use worksgood::notify::telegram_conversation as convo;
         if scope != ReplyScope::Group || text == convo::ack_line() {
             return;
         }
         let agent_id = convo::agent_for_bot(&self.config, bot_id);
         let entry = casa_feed::agent_entry(&self.personas, &agent_id, text, casa_feed::now_ms());
-        if let Err(e) = casa_feed::append_entry(&self.feed_path, &entry) {
+        // The turn is stamped RAW and verbatim, exactly as the gateway handed it
+        // over. Only `web-turn-<uuid v4>` qualifies, so the engine's internal
+        // hashed key can never reach the causal position.
+        let turn = self.canonical_turn();
+        let entry = match turn.as_deref() {
+            // The transient ack is excluded above, so every row that reaches
+            // here is the turn's answer. The phase is stamped by the writer,
+            // which KNOWS which it is — never derived from the text later.
+            Some(turn) => entry.with_turn(turn, casa_feed::ReplyPhase::Final),
+            None => entry,
+        };
+
+        let feed_id = match casa_feed::append_entry_allocating(&self.feed_path, &entry) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!(
+                    "[{}] casa feed: failed to mirror agent reply: {e}",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                );
+                return;
+            }
+        };
+
+        let Some(turn) = turn else { return };
+        if let Err(e) = self.write_engine_receipt(&turn, feed_id, &agent_id, bot_id, message_id, outcome)
+        {
+            // A missing receipt must never take delivery down — the family has
+            // the answer either way. It DOES leave the row unproven, and saying
+            // so plainly is the point: an operator can see the gap.
             eprintln!(
-                "[{}] casa feed: failed to mirror agent reply: {e}",
+                "[{}] casa receipts: reply row {feed_id} was delivered but not proven: {e}",
                 chrono::Utc::now().format("%H:%M:%S"),
             );
         }
     }
+
+    /// Build and append the engine receipt for one relayed row.
+    fn write_engine_receipt(
+        &self,
+        turn: &str,
+        feed_id: i64,
+        agent_id: &str,
+        bot_id: &str,
+        message_id: Option<&str>,
+        outcome: relay_receipt::RelayOutcome,
+    ) -> Result<(), relay_receipt::ReceiptError> {
+        write_engine_receipt_at(
+            &self.project_root(),
+            turn,
+            feed_id,
+            agent_id,
+            bot_id,
+            message_id,
+            outcome,
+            relay_receipt::ReplyPhase::Final,
+        )
+    }
+}
+
+/// Append ONE engine receipt for a row that was just written and relayed.
+///
+/// Shared by the listener's delivery seam and the scripted `wg telegram
+/// feed-write` seam, so a smoke test drives the SAME writer the family's
+/// replies go through rather than a look-alike that can drift away from it.
+#[allow(clippy::too_many_arguments)]
+fn write_engine_receipt_at(
+    root: &Path,
+    turn: &str,
+    feed_id: i64,
+    role_id: &str,
+    bot_id: &str,
+    message_id: Option<&str>,
+    outcome: relay_receipt::RelayOutcome,
+    phase: relay_receipt::ReplyPhase,
+) -> Result<(), relay_receipt::ReceiptError> {
+    // WHICH BOT PHYSICALLY SENT THIS — not the semantic reply role. One role can
+    // be spoken by different bots across a rotation, and "whose token sent it" is
+    // the question a delivery dispute turns on. Keyed digest, so a leaked ledger
+    // is not a reversible dictionary of the bot roster.
+    let scope_id = relay_receipt::scope_id_for_bot(root, bot_id)?;
+    // A POSITIVE message id is the only proof of delivery there is. Anything
+    // else — absent, unparseable, zero, negative — is UNPROVEN, and is recorded
+    // as unproven rather than guessed in either direction.
+    let mid = message_id
+        .and_then(|m| m.trim().parse::<i64>().ok())
+        .filter(|id| *id > 0);
+    let status = if mid.is_some() {
+        relay_receipt::RelayStatus::Delivered
+    } else {
+        relay_receipt::RelayStatus::Unproven
+    };
+    let receipt = relay_receipt::engine_receipt(
+        turn,
+        feed_id,
+        "agent",
+        role_id,
+        &scope_id,
+        mid,
+        status,
+        outcome,
+        phase,
+        std::env::var("WG_ATTEMPT_ID").ok().as_deref(),
+        casa_feed::now_ms(),
+    );
+    relay_receipt::append(root, &receipt)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4367,7 +4541,15 @@ where
     async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
         let guarded = self.guarded(text);
         let mid = self.inner.send(bot_id, chat_id, &guarded).await?;
-        self.delivery.mirror(self.scope, bot_id, &guarded);
+        // The transport's own answer travels with the row it proves: the receipt
+        // is written from `mid`, never inferred from the row afterwards.
+        self.delivery.mirror(
+            self.scope,
+            bot_id,
+            &guarded,
+            mid.as_deref(),
+            relay_receipt::RelayOutcome::Send,
+        );
         Ok(mid)
     }
 
@@ -4376,7 +4558,16 @@ where
         self.inner
             .edit(bot_id, chat_id, message_id, &guarded)
             .await?;
-        self.delivery.mirror(self.scope, bot_id, &guarded);
+        // An EDIT of the ack into the final answer is a different delivery from a
+        // fresh SEND, with a different message id story — typed so a fallback
+        // send after a failed edit cannot be read as the edit that never applied.
+        self.delivery.mirror(
+            self.scope,
+            bot_id,
+            &guarded,
+            Some(message_id),
+            relay_receipt::RelayOutcome::Edit,
+        );
         Ok(())
     }
 }
@@ -5562,6 +5753,11 @@ pub fn run_feed_write(
     agent_id: Option<&str>,
     text: &str,
     src_id: Option<&str>,
+    turn_id: Option<&str>,
+    reply_phase: Option<&str>,
+    non_relay_type: Option<&str>,
+    message_id: Option<&str>,
+    bot_id: Option<&str>,
 ) -> Result<()> {
     let personas = load_feed_persona_catalog(root);
     let entry = match kind {
@@ -5584,12 +5780,76 @@ pub fn run_feed_write(
         }
         other => anyhow::bail!("--kind must be 'group' or 'agent', got '{other}'"),
     };
+
+    // The causal stamps, from the flags or from the environment the gateway
+    // dispatched us with. `WG_TURN_ID` carries the RAW accepted turn; it is
+    // passed through UNTOUCHED and validated at write, so a hashed or
+    // placeholder id produces no row rather than a row that certifies nothing.
+    let turn_id = turn_id
+        .map(str::to_string)
+        .or_else(|| std::env::var("WG_TURN_ID").ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let entry = match turn_id.as_deref() {
+        Some(turn) => {
+            let phase = match reply_phase.map(str::trim).unwrap_or("final") {
+                "ack" => casa_feed::ReplyPhase::Ack,
+                "final" => casa_feed::ReplyPhase::Final,
+                "watchdog" => casa_feed::ReplyPhase::Watchdog,
+                "failure" => casa_feed::ReplyPhase::Failure,
+                other => anyhow::bail!(
+                    "--reply-phase must be one of ack|final|watchdog|failure, got '{other}'"
+                ),
+            };
+            entry.with_turn(turn, phase)
+        }
+        None => entry,
+    };
+    let entry = match non_relay_type {
+        Some(kind) => entry.with_non_relay_type(kind.trim()),
+        None => entry,
+    };
+
     let feed_path = casa_feed::feed_path_for(root);
-    casa_feed::append_entry(&feed_path, &entry)
+    // The BOUND-OR-BLOCKED gate applies to this writer exactly as it does to the
+    // listener's: a diagnostic is still a row the family's pane shows and an
+    // auditor counts, and `feed-write --kind agent` is precisely the shape that
+    // put unattributable helper rows into a certification run.
+    let feed_id = casa_feed::append_entry_allocating(&feed_path, &entry)
         .with_context(|| format!("failed to append to feed {}", feed_path.display()))?;
-    // The written line is itself display-safe (the six-field allowlist), so
-    // echoing it back cannot leak a secret — handy for the smoke assertion.
+    // The written line is itself display-safe (the field allowlist), so echoing
+    // it back cannot leak a secret — handy for the smoke assertion. The global
+    // feed id goes with it: a caller that must later prove this row needs the id
+    // it was ACTUALLY allocated, never an ordinal it counted for itself.
     println!("{}", entry.to_json_line());
+    println!("feedId={feed_id}");
+
+    // The RECEIPT half, through the very same writer the listener's delivery
+    // seam uses. A receipt needs both a causal turn to join on and a transport
+    // answer to record, so it is written only when the caller supplies a
+    // `--message-id`; without one there is no delivery to prove and inventing a
+    // receipt would forge exactly the link the ledger exists to establish.
+    if let (Some(turn), Some(mid)) = (turn_id.as_deref(), message_id) {
+        let phase = match reply_phase.map(str::trim).unwrap_or("final") {
+            "ack" => relay_receipt::ReplyPhase::Ack,
+            "watchdog" => relay_receipt::ReplyPhase::Watchdog,
+            "failure" => relay_receipt::ReplyPhase::Failure,
+            _ => relay_receipt::ReplyPhase::Final,
+        };
+        let role = agent_id.unwrap_or("unknown");
+        write_engine_receipt_at(
+            root,
+            turn,
+            feed_id,
+            role,
+            bot_id.unwrap_or(role),
+            Some(mid),
+            relay_receipt::RelayOutcome::Send,
+            phase,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("receipt=written");
+    }
     Ok(())
 }
 
@@ -12830,6 +13090,306 @@ domains = ["calendar"]
             1,
             "a private delivery appends no shared-feed line"
         );
+    }
+
+    // --- the ENGINE's own receipt, written at the delivery seam --------------
+
+    /// A transport that answers with a REAL positive Bot API message id, which
+    /// is the only thing that proves a delivery.
+    #[derive(Default)]
+    struct NumberedReplySink {
+        /// The next message id this transport will answer with. Distinct across
+        /// transports on purpose: one Telegram message can only be delivered
+        /// once, so two sinks handing out the SAME id is a replay, not two
+        /// deliveries, and the ledger is right to refuse the second.
+        next: std::sync::atomic::AtomicI64,
+        sends: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl NumberedReplySink {
+        fn starting_at(first: i64) -> Self {
+            Self {
+                next: std::sync::atomic::AtomicI64::new(first),
+                sends: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl worksgood::notify::telegram_conversation::ReplySink for NumberedReplySink {
+        async fn send(&self, _bot: &str, _chat: &str, text: &str) -> Result<Option<String>> {
+            self.sends.lock().unwrap().push(text.to_string());
+            let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 501;
+            Ok(Some(id.to_string()))
+        }
+        async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    const ENGINE_TURN: &str = "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
+    /// ITEMS 1 + 5 — the engine writes its OWN receipt, and the mirrored row
+    /// carries the accepted turn RAW and verbatim.
+    ///
+    /// This is the whole point of the contract: before it, "the helper replied"
+    /// was reconstructed from the row the writer itself had written, and the
+    /// relay's `{ok, message_id}` was discarded. Now the transport's own answer
+    /// is recorded independently, and the row and the receipt name each other.
+    #[test]
+    fn an_engine_reply_writes_its_own_receipt_joined_to_the_row_by_global_feed_id() {
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let delivery = opaque_delivery(&feed).with_turn_override(ENGINE_TURN);
+        let sink = delivery.wrap(
+            NumberedReplySink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(sink.send("harbor", "group-chat", "Dinner is pasta."))
+            .unwrap();
+
+        // The ROW carries the RAW turn, verbatim.
+        let lines = feed_lines(&feed);
+        assert_eq!(lines.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(row["turnId"], ENGINE_TURN, "the raw accepted turn, verbatim");
+        assert_eq!(row["replyPhase"], "final");
+        assert_eq!(row["kind"], "agent");
+
+        // The RECEIPT is an independent record in its own ledger.
+        let receipts = relay_receipt::read_all(dir.path());
+        assert_eq!(receipts.len(), 1, "the engine wrote exactly one receipt");
+        let r = &receipts[0];
+        assert_eq!(r.provenance, "engine", "written BY the engine, not inferred");
+        assert_eq!(r.turn_id, ENGINE_TURN);
+        assert_eq!(r.status, relay_receipt::RelayStatus::Delivered);
+        assert_eq!(r.message_id, Some(501), "the transport's OWN answer");
+        assert_eq!(r.outcome, relay_receipt::RelayOutcome::Send);
+        assert_eq!(r.role_id, "harbor");
+
+        // ITEM 3 — the join is on the GLOBAL FEED ID, and it lands on this row.
+        assert_eq!(r.feed_id, 1);
+        assert_eq!(
+            row["text"].as_str().unwrap(),
+            "Dinner is pasta.",
+            "the receipt's feed id names THIS row"
+        );
+
+        // ITEM 2 — the scope id is the ACTUAL SENDING BOT, minted through a
+        // keyed digest. A raw sha256 of the bot id would be reversible by
+        // dictionary in milliseconds: a bot roster is a handful of short stable
+        // strings.
+        assert!(relay_receipt::is_valid_scope_id(&r.transport_scope_id));
+        assert!(
+            !relay_receipt::is_dictionary_reversible(&r.transport_scope_id, "harbor"),
+            "the transport scope id must not be a raw sha of the bot id"
+        );
+        // And the key that makes it unreversible never reaches the ledger.
+        let ledger = std::fs::read_to_string(relay_receipt::ledger_path_for(dir.path())).unwrap();
+        assert!(!ledger.contains("stub-token"), "no credential in the ledger");
+    }
+
+    /// ITEM 3, the exact-row join under the condition that breaks an ordinal
+    /// one: TWO engine replies in the SAME MILLISECOND. Each receipt must name
+    /// its own row. A joiner that matched on the timestamp would pair both
+    /// receipts to the first row and leave the second unproven.
+    #[test]
+    fn two_same_millisecond_engine_replies_each_get_the_receipt_for_their_own_row() {
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Two DIFFERENT accepted turns landing in the same instant — two
+        // household members asking at once is not exotic.
+        let second_turn = "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3302";
+        let first_sink = opaque_delivery(&feed)
+            .with_turn_override(ENGINE_TURN)
+            .wrap(NumberedReplySink::default(), ReplyScope::Group, GuardPolicy::AlreadyGuarded);
+        rt.block_on(first_sink.send("harbor", "group-chat", "The FIRST answer."))
+            .unwrap();
+        let second_sink = opaque_delivery(&feed).with_turn_override(second_turn).wrap(
+            NumberedReplySink::starting_at(10),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        rt.block_on(second_sink.send("harbor", "group-chat", "The SECOND answer."))
+            .unwrap();
+
+        let lines = feed_lines(&feed);
+        assert_eq!(lines.len(), 2);
+        let rows: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        let receipts = relay_receipt::read_all(dir.path());
+        assert_eq!(receipts.len(), 2);
+        let by_turn = |t: &str| {
+            receipts
+                .iter()
+                .find(|r| r.turn_id == t)
+                .expect("a receipt per turn")
+        };
+        let first = by_turn(ENGINE_TURN);
+        let second = by_turn(second_turn);
+
+        assert_ne!(first.feed_id, second.feed_id, "distinct rows, distinct ids");
+        assert_eq!(
+            rows[(first.feed_id - 1) as usize]["text"],
+            "The FIRST answer."
+        );
+        assert_eq!(
+            rows[(second.feed_id - 1) as usize]["text"],
+            "The SECOND answer."
+        );
+        // And each receipt carries its own Telegram message id: one message can
+        // only be delivered once, which is what the replay guard keys on.
+        assert_ne!(first.message_id, second.message_id);
+    }
+
+    /// A reply the transport ACCEPTED WITHOUT a usable message id is recorded
+    /// UNPROVEN — never as a delivery. We cannot tell whether the family has it,
+    /// and the honest record says so rather than guessing in either direction.
+    #[test]
+    fn a_reply_with_no_usable_message_id_is_recorded_unproven_not_delivered() {
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let delivery = opaque_delivery(&feed).with_turn_override(ENGINE_TURN);
+        // `ExactReplySink` answers "message-1" — accepted, but not a positive id.
+        let sink = delivery.wrap(
+            ExactReplySink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(sink.send("harbor", "group-chat", "Dinner is pasta."))
+            .unwrap();
+
+        let receipts = relay_receipt::read_all(dir.path());
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].status, relay_receipt::RelayStatus::Unproven);
+        assert_eq!(receipts[0].message_id, None);
+    }
+
+    /// ITEM 4 — the replay guard, on the ENGINE's writer. One Telegram message
+    /// can only be delivered once, so a second receipt claiming the same
+    /// (scope, message id) is a replayed claim of an old delivery. It is
+    /// refused AT WRITE, and the delivery still happens — the family's answer is
+    /// never held hostage to the ledger.
+    #[test]
+    fn a_replayed_delivery_claim_is_refused_at_write_without_breaking_delivery() {
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        // A transport that answers with the SAME message id twice — a re-read of
+        // one stored response, replayed.
+        #[derive(Default)]
+        struct FrozenIdSink;
+        #[async_trait::async_trait]
+        impl worksgood::notify::telegram_conversation::ReplySink for FrozenIdSink {
+            async fn send(&self, _b: &str, _c: &str, _t: &str) -> Result<Option<String>> {
+                Ok(Some("777".to_string()))
+            }
+            async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let first = opaque_delivery(&feed)
+            .with_turn_override(ENGINE_TURN)
+            .wrap(FrozenIdSink, ReplyScope::Group, GuardPolicy::AlreadyGuarded);
+        rt.block_on(first.send("harbor", "group-chat", "First."))
+            .unwrap();
+        // A DIFFERENT turn, so nothing but the replay guard itself can refuse
+        // the second receipt.
+        let second = opaque_delivery(&feed)
+            .with_turn_override("web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3309")
+            .wrap(FrozenIdSink, ReplyScope::Group, GuardPolicy::AlreadyGuarded);
+        rt.block_on(second.send("harbor", "group-chat", "Second."))
+            .unwrap();
+
+        assert_eq!(
+            relay_receipt::read_all(dir.path()).len(),
+            1,
+            "the replayed claim of message 777 was refused"
+        );
+        assert_eq!(
+            feed_lines(&feed).len(),
+            2,
+            "delivery is never held hostage to the ledger"
+        );
+    }
+
+    /// ITEM 8, at the ENGINE seam. `web_physical_turn_key()` hashes the turn for
+    /// the internal delivery digest; that hash must never reach the causal
+    /// position. `canonical_turn_id` refuses it, so the row is written UNBOUND
+    /// and NO receipt is minted — rather than a receipt carrying an id that can
+    /// never join a gateway row.
+    #[test]
+    fn a_hashed_turn_id_in_the_environment_produces_no_receipt() {
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+        let hashed =
+            "web-turn-1e4d3c2b1a09f8e7d6c5b4a3928170695e4d3c2b1a09f8e7d6c5b4a392817069";
+
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let delivery = opaque_delivery(&feed).with_turn_override(hashed);
+        let sink = delivery.wrap(
+            NumberedReplySink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(sink.send("harbor", "group-chat", "Dinner is pasta."))
+            .unwrap();
+
+        let row: serde_json::Value = serde_json::from_str(&feed_lines(&feed)[0]).unwrap();
+        assert!(
+            row["turnId"].is_null(),
+            "the internal hashed key never reaches the causal position: {row}"
+        );
+        assert!(
+            relay_receipt::read_all(dir.path()).is_empty(),
+            "NO receipt is minted for an id that could never join"
+        );
+    }
+
+    /// ITEM 7 — during a SEALED run an engine reply that carries no canonical
+    /// turn is prevented from writing the certifying feed at all. The family's
+    /// message still goes out over Telegram; what is refused is the
+    /// unattributable ROW, which is the thing an auditor would otherwise count
+    /// as evidence of something nobody can trace.
+    #[test]
+    fn a_sealed_run_blocks_an_unbound_engine_reply_row_but_not_the_send() {
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        std::fs::create_dir_all(feed.parent().unwrap()).unwrap();
+        std::fs::write(casa_feed::seal_path_for(dir.path()), "{\"sealed\":true}").unwrap();
+
+        // No canonical turn at all — the unbound shape.
+        let delivery = opaque_delivery(&feed).with_turn_override("");
+        let sink = delivery.wrap(
+            NumberedReplySink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(sink.send("harbor", "group-chat", "An untraceable report-back."))
+            .unwrap();
+
+        assert_eq!(sink.inner.sends.lock().unwrap().len(), 1, "the send happened");
+        assert!(
+            feed_lines(&feed).is_empty(),
+            "no unbound row entered the certifying feed"
+        );
+        assert!(relay_receipt::read_all(dir.path()).is_empty());
     }
 
     #[test]

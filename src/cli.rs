@@ -7170,6 +7170,46 @@ pub enum TelegramCommands {
         /// both physical lines to one pane message. Not a secret.
         #[arg(long)]
         src_id: Option<String>,
+
+        /// The RAW accepted turn id (`web-turn-<uuid v4>`) this row belongs to,
+        /// stamped verbatim as `turnId`. Falls back to `WG_TURN_ID`. A hashed
+        /// `web-turn-<64hex>` (the engine's INTERNAL idempotency key), an
+        /// all-hyphen placeholder or a wrong-version uuid is REFUSED — no row is
+        /// written — because an id that cannot join the gateway's rows certifies
+        /// nothing while making every row read as unproven.
+        #[arg(long)]
+        turn_id: Option<String>,
+
+        /// Which phase of the turn this row is: `ack`, `final` (default),
+        /// `watchdog` or `failure`. Stamped by the writer, which knows; deriving
+        /// it from the text later is how a watchdog line gets counted as the
+        /// turn's final answer.
+        #[arg(long)]
+        reply_phase: Option<String>,
+
+        /// Why this row legitimately has NO delivery receipt:
+        /// `telegram-inbound`, `engine-lifecycle` or `diagnostic`. A row with
+        /// neither a turn id nor one of these is UNBOUND, and a sealed run
+        /// (`.casa/feed-seal.json`) refuses to write an unbound agent row at all.
+        #[arg(long)]
+        non_relay_type: Option<String>,
+
+        /// The transport's OWN answer for this row — the positive Bot API
+        /// `message_id` the send returned. Supplying it (with a `--turn-id`)
+        /// makes the writer append the ENGINE's receipt for the row through the
+        /// same seam the listener uses. Absent, no receipt is written: there is
+        /// no delivery to prove, and minting one would forge the very link the
+        /// ledger exists to establish.
+        #[arg(long)]
+        message_id: Option<String>,
+
+        /// The bot that PHYSICALLY sent the message, for the receipt's
+        /// transport-scope id. Not the semantic reply role: one role can be
+        /// spoken by different bots across a rotation, and "whose token sent
+        /// it" is the question a delivery dispute turns on. Defaults to
+        /// `--agent-id`.
+        #[arg(long)]
+        bot_id: Option<String>,
     },
 
     /// Classify an inbound message exactly as `wg telegram listen` would

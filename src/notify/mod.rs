@@ -15,6 +15,7 @@ pub mod email;
 pub mod errand;
 pub mod family_plan;
 pub mod fast_lane;
+pub mod feed_lock;
 pub mod grounding;
 pub mod lifecycle;
 pub mod listener_health;

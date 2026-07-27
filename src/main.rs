@@ -4051,6 +4051,11 @@ fn main() -> Result<()> {
                 agent_id,
                 text,
                 src_id,
+                turn_id,
+                reply_phase,
+                non_relay_type,
+                message_id,
+                bot_id,
             } => commands::telegram::run_feed_write(
                 &root,
                 &kind,
@@ -4058,6 +4063,11 @@ fn main() -> Result<()> {
                 agent_id.as_deref(),
                 &text,
                 src_id.as_deref(),
+                turn_id.as_deref(),
+                reply_phase.as_deref(),
+                non_relay_type.as_deref(),
+                message_id.as_deref(),
+                bot_id.as_deref(),
             ),
             TelegramCommands::Classify {
                 channel,
