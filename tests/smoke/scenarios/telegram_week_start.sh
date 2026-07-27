@@ -261,4 +261,137 @@ if [[ -e "$q_scratch/plans/$this_code-family-plan.md" ]]; then
     loud_fail "asking whether the week was started CREATED a week"
 fi
 
+# ── NEGATION P0 (task week-start-engine-2): a REFUSAL creates nothing ────────
+# Detection is a substring scan over a closed list of imperatives, and a
+# substring scan cannot see a "don't" in front of the phrase it matched: "Don't
+# start the week." named the lane in order to REFUSE it and the engine created
+# the plan of record. The one sentence that could not have been clearer about
+# wanting no plan was the one that produced one.
+#
+# Each phrasing gets its OWN scratch project — a shared one would let the first
+# draft mask every later leg behind "already planned", which is a pass for the
+# wrong reason.
+negation_writes_nothing() {
+    local text="$1" tag="$2" ns out
+    ns="$(make_scratch)"
+    mkdir -p "$ns/plans" "$ns/.wg"
+    cp "$ended" "$ns/plans/$ended_code-family-plan.md"
+    local ended_sum
+    ended_sum="$(sha_of "$ns/plans/$ended_code-family-plan.md")"
+
+    # The read-only verdict must SAY it refused. Absence of a file is not enough:
+    # a binary that crashed also writes no plan and would pass a file check.
+    if ! out="$("$wg_bin" --json telegram week-start "$text" --now "$now" 2>/dev/null)"; then
+        loud_fail "the week-start seam exited nonzero for the refusal: $text"
+    fi
+    printf '%s' "$out" | python3 "$scratch/assert_negated.py" \
+        || loud_fail "a REFUSAL was not reported as one ($tag): $text"
+
+    # …and --apply must refuse rather than draft.
+    if "$wg_bin" --json telegram week-start "$text" --root "$ns" --now "$now" \
+        --apply --turn-id "turn-neg-$tag" >/dev/null 2>&1; then
+        loud_fail "a REFUSAL was accepted as an instruction to draft ($tag): $text"
+    fi
+    if [[ -e "$ns/plans/$this_code-family-plan.md" ]]; then
+        loud_fail "'$text' CREATED this week's plan of record"
+    fi
+    [[ "$(sha_of "$ns/plans/$ended_code-family-plan.md")" == "$ended_sum" ]] \
+        || loud_fail "a refused week-start edited the week that had already ended ($tag)"
+}
+
+cat >"$scratch/assert_negated.py" <<'PY'
+import json, sys
+d = json.loads(sys.stdin.read())
+if d.get("recognized"):
+    print(f"a refusal was recognized as a week-start ask: {d.get('lane')!r}", file=sys.stderr)
+    sys.exit(1)
+if not d.get("negated"):
+    print(f"the refusal was not reported as a refusal: {d!r}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+negation_writes_nothing "Don't start the week." dont
+negation_writes_nothing "Do not start the week." donot
+negation_writes_nothing "Please don't set up this week." please-dont
+negation_writes_nothing "Never start the week without asking me first." never
+negation_writes_nothing "Not yet — don't draft this week's plan." not-yet
+negation_writes_nothing "Cancel that, don't start the week." cancel
+negation_writes_nothing "Stop — do not plan this week." stop
+negation_writes_nothing "Not yet, start the week later." later
+
+# THE OTHER DIRECTION. A guard that refused every sentence with a "not" in it
+# would break the promise silently: "this week is not set up" is the usual REASON
+# for a genuine ask. These must still be recognized.
+recognize_is "This week is not set up yet — please start the week." yes
+recognize_is "There's no plan on the board, so start this week." yes
+recognize_is "Don't worry about the shopping list; start the week." yes
+
+# ── SIDECAR P0 (task week-start-engine-2): parked dinners reach the week ─────
+# `plans/<week>-dinner-suggestions.md` is where the "suggest a dinner"
+# affordance parks what the family types BEFORE the week exists. Two bugs met
+# here: shape discovery keyed on the FILENAME, so the sidecar (a bullet list,
+# and the newest week-coded file on disk) was read as "the household's most
+# recent plan" and supplied the shape for the new week; and nothing folded the
+# parked dinners in, so starting the week threw them away. The family types a
+# dinner, starts the week, and their dinner is gone.
+side="$(make_scratch)"
+mkdir -p "$side/plans" "$side/.wg"
+cp "$ended" "$side/plans/$ended_code-family-plan.md"
+# The EXACT line shape the affordance writes.
+cat >"$side/plans/$this_code-dinner-suggestions.md" <<'PARKED'
+# Dinner suggestions for the week of 2026-W31
+
+These are ideas the family added before the plan was drafted.
+
+- **Monday** (2026-07-27) — mushroom risotto · suggested by a household member
+- **Wednesday** (2026-07-29) — we are out, no dinner needed · suggested by a household member
+- **Thursday** (2026-07-30) — pasta al pomodoro · suggested by a household member
+PARKED
+sidecar="$side/plans/$this_code-dinner-suggestions.md"
+side_drafted="$side/plans/$this_code-family-plan.md"
+
+if ! out="$("$wg_bin" --json telegram week-start \
+    "Please draft this week's family plan — start the week." --root "$side" \
+    --now "$now" --apply --turn-id "turn-week-start-sidecar" 2>/dev/null)"; then
+    loud_fail "the week-start seam exited nonzero with a parked-dinner sidecar present"
+fi
+printf '%s' "$out" | python3 "$scratch/assert_applied.py" applied "$this_code" "Mon" "mushroom risotto" \
+    || loud_fail "a parked dinner did not reach the drafted week"
+[[ -f "$side_drafted" ]] || loud_fail "no plan was drafted with a sidecar present"
+
+# THE BYTES: every parked dinner is on its own night in the plan on disk.
+grep -qi "mushroom risotto" "$side_drafted" \
+    || loud_fail "Monday's parked dinner was dropped from the drafted week"
+grep -qi "pasta al pomodoro" "$side_drafted" \
+    || loud_fail "Thursday's parked dinner was dropped from the drafted week"
+grep -qi "no dinner needed" "$side_drafted" \
+    || loud_fail "Wednesday's parked non-cook night was dropped from the drafted week"
+
+# THE SHAPE came from the PLAN, never from the sidecar: seven day rows and the
+# household's own meals columns, not a bullet list.
+side_rows="$(grep -cE '^\| (Mon|Tue|Wed|Thu|Fri|Sat|Sun) ' "$side_drafted" || true)"
+[[ "$side_rows" == "7" ]] \
+    || loud_fail "the sidecar supplied the shape: $side_rows day rows, expected 7"
+grep -q "| Day | Slot | Dinner | Prep |" "$side_drafted" \
+    || loud_fail "the drafted week did not inherit the household's own meals columns"
+grep -q "^## 4. Shopping list" "$side_drafted" \
+    || loud_fail "the drafted week did not inherit the household's own shopping heading"
+# …and the sidecar never becomes a phantom week: its own text is not copied in.
+if grep -q "Dinner suggestions for the week" "$side_drafted"; then
+    loud_fail "the sidecar's own body was copied into the plan of record"
+fi
+
+# RETIREMENT IS IDEMPOTENT and never destroys what the family typed.
+grep -q "Folded into:.* plans/$this_code-family-plan.md" "$sidecar" \
+    || loud_fail "the folded sidecar was not stamped with the plan it landed in"
+grep -qi "pasta al pomodoro" "$sidecar" \
+    || loud_fail "retiring the sidecar destroyed the family's own words"
+stamps="$(grep -c "Folded into:" "$sidecar" || true)"
+[[ "$stamps" == "1" ]] || loud_fail "the sidecar carries $stamps folded-into stamps, expected 1"
+sidecar_sum="$(sha_of "$sidecar")"
+"$wg_bin" --json telegram week-start "Please draft this week's family plan — start the week." \
+    --root "$side" --now "$now" --apply --turn-id "turn-week-start-sidecar" >/dev/null 2>&1 || true
+[[ "$(sha_of "$sidecar")" == "$sidecar_sum" ]] \
+    || loud_fail "a refire re-stamped the sidecar — retirement is not idempotent"
+
 echo "PASS: telegram_week_start"

@@ -3601,6 +3601,51 @@ Keep what I just asked for: \"Set Tuesday's dinner to homemade pizza.\"";
         }
     }
 
+    /// A REFUSED week-start is never a write of any kind. The lane is tested
+    /// first, before every other shape, so if the negation guard were only in
+    /// the CLI the classifier would still hand "don't start the week" to a
+    /// writer — this pins the refusal at the choke point.
+    #[test]
+    fn a_negated_week_start_is_never_a_fast_lane_write() {
+        for msg in [
+            "Don't start the week.",
+            "Do not draft this week's plan.",
+            "Not yet — set up this week on Sunday.",
+            "Cancel that, don't start the week.",
+        ] {
+            match classify(msg, monday_w31()) {
+                Classification::FastLane(op) => {
+                    panic!("a REFUSAL became a write ({op:?}): {msg:?}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A REFUSED week-start writes nothing THROUGH THE REAL LANE, on a project
+    /// whose newest plan is the week that already ended — the exact state in
+    /// which the substring bug drafted a week nobody asked for.
+    #[test]
+    fn a_negated_week_start_leaves_the_project_byte_identical() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("plans")).unwrap();
+        let ended = root.path().join("plans/2026-W30-family-plan.md");
+        std::fs::write(&ended, ENDED_W30).unwrap();
+        let before = std::fs::read_to_string(&ended).unwrap();
+
+        let _ = run_fast_lane(root.path(), "Don't start the week.", monday_w31());
+
+        assert!(
+            !root.path().join("plans/2026-W31-family-plan.md").exists(),
+            "a refused week-start drafted a week anyway",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ended).unwrap(),
+            before,
+            "a refused week-start edited the week that already ended",
+        );
+    }
+
     /// THE ARCHIVED-WEEK TRAP. The carried quote reads exactly like a bare meal
     /// swap. If the ordinary matcher saw it first, the edit would land on the
     /// newest plan on disk — which on this Monday is the week that has already

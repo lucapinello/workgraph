@@ -289,6 +289,92 @@ fn founding_display_name(sender: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Operator log lines that touch household identifiers or private bodies
+// ---------------------------------------------------------------------------
+//
+// These four lines are built by NAMED functions rather than inline `println!`s
+// for one reason: a "the raw chat id never appears" promise that is only
+// enforced by a source-sweep can be quietly broken by the next edit to the call
+// site, and a sweep cannot tell a redacted interpolation from a raw one in a
+// format string it does not evaluate. Rendering through a function makes the
+// promise a hermetic test over the ACTUAL line: feed it a raw id and a private
+// body, assert neither survives.
+//
+// What deliberately survives: timestamps, task ids, event slugs, bot ids and
+// counts. Those are work-graph and configuration identifiers — they are what
+// makes an operator log worth keeping, and none of them is the family's.
+
+/// The startup banner's chat line.
+fn startup_chat_line(chat_id: &str) -> String {
+    format!(
+        "Chat ID: {}",
+        worksgood::notify::telegram::redact_id("chat", chat_id)
+    )
+}
+
+/// The line printed when a group message arrives twice and the second copy is
+/// dropped. The highest-volume line in the file that touches identifiers.
+fn duplicate_message_log_line(
+    stamp: &str,
+    chat_id: &str,
+    sender: &str,
+    date: i64,
+    message_id: Option<&str>,
+) -> String {
+    use worksgood::notify::telegram::redact_id;
+    format!(
+        "[{stamp}] Duplicate group message (chat {}, from {}, date {date}, msg {}) dropped — already handled",
+        redact_id("chat", chat_id),
+        redact_id("from", sender),
+        redact_id("msg", message_id.unwrap_or("")),
+    )
+}
+
+/// The line printed after a lifecycle message is delivered. It used to carry
+/// the whole text of what the house had just said to the family.
+fn lifecycle_delivered_log_line(
+    stamp: &str,
+    event_slug: &str,
+    task_id: &str,
+    chat_id: &str,
+    bot_id: &str,
+    message_id: &str,
+    text: &str,
+) -> String {
+    use worksgood::notify::telegram::{redact_body, redact_id};
+    format!(
+        "[{stamp}] lifecycle {event_slug} for {task_id} → chat {} via {bot_id} (message_id {}): {}",
+        redact_id("chat", chat_id),
+        redact_id("msg", message_id),
+        redact_body(text),
+    )
+}
+
+/// The line printed when a family ask dead-ends and the owner is alerted. It
+/// named the family member who asked and quoted what they asked for.
+fn dead_end_alert_log_line(stamp: &str, task_id: &str, requester: &str, text: &str) -> String {
+    use worksgood::notify::telegram::{redact_body, redact_id};
+    let who = if requester.trim().is_empty() {
+        "requester unknown".to_string()
+    } else {
+        redact_id("from", requester.trim())
+    };
+    format!(
+        "[{stamp}] DEAD-END family ask {task_id} ({who}): {}",
+        redact_body(text)
+    )
+}
+
+/// The line printed when that operator alert reaches the owner's DM.
+fn operator_alert_sent_log_line(stamp: &str, task_id: &str, chat_id: &str, bot_id: &str) -> String {
+    format!(
+        "[{stamp}] operator alert for {task_id} → owner chat {} via {}",
+        worksgood::notify::telegram::redact_id("chat", chat_id),
+        if bot_id.is_empty() { "legacy bot" } else { bot_id },
+    )
+}
+
 /// Extract the login nonce from a `/start` deep-link message body, or `None`
 /// when this is not a `login_` deep link. Accepts `/start login_<nonce>` and
 /// the `@bot`-qualified `/start@otto_bot login_<nonce>` form. The command token
@@ -487,7 +573,9 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
 
     println!("Starting Telegram listener...");
     println!("{}", bot_banner(&config));
-    println!("Chat ID: {}", effective_chat_id);
+    // The startup banner is the line most often pasted into an issue when the
+    // listener misbehaves, and it printed the household's raw group chat id.
+    println!("{}", startup_chat_line(&effective_chat_id));
 
     // Build one channel per configured bot. Live evidence for this whole task:
     // Luca tags a bot in the group and the @mention lands ONLY in that bot's
@@ -732,13 +820,21 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     let sender = msg.sender_id.as_deref().unwrap_or(msg.sender.as_str());
                     let key = DedupeKey::from_content(cid, sender, date, &msg.body);
                     if !dedupe.first_delivery(key) {
+                        // Every identifier here is redacted: this line fires on
+                        // ordinary family traffic, so it is the highest-volume
+                        // place a raw chat id, a raw sender id and a message id
+                        // all landed in one log line. The digests still answer
+                        // the operator's question — is one chat duplicating, is
+                        // one sender duplicating, is it the same message.
                         println!(
-                            "[{}] Duplicate group message (chat {}, from {}, date {}, msg {}) dropped — already handled",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                            cid,
-                            sender,
-                            date,
-                            msg.message_id.as_deref().unwrap_or("none"),
+                            "{}",
+                            duplicate_message_log_line(
+                                &chrono::Utc::now().format("%H:%M:%S").to_string(),
+                                cid,
+                                sender,
+                                date,
+                                msg.message_id.as_deref(),
+                            )
                         );
                         continue;
                     }
@@ -6290,6 +6386,12 @@ pub fn run_week_start(
     };
 
     let ask = week_start::detect(message);
+    // A message that NAMES the lane in order to refuse it ("don't start the
+    // week") is reported as a refusal, not as unrecognized noise: the family
+    // asked for a specific thing not to happen, and "nothing was created" is the
+    // honest answer to that. It is also what a proof can assert — the absence of
+    // a file alone would pass on a binary that simply crashed.
+    let negated = week_start::negated(message);
     let (week_code, monday, sunday) = week_start::iso_week_of(today);
 
     // The correlation key the live turn builds. `--turn-id` (or WG_TURN_ID) is
@@ -6301,6 +6403,11 @@ pub fn run_week_start(
     if apply {
         let root = root.ok_or_else(|| anyhow::anyhow!("--apply needs --root <project dir>"))?;
         if ask.is_none() {
+            if negated {
+                anyhow::bail!(
+                    "a NEGATED week-start ask — nothing was created (the message refuses the lane)"
+                );
+            }
             anyhow::bail!("not a week-start ask — nothing to apply");
         }
         // The occurrence journal belongs to the PROJECT whose week is being
@@ -6418,6 +6525,7 @@ pub fn run_week_start(
                 "message": message,
                 "lane": if ask.is_some() { "week-start" } else { "none" },
                 "recognized": ask.is_some(),
+                "negated": negated,
                 "carried": ask.as_ref().map(|a| a.carried.clone()).unwrap_or_default(),
                 "today": today.to_string(),
                 "week": week_code,
@@ -6435,6 +6543,9 @@ pub fn run_week_start(
         "lane:    {}",
         if ask.is_some() { "week-start" } else { "none" }
     );
+    if negated {
+        println!("negated: yes — the message refuses the lane; nothing is created");
+    }
     if let Some(a) = &ask {
         for c in &a.carried {
             println!("carried: {c}");
@@ -6850,15 +6961,22 @@ async fn deliver_lifecycle_fire(
     }
     let message_id = result?.unwrap_or_default();
 
+    // The lifecycle line carried the destination chat id, the returned message
+    // id, AND the full text of what the house just said to the family — the
+    // whole private body, verbatim, in a log an operator tails. The task id and
+    // the event slug are work-graph identifiers and stay: they are what makes
+    // this line diagnosable at all.
     println!(
-        "[{}] lifecycle {} for {} → chat {} via {} (message_id {}): {}",
-        chrono::Utc::now().format("%H:%M:%S"),
-        fire.event.slug(),
-        fire.task_id,
-        fire.origin.chat_id,
-        bot_id,
-        message_id,
-        fire.text,
+        "{}",
+        lifecycle_delivered_log_line(
+            &chrono::Utc::now().format("%H:%M:%S").to_string(),
+            fire.event.slug(),
+            &fire.task_id,
+            &fire.origin.chat_id,
+            &bot_id,
+            &message_id,
+            &fire.text,
+        )
     );
 
     Ok(())
@@ -6905,16 +7023,18 @@ async fn deliver_operator_alert(
     coordination_owner: Option<&str>,
     alert: &worksgood::notify::lifecycle::OperatorAlert,
 ) -> bool {
+    // A dead-end alert names the family member who asked and quotes what they
+    // asked for. Both are theirs, not the log's: the operator needs to know an
+    // ask dead-ended and which task it was, and the alert itself — which goes to
+    // the owner's DM, not to a log file — carries the words.
     eprintln!(
-        "[{}] DEAD-END family ask {} ({}): {}",
-        chrono::Utc::now().format("%H:%M:%S"),
-        alert.task_id,
-        if alert.requester.trim().is_empty() {
-            "unknown requester"
-        } else {
-            alert.requester.trim()
-        },
-        alert.text,
+        "{}",
+        dead_end_alert_log_line(
+            &chrono::Utc::now().format("%H:%M:%S").to_string(),
+            &alert.task_id,
+            &alert.requester,
+            &alert.text,
+        )
     );
     let Some((bot_id, chat_id)) = operator_alert_route(config, coordination_owner) else {
         eprintln!(
@@ -6927,15 +7047,13 @@ async fn deliver_operator_alert(
     match sink.send(&bot_id, &chat_id, &alert.text).await {
         Ok(_) => {
             println!(
-                "[{}] operator alert for {} → owner chat {} via {}",
-                chrono::Utc::now().format("%H:%M:%S"),
-                alert.task_id,
-                chat_id,
-                if bot_id.is_empty() {
-                    "legacy bot"
-                } else {
-                    &bot_id
-                },
+                "{}",
+                operator_alert_sent_log_line(
+                    &chrono::Utc::now().format("%H:%M:%S").to_string(),
+                    &alert.task_id,
+                    &chat_id,
+                    &bot_id,
+                )
             );
             true
         }
@@ -9703,6 +9821,138 @@ mod tests {
 
         let outcome = classify_inbound_message(dir, "telegram", "55501234", "yes");
         assert_eq!(outcome, InboundOutcome::Unmatched);
+    }
+
+    // ── operator-log privacy (hermetic never-appear proofs) ─────────────────
+
+    /// The household values a log line must never carry. Distinctive enough
+    /// that a substring check is decisive, and shaped like the real thing.
+    const RAW_CHAT: &str = "-1002233445566";
+    const RAW_SENDER: &str = "987654321";
+    const RAW_MSG: &str = "44815162342";
+    const PRIVATE_BODY: &str =
+        "Tuesday is homemade pizza and please remind me about the dentist on Thursday";
+
+    /// Every word of a private body long enough to be recognizable, plus every
+    /// raw identifier — none of them may appear in `line`.
+    fn assert_nothing_private_survives(what: &str, line: &str) {
+        for raw in [RAW_CHAT, RAW_SENDER, RAW_MSG] {
+            assert!(
+                !line.contains(raw),
+                "{what} leaked the raw identifier {raw}: {line}",
+            );
+            // …and not with the sign stripped, either.
+            assert!(
+                !line.contains(raw.trim_start_matches('-')),
+                "{what} leaked the raw identifier {raw} unsigned: {line}",
+            );
+        }
+        let low = line.to_lowercase();
+        for word in PRIVATE_BODY.split_whitespace() {
+            let word: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+            if word.len() < 4 {
+                continue;
+            }
+            assert!(
+                !low.contains(&word.to_lowercase()),
+                "{what} leaked the private word {word:?}: {line}",
+            );
+        }
+    }
+
+    /// THE STARTUP BANNER (site 1) — the line most often pasted into an issue.
+    #[test]
+    fn the_startup_banner_never_prints_the_raw_chat_id() {
+        let line = startup_chat_line(RAW_CHAT);
+        assert_nothing_private_survives("the startup banner", &line);
+        assert!(line.starts_with("Chat ID: chat#"), "{line}");
+    }
+
+    /// THE DUPLICATE-DROP LINE (site 2) — three raw identifiers in one line, on
+    /// the highest-volume path in the file.
+    #[test]
+    fn the_duplicate_drop_line_never_prints_a_raw_identifier() {
+        let line = duplicate_message_log_line("12:00:00", RAW_CHAT, RAW_SENDER, 1_785_000_000, Some(RAW_MSG));
+        assert_nothing_private_survives("the duplicate-drop line", &line);
+        // What an operator still gets: the shape of the event, and tokens they
+        // can correlate down the log.
+        assert!(line.contains("Duplicate group message"), "{line}");
+        assert!(line.contains("chat#") && line.contains("from#") && line.contains("msg#"), "{line}");
+        // A message with no id says so, rather than printing an empty token.
+        assert!(
+            duplicate_message_log_line("12:00:00", RAW_CHAT, RAW_SENDER, 0, None).contains("msg#none"),
+            "an absent message id should read as absent",
+        );
+    }
+
+    /// THE LIFECYCLE LINE (site 3) — this one carried the whole private body.
+    #[test]
+    fn the_lifecycle_line_never_prints_the_body_or_the_chat() {
+        let line = lifecycle_delivered_log_line(
+            "12:00:00",
+            "task-done",
+            "some-task-id",
+            RAW_CHAT,
+            "telegram:otto",
+            RAW_MSG,
+            PRIVATE_BODY,
+        );
+        assert_nothing_private_survives("the lifecycle delivery line", &line);
+        // The work-graph identifiers are NOT private and must survive, or the
+        // line stops being diagnosable at all.
+        assert!(line.contains("some-task-id"), "{line}");
+        assert!(line.contains("task-done"), "{line}");
+        assert!(line.contains("telegram:otto"), "{line}");
+        assert!(
+            line.contains(&format!("{} chars", PRIVATE_BODY.chars().count())),
+            "the body's shape was lost too: {line}",
+        );
+    }
+
+    /// THE OPERATOR ALERT (site 4) — it named the family member who asked and
+    /// quoted what they asked for.
+    #[test]
+    fn the_dead_end_alert_line_never_prints_the_requester_or_the_ask() {
+        let line = dead_end_alert_log_line("12:00:00", "some-task-id", RAW_SENDER, PRIVATE_BODY);
+        assert_nothing_private_survives("the dead-end alert line", &line);
+        assert!(line.contains("DEAD-END family ask some-task-id"), "{line}");
+        assert!(line.contains("from#"), "{line}");
+        // An unknown requester says so rather than printing an empty token.
+        assert!(
+            dead_end_alert_log_line("12:00:00", "t", "  ", "x").contains("requester unknown"),
+            "an absent requester should read as absent",
+        );
+
+        let sent = operator_alert_sent_log_line("12:00:00", "some-task-id", RAW_CHAT, "telegram:otto");
+        assert_nothing_private_survives("the operator-alert send line", &sent);
+        assert!(sent.contains("telegram:otto"), "{sent}");
+        assert!(
+            operator_alert_sent_log_line("12:00:00", "t", RAW_CHAT, "").contains("legacy bot"),
+            "the legacy-bot wording was lost",
+        );
+    }
+
+    /// THE NEGATIVE CONTROL. `assert_nothing_private_survives` is a "must not
+    /// appear" assertion, and those pass vacuously on an empty or gutted line.
+    /// Feed it the UNREDACTED shape of each line and it must fail — otherwise
+    /// the four tests above prove nothing.
+    #[test]
+    fn the_never_appear_log_assertions_have_teeth() {
+        let unredacted = [
+            format!("Chat ID: {RAW_CHAT}"),
+            format!("[12:00:00] Duplicate group message (chat {RAW_CHAT}, from {RAW_SENDER}, date 0, msg {RAW_MSG}) dropped"),
+            format!("[12:00:00] lifecycle task-done for t → chat {RAW_CHAT} via b (message_id {RAW_MSG}): {PRIVATE_BODY}"),
+            format!("[12:00:00] DEAD-END family ask t ({RAW_SENDER}): {PRIVATE_BODY}"),
+        ];
+        for line in unredacted {
+            let caught = std::panic::catch_unwind(|| {
+                assert_nothing_private_survives("control", &line);
+            });
+            assert!(
+                caught.is_err(),
+                "the never-appear assertion passed on an UNREDACTED line, so it has no teeth: {line}",
+            );
+        }
     }
 
     #[test]

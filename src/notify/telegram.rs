@@ -910,6 +910,90 @@ pub fn redact_bot_token(s: &str) -> String {
     re.replace_all(s, "bot<redacted>").into_owned()
 }
 
+// ---------------------------------------------------------------------------
+// Identifier and body redaction for operator logs
+// ---------------------------------------------------------------------------
+
+/// The salt every identifier digest below is keyed with.
+///
+/// A raw Telegram chat id is eight digits and a sender id is nine — low enough
+/// entropy that an UNKEYED hash is not redaction at all: anyone holding the log
+/// can enumerate the space in seconds and recover the id. So the digest is
+/// keyed, and by default the key is 32 bytes minted freshly per process. The
+/// consequence is deliberate: a digest correlates lines WITHIN one listener run
+/// (which is the diagnostic question — "which chat went quiet just now?") and
+/// says nothing at all across runs or across households.
+///
+/// `WG_REDACTION_SALT` pins the key for an operator who needs correlation across
+/// a restart, and for the hermetic proofs that assert a digest is stable.
+fn redaction_salt() -> &'static [u8] {
+    static SALT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    SALT.get_or_init(|| {
+        if let Ok(pinned) = std::env::var("WG_REDACTION_SALT") {
+            if !pinned.is_empty() {
+                return pinned.into_bytes();
+            }
+        }
+        let mut buf = [0u8; 32];
+        // A failed mint must not fall back to a PREDICTABLE salt — that would
+        // silently turn the keyed digest back into the enumerable one. Use a
+        // uuid (v4, OS entropy) instead, which fails the same way or not at all.
+        if getrandom::getrandom(&mut buf).is_ok() {
+            buf.to_vec()
+        } else {
+            uuid::Uuid::new_v4().as_bytes().to_vec()
+        }
+    })
+}
+
+/// Six hex characters of a keyed digest over `raw`.
+fn keyed_digest(domain: &str, raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(redaction_salt());
+    h.update(b"\x1f");
+    h.update(domain.as_bytes());
+    h.update(b"\x1f");
+    h.update(raw.as_bytes());
+    hex::encode(&h.finalize()[..3])
+}
+
+/// A stand-in for a raw Telegram identifier in an operator log: `chat#7f3a1c`.
+///
+/// Chat ids, sender ids and message ids are HOUSEHOLD identifiers. They are not
+/// credentials — a chat id grants nobody anything — but they are not the
+/// engine's to publish either: operator logs get pasted into issues, monitors
+/// and chats, and a raw sender id is a durable handle on a specific person that
+/// outlives the incident it was pasted for. The digest keeps every diagnostic
+/// that mattered — the same chat is the same token on every line, two senders
+/// are visibly two — while the identifier itself never leaves the process.
+///
+/// `kind` is the label the operator reads (`chat`, `from`, `msg`); it also
+/// domain-separates the digest, so a chat id and a message id that happen to be
+/// equal do not print as the same token.
+pub fn redact_id(kind: &str, raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return format!("{kind}#none");
+    }
+    format!("{kind}#{}", keyed_digest(kind, raw))
+}
+
+/// The SHAPE of a private message body — `<47 chars, body#a3f19c>` — with none
+/// of its words.
+///
+/// What a family says to each other, and what the house says back, is the most
+/// private thing this process handles. An operator debugging delivery needs to
+/// know that a body was non-empty, roughly how long it was, and whether the
+/// line they are looking at is the SAME body as the one three lines up. None of
+/// those questions needs the text, so the text is never printed.
+pub fn redact_body(text: &str) -> String {
+    if text.is_empty() {
+        return "<empty>".to_string();
+    }
+    format!("<{} chars, body#{}>", text.chars().count(), keyed_digest("body", text))
+}
+
 /// Turn an error whose text can embed a Bot API URL into a FLAT, token-free
 /// `anyhow::Error` — the write-time choke point for every token-bearing call.
 ///
@@ -1340,6 +1424,86 @@ mod tests {
         // The human-facing bot NAME (`telegram:otto`, `bot_id`) must be kept —
         // it has no `bot<digits>:` shape so it is never touched.
         assert!(redact_bot_token(clean).contains("telegram:otto"));
+    }
+
+    // ── identifier and body redaction ───────────────────────────────────────
+
+    /// A raw chat id, sender id or message id must NEVER appear in a redacted
+    /// token — not as a substring, not reversed, not in any base. This is the
+    /// whole promise, so it is asserted directly rather than inferred from the
+    /// shape of the output.
+    #[test]
+    fn a_redacted_id_never_contains_the_raw_id() {
+        for raw in ["-1002233445566", "987654321", "4242", "@a_handle"] {
+            for kind in ["chat", "from", "msg"] {
+                let out = redact_id(kind, raw);
+                assert!(
+                    !out.contains(raw),
+                    "the raw identifier survived redaction: {out}"
+                );
+                assert!(out.starts_with(&format!("{kind}#")), "{out}");
+            }
+        }
+    }
+
+    /// The digest still answers the operator's question: the same id is the
+    /// same token every time, two ids are two tokens, and the SAME digits under
+    /// two kinds do not collide into one token.
+    #[test]
+    fn a_redacted_id_correlates_without_identifying() {
+        assert_eq!(redact_id("chat", "-100123"), redact_id("chat", "-100123"));
+        assert_ne!(redact_id("chat", "-100123"), redact_id("chat", "-100124"));
+        assert_ne!(redact_id("chat", "4242"), redact_id("msg", "4242"));
+        assert_eq!(redact_id("msg", "  "), "msg#none");
+        assert_eq!(redact_id("msg", ""), "msg#none");
+    }
+
+    /// A private body never reaches the log — not one word of it. What survives
+    /// is the length and a correlation digest.
+    #[test]
+    fn a_redacted_body_keeps_no_words() {
+        let body = "Homemade pizza on Tuesday, and can you remind me about the dentist";
+        let out = redact_body(body);
+        for word in body.split_whitespace() {
+            let word: String = word
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            if word.len() < 4 {
+                continue;
+            }
+            assert!(
+                !out.to_lowercase().contains(&word),
+                "the body leaked the word {word:?}: {out}",
+            );
+        }
+        assert!(out.contains("66 chars"), "{out}");
+        assert_eq!(redact_body(body), redact_body(body));
+        assert_ne!(redact_body(body), redact_body("something else entirely"));
+        assert_eq!(redact_body(""), "<empty>");
+    }
+
+    /// THE NEGATIVE CONTROL for the two tests above: the same assertions run
+    /// against the UNREDACTED value must FAIL. Without this, a redactor that
+    /// returned the empty string — or a body whose words all happened to be
+    /// short — would pass a "must not appear" check vacuously.
+    #[test]
+    fn the_never_appear_assertions_have_teeth() {
+        let raw = "-1002233445566";
+        assert!(
+            format!("chat#{raw}").contains(raw),
+            "the raw-id assertion cannot fail, so it proves nothing",
+        );
+        let body = "Homemade pizza on Tuesday";
+        assert!(
+            body.to_lowercase().contains("pizza"),
+            "the body assertion cannot fail, so it proves nothing",
+        );
+        assert!(
+            redact_body(body).len() > "<empty>".len(),
+            "a redactor that erased everything would pass vacuously",
+        );
     }
 
     #[test]

@@ -21,7 +21,11 @@
 //!   · [`detect`] recognizes the dispatched week-start ask and pulls out every
 //!     QUOTED carried request. Detection is deliberately narrow: a closed set of
 //!     imperative phrasings, never a question about the week ("did you start the
-//!     week?" is a read, and answering it must not write a plan).
+//!     week?" is a read, and answering it must not write a plan), and never a
+//!     NEGATED one — "Don't start the week." names the lane precisely in order
+//!     to refuse it, and a substring scan for "start the week" read that as
+//!     consent and created the plan. [`negated`] reports that refusal so a
+//!     caller can say "nothing was created" instead of falling silently through.
 //!   · [`draft_week`] builds THIS week's plan document — the ordinary drafting
 //!     path: the household's own most recent plan supplies the SHAPE (its section
 //!     headings, its meals-table columns, its day-cell style, its store
@@ -80,6 +84,11 @@ pub struct DraftedWeek {
     pub end: NaiveDate,
     /// Every carried request, proven present in the plan that is now on disk.
     pub preserved: Vec<PreservedEdit>,
+    /// Every dinner the family PARKED for this week before it existed, proven
+    /// present in the plan that is now on disk.
+    pub parked: Vec<ParkedDinner>,
+    /// The sidecar this draft folded in and stamped, when there was one.
+    pub sidecar_retired: Option<PathBuf>,
 }
 
 /// Why a week-start ask did NOT produce a plan. Every variant leaves the
@@ -94,6 +103,16 @@ pub enum WeekStartError {
     /// A carried request was understood but did not survive the edit or the
     /// re-parse. Same rule: nothing is written.
     CarriedLost { request: String, reason: String },
+    /// A dinner the family PARKED for this week did not survive into the draft.
+    /// Same rule as a carried request: the whole draft is abandoned, because a
+    /// week that silently dropped a dinner someone typed in is the failure this
+    /// module exists to prevent — and it is the exact failure that shipped when
+    /// shape discovery read the sidecar as a plan.
+    ParkedLost {
+        date: NaiveDate,
+        dish: String,
+        reason: String,
+    },
     /// The plan could not be written, or could not be read back afterwards.
     Io(String),
     /// The written file did not parse back to the week we drafted — a dead
@@ -112,6 +131,9 @@ impl std::fmt::Display for WeekStartError {
             }
             WeekStartError::CarriedLost { request, reason } => {
                 write!(f, "carried request {request:?} did not land: {reason}")
+            }
+            WeekStartError::ParkedLost { date, dish, reason } => {
+                write!(f, "parked dinner {dish:?} for {date} did not land: {reason}")
             }
             WeekStartError::Io(m) => write!(f, "week-start io: {m}"),
             WeekStartError::Unverified(m) => write!(f, "drafted week failed verification: {m}"),
@@ -146,6 +168,125 @@ const QUESTION_OPENERS: &[&str] = &[
     "did ", "do ", "does ", "have ", "has ", "is ", "are ", "was ", "were ", "will ", "would ",
     "can ", "could ", "should ", "shall ", "when ", "what ", "why ", "how ", "who ", "where ",
 ];
+
+/// Cues that TURN THE START PHRASE OFF. Detection is a substring scan for a
+/// closed list of imperatives, and a substring scan reads "Don't start the week"
+/// as an instruction to start the week — the negation is invisible to it. That
+/// is the whole bug: the sentence that most explicitly says *do not create the
+/// plan* created the plan.
+///
+/// These are matched inside the CLAUSE that carries the start phrase, never
+/// across the whole message, because a plain "not" somewhere else is usually
+/// part of the reason FOR the ask: "this week is not set up — please start the
+/// week" is a genuine request and must stay green. For the same reason the list
+/// holds no bare `not `: every entry is a multi-word form that cannot be the
+/// premise of a positive ask.
+const NEGATION_CUES: &[&str] = &[
+    "don't",
+    "don\u{2019}t",
+    "dont",
+    "do not",
+    "doesn't",
+    "doesn\u{2019}t",
+    "does not",
+    "didn't",
+    "didn\u{2019}t",
+    "won't",
+    "won\u{2019}t",
+    "will not",
+    "can't",
+    "can\u{2019}t",
+    "cannot",
+    "never",
+    "not yet",
+    "not now",
+    "no need to",
+    "rather not",
+    "without starting",
+    "without setting up",
+    "without creating",
+    "without drafting",
+    "without planning",
+    "instead of starting",
+    "hold off",
+    "cancel",
+    "stop",
+];
+
+/// A clause that is NOTHING BUT a refusal. "Not yet, start the week later"
+/// splits into a bare refusal and a clause the cue scan alone would read as an
+/// instruction, so a standalone refusal anywhere in the message turns the whole
+/// message off. Matched whole-clause — "no need for a rush" is not "no thanks".
+const STANDALONE_REFUSALS: &[&str] = &[
+    "not yet",
+    "not now",
+    "not this week",
+    "no thanks",
+    "no thank you",
+    "never mind",
+    "nevermind",
+    "hold off",
+    "hold on",
+    "cancel",
+    "cancel that",
+    "stop",
+    "stop that",
+];
+
+/// Split an instruction into clauses. Sentence AND clause punctuation both
+/// count: the negation has to be scoped to the part of the sentence that
+/// carries the start phrase, or the guard becomes the same blunt substring scan
+/// it exists to fix.
+fn clauses(low: &str) -> Vec<&str> {
+    low.split(|c: char| {
+        matches!(
+            c,
+            '.' | '!' | '?' | ';' | ',' | ':' | '\n' | '\u{2014}' | '\u{2013}' | '-'
+        )
+    })
+    .map(|c| c.trim())
+    .filter(|c| !c.is_empty())
+    .collect()
+}
+
+/// Is this recognized-looking instruction actually the family saying DON'T?
+///
+/// `low` is the lowercased message with its quoted carriage already removed, so
+/// a quoted request can no more negate the instruction than it can smuggle one
+/// in.
+fn negates_start(low: &str) -> bool {
+    for clause in clauses(low) {
+        let bare = clause
+            .trim_start_matches("please ")
+            .trim_start_matches("ok ")
+            .trim_start_matches("okay ")
+            .trim_end_matches(" please")
+            .trim();
+        if STANDALONE_REFUSALS.iter().any(|r| bare == *r) {
+            return true;
+        }
+        if START_PHRASES.iter().any(|p| clause.contains(p))
+            && NEGATION_CUES.iter().any(|c| clause.contains(c))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does `message` name the week-start lane but REFUSE it? True only when a start
+/// phrase is present and negated — so a caller can answer honestly ("nothing was
+/// created") instead of falling silently through to the composer, and a proof
+/// can assert the refusal rather than merely the absence of a file.
+pub fn negated(message: &str) -> bool {
+    let (_carried, instruction) = split_quoted(message);
+    let low = instruction.to_lowercase();
+    let low = low.trim();
+    if !START_PHRASES.iter().any(|p| low.contains(p)) {
+        return false;
+    }
+    negates_start(low)
+}
 
 /// Pull every double-quoted span out of `text`, returning (spans, text with the
 /// spans removed). Straight and curly quotes both count — the gateway quotes the
@@ -213,6 +354,12 @@ pub fn detect(message: &str) -> Option<WeekStartAsk> {
         return None;
     }
     if low.contains('?') && !low.contains("please") && !low.contains("let's") {
+        return None;
+    }
+    // "Don't start the week." NAMES the lane in order to refuse it. A substring
+    // scan cannot see that, and the sentence that most explicitly says *do not
+    // create the plan* is the one that created it.
+    if negates_start(low) {
         return None;
     }
     Some(WeekStartAsk { carried })
@@ -393,7 +540,40 @@ fn shape_of(content: &str) -> PlanShape {
     shape
 }
 
+/// Files that live in `plans/` under a week-coded name but are NOT plans of
+/// record. `plans/2026-W30-dinner-suggestions.md` is the parked-dinner
+/// side-channel the "suggest a dinner" affordance writes; the recipe and workout
+/// notes are companions a household member keeps beside the week. Every one of
+/// them has a week-coded stem, so the name alone cannot tell them apart from the
+/// plan — and shape discovery, which only looked at the name, happily read a
+/// bullet list of parked dinners as "the household's most recent plan" and
+/// drafted the new week in ITS shape: no meals table, no store sections, and the
+/// parked dinners themselves dropped on the floor.
+const SIDECAR_SUFFIXES: &[&str] = &["dinner-suggestions"];
+
+/// Is this stem a week-coded file that is NOT a plan of record?
+fn is_sidecar_stem(stem: &str) -> bool {
+    let low = stem.to_ascii_lowercase();
+    SIDECAR_SUFFIXES.iter().any(|s| low.ends_with(s))
+}
+
+/// Does this document actually READ like a plan of record? The name check above
+/// is a closed list and a household may keep a companion nobody enumerated, so
+/// shape discovery ALSO insists on structure: a plan has a meals section. A
+/// recipe card or a workout note does not, and a shape copied from one would
+/// produce a week with nowhere to put dinner.
+fn looks_like_plan(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.trim()
+            .strip_prefix("## ")
+            .map(family_plan::is_meals_section_heading)
+            .unwrap_or(false)
+    })
+}
+
 /// The newest plan on disk, by week code — the household's most recent example.
+/// Sidecars and companions are excluded: the shape a new week inherits must come
+/// from a real plan of record or from nothing at all.
 fn newest_plan(root: &Path) -> Option<String> {
     let plans_dir = root.join("plans");
     let mut best: Option<(String, String)> = None;
@@ -403,17 +583,147 @@ fn newest_plan(root: &Path) -> Option<String> {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if is_sidecar_stem(stem) {
+            continue;
+        }
         let Some(week) = week_code_of_stem(stem) else {
             continue;
         };
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
+        if !looks_like_plan(&content) {
+            continue;
+        }
         if best.as_ref().map(|(w, _)| week > *w).unwrap_or(true) {
             best = Some((week, content));
         }
     }
     best.map(|(_, c)| c)
+}
+
+// ---------------------------------------------------------------------------
+// Parked dinners — the side-channel the family filled in BEFORE the week existed
+// ---------------------------------------------------------------------------
+
+/// One dinner the family parked for a night of the week being drafted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedDinner {
+    /// The night it was parked for.
+    pub date: NaiveDate,
+    /// The dish, with its provenance tail (`· suggested by …`) already peeled.
+    pub dish: String,
+}
+
+/// The sidecar path for a week code.
+fn sidecar_path(root: &Path, week_code: &str) -> PathBuf {
+    root.join("plans")
+        .join(format!("{week_code}-dinner-suggestions.md"))
+}
+
+/// Peel the provenance tail off a parked line. The writer appends
+/// `· suggested by Luca`, `· requested by …`, `· recipe written by … in \`path\``
+/// — none of which is the dish, and a leaked file path in a dinner cell is a
+/// sentence the house would have to explain.
+fn strip_provenance(raw: &str) -> String {
+    raw.split('\u{b7}').next().unwrap_or(raw).trim().to_string()
+}
+
+/// Read the dinners parked for `week_code`, in file order, keyed to their date.
+/// Format-tolerant by design — it mirrors the writer
+/// (`weekAdapter._parkSuggestion`), whose line is
+/// `- **Tuesday** (2026-07-28) — Homemade pizza · suggested by Luca`. The ISO
+/// date in the parentheses is authoritative; the weekday word beside it is the
+/// family's own copy. Never throws: a missing sidecar is simply no parked
+/// dinners.
+pub fn parked_dinners(root: &Path, week_code: &str) -> Vec<ParkedDinner> {
+    let Ok(body) = std::fs::read_to_string(sidecar_path(root, week_code)) else {
+        return Vec::new();
+    };
+    parse_parked(&body)
+}
+
+/// Pure parse of a sidecar body. LAST write for a night wins, matching the
+/// surface the family typed into: a re-typed dinner replaces the earlier one
+/// rather than stacking a second dish onto the same night.
+fn parse_parked(body: &str) -> Vec<ParkedDinner> {
+    let mut out: Vec<ParkedDinner> = Vec::new();
+    for raw in body.lines() {
+        let line = raw.trim();
+        let Some(rest) = line.strip_prefix("- ") else {
+            continue;
+        };
+        // `**Tuesday** (2026-07-28) — dish …`
+        let Some(open) = rest.find('(') else { continue };
+        let Some(close) = rest[open..].find(')') else {
+            continue;
+        };
+        let iso = rest[open + 1..open + close].trim();
+        let Ok(date) = NaiveDate::parse_from_str(iso, "%Y-%m-%d") else {
+            continue;
+        };
+        let tail = rest[open + close + 1..].trim();
+        // The em-dash separator, with the en-dash and a plain hyphen tolerated.
+        let dish = tail
+            .trim_start_matches(['\u{2014}', '\u{2013}', '-'])
+            .trim();
+        let dish = strip_provenance(dish);
+        if dish.is_empty() {
+            continue;
+        }
+        out.retain(|p| p.date != date);
+        out.push(ParkedDinner { date, dish });
+    }
+    out
+}
+
+/// Stamp that says a sidecar's dinners are IN the plan now.
+const FOLDED_MARKER: &str = "**Folded into:**";
+
+/// Retire the sidecar whose dinners have provably landed in `plan_path`.
+///
+/// IDEMPOTENT and NON-DESTRUCTIVE: the family's own words stay in the file; a
+/// stamp naming the plan they were folded into is inserted after the heading.
+/// Running it again finds the stamp and leaves the file byte-identical, so a
+/// dispatcher refire cannot double-stamp — and nothing is ever deleted, because
+/// a side-channel note the family typed into is not the engine's to throw away.
+/// The filename is left ALONE on purpose: every `plans/*.md` with a week-coded
+/// name that is not a known sidecar suffix is a candidate plan to the surfaces
+/// that read this directory, so a "retired" rename would become a phantom week.
+///
+/// Returns `Ok(true)` when it wrote, `Ok(false)` when there was nothing to do.
+pub fn retire_sidecar(root: &Path, week_code: &str, plan_path: &Path) -> std::io::Result<bool> {
+    let path = sidecar_path(root, week_code);
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    if body.contains(FOLDED_MARKER) {
+        return Ok(false);
+    }
+    let rel = plan_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| format!("plans/{n}"))
+        .unwrap_or_else(|| plan_path.display().to_string());
+    let stamp = format!("{FOLDED_MARKER} {rel}");
+    let mut out = String::with_capacity(body.len() + stamp.len() + 2);
+    let mut stamped = false;
+    for line in body.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if !stamped && line.trim_start().starts_with("# ") {
+            out.push('\n');
+            out.push_str(&stamp);
+            out.push('\n');
+            stamped = true;
+        }
+    }
+    if !stamped {
+        out.push_str(&stamp);
+        out.push('\n');
+    }
+    crate::atomic_file::write_atomic(&path, out.as_bytes())?;
+    Ok(true)
 }
 
 /// `2026-W31` from a filename stem like `2026-W31-family-plan`.
@@ -616,6 +926,43 @@ pub fn draft_week(
     let shape = newest_plan(root).map(|c| shape_of(&c)).unwrap_or_default();
     let mut content = scaffold(&week_code, monday, sunday, &shape);
 
+    // FOLD IN THE PARKED DINNERS FIRST. Before this week had a plan, the "suggest
+    // a dinner" affordance was the only place to put one, and everything the
+    // family typed there went into the sidecar. Drafting the week WITHOUT them
+    // silently throws that away — the family types a dinner, the week gets
+    // started, and their dinner is gone. Carried requests are applied after, so
+    // an explicit ask made NOW beats a suggestion parked earlier for the same
+    // night.
+    let mut parked: Vec<ParkedDinner> = Vec::new();
+    for entry in parked_dinners(root, &week_code) {
+        if entry.date < monday || entry.date > sunday {
+            continue;
+        }
+        let op = FastLaneOp::MealSwap {
+            day: entry.date.weekday(),
+            dish: entry.dish.clone(),
+        };
+        match fast_lane::apply_to_content_with_calendar_owner(
+            &week_code,
+            &content,
+            &op,
+            calendar_owner,
+        ) {
+            Ok(edited) => {
+                content = edited;
+                parked.retain(|p| p.date != entry.date);
+                parked.push(entry);
+            }
+            Err(e) => {
+                return Err(WeekStartError::ParkedLost {
+                    date: entry.date,
+                    dish: entry.dish,
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+
     // Apply the carried requests to the DRAFT, in the family's own words, through
     // the same editors a live chat turn uses. Anything the closed set cannot
     // express aborts the draft — a week that quietly dropped the request is the
@@ -686,6 +1033,34 @@ pub fn draft_week(
     for edit in &preserved {
         verify_preserved(&doc, edit)?;
     }
+    // A parked dinner is proven the same way a carried one is — against the
+    // BYTES, on the night it was parked for. Only requests applied later may
+    // legitimately have replaced it.
+    for entry in &parked {
+        if preserved.iter().any(|e| replaced_night(e, entry.date, &doc)) {
+            continue;
+        }
+        let landed = doc
+            .meal_on(entry.date)
+            .map(|m| m.dish.to_lowercase().contains(&entry.dish.to_lowercase()))
+            .unwrap_or(false);
+        if !landed {
+            return Err(WeekStartError::ParkedLost {
+                date: entry.date,
+                dish: entry.dish.clone(),
+                reason: "absent from the plan that was written".into(),
+            });
+        }
+    }
+
+    // The dinners are IN the week now. Stamp the side-channel so a later read
+    // does not offer them a second time as if the week were still un-planned.
+    // NON-FATAL: the plan above is proven on disk, and reporting "no week" over
+    // a stamp that did not write would be the dishonest direction.
+    let sidecar_retired = match retire_sidecar(root, &week_code, &path) {
+        Ok(true) => Some(sidecar_path(root, &week_code)),
+        _ => None,
+    };
 
     Ok(DraftedWeek {
         week_code,
@@ -693,7 +1068,19 @@ pub fn draft_week(
         start: monday,
         end: sunday,
         preserved,
+        parked,
+        sidecar_retired,
     })
+}
+
+/// Did a carried request legitimately take over `date`'s dinner? A parked
+/// dinner it overwrote is not "lost" — it was superseded by an ask the family
+/// made afterwards, and both are visible in the report.
+fn replaced_night(edit: &PreservedEdit, date: NaiveDate, doc: &PlanDoc) -> bool {
+    match fast_lane::classify(&edit.request, doc.start.unwrap_or(date)) {
+        Classification::FastLane(FastLaneOp::MealSwap { day, .. }) => day == date.weekday(),
+        _ => false,
+    }
 }
 
 /// Prove one carried request survived into the document that is on disk.
@@ -749,6 +1136,17 @@ pub fn report_line(drafted: &DraftedWeek) -> String {
     );
     for edit in &drafted.preserved {
         line.push_str(&format!(" · {}", edit.report.trim_start_matches("Done — ")));
+    }
+    // Say what was carried across from the side-channel, by name. The family
+    // typed those dinners in before the week existed; "your week is started" with
+    // no mention of them reads as if they were lost even when they were not.
+    if !drafted.parked.is_empty() {
+        let kept: Vec<String> = drafted
+            .parked
+            .iter()
+            .map(|p| format!("{} {}", p.date.format("%a"), p.dish))
+            .collect();
+        line.push_str(&format!(" · kept your dinners: {}", kept.join(", ")));
     }
     line
 }
@@ -852,6 +1250,112 @@ mod tests {
     #[test]
     fn a_quoted_start_phrase_alone_does_not_trigger() {
         assert!(detect("She said \"start the week\" earlier.").is_none());
+    }
+
+    // ── negation (P0) ───────────────────────────────────────────────────────
+
+    /// THE P0. A negated ask names the lane in order to REFUSE it. The substring
+    /// scan read "Don't start the week." as consent and drafted the plan — the
+    /// one sentence that could not have been clearer about wanting no plan.
+    #[test]
+    fn a_negated_ask_never_drafts() {
+        for msg in [
+            "Don't start the week.",
+            "Don\u{2019}t start the week.",
+            "Do not start the week.",
+            "Please don't set up this week.",
+            "Never start the week without asking me first.",
+            "Not yet — don't draft this week's plan.",
+            "Cancel that, don't start the week.",
+            "Stop — do not plan this week.",
+            "Hold off, don't get this week started.",
+            "I can't start the week myself, and you shouldn't either — do not start the week.",
+        ] {
+            assert!(
+                detect(msg).is_none(),
+                "a REFUSAL was read as consent and would draft a week: {msg:?}"
+            );
+            assert!(negated(msg), "the refusal was not reported as one: {msg:?}");
+        }
+    }
+
+    /// A bare refusal in its own clause turns the whole message off, even when
+    /// the clause that carries the start phrase reads clean on its own.
+    #[test]
+    fn a_standalone_refusal_clause_turns_the_whole_message_off() {
+        for msg in [
+            "Not yet, start the week later.",
+            "Not this week. Plan this week when we're back.",
+            "Never mind — set up this week another time.",
+            "Cancel: start the week tomorrow instead.",
+        ] {
+            assert!(detect(msg).is_none(), "read as consent: {msg:?}");
+            assert!(negated(msg), "not reported as a refusal: {msg:?}");
+        }
+    }
+
+    /// THE FALSE-POSITIVE CONTROL. The guard scopes the negation to the clause
+    /// that carries the start phrase, because "the week is NOT set up" is the
+    /// usual REASON for a genuine ask. A guard that refused these would have
+    /// broken the promise in the other direction, silently.
+    #[test]
+    fn a_negation_elsewhere_in_the_sentence_still_drafts() {
+        for msg in [
+            "This week is not set up yet — please start the week.",
+            "There's no plan on the board, so start this week.",
+            "I couldn't do it last night. Please draft this week's family plan.",
+            "Don't worry about the shopping list; start the week.",
+        ] {
+            assert!(
+                detect(msg).is_some(),
+                "a genuine ask was refused by the negation guard: {msg:?}"
+            );
+            assert!(!negated(msg), "a genuine ask was reported negated: {msg:?}");
+        }
+    }
+
+    /// The negation lives in the INSTRUCTION, not in the carriage: a family
+    /// request that happens to contain "don't" is still carried into the draft.
+    #[test]
+    fn a_negation_inside_the_quoted_carriage_does_not_refuse_the_ask() {
+        let ask = detect(
+            "Please draft this week's family plan — start the week. Keep what I asked for: \
+             \"Set Tuesday's dinner to homemade pizza, don't put fish on Tuesday.\"",
+        )
+        .expect("the carriage negated the instruction it was quoted inside");
+        assert_eq!(ask.carried.len(), 1);
+        assert!(ask.carried[0].contains("don't"));
+    }
+
+    /// `negated` speaks only about the week-start lane; ordinary chatter with a
+    /// "don't" in it is not a refused week-start.
+    #[test]
+    fn negated_is_silent_about_messages_that_are_not_week_start_asks() {
+        assert!(!negated("Don't put fish on Tuesday."));
+        assert!(!negated("yes"));
+        assert!(!negated("Did you start the week?"));
+    }
+
+    /// The refusal reaches the DRAFTING side too: a negated ask leaves the
+    /// project byte-identical because it never becomes an ask at all.
+    #[test]
+    fn a_negated_ask_writes_no_plan_to_disk() {
+        let dir = scratch(true);
+        let before = std::fs::read_dir(dir.path().join("plans"))
+            .unwrap()
+            .count();
+        assert!(detect("Don't start the week.").is_none());
+        assert!(
+            !dir.path()
+                .join("plans")
+                .join("2026-W31-family-plan.md")
+                .exists(),
+            "a refused week-start left a plan on disk",
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("plans")).unwrap().count(),
+            before
+        );
     }
 
     // ── drafting ────────────────────────────────────────────────────────────
@@ -1004,6 +1508,204 @@ mod tests {
             .flat_map(|s| s.items.iter())
             .any(|i| i.to_lowercase().contains("olive oil")));
         assert_eq!(out.preserved.len(), 2);
+    }
+
+    // ── the parked-dinner sidecar (P0) ──────────────────────────────────────
+
+    /// The EXACT bytes `weekAdapter._parkSuggestion` writes, for the week being
+    /// drafted. Written by hand from the live note in `plans/` rather than
+    /// invented, because a fixture in a format nothing produces proves nothing.
+    const W31_SIDECAR: &str = "\
+# Dinner suggestions for the week of 2026-W31
+
+These are ideas the family added before the plan was drafted. Otto folds them
+into the Sunday draft for this week.
+
+- **Monday** (2026-07-27) — Mushroom risotto (Vegetarian, fits the Monday veg slot) · requested by a household member · recipe written in `plans/2026-W31-recipes.md`
+- **Wednesday** (2026-07-29) — We are out, no dinner needed · suggested by a household member
+- **Thursday** (2026-07-30) — Pasta al pomodoro · suggested by a household member
+";
+
+    fn park(dir: &Path, body: &str) -> PathBuf {
+        let p = dir.join("plans").join("2026-W31-dinner-suggestions.md");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// THE P0. A sidecar sorts NEWEST by week code, so shape discovery read a
+    /// bullet list of parked dinners as "the household's most recent plan" — and
+    /// a week drafted in that shape has no meals table at all.
+    #[test]
+    fn a_sidecar_is_never_mistaken_for_the_households_shape() {
+        let dir = scratch(true);
+        park(dir.path(), W31_SIDECAR);
+        let shape = newest_plan(dir.path()).map(|c| shape_of(&c)).unwrap();
+        assert_eq!(
+            shape.meals_heading, "1. Dinners (planner → cook)",
+            "shape discovery read the parked-dinner sidecar as the plan",
+        );
+        assert_eq!(shape.shopping_sections, vec!["Greengrocer / produce"]);
+    }
+
+    /// LIVE SHAPE. The household's real `plans/` holds recipe cards, workout
+    /// notes and a check-in beside the plan, every one of them week-coded. The
+    /// plan of record must still be the shape a new week inherits.
+    #[test]
+    fn companions_beside_the_plan_never_supply_the_shape() {
+        let dir = scratch(true);
+        let plans = dir.path().join("plans");
+        park(dir.path(), W31_SIDECAR);
+        std::fs::write(
+            plans.join("2026-W31-cook-recipes.md"),
+            "# Recipes for 2026-W31\n\n## Mushroom risotto\n\n- Arborio rice\n",
+        )
+        .unwrap();
+        std::fs::write(
+            plans.join("2026-W31-workouts.md"),
+            "# Workouts 2026-W31\n\n## Monday\n\n- 5k\n",
+        )
+        .unwrap();
+        let shape = newest_plan(dir.path()).map(|c| shape_of(&c)).unwrap();
+        assert_eq!(shape.meals_heading, "1. Dinners (planner → cook)");
+        assert!(shape.meals_header.contains(&"Prep".to_string()), "{shape:?}");
+    }
+
+    #[test]
+    fn parked_lines_parse_with_their_provenance_peeled() {
+        let parked = parse_parked(W31_SIDECAR);
+        assert_eq!(parked.len(), 3);
+        assert_eq!(parked[0].date, NaiveDate::from_ymd_opt(2026, 7, 27).unwrap());
+        assert_eq!(
+            parked[0].dish,
+            "Mushroom risotto (Vegetarian, fits the Monday veg slot)",
+            "the provenance tail leaked into the dish",
+        );
+        assert_eq!(parked[1].dish, "We are out, no dinner needed");
+        assert_eq!(parked[2].dish, "Pasta al pomodoro");
+    }
+
+    /// A night typed twice keeps the LAST one — the same rule the surface the
+    /// family typed into applies, so the plan matches what they last saw.
+    #[test]
+    fn a_re_parked_night_keeps_the_last_dinner() {
+        let parked = parse_parked(
+            "- **Tuesday** (2026-07-28) — Homemade pizza · suggested by a household member\n\
+             - **Tuesday** (2026-07-28) — Lentil soup · suggested by a household member\n",
+        );
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].dish, "Lentil soup");
+    }
+
+    /// THE BUG, END TO END: the dinners the family parked BEFORE the week
+    /// existed are IN the week that gets drafted — read back from disk, on their
+    /// own nights.
+    #[test]
+    fn parked_dinners_land_in_the_drafted_week() {
+        let dir = scratch(true);
+        park(dir.path(), W31_SIDECAR);
+        let ask = detect("Please draft this week's family plan — start the week.").unwrap();
+        let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
+
+        let doc = PlanDoc::parse("2026-W31", &std::fs::read_to_string(&out.path).unwrap());
+        let on = |d: u32| {
+            doc.meal_on(NaiveDate::from_ymd_opt(2026, 7, d).unwrap())
+                .map(|m| m.dish.to_lowercase())
+                .unwrap_or_default()
+        };
+        assert!(on(27).contains("mushroom risotto"), "Monday: {:?}", on(27));
+        assert!(on(29).contains("no dinner needed"), "Wednesday: {:?}", on(29));
+        assert!(on(30).contains("pasta al pomodoro"), "Thursday: {:?}", on(30));
+        assert_eq!(out.parked.len(), 3);
+        let line = report_line(&out);
+        assert!(line.to_lowercase().contains("risotto"), "{line}");
+    }
+
+    /// A dinner parked for a night OUTSIDE the week being drafted belongs to
+    /// that other week and is left where it is.
+    #[test]
+    fn a_dinner_parked_for_another_week_is_not_pulled_in() {
+        let dir = scratch(true);
+        park(
+            dir.path(),
+            "# Dinner suggestions for the week of 2026-W31\n\n\
+             - **Monday** (2026-08-03) — Next week's chili · suggested by a household member\n",
+        );
+        let ask = detect("Please draft this week's family plan — start the week.").unwrap();
+        let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
+        assert!(out.parked.is_empty());
+        let written = std::fs::read_to_string(&out.path).unwrap();
+        assert!(!written.to_lowercase().contains("chili"), "{written}");
+    }
+
+    /// A request carried into the ask NOW beats a dinner parked for that night
+    /// earlier — and the parked one is not reported as lost.
+    #[test]
+    fn a_carried_request_supersedes_a_parked_dinner_for_the_same_night() {
+        let dir = scratch(true);
+        park(
+            dir.path(),
+            "# Dinner suggestions for the week of 2026-W31\n\n\
+             - **Tuesday** (2026-07-28) — Lentil soup · suggested by a household member\n",
+        );
+        let ask = detect(
+            "Please draft this week's family plan — start the week. Keep what I asked for: \
+             \"Set Tuesday's dinner to homemade pizza.\"",
+        )
+        .unwrap();
+        let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
+        let doc = PlanDoc::parse("2026-W31", &std::fs::read_to_string(&out.path).unwrap());
+        let tue = doc
+            .meal_on(NaiveDate::from_ymd_opt(2026, 7, 28).unwrap())
+            .unwrap();
+        assert!(tue.dish.to_lowercase().contains("homemade pizza"), "{tue:?}");
+        assert!(!tue.dish.to_lowercase().contains("lentil"), "{tue:?}");
+    }
+
+    /// RETIREMENT IS IDEMPOTENT and never destroys the family's words: the
+    /// stamp lands once, a second run is byte-identical, and every parked line
+    /// is still readable in the file.
+    #[test]
+    fn sidecar_retirement_stamps_once_and_keeps_every_line() {
+        let dir = scratch(true);
+        let sidecar = park(dir.path(), W31_SIDECAR);
+        let ask = detect("Please draft this week's family plan — start the week.").unwrap();
+        let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
+        assert_eq!(out.sidecar_retired.as_deref(), Some(sidecar.as_path()));
+
+        let stamped = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(
+            stamped.contains("**Folded into:** plans/2026-W31-family-plan.md"),
+            "{stamped}"
+        );
+        assert!(stamped.contains("Pasta al pomodoro"), "{stamped}");
+        assert_eq!(stamped.matches(FOLDED_MARKER).count(), 1, "{stamped}");
+
+        // Retiring again — the dispatcher refire — changes nothing at all.
+        assert!(!retire_sidecar(dir.path(), "2026-W31", &out.path).unwrap());
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), stamped);
+    }
+
+    /// A refused draft leaves the sidecar untouched: nothing is stamped as
+    /// folded into a plan that was never written.
+    #[test]
+    fn an_abandoned_draft_never_stamps_the_sidecar() {
+        let dir = scratch(true);
+        let sidecar = park(dir.path(), W31_SIDECAR);
+        let before = std::fs::read_to_string(&sidecar).unwrap();
+        let ask = WeekStartAsk {
+            carried: vec!["Rebalance the whole week around the travel.".to_string()],
+        };
+        assert!(draft_week(dir.path(), MON_W31(), &ask, None).is_err());
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), before);
+    }
+
+    #[test]
+    fn a_week_with_no_sidecar_drafts_and_retires_nothing() {
+        let dir = scratch(true);
+        let ask = detect("Please draft this week's family plan — start the week.").unwrap();
+        let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
+        assert!(out.parked.is_empty());
+        assert!(out.sidecar_retired.is_none());
     }
 
     #[test]
