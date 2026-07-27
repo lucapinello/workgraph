@@ -896,8 +896,9 @@ pub fn acquire(root: &Path, name: &str, opts: &Options) -> Result<ProjectLock, L
     let host = hostname();
     let pid = std::process::id();
     let deadline = (opts.now_ms)() + opts.wait_ms as i64;
-    let mut last_detail = "timeout".to_string();
-    loop {
+    // The loop yields the classification it exits on: a taker never reports a
+    // reason it did not actually observe.
+    let last_detail = loop {
         let token = mint_token();
         match try_publish(&path, &token, pid, &host, (opts.now_ms)()) {
             Published::Took { dev, ino } => {
@@ -946,15 +947,17 @@ pub fn acquire(root: &Path, name: &str, opts: &Options) -> Result<ProjectLock, L
 
         // EEXIST: somebody holds it. Classify WHY — for the caller and for a
         // human — then wait, or give up. NOTHING below removes a lock file (§5).
-        last_detail = classify_held(&path, &host, opts).to_string();
+        let detail = classify_held(&path, &host, opts).to_string();
+        // The deadline is checked on EVERY loop edge, before sleeping: a caller
+        // that asked for 120ms gets at most 120ms, whichever branch it landed in.
         if (opts.now_ms)() >= deadline {
-            break;
+            break detail;
         }
         std::thread::sleep(std::time::Duration::from_millis(opts.sleep_ms));
         if (opts.now_ms)() >= deadline {
-            break;
+            break detail;
         }
-    }
+    };
 
     if last_detail == "held" || last_detail == "timeout" {
         Err(LockRefusal::Busy {
