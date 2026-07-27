@@ -487,7 +487,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
 
     println!("Starting Telegram listener...");
     println!("{}", bot_banner(&config));
-    println!("Chat ID: {}", effective_chat_id);
+    // The listener's startup banner is written to a log file that outlives the
+    // run; the chat it is bound to is the household's, and an opaque handle is
+    // all an operator needs to tell one run's binding from another's.
+    println!(
+        "Chat ID: {}",
+        worksgood::notify::telegram::redact_chat_id(&effective_chat_id)
+    );
 
     // Build one channel per configured bot. Live evidence for this whole task:
     // Luca tags a bot in the group and the @mention lands ONLY in that bot's
@@ -733,12 +739,15 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     let key = DedupeKey::from_content(cid, sender, date, &msg.body);
                     if !dedupe.first_delivery(key) {
                         println!(
-                            "[{}] Duplicate group message (chat {}, from {}, date {}, msg {}) dropped — already handled",
+                            "[{}] {}",
                             chrono::Utc::now().format("%H:%M:%S"),
-                            cid,
-                            sender,
-                            date,
-                            msg.message_id.as_deref().unwrap_or("none"),
+                            duplicate_drop_line(
+                                cid,
+                                sender,
+                                date,
+                                msg.message_id.as_deref().unwrap_or(""),
+                                &msg.body,
+                            ),
                         );
                         continue;
                     }
@@ -6237,6 +6246,67 @@ pub fn run_remind(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Log lines that touch household identifiers
+// ---------------------------------------------------------------------------
+//
+// THE LEAK. `.casa/telegram.log` outlives every run and is copied into bug
+// reports, pasted into chats and read by anyone with the box. Four of its noisiest
+// lines printed the RAW negative group / DM chat id, the RAW numeric sender id,
+// the message id, and — on the duplicate-drop path, which fires on ORDINARY family
+// traffic — the private message body. Together that is a durable, plain-text
+// record of who messaged whom, when, and what they said.
+//
+// These lines are rendered by PURE functions so the proof can assert on the real
+// output rather than on the shape of a `println!` — a redaction you cannot capture
+// is a redaction you cannot prove. Every identifier goes out as a stable opaque
+// tag, so the diagnostics the lines exist for (which chat went quiet, is this the
+// same duplicate again, did the report-back land) all still work.
+
+/// The listener's duplicate-drop line.
+fn duplicate_drop_line(
+    chat_id: &str,
+    sender: &str,
+    date: i64,
+    message_id: &str,
+    body: &str,
+) -> String {
+    use worksgood::notify::telegram::{
+        redact_actor_id, redact_body, redact_chat_id, redact_message_id,
+    };
+    format!(
+        "Duplicate group message ({}, from {}, date {}, {}, {}) dropped — already handled",
+        redact_chat_id(chat_id),
+        redact_actor_id(sender),
+        date,
+        redact_message_id(message_id),
+        redact_body(body),
+    )
+}
+
+/// The lifecycle report-back's delivery line. The event slug and task id are
+/// work-graph identifiers, not household ones — they stay, and they are what an
+/// operator actually reads this line for.
+fn lifecycle_delivery_line(
+    event: &str,
+    task_id: &str,
+    chat_id: &str,
+    bot_id: &str,
+    message_id: &str,
+    text: &str,
+) -> String {
+    use worksgood::notify::telegram::{redact_body, redact_chat_id, redact_message_id};
+    format!(
+        "lifecycle {} for {} → {} via {} ({}): {}",
+        event,
+        task_id,
+        redact_chat_id(chat_id),
+        bot_id,
+        redact_message_id(message_id),
+        redact_body(text),
+    )
+}
+
 /// Resolve which bot fronts a reminder's recipient and the chat to DM.
 ///
 /// A non-empty plan Source is already a roster-resolved stable persona id, so
@@ -6307,17 +6377,44 @@ pub fn run_week_start(
         // drafted, not to whatever directory the command was invoked from —
         // otherwise two scratch projects (or two runs of a test) would share one
         // turn ledger and the second would replay the first one's outcome.
+        //
+        // THE HOLE THAT WAS IN THAT: the scoping only held for a project that
+        // ALREADY had a `.wg/`, and a scratch project has none — so every scratch
+        // run fell back to the ambient workgraph dir and they all shared one
+        // ledger. Observed: the same ask, run against a FRESH project, replayed a
+        // previous project's outcome and reported "this week's plan is started"
+        // with no plan file anywhere on this disk. Create the journal home under
+        // the root instead; a project's turn ledger is the project's.
         let journal_dir = root.join(".wg");
-        let journal_dir = if journal_dir.is_dir() {
-            journal_dir
-        } else {
-            workgraph_dir.to_path_buf()
-        };
+        if !journal_dir.is_dir() {
+            std::fs::create_dir_all(&journal_dir).with_context(|| {
+                format!("create the occurrence journal at {}", journal_dir.display())
+            })?;
+        }
+        let _ = workgraph_dir;
         let (journal, state) = OccurrenceJournal::<WebFastLaneOutcome>::claim(
             &journal_dir,
             WEB_FAST_LANE_OCCURRENCE_DOMAIN,
             &physical_turn_key,
         )?;
+        // A replay is only honest if the thing it claims to have done is STILL
+        // THERE. A week-start's whole outcome is one file; if that file is absent,
+        // "already started" is a lie told with a ledger entry as its evidence —
+        // the dead-pipeline-claims-success failure, arriving through the
+        // idempotency guard instead of around it. So a replay whose plan is gone
+        // is not a replay: the week is drafted, which is what the family asked
+        // for and what the ledger says already happened.
+        let plan_path = root.join("plans").join(format!("{week_code}-family-plan.md"));
+        let replay_is_honest = plan_path.exists();
+        let state = match state {
+            OccurrenceState::Applied(prior) | OccurrenceState::Delivered(prior)
+                if !replay_is_honest =>
+            {
+                let _ = prior;
+                OccurrenceState::New
+            }
+            other => other,
+        };
         applied = Some(match state {
             // The SAME accepted turn arriving again (a dispatcher refire): the
             // durable outcome wins and nothing is drafted a second time.
@@ -6327,6 +6424,7 @@ pub fn run_week_start(
                     "already_delivered": true,
                     "op": prior.op_kind,
                     "report": prior.report,
+                    "plan_exists": true,
                 })
             }
             OccurrenceState::Incomplete => serde_json::json!({
@@ -6851,14 +6949,16 @@ async fn deliver_lifecycle_fire(
     let message_id = result?.unwrap_or_default();
 
     println!(
-        "[{}] lifecycle {} for {} → chat {} via {} (message_id {}): {}",
+        "[{}] {}",
         chrono::Utc::now().format("%H:%M:%S"),
-        fire.event.slug(),
-        fire.task_id,
-        fire.origin.chat_id,
-        bot_id,
-        message_id,
-        fire.text,
+        lifecycle_delivery_line(
+            fire.event.slug(),
+            &fire.task_id,
+            &fire.origin.chat_id,
+            &bot_id,
+            &message_id.to_string(),
+            &fire.text,
+        ),
     );
 
     Ok(())
@@ -6905,6 +7005,12 @@ async fn deliver_operator_alert(
     coordination_owner: Option<&str>,
     alert: &worksgood::notify::lifecycle::OperatorAlert,
 ) -> bool {
+    // DELIBERATELY NOT REDACTED, unlike the routing lines below it. This is the
+    // escalation of last resort: it fires precisely when the DM cannot be sent, and
+    // an operator reading it needs to know WHAT the family asked that dead-ended.
+    // Reducing it to a hash would leave the alert with nothing to act on. It
+    // carries no chat id, no sender id and no message id — the requester is a
+    // roster name the operator must be able to read.
     eprintln!(
         "[{}] DEAD-END family ask {} ({}): {}",
         chrono::Utc::now().format("%H:%M:%S"),
@@ -6926,11 +7032,12 @@ async fn deliver_operator_alert(
     };
     match sink.send(&bot_id, &chat_id, &alert.text).await {
         Ok(_) => {
+            // The owner's DM chat id is the most personal identifier in this file.
             println!(
-                "[{}] operator alert for {} → owner chat {} via {}",
+                "[{}] operator alert for {} → owner {} via {}",
                 chrono::Utc::now().format("%H:%M:%S"),
                 alert.task_id,
-                chat_id,
+                worksgood::notify::telegram::redact_chat_id(&chat_id),
                 if bot_id.is_empty() {
                     "legacy bot"
                 } else {
@@ -8958,6 +9065,88 @@ mod tests {
     use std::collections::HashMap;
     use worksgood::agency::{TelegramBinding, TelegramBindingMap};
     use worksgood::notify::telegram::TelegramBotConfig;
+
+    // ── the log lines never carry the household's identifiers ───────────────
+    //
+    // Hermetic and exact: the fixtures below are the real shapes — a negative
+    // supergroup id, a negative DM id, a numeric sender id, a bot-token-shaped
+    // string, and a distinctive private body. None of them may appear ANYWHERE in
+    // the rendered line, and the assertion is over the line the log really gets.
+
+    const GROUP_CHAT: &str = "-1002233445566";
+    const DM_CHAT: &str = "-987654321";
+    const SENDER_ID: &str = "6123456789";
+    const MESSAGE_ID: &str = "48271";
+    const TOKEN_ISH: &str = "8123456789:AAH_fakefakefakefakefakefakefake-fake";
+    const PRIVATE_BODY: &str =
+        "Nadin is at the clinic on Thursday, don't tell the kids about the surprise";
+
+    fn assert_opaque(line: &str, raws: &[&str]) {
+        for raw in raws {
+            assert!(
+                !line.contains(raw),
+                "a household identifier reached the log verbatim ({raw:?}) in: {line}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_duplicate_drop_line_carries_no_raw_ids_or_body() {
+        let line = duplicate_drop_line(GROUP_CHAT, SENDER_ID, 1_784_500_000, MESSAGE_ID, PRIVATE_BODY);
+        assert_opaque(
+            &line,
+            &[GROUP_CHAT, DM_CHAT, SENDER_ID, MESSAGE_ID, PRIVATE_BODY],
+        );
+        // A body PREFIX is not a redaction — of a short message it is the message.
+        assert_opaque(&line, &["Nadin", "clinic", "surprise", "don't tell"]);
+        // …and the line is still a useful diagnostic.
+        assert!(line.contains("Duplicate group message"), "{line}");
+        assert!(line.contains("chat:"), "{line}");
+        assert!(line.contains("who:"), "{line}");
+        assert!(line.contains("body:"), "{line}");
+    }
+
+    #[test]
+    fn the_lifecycle_delivery_line_carries_no_raw_chat_or_text() {
+        let line = lifecycle_delivery_line(
+            "task-done",
+            "week-start-engine",
+            DM_CHAT,
+            "telegram:otto",
+            MESSAGE_ID,
+            PRIVATE_BODY,
+        );
+        assert_opaque(&line, &[DM_CHAT, GROUP_CHAT, MESSAGE_ID, PRIVATE_BODY]);
+        // The work-graph identifiers are NOT household data and must survive.
+        assert!(line.contains("week-start-engine"), "{line}");
+        assert!(line.contains("task-done"), "{line}");
+        assert!(line.contains("telegram:otto"), "{line}");
+    }
+
+    /// A token-shaped string is never echoed by these lines either, whichever
+    /// field it arrives in — a mis-set config puts a token where an id belongs.
+    #[test]
+    fn a_token_shaped_value_never_survives_a_log_line() {
+        let dup = duplicate_drop_line(TOKEN_ISH, TOKEN_ISH, 0, TOKEN_ISH, TOKEN_ISH);
+        assert_opaque(&dup, &[TOKEN_ISH, "AAH_fakefakefakefakefakefakefake-fake"]);
+        let life = lifecycle_delivery_line("x", "t", TOKEN_ISH, "b", TOKEN_ISH, TOKEN_ISH);
+        assert_opaque(&life, &[TOKEN_ISH, "AAH_fakefakefakefakefakefakefake-fake"]);
+    }
+
+    /// The tags must be STABLE (so one chat is followable through a log) and
+    /// DISTINCT (so two households, or a chat and a sender sharing a number, never
+    /// collapse into one tag).
+    #[test]
+    fn opaque_tags_are_stable_and_do_not_collide() {
+        use worksgood::notify::telegram::{redact_actor_id, redact_body, redact_chat_id};
+        assert_eq!(redact_chat_id(GROUP_CHAT), redact_chat_id(GROUP_CHAT));
+        assert_ne!(redact_chat_id(GROUP_CHAT), redact_chat_id(DM_CHAT));
+        // Domain separation: the same number as a chat and as a sender.
+        assert_ne!(redact_chat_id(SENDER_ID), redact_actor_id(SENDER_ID));
+        assert_ne!(redact_body("yes"), redact_body("no"));
+        assert_eq!(redact_body(""), "body:empty");
+        assert_eq!(redact_chat_id("  "), "chat:none");
+    }
 
     fn ts() -> chrono::DateTime<chrono::Utc> {
         "2026-07-10T12:00:00Z".parse().unwrap()

@@ -910,6 +910,73 @@ pub fn redact_bot_token(s: &str) -> String {
     re.replace_all(s, "bot<redacted>").into_owned()
 }
 
+/// A stable, opaque handle for one household identifier or body.
+///
+/// Correlation without disclosure: the same input always renders the same short
+/// tag, so an operator can still follow ONE chat / ONE sender / ONE message
+/// through a log, and cannot read out of the log who or where that is. Domain-
+/// separated so a chat id and a sender id that happen to be the same number do
+/// not render as the same tag.
+fn opaque_tag(domain: &str, value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(domain.as_bytes());
+    h.update([0u8]);
+    h.update(value.as_bytes());
+    let digest = h.finalize();
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A chat id, safe to log: `chat:1f4c8a90`.
+///
+/// THE LEAK THIS CLOSES. The listener's startup banner, its duplicate-drop line,
+/// the lifecycle report-back and the operator-alert path each printed the RAW
+/// negative group / DM chat id, the RAW sender id, and — in the duplicate case —
+/// the private message body, into `.casa/telegram.log`. A chat id is not a
+/// credential (see [`redacted_api_error`], which is why the API-error path leaves
+/// numbers alone), but a household's log is not a place to keep a durable, plain
+/// record of who messaged whom and what they said. These render the same
+/// identifier consistently so the diagnostics they exist for still work.
+pub fn redact_chat_id(id: &str) -> String {
+    let t = id.trim();
+    if t.is_empty() {
+        return "chat:none".to_string();
+    }
+    format!("chat:{}", opaque_tag("chat", t))
+}
+
+/// A sender / actor id, safe to log: `who:0a1b2c3d`.
+pub fn redact_actor_id(id: &str) -> String {
+    let t = id.trim();
+    if t.is_empty() {
+        return "who:none".to_string();
+    }
+    format!("who:{}", opaque_tag("actor", t))
+}
+
+/// A Telegram message id, safe to log: `msg:9c2f0b71`.
+pub fn redact_message_id(id: &str) -> String {
+    let t = id.trim();
+    if t.is_empty() {
+        return "msg:none".to_string();
+    }
+    format!("msg:{}", opaque_tag("message", t))
+}
+
+/// A message body reduced to its SHAPE: `body:42ch/7e10a4b2`.
+///
+/// Length plus a stable digest — enough to tell "the same text again" from "a
+/// different message", never enough to read the family's words back. Never emit
+/// a body prefix or a "first N chars" preview: a preview of a short message is
+/// the whole message.
+pub fn redact_body(body: &str) -> String {
+    let n = body.chars().count();
+    if n == 0 {
+        return "body:empty".to_string();
+    }
+    format!("body:{}ch/{}", n, opaque_tag("body", body))
+}
+
 /// Turn an error whose text can embed a Bot API URL into a FLAT, token-free
 /// `anyhow::Error` — the write-time choke point for every token-bearing call.
 ///
@@ -934,11 +1001,13 @@ pub fn redact_bot_token(s: &str) -> String {
 /// Use this — never `.context()` — on any fallible call whose URL contains a
 /// bot token: send/`api_call`, `getUpdates`, `getFile`, file downloads.
 ///
-/// Numeric chat ids are deliberately NOT redacted: they are household
-/// identifiers, not credentials (they appear in `notify.toml`, in `wg telegram
-/// status` output, and in the routing logs an operator reads to tell WHICH chat
-/// went quiet). Scrubbing them would blind the diagnostics without protecting a
-/// secret — a token grants send access to every chat, a chat id grants nothing.
+/// Numeric chat ids are deliberately not redacted BY THIS FUNCTION: they are
+/// household identifiers, not credentials (a token grants send access to every
+/// chat; a chat id grants nothing), and an API error must still say WHICH call
+/// failed. Log SITES that print a chat id, a sender id, or a message body as
+/// routine narration are a different question — those go through
+/// [`redact_chat_id`] / [`redact_actor_id`] / [`redact_body`], which keep the
+/// correlation and drop the disclosure.
 pub fn redacted_api_error<E>(context: &str, err: E) -> anyhow::Error
 where
     E: std::error::Error,
