@@ -2153,14 +2153,38 @@ pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct WeekContext {
     by_day: std::collections::HashMap<String, String>,
+    /// The LUNCH the plan gives a weekday, when it states one (task
+    /// meal-read-lane). The gateway used to forward the Dinners table alone, so a
+    /// lunch question reached the composer with nothing to answer from and the
+    /// wrong-slot guard had to treat EVERY lunch claim as wrong. Both are now
+    /// answerable: this map is the plan's own lunches, keyed like `by_day`.
+    lunch_by_day: std::collections::HashMap<String, String>,
+    /// Weekdays the plan marks as no-cook (out / takeaway / leftovers). Not dishes:
+    /// a sentence about cooking must never be "named" by one and rewritten.
+    non_cook: std::collections::HashSet<String>,
     today: Option<String>,
     tomorrow: Option<String>,
 }
 
 impl WeekContext {
-    /// No day carries a planned dish — the guard is a no-op.
+    /// No day carries a planned dish in ANY slot — the guard is a no-op.
     pub fn is_empty(&self) -> bool {
-        self.by_day.is_empty()
+        self.by_day.is_empty() && self.lunch_by_day.is_empty()
+    }
+
+    /// Every (weekday, dish, slot) the plan gives a dish, dinners first. No-cook
+    /// nights are excluded on purpose: "no cooking \u{2014} we're out this evening" is not
+    /// a dish, and treating it as one lets an ordinary sentence about cooking be
+    /// "named" by it and rewritten.
+    fn planned_slots(&self) -> Vec<(&String, &String, &'static str)> {
+        let mut out: Vec<(&String, &String, &'static str)> = self
+            .by_day
+            .iter()
+            .filter(|(day, _)| !self.non_cook.contains(*day))
+            .map(|(day, dish)| (day, dish, "dinner"))
+            .collect();
+        out.extend(self.lunch_by_day.iter().map(|(day, dish)| (day, dish, "lunch")));
+        out
     }
 }
 
@@ -2173,6 +2197,25 @@ pub fn parse_week_context(text: &str) -> WeekContext {
     let mut wc = WeekContext::default();
     for raw in text.lines() {
         let line = raw.trim();
+        // The slot-complete block (task meal-read-lane) adds "\u{2022} "-bulleted lines
+        // BESIDE the unchanged "- " dinner rows: a lunch the plan names, and a night
+        // with no cooking. A "- " line is still a DINNER and nothing else, so an
+        // engine build that predates this still reads exactly the map it always did.
+        if let Some(rest) = line.strip_prefix("\u{2022} ") {
+            if let Some((left, dish)) = rest.split_once(':') {
+                let head = left.trim().to_lowercase();
+                let day = head.split('(').next().unwrap_or(&head).trim().to_string();
+                let dish = dish.trim();
+                if weekday_token(&day).is_some() && !dish.is_empty() {
+                    if head.ends_with("lunch") {
+                        wc.lunch_by_day.insert(day, dish.to_string());
+                    } else if dish.to_lowercase().contains("no cooking") {
+                        wc.non_cook.insert(day);
+                    }
+                }
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("- ") {
             // "Saturday (July 25): Baked white fish" → day, dish.
             if let Some((left, dish)) = rest.split_once(':') {
@@ -2219,11 +2262,14 @@ pub fn week_context_block(week_context: &str) -> Option<String> {
     }
     let mut out = String::new();
     out.push_str(
-        "THIS WEEK'S DINNERS — the family's real plan, parsed from the Dinners table. \
-         Answer any dinner or meal question (today, tonight, tomorrow, or a named day) \
-         FROM this table, never from a plan's prose notes or a week \"skeleton\". If a \
-         day below has a dish, that day IS planned — NEVER say it is empty, unplanned, \
-         not locked in, not set, or undecided:\n",
+        "THIS WEEK'S MEALS — the family's real plan, parsed from the plan file. \
+         Answer any meal question (today, tonight, tomorrow, or a named day; DINNER or \
+         LUNCH) FROM this list, never from a plan's prose notes or a week \"skeleton\", \
+         and never from another day's row. If a day below has an entry, that day IS \
+         planned — NEVER say it is empty, unplanned, not locked in, not set, or \
+         undecided. Keep the SLOT the person asked about: a lunch question is answered \
+         with that day's lunch, never with its dinner. A night marked as no cooking is \
+         the answer for that day — say so plainly, never substitute another day's dish:\n",
     );
     out.push_str(text);
     out.push('\n');
@@ -2472,12 +2518,17 @@ const DISH_FILLER_WORDS: &[&str] = &[
 /// context is the DINNERS table, so a dish found there placed at any of these
 /// slots is a wrong-slot claim. `dinner`/`supper` are deliberately absent — they
 /// are the truthful slot.
-const NON_DINNER_SLOT_STEMS: &[(&str, &str)] = &[
+const MEAL_SLOT_STEMS: &[(&str, &str)] = &[
     ("breakfast", "breakfast"),
     ("brunch", "brunch"),
     ("lunch", "lunch"),
     ("midday", "midday"),
     ("snack", "snack"),
+    // dinner/supper are here since task meal-read-lane: with LUNCHES in the map the
+    // test is no longer "is this slot dinner?" but "is this the slot the plan gives
+    // this dish?", so a LUNCH dish claimed at dinner is a wrong-slot claim too.
+    ("dinner", "dinner"),
+    ("supper", "dinner"),
 ];
 
 /// Cues that a sentence is about eating LEFTOVERS rather than asserting where the
@@ -2533,6 +2584,8 @@ pub struct MisplacedWeekClaim {
     pub dish: String,
     /// The capitalised weekday the plan actually holds the dish on.
     pub true_day: String,
+    /// The slot the plan actually holds the dish at ("dinner" / "lunch").
+    pub true_slot: String,
     /// The capitalised weekday the draft placed it on, when that is the wrong day.
     pub claimed_day: Option<String>,
     /// The non-dinner slot the draft placed it at ("lunch"), when it named one.
@@ -2674,7 +2727,7 @@ fn claimed_days_in(sentence: &str, wc: &WeekContext) -> Vec<String> {
 /// The non-dinner slot the normalised `sentence` names, if any.
 fn claimed_slot_in(sentence: &str) -> Option<String> {
     for tok in sentence.split(' ') {
-        for (stem, label) in NON_DINNER_SLOT_STEMS {
+        for (stem, label) in MEAL_SLOT_STEMS {
             if tok.starts_with(stem) {
                 return Some((*label).to_string());
             }
@@ -2714,33 +2767,38 @@ pub fn misplaced_week_claims(draft: &str, wc: &WeekContext) -> Vec<MisplacedWeek
         }
         // Which planned dishes does this sentence name? Exactly one, or we cannot
         // name a single truth (two days' dishes sharing a word ⇒ leave it alone).
-        let named: Vec<(&String, &String)> = wc
-            .by_day
+        let planned = wc.planned_slots();
+        let named: Vec<&(&String, &String, &'static str)> = planned
             .iter()
-            .filter(|(_, dish)| sentence_names_dish(&sentence.norm, dish))
+            .filter(|(_, dish, _)| sentence_names_dish(&sentence.norm, dish))
             .collect();
         if named.len() != 1 {
             continue;
         }
-        let (true_day, dish) = named[0];
+        let (true_day, dish, true_slot) = *named[0];
         if mentions_leftovers(&sentence.norm) {
             continue;
         }
         let days = claimed_days_in(&sentence.norm, wc);
-        // The sentence names the real day (possibly alongside another, as a
-        // contrast) — it is grounded, or too tangled to safely rewrite.
-        if days.iter().any(|d| d == true_day) {
+        let claimed_slot = claimed_slot_in(&sentence.norm);
+        let right_day = days.iter().any(|d| d == true_day);
+        let right_slot = claimed_slot.as_deref().map_or(true, |s| s == true_slot);
+        // GROUNDED when the sentence names the real day AND either names no slot or
+        // names the right one. "Saturday's lunch is the panzanella" is provably true
+        // now that the plan's lunches ride in the context, and must survive.
+        if right_day && right_slot {
             continue;
         }
         let claimed_day = days.first().map(|d| capitalize_weekday(d));
-        let claimed_slot = claimed_slot_in(&sentence.norm);
-        // No day claim and no slot claim ⇒ a casual mention. Nothing to correct.
-        if claimed_day.is_none() && claimed_slot.is_none() {
+        // No day claim and no slot claim \u{21d2} a casual mention. Nothing to correct \u{2014} and a
+        // sentence with no day that names the dish's OWN slot claims no placement either.
+        if claimed_day.is_none() && (claimed_slot.is_none() || right_slot) {
             continue;
         }
         out.push(MisplacedWeekClaim {
             dish: dish.clone(),
             true_day: capitalize_weekday(true_day),
+            true_slot: true_slot.to_string(),
             claimed_day,
             claimed_slot,
             span: (sentence.start, sentence.end),
@@ -2753,7 +2811,8 @@ pub fn misplaced_week_claims(draft: &str, wc: &WeekContext) -> Vec<MisplacedWeek
 /// The truthful placement sentence for one misplaced claim — the same shape the
 /// never-claim-empty rewrite uses, so both guards speak with one voice.
 pub fn week_placement_truth_line(claim: &MisplacedWeekClaim) -> String {
-    format!("{}'s dinner is {}.", claim.true_day, claim.dish)
+    let slot = if claim.true_slot.is_empty() { "dinner" } else { claim.true_slot.as_str() };
+    format!("{}'s {} is {}.", claim.true_day, slot, claim.dish)
 }
 
 /// Rewrite `draft` so each misplaced claim's sentence states the truthful
@@ -4244,7 +4303,13 @@ label = "Fallback Member"
         assert!(block.contains("Baked white fish with tomato, olives & capers"));
         let lower = block.to_lowercase();
         assert!(lower.contains("never say it is empty"), "{block}");
-        assert!(lower.contains("from this table"), "{block}");
+        assert!(lower.contains("from this list"), "{block}");
+        // SLOT-COMPLETE (task meal-read-lane): the instruction covers lunch and the
+        // no-cook nights too. A dinner-only instruction is what let a lunch question be
+        // answered with a dinner row, and a Wednesday-out question with another day's dish.
+        assert!(lower.contains("dinner or lunch"), "{block}");
+        assert!(lower.contains("keep the slot"), "{block}");
+        assert!(lower.contains("no cooking"), "{block}");
     }
 
     // -----------------------------------------------------------------------
@@ -4465,6 +4530,123 @@ label = "Fallback Member"
             misplaced_week_claims(&honest, &wc).is_empty(),
             "the honest never-claim-empty line must not be re-flagged: {honest}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SLOT-COMPLETE week context (task meal-read-lane) — live-cert run 2, C023/C024
+    // -----------------------------------------------------------------------
+
+    /// The live W30 week as the gateway now forwards it: the unchanged "- " DINNER
+    /// rows, plus "\u{2022} "-bulleted lines for the lunches the plan states and the night
+    /// with no cooking. Saturday carries BOTH slots — pizza at dinner, panzanella at
+    /// lunch — which is the pair the run-2 P0 confused.
+    fn w30_slotted_context() -> String {
+        "This week's meals, parsed from the family plan:\n\
+         - Wednesday (Jul 22): No cooking \u{2014} we're out this evening\n\
+         - Saturday (Jul 25): Pizza margherita, homemade dough\n\
+         - Sunday (Jul 26): Clear-the-fridge frittata, greens folded through\n\
+         Lunches the plan names \u{2014} a day not listed here has no lunch planned at home:\n\
+         \u{2022} Saturday (Jul 25) lunch: a big tomato-and-bread panzanella\n\
+         \u{2022} Sunday (Jul 26) lunch: a simple soup or a cheese-and-tomato toastie\n\
+         Nights with NO cooking planned \u{2014} answer these as themselves, never with another\n\
+         day's dish:\n\
+         \u{2022} Wednesday (Jul 22): out \u{2014} no cooking (No cooking \u{2014} we're out this evening)\n\
+         Today is Sunday \u{2014} dinner: Clear-the-fridge frittata, greens folded through.\n\
+         Tomorrow is Monday \u{2014} no dinner planned yet."
+            .to_string()
+    }
+
+    /// The BIGGER BLOCK PASSES THROUGH: the dinner map the engine always parsed is
+    /// byte-for-byte what it was, and the new bulleted lines add the lunches and the
+    /// no-cook night rather than corrupting a dinner row.
+    #[test]
+    fn parse_week_context_reads_lunches_and_no_cook_nights_without_disturbing_dinners() {
+        let wc = parse_week_context(&w30_slotted_context());
+        assert_eq!(
+            wc.by_day.get("saturday").map(String::as_str),
+            Some("Pizza margherita, homemade dough"),
+            "the DINNER rows must parse exactly as before"
+        );
+        assert_eq!(
+            wc.lunch_by_day.get("saturday").map(String::as_str),
+            Some("a big tomato-and-bread panzanella")
+        );
+        assert_eq!(
+            wc.lunch_by_day.get("sunday").map(String::as_str),
+            Some("a simple soup or a cheese-and-tomato toastie")
+        );
+        assert!(!wc.lunch_by_day.contains_key("wednesday"), "no lunch may be invented");
+        assert!(wc.non_cook.contains("wednesday"), "the no-cook night is marked");
+        assert_eq!(wc.today.as_deref(), Some("sunday"));
+        assert_eq!(wc.tomorrow.as_deref(), Some("monday"));
+        // FORWARD COMPATIBILITY IN BOTH DIRECTIONS: the dinner-only block an older
+        // gateway sends still parses, and carries no lunches rather than failing.
+        let old = parse_week_context(&c004_week_context());
+        assert_eq!(old.lunch_by_day.len(), 0);
+        assert!(old.non_cook.is_empty());
+        assert!(!old.is_empty());
+    }
+
+    /// A TRUE lunch placement survives. Before the lunches rode in the context the
+    /// guard had to treat every non-dinner slot as wrong, so a correct answer to a
+    /// lunch question would have been "corrected" into a dinner.
+    #[test]
+    fn a_true_lunch_placement_is_never_rewritten() {
+        let wc = parse_week_context(&w30_slotted_context());
+        for draft in [
+            "Saturday's lunch was a big tomato-and-bread panzanella.",
+            "The panzanella is Saturday's lunch.",
+            "We had the panzanella for lunch.",
+        ] {
+            assert!(
+                misplaced_week_claims(draft, &wc).is_empty(),
+                "a true lunch line was rewritten: {draft}"
+            );
+        }
+    }
+
+    /// …and a dish placed at a slot the plan does NOT give it is still corrected, in
+    /// both directions, with the truth line naming the real slot.
+    #[test]
+    fn a_dish_at_the_wrong_slot_or_day_is_corrected_with_its_real_slot() {
+        let wc = parse_week_context(&w30_slotted_context());
+        // The C024 lie said in full: Saturday's DINNER offered as the lunch.
+        let draft = "Saturday's lunch was pizza margherita with homemade dough.";
+        let claims = misplaced_week_claims(draft, &wc);
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].true_slot, "dinner");
+        assert_eq!(claims[0].claimed_slot.as_deref(), Some("lunch"));
+        assert_eq!(
+            week_placement_rewrite(draft, &claims),
+            "Saturday's dinner is Pizza margherita, homemade dough."
+        );
+        // The mirror image: a LUNCH dish moved to another day.
+        let moved = "Sunday's lunch was the panzanella.";
+        let claims = misplaced_week_claims(moved, &wc);
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].true_day, "Saturday");
+        assert_eq!(claims[0].true_slot, "lunch");
+        assert_eq!(
+            week_placement_rewrite(moved, &claims),
+            "Saturday's lunch is a big tomato-and-bread panzanella.",
+            "the truth line must name the LUNCH it really is, not a dinner it never was"
+        );
+    }
+
+    /// A NO-COOK night is not a dish. Treating "No cooking \u{2014} we're out this evening" as
+    /// one lets any sentence carrying "cooking"/"evening" be named by it and rewritten.
+    #[test]
+    fn a_no_cook_night_is_not_a_dish() {
+        let wc = parse_week_context(&w30_slotted_context());
+        for draft in [
+            "I'll get the cooking started early Saturday.",
+            "Wednesday is a night out \u{2014} no cooking planned.",
+        ] {
+            assert!(
+                misplaced_week_claims(draft, &wc).is_empty(),
+                "a no-cook row was treated as a dish: {draft}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

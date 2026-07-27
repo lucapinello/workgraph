@@ -6516,8 +6516,11 @@ domains = ["calendar", "coordination", "shopping"]
         let calendar_pos = lower
             .find("calendar")
             .expect("the always-on calendar-truth line is present");
+        // "THIS WEEK'S MEALS" since task meal-read-lane — the forwarded block carries
+        // every slot the plan knows (dinners, lunches, no-cook nights), not the Dinners
+        // table alone.
         let week_pos = prompt
-            .find("THIS WEEK'S DINNERS")
+            .find("THIS WEEK'S MEALS")
             .expect("forwarded week block present");
         let plan_pos = prompt
             .find("Chickpea")

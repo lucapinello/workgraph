@@ -3070,7 +3070,12 @@ pub fn run_compose_prompt(
             "message": message,
             "blocks": {
                 "thread": prompt.contains("Recent messages in this conversation"),
-                "week": prompt.contains("THIS WEEK'S DINNERS"),
+                // "MEALS" since task meal-read-lane — the forwarded block carries every
+                // slot the plan knows (dinners, lunches, no-cook nights), not just the
+                // Dinners table. A stale needle here would report `week: false` on a
+                // prompt that DOES carry the week — the exact "green stub over an unread
+                // var" shape this diagnostic exists to prevent.
+                "week": prompt.contains("THIS WEEK'S MEALS"),
                 "memory": prompt.contains("FAMILY MEMORY"),
                 "corrections": prompt.contains("correction"),
             },
