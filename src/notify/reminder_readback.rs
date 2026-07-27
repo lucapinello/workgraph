@@ -31,6 +31,17 @@
 //! same honest "nothing set about that" a stranger would — the date is never
 //! disclosed, and no hint that a reminder exists leaks out.
 //!
+//! ## What counts as "a reminder" here
+//!
+//! The two sources the reminder engine itself schedules and fires: the weekly
+//! plan's `⏰ Reminder:` calendar rows and the ad-hoc list. The `/reminders`
+//! command additionally surfaces work-graph rows (tasks awaiting a human reply,
+//! upcoming crons); those are deliberately NOT merged in here. They carry raw
+//! task titles, and a family member asking "what reminders do I have?" would get
+//! engineering copy back — the same leak the activity feed had to be taught to
+//! drop. `/reminders` remains the surface for those; this lane answers about the
+//! reminders the family actually asked to be reminded of.
+//!
 //! ## Shape of the answer
 //!
 //! Exactly one line, in family voice, naming what the reminder is about and the
