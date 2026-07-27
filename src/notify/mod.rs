@@ -43,6 +43,7 @@ pub mod telegram_standup;
 pub mod telegram_voice;
 pub mod voice;
 pub mod webhook;
+pub mod relay_receipt;
 pub mod week_start;
 
 use std::fmt;

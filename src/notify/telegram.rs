@@ -418,14 +418,36 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Extract the message_id from a sendMessage response.
-    fn extract_message_id(json: &serde_json::Value) -> MessageId {
+    /// Extract the message_id from a sendMessage response — or FAIL.
+    ///
+    /// This used to end in `.unwrap_or(0)` and return `MessageId("0")`, which
+    /// every caller then treated as a delivered message. A send whose response
+    /// carried no usable `result.message_id` therefore reported SUCCESS with an
+    /// id that identifies nothing: nothing could be edited, nothing could be
+    /// proven, and a receipt written from it would assert a delivery that has no
+    /// evidence behind it. The receipt contract is explicit about the boundary —
+    /// delivered means the Bot API said `ok` AND returned a POSITIVE
+    /// `result.message_id`; anything else is failed or unproven — so this is
+    /// where that boundary is enforced, once, for every send path.
+    ///
+    /// Zero and negatives are rejected together: a message id is a positive
+    /// integer, and `0` is exactly the value the old default invented.
+    fn extract_message_id(json: &serde_json::Value) -> Result<MessageId> {
         let mid = json
             .get("result")
             .and_then(|r| r.get("message_id"))
-            .and_then(|m| m.as_i64())
-            .unwrap_or(0);
-        MessageId(mid.to_string())
+            .and_then(|m| m.as_i64());
+        match mid {
+            Some(id) if id > 0 => Ok(MessageId(id.to_string())),
+            Some(id) => anyhow::bail!(
+                "sendMessage returned ok with a non-positive message_id ({id}) — \
+                 the send is NOT proven delivered"
+            ),
+            None => anyhow::bail!(
+                "sendMessage returned ok with no result.message_id — \
+                 the send is NOT proven delivered"
+            ),
+        }
     }
 
     /// Download a photo this bot received (`getFile` → GET the file URL) to
@@ -561,7 +583,7 @@ impl NotificationChannel for TelegramChannel {
             "text": message,
         });
         let resp = self.api_call("sendMessage", &body).await?;
-        Ok(Self::extract_message_id(&resp))
+        Self::extract_message_id(&resp)
     }
 
     async fn send_rich(&self, target: &str, message: &RichMessage) -> Result<MessageId> {
@@ -583,7 +605,7 @@ impl NotificationChannel for TelegramChannel {
         }
 
         let resp = self.api_call("sendMessage", &body).await?;
-        Ok(Self::extract_message_id(&resp))
+        Self::extract_message_id(&resp)
     }
 
     async fn send_with_actions(
@@ -612,7 +634,7 @@ impl NotificationChannel for TelegramChannel {
         });
 
         let resp = self.api_call("sendMessage", &body).await?;
-        Ok(Self::extract_message_id(&resp))
+        Self::extract_message_id(&resp)
     }
 
     fn supports_receive(&self) -> bool {
@@ -1960,15 +1982,38 @@ agent_id = "nora"
                 "text": "hello"
             }
         });
-        let mid = TelegramChannel::extract_message_id(&json);
+        let mid = TelegramChannel::extract_message_id(&json).expect("a real id must be accepted");
         assert_eq!(mid.0, "42");
     }
 
+    /// THE SUCCESS-0 LIE. `ok:true` with no usable `result.message_id` used to
+    /// return `MessageId("0")`, and every caller read that as a delivered
+    /// message: nothing to edit, nothing to prove, and a receipt asserting a
+    /// delivery with no evidence behind it. Delivered means ok AND a POSITIVE
+    /// message id; everything else is a failure, here, once, for all send paths.
     #[test]
-    fn extract_message_id_missing_returns_zero() {
-        let json = serde_json::json!({"ok": true});
-        let mid = TelegramChannel::extract_message_id(&json);
-        assert_eq!(mid.0, "0");
+    fn extract_message_id_refuses_an_ok_with_no_proof_of_delivery() {
+        for json in [
+            serde_json::json!({"ok": true}),
+            serde_json::json!({"ok": true, "result": {}}),
+            serde_json::json!({"ok": true, "result": {"message_id": 0}}),
+            serde_json::json!({"ok": true, "result": {"message_id": -1}}),
+            serde_json::json!({"ok": true, "result": {"message_id": "42"}}),
+            serde_json::json!({"ok": true, "result": {"message_id": null}}),
+        ] {
+            let out = TelegramChannel::extract_message_id(&json);
+            assert!(
+                out.is_err(),
+                "an unproven send was reported as delivered: {json} -> {:?}",
+                out.map(|m| m.0),
+            );
+        }
+        // …and the error says what it means, so an operator reading the log is
+        // not left guessing whether the message went out.
+        let err = TelegramChannel::extract_message_id(&serde_json::json!({"ok": true}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NOT proven delivered"), "{err}");
     }
 
     // ---- multi-poll dispatch ----------------------------------------------
