@@ -69,9 +69,17 @@ feed_write() {
 
 # The seam must EXIST. A binary predating it would otherwise sail through every
 # negative leg below by failing them for the wrong reason.
-if ! feed_write --help 2>&1 | grep -q -- "--turn-id"; then
-    loud_fail "the installed wg has no 'feed-write --turn-id' seam — stale install (this is the state this scenario pins)"
-fi
+#
+# The help text is CAPTURED FIRST rather than piped into `grep -q`. Under
+# `set -o pipefail` a `-q` grep exits at the first match, `wg` dies of SIGPIPE
+# writing the rest of its help, and the pipeline reports failure — so the probe
+# went red against a binary that HAS the seam, and this scenario failed for
+# every build, correct or stale, which is a gate that pins nothing.
+help_text="$(feed_write --help 2>&1 || true)"
+case "$help_text" in
+    *--turn-id*) ;;
+    *) loud_fail "the installed wg has no 'feed-write --turn-id' seam — stale install (this is the state this scenario pins)" ;;
+esac
 
 echo "1. two engine replies in the SAME turn get DISTINCT global feed ids, each receipt naming its own row:"
 out_a=$(feed_write --kind agent --agent-id otto --bot-id otto \
@@ -106,14 +114,23 @@ receipts_after=$(grep -c . "$ledger")
     || loud_fail "a refused turn id still wrote a receipt ($receipts_before → $receipts_after)"
 echo "   → all three refused; feed and ledger byte-count unchanged"
 
-echo "3. the REPLAY guard: a second claim of the same (scope, message id) is refused at write:"
+echo "3. the REPLAY guard: a second claim of the same (scope, message id) is refused at write,"
+echo "   and the REFUSED RECEIPT TAKES ITS ROW WITH IT (one transaction):"
+rows_before=$(grep -c . "$feed")
 if feed_write --kind agent --agent-id otto --bot-id otto \
     --text "A replayed claim." \
     --turn-id "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3309" \
     --message-id 501 >/dev/null 2>&1; then
     loud_fail "a replayed claim of message 501 was accepted"
 fi
-echo "   → refused"
+# The row and the receipt are ONE transaction. Written in two, the refused
+# receipt would leave "A replayed claim." in the family's conversation with
+# nothing able to prove it — the exact unprovable row the contract removes.
+[ "$(grep -c . "$feed")" -eq "$rows_before" ] \
+    || loud_fail "the refused receipt left its row behind — the write was not one transaction"
+grep -q "A replayed claim." "$feed" \
+    && loud_fail "an unprovable row survived its refused receipt"
+echo "   → refused, and no row survived it"
 
 echo "4. an inbound human message is writer-stamped kind:group + nonRelayType:telegram-inbound:"
 feed_write --kind group --sender nadin --text "what's for dinner tonight?" \
@@ -198,4 +215,44 @@ assert any(h["text"] == "we're out of milk" for h in humans), \
 print(f"   → {len(rows)} rows, {len(receipts)} receipts, every row bound, no secrets, keyed scope ids")
 PY
 
-echo "PASS: engine receipt contract — exact-row join by global feed id, raw turn ids only, inbound stamped, seal holds, replay refused"
+echo "7. the ATTEMPT is MINTED, not counted — a counted id writes nothing at all:"
+TURN_C="web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c330a"
+ATTEMPT_ONE="attempt-6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+ATTEMPT_TWO="attempt-6ba7b810-9dad-41d1-80b4-00c04fd430c9"
+rows_before=$(grep -c . "$feed")
+# `1`/`2` collide across unrelated processes by construction: one turn's real
+# second attempt then keys the same as another's first, and the receipt for the
+# send that actually reached the family is suppressed as a refire.
+if (cd "$scratch" && WG_DIR= WG_ATTEMPT_ID=1 wg telegram feed-write --root "$scratch" \
+        --kind agent --agent-id otto --bot-id otto --text "counted attempt" \
+        --turn-id "$TURN_C" --message-id 601 >/dev/null 2>&1); then
+    loud_fail "a COUNTED attempt id was accepted"
+fi
+[ "$(grep -c . "$feed")" -eq "$rows_before" ] \
+    || loud_fail "a refused attempt id still left a row behind"
+echo "   → refused; feed unchanged"
+
+echo "8. a SELF-HEAL RETRY is not a refire — attempt 2 of one turn writes its own receipt:"
+attempt_write() {
+    local attempt="$1" mid="$2" text="$3"
+    (cd "$scratch" && WG_DIR= WG_ATTEMPT_ID="$attempt" wg telegram feed-write --root "$scratch" \
+        --kind agent --agent-id otto --bot-id otto --text "$text" \
+        --turn-id "$TURN_C" --message-id "$mid")
+}
+receipts_before=$(grep -c . "$ledger")
+attempt_write "$ATTEMPT_ONE" 601 "attempt one" >/dev/null \
+    || loud_fail "a minted attempt id was refused"
+# A REFIRE of the same attempt writes nothing...
+if attempt_write "$ATTEMPT_ONE" 602 "a refire" >/dev/null 2>&1; then
+    loud_fail "a refire of one attempt wrote a second receipt"
+fi
+# ...while the gateway's self-heal retry — a NEW attempt on the same turn — does.
+attempt_write "$ATTEMPT_TWO" 603 "attempt two" >/dev/null \
+    || loud_fail "a self-heal retry was suppressed as a refire"
+[ "$(grep -c . "$ledger")" -eq "$((receipts_before + 2))" ] \
+    || loud_fail "expected exactly two more receipts (attempt one and attempt two)"
+grep -q '"attemptId":"'"$ATTEMPT_TWO"'"' "$ledger" \
+    || loud_fail "the retry's receipt does not record WHICH attempt reached the family"
+echo "   → attempt 1 recorded, its refire refused, attempt 2 recorded"
+
+echo "PASS: engine receipt contract — exact-row join by global feed id, raw turn ids only, inbound stamped, seal holds, replay refused, one transaction, minted attempts"
