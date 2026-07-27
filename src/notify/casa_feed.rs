@@ -476,7 +476,9 @@ pub enum FeedWriteError {
     TurnWithoutPhase,
     /// The certifying feed is SEALED and this writer is not bound to a causal
     /// turn. See [`sealed_reason`].
-    Sealed { kind: &'static str },
+    Sealed {
+        kind: &'static str,
+    },
     /// The feed could not be serialised against the gateway. The row did NOT go
     /// in — an unserialised append can be destroyed by a concurrent rotation.
     NotSerialised(super::feed_lock::LockRefusal),
@@ -640,25 +642,119 @@ fn count_entries(body: &str) -> usize {
 /// cannot be taken: an unserialised append can land inside a rotation and be
 /// present in neither the archive nor the live file — a message the household
 /// said that the house then denies ever hearing.
-pub fn append_entry_allocating(
+pub fn append_entry_allocating(feed_path: &Path, entry: &FeedEntry) -> Result<i64, FeedWriteError> {
+    append_entry_proving(feed_path, entry, |_id, _lock| {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .map_err(|failure| match failure {
+        ProveFailure::Feed(e) => e,
+        ProveFailure::Proof(never) => match never {},
+    })
+}
+
+/// Why a proving append did not happen: the FEED half refused, or the PROOF half
+/// did. They are kept apart because they mean different things to an operator —
+/// "the row was never written" versus "the row could not be proven, so it was
+/// taken back out".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProveFailure<E> {
+    Feed(FeedWriteError),
+    Proof(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ProveFailure<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProveFailure::Feed(e) => write!(f, "{e}"),
+            ProveFailure::Proof(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Append one row and PROVE it in the SAME transaction: `prove` runs inside the
+/// critical section, with the row's global feed id and the held lock, and if it
+/// fails the row is TAKEN BACK OUT before anyone can see it.
+///
+/// WHY THE TWO HALVES MAY NOT BE TWO TRANSACTIONS. A row and the receipt that
+/// proves it are one fact. Written under two separate locks, a crash — or a
+/// corrupt ledger, or a refused duplicate claim — between them leaves a row in
+/// the family's conversation that nothing can ever prove: precisely the shape
+/// the receipt contract exists to eliminate, now produced by the mechanism
+/// meant to eliminate it. So the id allocation, the row bytes, and the receipt
+/// all land inside ONE section, and the only two outcomes visible on disk are
+/// "row and receipt" or "neither".
+///
+/// The rollback is a truncate back to the pre-append length, which is exact
+/// because we hold the lock: no other writer can have appended after us, so the
+/// only bytes past that offset are our own.
+pub fn append_entry_proving<E>(
     feed_path: &Path,
     entry: &FeedEntry,
-) -> Result<i64, FeedWriteError> {
-    validate(entry)?;
+    prove: impl FnOnce(i64, &super::feed_lock::FeedLock) -> Result<(), E>,
+) -> Result<i64, ProveFailure<E>> {
+    validate(entry).map_err(ProveFailure::Feed)?;
     if let Some(sealed) = sealed_reason(feed_path, entry) {
-        return Err(sealed);
+        return Err(ProveFailure::Feed(sealed));
     }
     if let Some(parent) = feed_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| FeedWriteError::Io(e.to_string()))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
     }
-    super::feed_lock::with_feed_lock(feed_path, super::feed_lock::DEFAULT_WAIT_MS, || {
-        append_entry(feed_path, entry).map_err(|e| FeedWriteError::Io(e.to_string()))?;
+    super::feed_lock::with_feed_lock(feed_path, super::feed_lock::DEFAULT_WAIT_MS, |lock| {
+        let before = fs::metadata(feed_path).map(|m| m.len()).unwrap_or(0);
+        append_entry_durable(feed_path, entry)
+            .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
         // Our bytes have landed, so our row is the LAST live line at this
         // instant — no counter is needed and none can drift.
         let live = count_entries(&fs::read_to_string(feed_path).unwrap_or_default());
-        Ok(archived_count_from_bytes(feed_path) as i64 + live as i64)
+        let feed_id = archived_count_from_bytes(feed_path) as i64 + live as i64;
+
+        match prove(feed_id, lock) {
+            Ok(()) => Ok(feed_id),
+            Err(proof_error) => {
+                // ROLL BACK. An unprovable row must not survive the attempt to
+                // prove it.
+                if let Err(e) = truncate_to(feed_path, before) {
+                    eprintln!(
+                        "[{}] casa feed: a row could not be proven AND could not be rolled back ({e}) \
+                         — feed row {feed_id} is on disk with nothing proving it",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                    );
+                }
+                Err(ProveFailure::Proof(proof_error))
+            }
+        }
     })
-    .map_err(FeedWriteError::NotSerialised)?
+    .map_err(|refusal| ProveFailure::Feed(FeedWriteError::NotSerialised(refusal)))?
+}
+
+/// Append one row and make it DURABLE — one write, then fsync of the file and of
+/// the directory. A feed row that a power loss can un-write is not a record.
+fn append_entry_durable(feed_path: &Path, entry: &FeedEntry) -> std::io::Result<()> {
+    if let Some(parent) = feed_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut line = entry.to_json_line();
+    line.push('\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(feed_path)?;
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    if let Some(parent) = feed_path.parent()
+        && let Ok(handle) = fs::File::open(parent)
+    {
+        let _ = handle.sync_all();
+    }
+    Ok(())
+}
+
+/// Cut the file back to `len` and make the cut durable.
+fn truncate_to(feed_path: &Path, len: u64) -> std::io::Result<()> {
+    let file = fs::OpenOptions::new().write(true).open(feed_path)?;
+    file.set_len(len)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -1070,8 +1166,8 @@ emoji = "①"
     #[test]
     fn the_raw_accepted_turn_id_is_written_verbatim() {
         let (_dir, feed) = scratch_feed();
-        let entry =
-            agent_entry(&catalog(), "harbor", "dinner is pasta", 1).with_turn(TURN, ReplyPhase::Final);
+        let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
+            .with_turn(TURN, ReplyPhase::Final);
 
         let feed_id = append_entry_allocating(&feed, &entry).unwrap();
         assert_eq!(feed_id, 1, "the first row of a fresh feed is global id 1");
@@ -1146,8 +1242,7 @@ emoji = "①"
         // first match proves the WRONG row. This is the failure the global id
         // exists to prevent, and the reason `ReceiptError::NoFeedId` refuses to
         // invent one.
-        let same_ts: Vec<&serde_json::Value> =
-            rows.iter().filter(|r| r["ts"] == same_ms).collect();
+        let same_ts: Vec<&serde_json::Value> = rows.iter().filter(|r| r["ts"] == same_ms).collect();
         assert_eq!(same_ts.len(), 2, "both rows share the timestamp");
         assert_eq!(
             same_ts[0]["text"], "the FIRST answer",
@@ -1171,7 +1266,11 @@ emoji = "①"
             "{\"ts\":1}\n{\"ts\":2}\n{\"ts\":3}\n",
         )
         .unwrap();
-        fs::write(archive.join("group-feed-0002.jsonl"), "{\"ts\":4}\n{\"ts\":5}\n").unwrap();
+        fs::write(
+            archive.join("group-feed-0002.jsonl"),
+            "{\"ts\":4}\n{\"ts\":5}\n",
+        )
+        .unwrap();
         // A manifest that LIES about the counts. The allocator must not believe
         // it: its name set matches the files on disk, so a name-set check —
         // which is all the read fast path does — cannot tell it is wrong.
@@ -1214,7 +1313,10 @@ emoji = "①"
                 .unwrap();
         assert_eq!(row["kind"], "group");
         assert_eq!(row["nonRelayType"], NON_RELAY_TELEGRAM_INBOUND);
-        assert!(row["turnId"].is_null(), "a human's message has no causal turn");
+        assert!(
+            row["turnId"].is_null(),
+            "a human's message has no causal turn"
+        );
     }
 
     /// The `nonRelayType` vocabulary is a CLOSED set. Free text would let any
@@ -1292,7 +1394,8 @@ emoji = "①"
         // Bound: it declares why it has no receipt.
         assert_eq!(rows[0]["nonRelayType"], NON_RELAY_TELEGRAM_INBOUND);
         assert!(
-            rows.iter().all(|r| !r["nonRelayType"].is_null() || !r["turnId"].is_null()),
+            rows.iter()
+                .all(|r| !r["nonRelayType"].is_null() || !r["turnId"].is_null()),
             "no unbound row was created: {rows:?}"
         );
     }
@@ -1305,7 +1408,10 @@ emoji = "①"
         let (dir, feed) = scratch_feed();
         assert!(!is_sealed(&feed));
         fs::write(seal_path_for(dir.path()), "{}").unwrap();
-        assert!(is_sealed(&feed), "a separate process's file seals this writer");
+        assert!(
+            is_sealed(&feed),
+            "a separate process's file seals this writer"
+        );
         fs::remove_file(seal_path_for(dir.path())).unwrap();
         assert!(!is_sealed(&feed));
     }
@@ -1352,12 +1458,28 @@ emoji = "①"
                     .map(|i| {
                         let entry = agent_entry(&cat, "harbor", &format!("w{worker} m{i}"), 1)
                             .with_non_relay_type(NON_RELAY_ENGINE_LIFECYCLE);
-                        append_entry_allocating(&feed, &entry).unwrap()
+                        for _ in 0..50 {
+                            match append_entry_allocating(&feed, &entry) {
+                                Ok(id) => return id,
+                                // Refused, not written — retry, exactly as a
+                                // real writer does. The lock FAILS CLOSED
+                                // (feed_lock §3): under contention a writer is
+                                // told "I did not do it" and NOTHING is on
+                                // disk, which is a visible retryable failure
+                                // rather than a silently corrupted feed.
+                                Err(FeedWriteError::NotSerialised(_)) => continue,
+                                Err(e) => panic!("unexpected feed write failure: {e}"),
+                            }
+                        }
+                        panic!("the feed lock was never obtainable in 50 attempts");
                     })
                     .collect::<Vec<i64>>()
             }));
         }
-        let mut ids: Vec<i64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let mut ids: Vec<i64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         ids.sort_unstable();
         assert_eq!(
             ids,

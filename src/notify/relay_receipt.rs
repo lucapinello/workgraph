@@ -184,7 +184,10 @@ pub struct Receipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptError {
     /// A typed id field did not match its schema shape.
-    BadShape { field: &'static str, value: String },
+    BadShape {
+        field: &'static str,
+        value: String,
+    },
     /// `status: delivered` with no positive message id — the delivery is not
     /// proven, so it may not be recorded as one.
     DeliveredWithoutMessageId,
@@ -192,19 +195,33 @@ pub enum ReceiptError {
     /// proves nothing, and a guessed ordinal names the WRONG row.
     NoFeedId,
     /// Another receipt already proves this row. One row, one receipt.
-    RowAlreadyProven { feed_id: i64, by: String },
+    RowAlreadyProven {
+        feed_id: i64,
+        by: String,
+    },
     /// This exact (transport scope, message id) delivery is already recorded —
     /// a replayed claim of an old delivery.
-    Replay { replay_key: String, by: String },
+    Replay {
+        replay_key: String,
+        by: String,
+    },
     /// This (turn, attempt) already wrote a receipt. A refire, not a retry.
-    AttemptAlreadyRecorded { attempt_id: String, by: String },
+    AttemptAlreadyRecorded {
+        attempt_id: String,
+        by: String,
+    },
     /// A receipt id was reused.
-    ReceiptIdReused { receipt_id: String },
+    ReceiptIdReused {
+        receipt_id: String,
+    },
     /// The ledger on disk is not wholly readable — an unreadable file, a line
     /// that does not parse, a torn tail. The evidence is DAMAGED, which is a
     /// different fact from "there is no evidence", and the difference decides
     /// whether a second claim of the same delivery gets certified.
-    LedgerCorrupt { line: usize, detail: String },
+    LedgerCorrupt {
+        line: usize,
+        detail: String,
+    },
     /// The receipt could not be serialised against the feed transaction it
     /// belongs to, so the row it proves was not written either.
     NotSerialised(String),
@@ -267,7 +284,11 @@ fn is_uuid_v4(s: &str) -> bool {
     }
     let lens = [8, 4, 4, 4, 12];
     for (part, want) in parts.iter().zip(lens) {
-        if part.len() != want || !part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()) {
+        if part.len() != want
+            || !part
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        {
             return false;
         }
     }
@@ -287,8 +308,11 @@ pub fn is_valid_receipt_id(s: &str) -> bool {
 /// `ts_<64 lowercase hex>`. Signed numerics, token-likes, names and chat ids all
 /// fail this by construction — none of them is 64 hex characters.
 pub fn is_valid_scope_id(s: &str) -> bool {
-    s.strip_prefix("ts_")
-        .is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()))
+    s.strip_prefix("ts_").is_some_and(|h| {
+        h.len() == 64
+            && h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    })
 }
 
 /// Mint a fresh receipt id.
@@ -595,9 +619,7 @@ pub fn append_locked(
             value: receipt.transport_scope_id.clone(),
         });
     }
-    if receipt.status == RelayStatus::Delivered
-        && !receipt.message_id.is_some_and(|id| id > 0)
-    {
+    if receipt.status == RelayStatus::Delivered && !receipt.message_id.is_some_and(|id| id > 0) {
         return Err(ReceiptError::DeliveredWithoutMessageId);
     }
     if receipt.feed_id <= 0 {
@@ -651,8 +673,7 @@ pub fn append_locked(
     // "succeeded" were no longer readable. A single buffer is a single atomic
     // append for any record short enough to fit the pipe/file atomicity window,
     // and the lock above covers the rest.
-    let mut line =
-        serde_json::to_string(receipt).map_err(|e| ReceiptError::Io(e.to_string()))?;
+    let mut line = serde_json::to_string(receipt).map_err(|e| ReceiptError::Io(e.to_string()))?;
     line.push('\n');
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -771,18 +792,31 @@ mod tests {
         assert!(is_valid_turn_id(TURN));
         assert!(is_valid_receipt_id(&mint_receipt_id()));
         // All-hyphens: the shape a placeholder takes when no id was minted.
-        assert!(!is_valid_turn_id("web-turn---------------------------------"));
+        assert!(!is_valid_turn_id(
+            "web-turn---------------------------------"
+        ));
         // Wrong version nibble (v1, not v4) and wrong variant.
-        assert!(!is_valid_turn_id("web-turn-3f2504e0-4f89-11d3-9a0c-0305e82c3301"));
-        assert!(!is_valid_turn_id("web-turn-3f2504e0-4f89-41d3-ca0c-0305e82c3301"));
+        assert!(!is_valid_turn_id(
+            "web-turn-3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+        ));
+        assert!(!is_valid_turn_id(
+            "web-turn-3f2504e0-4f89-41d3-ca0c-0305e82c3301"
+        ));
         // Uppercase hex is not the canonical form.
-        assert!(!is_valid_turn_id("web-turn-3F2504E0-4f89-41d3-9a0c-0305e82c3301"));
+        assert!(!is_valid_turn_id(
+            "web-turn-3F2504E0-4f89-41d3-9a0c-0305e82c3301"
+        ));
         // A signed numeric — a chat id wearing a turn id's name.
         assert!(!is_valid_turn_id("-1002233445566"));
         assert!(!is_valid_receipt_id("-1002233445566"));
         assert!(!is_valid_scope_id("-1002233445566"));
         // A token-like and a plain name.
-        assert!(!is_valid_scope_id(concat!("123456", ":", "AA-Ee", "_ffffffffffffffffffffffffffff")));
+        assert!(!is_valid_scope_id(concat!(
+            "123456",
+            ":",
+            "AA-Ee",
+            "_ffffffffffffffffffffffffffff"
+        )));
         assert!(!is_valid_scope_id("ts_the-helper-bot"));
         assert!(!is_valid_scope_id("the-helper-bot"));
         // The prefix alone is not the id.
@@ -931,7 +965,10 @@ mod tests {
         append(dir.path(), &r).unwrap();
         let key = std::fs::read(scope_key_path(dir.path())).unwrap();
         let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
-        assert!(!body.contains(&hex::encode(&key)), "the scope key leaked into the ledger");
+        assert!(
+            !body.contains(&hex::encode(&key)),
+            "the scope key leaked into the ledger"
+        );
     }
 
     // ── what a receipt refuses ──────────────────────────────────────────────
@@ -953,7 +990,10 @@ mod tests {
             append(dir.path(), &zero),
             Err(ReceiptError::DeliveredWithoutMessageId)
         );
-        assert!(read_all(dir.path()).is_empty(), "a refused receipt was written");
+        assert!(
+            read_all(dir.path()).is_empty(),
+            "a refused receipt was written"
+        );
     }
 
     /// A receipt that names no row proves nothing, and a guessed ordinal names
@@ -976,7 +1016,10 @@ mod tests {
         );
         assert!(matches!(
             append(dir.path(), &r),
-            Err(ReceiptError::BadShape { field: "turnId", .. })
+            Err(ReceiptError::BadShape {
+                field: "turnId",
+                ..
+            })
         ));
     }
 
@@ -1017,7 +1060,10 @@ mod tests {
         append(dir.path(), &receipt(dir.path(), TURN, 1, Some(4242))).unwrap();
         let replayed = receipt(dir.path(), TURN2, 2, Some(4242));
         assert!(
-            matches!(append(dir.path(), &replayed), Err(ReceiptError::Replay { .. })),
+            matches!(
+                append(dir.path(), &replayed),
+                Err(ReceiptError::Replay { .. })
+            ),
             "an old delivery was re-certified under a new turn",
         );
         assert_eq!(read_all(dir.path()).len(), 1);
@@ -1114,7 +1160,10 @@ mod tests {
             "provenance",
             "replyPhase",
         ] {
-            assert!(body.contains(&format!("\"{key}\"")), "missing {key}: {body}");
+            assert!(
+                body.contains(&format!("\"{key}\"")),
+                "missing {key}: {body}"
+            );
         }
         // The raw turn id is on the wire VERBATIM — a hashed one cannot join.
         assert!(body.contains(TURN), "{body}");
@@ -1156,7 +1205,11 @@ mod tests {
 
         // The lenient reader now sees NOTHING (this is the false-clean read that
         // made the duplicate look legitimate)...
-        assert_eq!(read_all(dir.path()).len(), 0, "visible_before=0, as audited");
+        assert_eq!(
+            read_all(dir.path()).len(),
+            0,
+            "visible_before=0, as audited"
+        );
 
         // ...and the strict one, which is what `append` uses, says DAMAGED.
         assert!(matches!(
@@ -1184,7 +1237,10 @@ mod tests {
     #[test]
     fn every_damaged_ledger_shape_fails_closed_and_none_authorises_a_receipt() {
         for (label, tail) in [
-            ("a torn tail", "{\"receiptId\":\"rcpt_3f2504e0-4f89-41d3-9a0"),
+            (
+                "a torn tail",
+                "{\"receiptId\":\"rcpt_3f2504e0-4f89-41d3-9a0",
+            ),
             ("json that is not a receipt", "{\"hello\":\"world\"}"),
             ("not json at all", "<<< a log line landed in the ledger"),
             ("a stray NUL-ish blob", "\u{1}\u{2}\u{3}"),
@@ -1198,7 +1254,10 @@ mod tests {
             std::fs::write(&path, &body).unwrap();
 
             assert!(
-                matches!(read_strict(dir.path()), Err(ReceiptError::LedgerCorrupt { line: 2, .. })),
+                matches!(
+                    read_strict(dir.path()),
+                    Err(ReceiptError::LedgerCorrupt { line: 2, .. })
+                ),
                 "{label} was not reported as damage"
             );
             let err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap_err();
@@ -1299,7 +1358,15 @@ mod tests {
             append(dir.path(), &r).unwrap();
         }
         let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
-        for token in ["\"send\"", "\"edit\"", "\"fallback\"", "\"ack\"", "\"final\"", "\"watchdog\"", "\"failure\""] {
+        for token in [
+            "\"send\"",
+            "\"edit\"",
+            "\"fallback\"",
+            "\"ack\"",
+            "\"final\"",
+            "\"watchdog\"",
+            "\"failure\"",
+        ] {
             assert!(body.contains(token), "missing {token}: {body}");
         }
         assert_eq!(read_all(dir.path()).len(), 4);
@@ -1342,7 +1409,11 @@ mod tests {
             append(root, &again),
             Err(ReceiptError::AttemptAlreadyRecorded { .. })
         ));
-        assert_eq!(read_all(root).len(), 1, "still exactly one delivery on record");
+        assert_eq!(
+            read_all(root).len(),
+            1,
+            "still exactly one delivery on record"
+        );
     }
 
     /// The other side of the same key, and the reason it is a PAIR: a self-heal

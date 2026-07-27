@@ -390,13 +390,18 @@ pub fn acquire(feed_path: &Path, wait_ms: u64) -> Result<FeedLock, LockRefusal> 
 
 /// Run `f` while holding the lock (protocol §6: nothing is finished up
 /// afterwards). The lock is released before the result is handed back.
+///
+/// `f` receives the held [`FeedLock`] as a WITNESS: a function that must run
+/// inside the section (appending the receipt that proves the row we just wrote)
+/// takes `&FeedLock` as a parameter, so it cannot be called from outside the
+/// transaction and cannot deadlock by taking the non-reentrant lock twice.
 pub fn with_feed_lock<T>(
     feed_path: &Path,
     wait_ms: u64,
-    f: impl FnOnce() -> T,
+    f: impl FnOnce(&FeedLock) -> T,
 ) -> Result<T, LockRefusal> {
     let lock = acquire(feed_path, wait_ms)?;
-    let out = f();
+    let out = f(&lock);
     lock.release();
     Ok(out)
 }
@@ -442,7 +447,11 @@ mod tests {
         assert!(parsed["acquiredMs"].is_i64());
         let token = parsed["token"].as_str().unwrap();
         assert_eq!(token.len(), 32, "16 crypto-random bytes as hex");
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
         assert_eq!(token, lock.token());
         lock.release();
     }
@@ -539,7 +548,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains("reclaim."))
             .collect();
-        assert!(debris.is_empty(), "unexpected quarantine debris: {debris:?}");
+        assert!(
+            debris.is_empty(),
+            "unexpected quarantine debris: {debris:?}"
+        );
     }
 
     /// A release that cannot be VERIFIED retains ownership so the holder can try
@@ -592,7 +604,7 @@ mod tests {
     fn with_feed_lock_runs_the_body_and_releases() {
         let dir = scratch();
         let feed = feed(&dir);
-        let out = with_feed_lock(&feed, DEFAULT_WAIT_MS, || 42).unwrap();
+        let out = with_feed_lock(&feed, DEFAULT_WAIT_MS, |_| 42).unwrap();
         assert_eq!(out, 42);
         assert!(
             !lock_path_for(&feed).exists(),
@@ -608,7 +620,7 @@ mod tests {
         let feed = feed(&dir);
         let held = acquire(&feed, DEFAULT_WAIT_MS).unwrap();
         let mut ran = false;
-        let refused = with_feed_lock(&feed, 20, || ran = true).unwrap_err();
+        let refused = with_feed_lock(&feed, 20, |_| ran = true).unwrap_err();
         assert_eq!(refused, LockRefusal::Timeout);
         assert!(!ran, "the body must NOT run when the lock was not acquired");
         held.release();
@@ -627,7 +639,7 @@ mod tests {
             let counter = counter.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..25 {
-                    with_feed_lock(&feed, 5_000, || {
+                    with_feed_lock(&feed, 5_000, |_| {
                         // Inside the section: read, pause, write. Without real
                         // exclusion this read-modify-write loses updates.
                         let mut seen = counter.lock().unwrap();
