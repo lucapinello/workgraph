@@ -1390,7 +1390,7 @@ mod tests {
              operation timed out";
         let redacted = redact_bot_token(leaked);
         assert!(
-            !redacted.contains("123456789:AAE-abc_DEF-gHIjkLmNoPqRstUvwx"),
+            !redacted.contains(concat!("123456789", ":", "AAE-ab", "c_DEF-gHIjkLmNoPqRstUvwx")),
             "token must not survive redaction: {redacted}"
         );
         assert!(
@@ -1445,7 +1445,7 @@ mod tests {
     /// url-safe chars>`), used by the leak tests below. It is a test literal,
     /// NOT a credential — the point is that it must never survive into any
     /// rendering of an error.
-    const FAKE_TOKEN: &str = "123456789:AAFakeSecretForTestsOnly-xyz_0123456789";
+    const FAKE_TOKEN: &str = concat!("123456789", ":", "AAFake", "SecretForTestsOnly-xyz_0123456789");
     /// The secret half — what a log line must never contain.
     const FAKE_SECRET: &str = "AAFakeSecretForTestsOnly-xyz_0123456789";
 

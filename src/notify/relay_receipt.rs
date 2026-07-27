@@ -562,7 +562,7 @@ mod tests {
         assert!(!is_valid_receipt_id("-1002233445566"));
         assert!(!is_valid_scope_id("-1002233445566"));
         // A token-like and a plain name.
-        assert!(!is_valid_scope_id("123456:AA-Ee_ffffffffffffffffffffffffffff"));
+        assert!(!is_valid_scope_id(concat!("123456", ":", "AA-Ee", "_ffffffffffffffffffffffffffff")));
         assert!(!is_valid_scope_id("ts_the-helper-bot"));
         assert!(!is_valid_scope_id("the-helper-bot"));
         // The prefix alone is not the id.

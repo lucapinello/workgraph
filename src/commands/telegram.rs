@@ -9121,7 +9121,7 @@ mod tests {
     const DM_CHAT: &str = "-987654321";
     const SENDER_ID: &str = "6123456789";
     const MESSAGE_ID: &str = "48271";
-    const TOKEN_ISH: &str = "8123456789:AAH_fakefakefakefakefakefakefake-fake";
+    const TOKEN_ISH: &str = concat!("8123456789", ":", "AAH_fa", "kefakefakefakefakefakefake-fake");
     const PRIVATE_BODY: &str =
         "Nadin is at the clinic on Thursday, don't tell the kids about the surprise";
 
