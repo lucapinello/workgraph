@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "THE SHARED PLAN-FILE SELECTION FIXTURE (task sidecar-is-not).",
+    "",
+    "Two independent readers decide which files under plans/ are week PLANS: the engine",
+    "(workgraph src/notify/family_plan.rs :: is_week_plan_candidate_stem, read through",
+    "load_plans / current_plan / the fast lane) and the gateway (weekly_planner",
+    "claw3d-bridge/src/weekSource.mjs :: discoverPlanFiles ∧ isWeekPlanCandidate). Neither",
+    "repo imports the other. Every time one side learned a rule the other did not, a",
+    "side-channel file became a plan of record: the parked -dinner-suggestions note drafted",
+    "a week titled 'Dinner suggestions for the week of …', and Nora's -review draft was",
+    "parsed as the week (prose '## Dinners', zero meals).",
+    "",
+    "This list is the ONE definition both sides are tested against:",
+    "  · engine  — src/notify/family_plan.rs, test `plan_candidate_fixtures_match_gateway_rule`",
+    "  · gateway — claw3d-bridge/test/planCandidateParity.test.mjs",
+    "The gateway test also compares this list entry-for-entry against its own inline copy,",
+    "so a one-sided edit fails there rather than silently re-opening the drift.",
+    "",
+    "CONVENTION: every household plan file is named `<YYYY-WNN>-<role>.md` — the week code",
+    "leads. The engine requires that prefix to read a week code at all (stricter than the",
+    "gateway's anywhere-in-the-name match); both writers emit the prefix, so every fixture",
+    "below is prefix-shaped and the two rules are exercised on the same ground."
+  ],
+  "candidates": [
+    { "file": "2026-W31-family-plan.md", "candidate": true, "why": "the canonical week plan" },
+    { "file": "2026-W29-family-plan.md", "candidate": true, "why": "an older canonical plan is still a plan" },
+    { "file": "2026-W31-workouts.md", "candidate": true, "why": "a section companion CONTRIBUTES (flow 35) — it loses selection on content, it is not excluded" },
+    { "file": "2026-W31-mira-workouts.md", "candidate": true, "why": "per-coach workouts companion" },
+    { "file": "2026-W31-bruno-recipes.md", "candidate": true, "why": "recipe cards companion" },
+    { "file": "2026-W31-skeleton.md", "candidate": true, "why": "a dinner skeleton is a legitimate companion, not an editorial note" },
+
+    { "file": "2026-W31-dinner-suggestions.md", "candidate": false, "why": "the parked side-channel note — never a plan of record" },
+    { "file": "2026-W31-family-plan.draft.md", "candidate": false, "why": "the atomic-publish half-written file" },
+    { "file": "2026-W31-workouts.draft.md", "candidate": false, "why": "any .draft.md is mid-write" },
+    { "file": "2026-W31-nora-review.md", "candidate": false, "why": "THE INCIDENT — an editorial review with a prose '## Dinners' section" },
+    { "file": "2026-W31-review.md", "candidate": false, "why": "editorial role, no persona" },
+    { "file": "2026-W31-reviews.md", "candidate": false, "why": "editorial role, plural" },
+    { "file": "2026-W31-draft.md", "candidate": false, "why": "a work-in-progress draft" },
+    { "file": "2026-W31-drafts.md", "candidate": false, "why": "drafts, plural" },
+    { "file": "2026-W31-notes.md", "candidate": false, "why": "scratch notes" },
+    { "file": "2026-W31-otto-notes.md", "candidate": false, "why": "any persona's notes" },
+    { "file": "2026-W31-scratch.md", "candidate": false, "why": "scratch" },
+    { "file": "2026-W31-wip.md", "candidate": false, "why": "work in progress" },
+    { "file": "2026-W31-summary.md", "candidate": false, "why": "a summary is about the week, not the week" },
+    { "file": "2026-W31-check-in.md", "candidate": false, "why": "a check-in note" },
+    { "file": "2026-W31-checkin.md", "candidate": false, "why": "a check-in note, unhyphenated" },
+    { "file": "2026-W31-family-plan-review.md", "candidate": false, "why": "a review OF the family plan is still a review — the role suffix decides, not the substring" },
+
+    { "file": "plans-readme.md", "candidate": false, "why": "no week code at all" },
+    { "file": "2026-W31-family-plan.txt", "candidate": false, "why": "not markdown" }
+  ]
+}

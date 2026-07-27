@@ -2085,27 +2085,55 @@ pub enum FastLaneResult {
 /// Locate the plan file that is "current" as of `today`, returning its path,
 /// week code, and parsed doc. Mirrors [`family_plan::current_plan`] but keeps the
 /// path so the file can be edited in place.
+///
+/// GATED BY THE SHARED CANDIDACY RULE ([`family_plan::is_week_plan_candidate_stem`],
+/// pinned to the gateway by tests/fixtures/plan_file_candidates.json). This lane
+/// does not merely READ the file it picks — it rewrites it — so an ungated glob
+/// here is worse than the read hazard `sidecar-is-not` was opened for: a meal swap
+/// would land inside `<week>-nora-review.md` or a parked `-dinner-suggestions`
+/// note, be round-trip verified there, and be reported to the family as applied
+/// while the plan of record never changed. Same collapse as `load_plans`: one file
+/// per week, the richest parse, the canonical `-family-plan` winning ties.
 fn current_plan_file(root: &Path, today: NaiveDate) -> Option<(PathBuf, String, PlanDoc)> {
     let plans_dir = root.join("plans");
-    let mut candidates: Vec<(PathBuf, String, PlanDoc)> = Vec::new();
+    // (path, week, doc) + the selection keys (content score, canonical?, mtime).
+    let mut best: Vec<((PathBuf, String, PlanDoc), (usize, bool, std::time::SystemTime))> =
+        Vec::new();
     for entry in std::fs::read_dir(&plans_dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if !family_plan::is_week_plan_candidate_stem(stem) {
+            continue;
+        }
         let week_code = match week_code_of(stem) {
             Some(w) => w,
             None => continue,
         };
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            candidates.push((
-                path,
-                week_code.clone(),
-                PlanDoc::parse(&week_code, &content),
-            ));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let doc = PlanDoc::parse(&week_code, &content);
+        let keys = (
+            family_plan::plan_content_score(&doc),
+            stem.to_ascii_lowercase().contains("family-plan"),
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH),
+        );
+        match best.iter_mut().find(|((_, w, _), _)| *w == week_code) {
+            Some(slot) => {
+                if keys > slot.1 {
+                    *slot = ((path, week_code, doc), keys);
+                }
+            }
+            None => best.push(((path, week_code, doc), keys)),
         }
     }
+    let mut candidates: Vec<(PathBuf, String, PlanDoc)> = best.into_iter().map(|(c, _)| c).collect();
     if candidates.is_empty() {
         return None;
     }
@@ -3481,6 +3509,87 @@ domains = ["meals"]
         let doc = PlanDoc::parse("2026-W29", &after);
         assert!(doc.meals.len() >= 5, "the meal table survived the edit");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- side-channel files are never the edit target (task sidecar-is-not) ----
+    //
+    // The read hazard `sidecar-is-not` was opened for has a WRITE twin here: this
+    // lane picks a file and rewrites it. Before the shared candidacy gate, any
+    // `plans/<week>-*.md` was a target — so a meal swap could land inside a review
+    // or a parked `-dinner-suggestions` note, round-trip cleanly there, and be
+    // reported to the family as applied while the plan of record never moved.
+
+    /// A file that is plan-SHAPED (real dinners table, real week header) but is not
+    /// a plan of record. Content cannot save us here — only the name can.
+    fn plan_shaped_impostor() -> String {
+        W29.to_string()
+    }
+
+    #[test]
+    fn the_fast_lane_never_edits_a_review_or_a_parked_note() {
+        for name in [
+            "2026-W29-nora-review.md",
+            "2026-W29-dinner-suggestions.md",
+            "2026-W29-family-plan.draft.md",
+            "2026-W29-otto-notes.md",
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "fastlane-sidecar-{}-{}",
+                std::process::id(),
+                name.replace('.', "_")
+            ));
+            std::fs::remove_dir_all(&dir).ok();
+            let plans = dir.join("plans");
+            std::fs::create_dir_all(&plans).unwrap();
+            let path = plans.join(name);
+            let before = plan_shaped_impostor();
+            std::fs::write(&path, &before).unwrap();
+
+            // No plan of record exists, so the honest outcome is a fallback to the
+            // full pipeline — never a confident edit of the impostor.
+            let result = run_fast_lane(&dir, "swap Friday to tacos", today());
+            assert!(
+                matches!(result, FastLaneResult::Fallback { .. }),
+                "{name}: expected a fallback, got {result:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "{name}: the file must be byte-identical — the lane never wrote here"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn the_fast_lane_edits_the_family_plan_beside_a_sidecar() {
+        let dir = std::env::temp_dir().join(format!("fastlane-sidecar-pick-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let plans = dir.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan_path = plans.join("2026-W29-family-plan.md");
+        let note_path = plans.join("2026-W29-dinner-suggestions.md");
+        std::fs::write(&plan_path, W29).unwrap();
+        let note = plan_shaped_impostor();
+        std::fs::write(&note_path, &note).unwrap();
+
+        match run_fast_lane(&dir, "swap Friday to tacos", today()) {
+            FastLaneResult::Applied { week_code, .. } => assert_eq!(week_code, "2026-W29"),
+            other => panic!("expected the swap to apply, got {other:?}"),
+        }
+        assert!(
+            std::fs::read_to_string(&plan_path)
+                .unwrap()
+                .to_lowercase()
+                .contains("tacos"),
+            "the edit landed in the plan of record"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&note_path).unwrap(),
+            note,
+            "and the parked note was not touched"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

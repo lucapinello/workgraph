@@ -292,16 +292,41 @@ impl PlanDoc {
     }
 }
 
-/// Load and parse every `plans/*.md` file under `dir` (the workgraph project
-/// root). Files are returned sorted by `week_code` so the newest week is last.
+/// Load and parse the weekly plans under `dir` (the workgraph project root):
+/// ONE document per ISO week, sorted by `week_code` so the newest week is last.
 /// A missing `plans/` directory yields an empty vec (not an error) — the
 /// commands then report honestly that there is no plan yet.
+///
+/// TWO GATES, both mirroring the gateway (claw3d-bridge/src/weekSource.mjs), and
+/// both there because "the newest `.md` in `plans/` whose name carries a week
+/// code" is NOT the same thing as "the household's plan of record":
+///
+///   1. CANDIDACY ([`is_week_plan_candidate_stem`]) — a parked
+///      `-dinner-suggestions` note, a `.draft.md` half-file, and the editorial
+///      roles (`-review`, `-notes`, `-scratch`, `-wip`, `-summary`, `-check-in`)
+///      are not plans. THE LIVE HAZARD this closes: [`current_plan`] falls back
+///      to the most recent plan by week code, so a review file for the current
+///      week — prose "## Dinners", zero meals — was returned as the plan of
+///      record, and `week_start`'s `plan_covering` read it as "this week is
+///      already planned".
+///   2. SELECTION — several files legitimately target one week (the canonical
+///      plan plus `-workouts` / `-recipes` / `-skeleton` companions). Before
+///      this collapse both landed in the vec under the same week code and
+///      `current_plan` returned whichever `read_dir` happened to yield first, so
+///      an empty companion could shadow the real plan. We keep the RICHEST
+///      parse per week ([`plan_content_score`]), the canonical `-family-plan`
+///      wins ties, then newest mtime. A companion therefore still represents its
+///      week when the family plan is missing (flow 35 — the workouts card still
+///      renders over an honest not-planned meals surface) and never when it is
+///      present.
 pub fn load_plans(dir: &Path) -> Vec<PlanDoc> {
     let plans_dir = dir.join("plans");
-    let mut docs = Vec::new();
+    // week code → (doc, content score, canonical?, mtime) — the incumbent for
+    // that week and the keys that decide whether a later file unseats it.
+    let mut best: Vec<(PlanDoc, usize, bool, std::time::SystemTime)> = Vec::new();
     let entries = match std::fs::read_dir(&plans_dir) {
         Ok(e) => e,
-        Err(_) => return docs,
+        Err(_) => return Vec::new(),
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -312,15 +337,35 @@ pub fn load_plans(dir: &Path) -> Vec<PlanDoc> {
             Some(s) => s,
             None => continue,
         };
+        if !is_week_plan_candidate_stem(stem) {
+            continue;
+        }
         // Only weekly-plan files (`2026-W29-family-plan`), keyed by week code.
         let week_code = match week_code_from_stem(stem) {
             Some(w) => w,
             None => continue,
         };
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            docs.push(PlanDoc::parse(&week_code, &content));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let doc = PlanDoc::parse(&week_code, &content);
+        let score = plan_content_score(&doc);
+        let canonical = is_family_plan_stem(stem);
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        match best.iter_mut().find(|(d, ..)| d.week_code == week_code) {
+            Some(slot) => {
+                let beats = (score, canonical, mtime) > (slot.1, slot.2, slot.3);
+                if beats {
+                    *slot = (doc, score, canonical, mtime);
+                }
+            }
+            None => best.push((doc, score, canonical, mtime)),
         }
     }
+    let mut docs: Vec<PlanDoc> = best.into_iter().map(|(d, ..)| d).collect();
     docs.sort_by(|a, b| a.week_code.cmp(&b.week_code));
     docs
 }
@@ -464,6 +509,110 @@ fn find_iso_dates(line: &str) -> Vec<NaiveDate> {
 pub fn is_sidecar_stem(stem: &str) -> bool {
     let low = stem.to_ascii_lowercase();
     low.ends_with("-dinner-suggestions") || low.ends_with("-dinner-suggestion")
+}
+
+/// The EDITORIAL roles a planning agent parks beside a plan: a review, a
+/// work-in-progress draft, scratch notes, a summary, a check-in. Mirrors the
+/// gateway's `PLAN_AUX_ROLE_RE` (claw3d-bridge/src/weekSource.mjs) plus the
+/// `<name>.draft.md` atomic-publish half-file that `discoverPlanFiles` skips.
+///
+/// Matched by ROLE SUFFIX, never by persona: the incident file was
+/// `<week>-nora-review.md`, and the next one will carry a different name. A
+/// review of the family plan (`<week>-family-plan-review.md`) is a review — the
+/// suffix decides, not the `family-plan` substring.
+pub fn is_aux_role_stem(stem: &str) -> bool {
+    let low = stem.to_ascii_lowercase();
+    if low.ends_with(".draft") {
+        return true;
+    }
+    [
+        "-review",
+        "-reviews",
+        "-draft",
+        "-drafts",
+        "-note",
+        "-notes",
+        "-scratch",
+        "-wip",
+        "-summary",
+        "-checkin",
+        "-check-in",
+    ]
+    .iter()
+    .any(|role| low.ends_with(role))
+}
+
+/// Is this filename stem a WEEK-PLAN CANDIDATE — a file that may represent its
+/// ISO week as the plan of record?
+///
+/// This is the engine half of a rule the gateway has enforced for longer
+/// (`discoverPlanFiles` ∧ `isWeekPlanCandidate`, claw3d-bridge/src/weekSource.mjs).
+/// The two sides are pinned equivalent by `tests/fixtures/plan_file_candidates.json`
+/// — see the test at the bottom of this file and the gateway's
+/// `claw3d-bridge/test/planCandidateParity.test.mjs`.
+///
+/// EXCLUDED: the parked `-dinner-suggestions` side channel, any `.draft.md`
+/// half-written file, and the editorial roles ([`is_aux_role_stem`]).
+///
+/// NOT EXCLUDED, on purpose: a `-workouts` / `-recipes` / `-skeleton` companion.
+/// Those carry REAL week content (flow 35: when the family plan is momentarily
+/// lost, the surviving workouts companion still renders its Moving card). They
+/// simply lose selection to the richer canonical plan on content score — see
+/// [`plan_content_score`] and [`load_plans`] — rather than being filtered out.
+pub fn is_week_plan_candidate_stem(stem: &str) -> bool {
+    if is_sidecar_stem(stem) {
+        return false;
+    }
+    let low = stem.to_ascii_lowercase();
+    if low.ends_with(".draft") {
+        return false;
+    }
+    // The canonical week plan always qualifies (mirrors the gateway's early
+    // return), so a role word inside the household's own plan name can never
+    // disqualify it.
+    if low.ends_with("-family-plan") {
+        return true;
+    }
+    !is_aux_role_stem(stem)
+}
+
+/// [`is_week_plan_candidate_stem`] at the FILE level: `2026-W31-nora-review.md`
+/// rather than its stem. Requires a markdown extension and a readable week code,
+/// so this is the complete engine-side answer to the gateway's
+/// `discoverPlanFiles` ∧ `isWeekPlanCandidate` — the shape the shared fixture
+/// list is written in.
+pub fn is_week_plan_candidate_file(name: &str) -> bool {
+    let path = Path::new(name);
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    week_code_from_stem(stem).is_some() && is_week_plan_candidate_stem(stem)
+}
+
+/// True for the canonical `…-family-plan` filename, used only as a TIE-BREAK in
+/// selection — content wins first, so a family plan that regressed to an empty
+/// parse can never out-rank a sibling that actually has the week's content.
+fn is_family_plan_stem(stem: &str) -> bool {
+    stem.to_ascii_lowercase().contains("family-plan")
+}
+
+/// How much real week content a parse yielded — dinners + workout sessions +
+/// shopping items + calendar rows. Zero for a companion that carries none of the
+/// plan sections. Mirrors the gateway's `planContentScore` (the engine's
+/// `PlanDoc` has no `confirmations` domain, so that term is absent here).
+pub fn plan_content_score(doc: &PlanDoc) -> usize {
+    doc.meals.len()
+        + doc.workouts.len()
+        + doc.shopping.iter().map(|s| s.items.len()).sum::<usize>()
+        + doc.calendar.len()
 }
 
 /// Extract the `YYYY-Wnn` week code from a filename stem like
@@ -655,6 +804,253 @@ mod tests {
         );
         assert_eq!(week_code_from_stem("notes"), None);
         assert_eq!(week_code_from_stem("2026-garbage"), None);
+    }
+
+    // ── plan-file selection (task sidecar-is-not) ────────────────────────────
+    //
+    // A file under `plans/` whose name carries a week code is not automatically a
+    // plan. `week-start-engine` closed the parked `-dinner-suggestions` note at
+    // two points; the SAME corruption class was still open one lane over, in the
+    // glob every other reader goes through: `current_plan` falls back to "the most
+    // recent plan by week code", so a review or a companion for the current week
+    // came back as the plan of record with no meals in it.
+
+    /// A plan with real content for a week — the plan of record.
+    fn family_plan_md(week: &str, monday: &str, sunday: &str) -> String {
+        format!(
+            "# Household weekly plan · {week}\n\n\
+             **Week of Monday {monday} → Sunday {sunday}**\n\
+             **Status:** PUBLISHED\n\n\
+             ## 1. Dinners\n\n\
+             | Day | Slot type | Dinner | Prep |\n\
+             |-----|-----------|--------|------|\n\
+             | Mon 07-27 | Vegetarian | Miso aubergine noodles | ~30 min |\n\
+             | Tue 07-28 | Fish | Baked trout | ~25 min |\n"
+        )
+    }
+
+    /// THE INCIDENT SHAPE: an editorial review that MASQUERADES as a plan — a
+    /// `## Dinners` section carrying prose and bullets, no meals table, and the
+    /// week's date range in the header so it parses as "covering" the week.
+    fn review_md(week: &str, monday: &str, sunday: &str) -> String {
+        format!(
+            "# Review of {week}\n\n\
+             **Week of Monday {monday} → Sunday {sunday}**\n\n\
+             ## Dinners\n\n\
+             The fish night landed twice this week; worth moving one to Thursday.\n\
+             - Tuesday felt rushed\n\
+             - Nobody finished the lentils\n"
+        )
+    }
+
+    fn write(root: &Path, name: &str, body: &str) {
+        std::fs::write(root.join("plans").join(name), body).unwrap();
+    }
+
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("plans")).unwrap();
+        dir
+    }
+
+    const MON: &str = "2026-07-27";
+    const SUN: &str = "2026-08-02";
+
+    #[test]
+    fn a_review_never_becomes_the_plan_of_record() {
+        let today = date(2026, 7, 28);
+
+        // With the real plan present, the review must not be selected …
+        let dir = project();
+        write(
+            dir.path(),
+            "2026-W31-family-plan.md",
+            &family_plan_md("2026-W31", MON, SUN),
+        );
+        write(
+            dir.path(),
+            "2026-W31-nora-review.md",
+            &review_md("2026-W31", MON, SUN),
+        );
+        let plans = load_plans(dir.path());
+        assert_eq!(plans.len(), 1, "one document per ISO week: {plans:#?}");
+        let chosen = current_plan(&plans, today).expect("a plan of record");
+        assert_eq!(chosen.week_code, "2026-W31");
+        assert_eq!(
+            chosen.meals.len(),
+            2,
+            "the family plan's dinners, not the review's prose"
+        );
+
+        // … and with NO plan on disk it must not become one either: the honest
+        // answer is that this week has no plan, not a plan with zero meals.
+        let bare = project();
+        write(
+            bare.path(),
+            "2026-W31-nora-review.md",
+            &review_md("2026-W31", MON, SUN),
+        );
+        assert!(
+            load_plans(bare.path()).is_empty(),
+            "a review is not a plan, even when it is the only file"
+        );
+        assert!(current_plan(&load_plans(bare.path()), today).is_none());
+
+        // Nor may it shadow an OLDER real plan by sorting last (the `plans.last()`
+        // fallback in current_plan is exactly how a sidecar became "the week").
+        let older = project();
+        write(
+            older.path(),
+            "2026-W30-family-plan.md",
+            &family_plan_md("2026-W30", "2026-07-20", "2026-07-26"),
+        );
+        write(
+            older.path(),
+            "2026-W31-nora-review.md",
+            &review_md("2026-W31", MON, SUN),
+        );
+        let plans = load_plans(older.path());
+        assert_eq!(
+            current_plan(&plans, today).unwrap().week_code,
+            "2026-W30",
+            "the last real plan, never the newer review"
+        );
+    }
+
+    /// THE NEGATIVE CONTROL. The test above passes trivially if the review simply
+    /// never parsed as a plan — so pin the hazard itself: run the PRE-FIX glob
+    /// (week code from the stem, nothing else) over the same directory and watch
+    /// it hand back the review, covering the day, with zero dinners in it. That is
+    /// the corruption `is_week_plan_candidate_stem` exists to prevent; if this
+    /// control ever stops reproducing, the test above has stopped proving anything.
+    #[test]
+    fn the_pre_fix_glob_did_return_the_review_as_the_plan() {
+        let dir = project();
+        write(
+            dir.path(),
+            "2026-W31-nora-review.md",
+            &review_md("2026-W31", MON, SUN),
+        );
+
+        let mut docs = Vec::new();
+        for entry in std::fs::read_dir(dir.path().join("plans")).unwrap().flatten() {
+            let path = entry.path();
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(week) = week_code_from_stem(stem) {
+                docs.push(PlanDoc::parse(&week, &std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+        let stale = current_plan(&docs, date(2026, 7, 28)).expect("the pre-fix hazard");
+        assert_eq!(stale.week_code, "2026-W31");
+        assert!(
+            stale.meals.is_empty(),
+            "a plan of record with no dinners — the bug, reproduced"
+        );
+    }
+
+    #[test]
+    fn drafts_and_editorial_roles_are_not_loaded() {
+        let dir = project();
+        for name in [
+            "2026-W31-family-plan.draft.md",
+            "2026-W31-review.md",
+            "2026-W31-otto-notes.md",
+            "2026-W31-scratch.md",
+            "2026-W31-wip.md",
+            "2026-W31-summary.md",
+            "2026-W31-check-in.md",
+            "2026-W31-dinner-suggestions.md",
+            "2026-W31-family-plan-review.md",
+        ] {
+            write(dir.path(), name, &family_plan_md("2026-W31", MON, SUN));
+        }
+        assert!(
+            load_plans(dir.path()).is_empty(),
+            "every excluded role, even when it parses as a rich plan"
+        );
+
+        // The canonical plan beside them is still found.
+        write(
+            dir.path(),
+            "2026-W31-family-plan.md",
+            &family_plan_md("2026-W31", MON, SUN),
+        );
+        let plans = load_plans(dir.path());
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].meals.len(), 2);
+    }
+
+    #[test]
+    fn a_companion_contributes_but_never_outranks_the_family_plan() {
+        let workouts = format!(
+            "# Moving · 2026-W31\n\n**Week of Monday {MON} → Sunday {SUN}**\n\n\
+             ## 2. Workouts\n\n\
+             ### Luca\n\n\
+             | Day | Session |\n|-----|---------|\n| Mon | Lower (strength) |\n"
+        );
+
+        // Alone (flow 35 — the family plan is momentarily lost): the companion
+        // still represents its week, so its Moving content still renders.
+        let alone = project();
+        write(alone.path(), "2026-W31-mira-workouts.md", &workouts);
+        let plans = load_plans(alone.path());
+        assert_eq!(plans.len(), 1, "the companion is a candidate, not filtered");
+        assert!(
+            !plans[0].workouts.is_empty(),
+            "and it contributes its section"
+        );
+        assert!(plans[0].meals.is_empty(), "honestly empty on dinners");
+
+        // Beside the canonical plan: the plan wins, every time, regardless of
+        // which file `read_dir` yields first or which was touched last.
+        let both = project();
+        write(both.path(), "2026-W31-mira-workouts.md", &workouts);
+        write(
+            both.path(),
+            "2026-W31-family-plan.md",
+            &family_plan_md("2026-W31", MON, SUN),
+        );
+        // Touch the companion so it is the NEWEST file — mtime must not decide.
+        filetime_touch(&both.path().join("plans").join("2026-W31-mira-workouts.md"));
+        let plans = load_plans(both.path());
+        assert_eq!(plans.len(), 1, "one document per ISO week");
+        assert_eq!(
+            plans[0].meals.len(),
+            2,
+            "the richer canonical plan represents the week"
+        );
+    }
+
+    /// Bump a file's mtime past its siblings without pulling in a new crate:
+    /// rewrite it in place after a short pause.
+    fn filetime_touch(path: &Path) {
+        let body = std::fs::read_to_string(path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// THE ANTI-DRIFT PIN. The gateway (`discoverPlanFiles` ∧
+    /// `isWeekPlanCandidate`, claw3d-bridge/src/weekSource.mjs) and the engine
+    /// answer the same question in two languages, in two repos that do not import
+    /// each other — which is how the engine spent months without the rule at all.
+    /// Both are now tested against ONE list; the gateway's half lives in
+    /// claw3d-bridge/test/planCandidateParity.test.mjs.
+    #[test]
+    fn plan_candidate_fixtures_match_gateway_rule() {
+        const FIXTURES: &str = include_str!("../../tests/fixtures/plan_file_candidates.json");
+        let parsed: serde_json::Value = serde_json::from_str(FIXTURES).expect("fixture json");
+        let rows = parsed["candidates"].as_array().expect("candidates array");
+        assert!(rows.len() >= 20, "the list must stay comprehensive");
+        for row in rows {
+            let file = row["file"].as_str().unwrap();
+            let want = row["candidate"].as_bool().unwrap();
+            assert_eq!(
+                is_week_plan_candidate_file(file),
+                want,
+                "{file}: {}",
+                row["why"].as_str().unwrap_or("")
+            );
+        }
     }
 
     #[test]

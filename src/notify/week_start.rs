@@ -488,35 +488,15 @@ fn shape_of(content: &str) -> PlanShape {
     shape
 }
 
-/// Filename roles that are NOT a household plan of record: the atomic-publish
-/// half-written file, and a persona's review / scratch notes left beside the plan.
-/// Mirrors the gateway's selection gate (`isWeekPlanCandidate`,
-/// claw3d-bridge/src/weekSource.mjs) — a review's prose "## Dinners" section has no
-/// meals table, so a week drafted in its shape would have no meals table either.
-fn is_aux_role_stem(stem: &str) -> bool {
-    let low = stem.to_ascii_lowercase();
-    if low.ends_with(".draft") {
-        return true;
-    }
-    for role in [
-        "-review",
-        "-reviews",
-        "-draft",
-        "-drafts",
-        "-note",
-        "-notes",
-        "-scratch",
-        "-wip",
-        "-summary",
-        "-checkin",
-        "-check-in",
-    ] {
-        if low.ends_with(role) {
-            return true;
-        }
-    }
-    false
-}
+// The filename roles that are NOT a household plan of record — the atomic-publish
+// `.draft` half-file, a persona's review / scratch notes — used to live here as
+// `is_aux_role_stem`. THIS lane learned the rule first (task week-start-engine)
+// while every OTHER engine lane read through a glob that had never heard of it
+// (task sidecar-is-not): `current_plan()` would hand back a `-nora-review.md` as
+// the plan of record. The rule now has ONE definition, in
+// `family_plan::{is_aux_role_stem, is_week_plan_candidate_stem}`, pinned to the
+// gateway's by tests/fixtures/plan_file_candidates.json. A second copy here is
+// precisely the drift that opened the gap, so there is no twin.
 
 /// Could this document supply a week's SHAPE? A shape source must actually be a
 /// week plan: a meals section with a table under it. A `-workouts` or `-recipes`
@@ -542,12 +522,17 @@ fn is_plan_shaped(content: &str) -> bool {
 ///
 /// GATED THREE WAYS, because "the newest `.md` in `plans/` whose name carries a
 /// week code" is not the same thing as "the household's most recent plan":
-///   · a `-dinner-suggestions` note is a side-channel, not a plan
-///     ([`family_plan::is_sidecar_stem`]) — reading one as the shape produced a
-///     drafted week titled "Dinner suggestions for the week of …";
+///   · a `-dinner-suggestions` note is a side-channel, not a plan — reading one as
+///     the shape produced a drafted week titled "Dinner suggestions for the week
+///     of …";
 ///   · a review / `.draft` / notes file is scratch, not a plan of record;
-///   · whatever survives must be PLAN-SHAPED (a meals section with a table), so a
-///     `-workouts` companion never supplies the shape of a week of dinners.
+/// Both of those are now the SHARED candidacy rule
+/// ([`family_plan::is_week_plan_candidate_stem`], pinned to the gateway by
+/// tests/fixtures/plan_file_candidates.json) rather than a gate this lane owns.
+///   · whatever survives must additionally be PLAN-SHAPED (a meals section with a
+///     table) — a stricter requirement that belongs to THIS lane alone, because a
+///     `-workouts` companion is a legitimate week candidate elsewhere and still
+///     must never supply the shape of a week of dinners.
 /// The canonical `-family-plan` wins ties for its week outright.
 fn newest_plan(root: &Path) -> Option<String> {
     let plans_dir = root.join("plans");
@@ -559,7 +544,7 @@ fn newest_plan(root: &Path) -> Option<String> {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if family_plan::is_sidecar_stem(stem) || is_aux_role_stem(stem) {
+        if !family_plan::is_week_plan_candidate_stem(stem) {
             continue;
         }
         let Some(week) = week_code_of_stem(stem) else {
@@ -885,9 +870,20 @@ fn retire_parked(root: &Path, week_code: &str, folded: usize) {
 // ---------------------------------------------------------------------------
 
 /// Does a plan of record already cover `day`?
+///
+/// A plan of record has DINNERS in it. `load_plans` now keeps the richest
+/// candidate per week rather than every week-coded file (task sidecar-is-not), but
+/// a legitimate `-workouts` / `-recipes` companion is still a candidate — it has
+/// to be, so its section survives when the family plan is momentarily lost — and a
+/// companion carrying the week's date range in its header would otherwise answer
+/// "yes, this week is already planned" for a week with no dinners in it. That is
+/// the same lie the parked-suggestions note told, one question over: the family
+/// asks the house to start the week and is told it already did.
+/// The canonical `<week>-family-plan.md` is checked separately by the caller, so a
+/// real plan mid-draft is still never overwritten.
 fn plan_covering(root: &Path, day: NaiveDate) -> Option<String> {
     for doc in family_plan::load_plans(root) {
-        if doc.covers(day) {
+        if doc.covers(day) && !doc.meals.is_empty() {
             return Some(doc.week_code);
         }
     }
