@@ -27,11 +27,19 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./_helpers.sh
 
 require_wg
-# A deployed binary older than this lane has no `--ask` — skip loudly rather than
-# FAIL, so the scenario only gates a wg actually built with the readback lane.
-if ! wg telegram remind --help 2>&1 | grep -q -- "--ask"; then
-    loud_skip "STALE WG BINARY" "wg telegram remind has no --ask flag; rebuild/install from the fork"
-fi
+# A deployed binary older than this lane has no `--ask`. That FAILS rather than
+# skipping: a stale install is the exact state this pins — the whole point of the
+# lane is that the answer comes from the deployed engine, and a SKIP here would
+# read green while the family's reminder question was still being answered by a
+# composer with no reminder data in front of it.
+# Captured, not piped: under `set -o pipefail` a `wg … | grep -q` races — grep
+# exits on the first match, wg dies of SIGPIPE (141), and the pipeline reports
+# failure even though the flag was found. That flapped this very check.
+remind_help="$(wg telegram remind --help 2>&1 || true)"
+case "$remind_help" in
+    *--ask*) ;;
+    *) loud_fail "stale wg: 'telegram remind' has no --ask flag — install the engine (cargo install --path . --force --locked)" ;;
+esac
 
 scratch="$(make_scratch)"
 export WG_DIR="$scratch/.wg"
