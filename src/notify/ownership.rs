@@ -638,6 +638,26 @@ impl OwnerMap {
         }
     }
 
+    /// Attach household-authored `(persona id, display name)` pairs to a map built
+    /// with [`from_pairs`](Self::from_pairs). Ids are trimmed/lower-cased and pairs
+    /// with an empty id or name are dropped — a display name is only ever what the
+    /// household wrote down, never derived from an id.
+    pub fn set_display_names<I, S, T>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = (S, T)>,
+        S: Into<String>,
+        T: Into<String>,
+    {
+        self.display_names = names
+            .into_iter()
+            .filter_map(|(id, name)| {
+                let id = id.into().trim().to_lowercase();
+                let name = name.into().trim().to_string();
+                (!id.is_empty() && !name.is_empty()).then_some((id, name))
+            })
+            .collect();
+    }
+
     /// Parse `<root>/household.toml`'s `[[agent]]` blocks (id + domains). Returns
     /// `None` when the file is absent, malformed, or has no usable agents.
     pub fn from_household_toml(root: &Path) -> Option<Self> {

@@ -1634,7 +1634,17 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 &route_body,
                                 reminder_now.date(),
                             )
-                        });
+                        })
+                        // CAPABILITY short-circuit (task
+                        // capability-answer-no-invented-work, live-cert C011). "What
+                        // kinds of things can you help with?" is a social act with a
+                        // deterministic answer, and routing it through the composer is
+                        // what produced a 22.6-second reply carrying a phantom promise
+                        // correction plus a task for work nobody asked for. Answered
+                        // from the configured household instead: instant, one voice,
+                        // nothing created. Checked LAST so a lane-specific ask, a
+                        // reminder or a list mutation still owns its turn.
+                        .or_else(|| try_capability_answer(&workgraph_dir, &route_body));
                         if let Some((short_circuit_lane, confirmation)) = short_circuit {
                             let owner_map =
                                 ownership::OwnerMap::load(&project_root(&workgraph_dir));
@@ -2004,6 +2014,37 @@ fn try_shopping_language(
         FastLaneResult::Answered { reply, .. } => Some(("shopping-ask", reply)),
         FastLaneResult::Fallback { .. } => None,
     }
+}
+
+/// Answer a bare CAPABILITY ask ("What kinds of things can you help with?")
+/// instantly from the configured household, returning `(lane, reply)`.
+///
+/// THE GAP THIS CLOSES (task capability-answer-no-invented-work, live-cert run 2
+/// C011). Asked in the family group at 21:18 on 2026-07-26, that question took
+/// **22.6 seconds** through the full compose pipeline, came back with a phantom
+/// promise correction ("I said I'd set that up but hit a snag … flagged it for the
+/// coordinator"), and MINTED A TASK for a question that needs no work at all — a
+/// human then answered it by hand. A capability ask has a deterministic answer, so
+/// it is answered here: instantly, model-free, creating nothing.
+///
+/// Returns `None` — leaving the turn exactly where it was — when the message is not
+/// a bare capability ask (a lane-specific "what can you do about dinner?" keeps its
+/// owner) or when the household declares no domain ownership to describe. Unlike
+/// the reminder/shopping short-circuits this needs NO confirmed-human gate: it
+/// changes nothing and reveals nothing a family member could not already see.
+fn try_capability_answer(workgraph_dir: &Path, body: &str) -> Option<(&'static str, String)> {
+    use worksgood::notify::capability;
+    use worksgood::notify::grounding;
+    use worksgood::notify::ownership::OwnerMap;
+
+    if !capability::is_capability_ask(body) {
+        return None;
+    }
+    let root = project_root(workgraph_dir);
+    let answer = capability::capability_answer(&OwnerMap::load(&root))?;
+    // Same guard every deterministic family-facing reply passes through.
+    let roster = grounding::load_family_voice_roster(&root, workgraph_dir);
+    Some(("capability", grounding::enforce_family_voice(&answer, &roster)))
 }
 
 /// Detect a "cancel the reminder about …" request and drop the ONE pending
@@ -6158,12 +6199,26 @@ pub fn run_parity(reply_text: &str, human: Option<&str>, _dry_run: bool, json: b
     use worksgood::notify::parity::{self, PromiseKind};
 
     // The audit runs over the human-facing reply, with any machine tail stripped
-    // — exactly as the live turn sees it.
+    // — exactly as the live turn sees it. With the human's ask in hand it is the
+    // INTENT-AWARE audit the live turn runs (task capability-answer-no-invented-work);
+    // with no ask it stays the reply-only classifier.
     let directive = lifecycle::extract_task_directive(reply_text.trim());
-    let audit = parity::audit_promise(&directive.reply);
+    let audit = match human {
+        Some(ask) => parity::audit_promise_in_turn(ask, &directive.reply),
+        None => parity::audit_promise(&directive.reply),
+    };
+    // Did the human ask for work at all? A turn that did not can never receive a
+    // correction tail, however the reply is worded.
+    let asked_for_action = human.map(parity::turn_requests_action);
     let has_artifact = directive.title.is_some();
     // A mismatch is the parity gap: a one-off action promised, no artifact.
     let mismatch = audit.commits_action() && !has_artifact;
+    // What the live turn would actually append to the reply.
+    let correction = if mismatch && asked_for_action.unwrap_or(true) {
+        Some(parity::correction_line())
+    } else {
+        None
+    };
     let fallback_title = if mismatch {
         Some(parity::fallback_task_title(
             human.unwrap_or(""),
@@ -6184,6 +6239,8 @@ pub fn run_parity(reply_text: &str, human: Option<&str>, _dry_run: bool, json: b
                 "mismatch": mismatch,
                 "matched": audit.matched,
                 "fallbackTitle": fallback_title,
+                "requestedAction": asked_for_action,
+                "correction": correction,
             }))?
         );
         return Ok(());
@@ -6192,6 +6249,12 @@ pub fn run_parity(reply_text: &str, human: Option<&str>, _dry_run: bool, json: b
     println!("promised: {}", audit.kind.slug());
     if let Some(m) = &audit.matched {
         println!("matched:  \"{m}\"");
+    }
+    if let Some(asked) = asked_for_action {
+        println!(
+            "asked:    the turn {} ask for work",
+            if asked { "DID" } else { "did NOT" }
+        );
     }
     match directive.title {
         Some(t) => println!("artifact: TASK_CREATE present → \"{t}\""),
@@ -6205,6 +6268,10 @@ pub fn run_parity(reply_text: &str, human: Option<&str>, _dry_run: bool, json: b
             println!("verdict:  MISMATCH → promised an action but no artifact");
             println!("          a live turn would retry once, then fall back to task:");
             println!("          \"{}\"", fallback_title.unwrap_or_default());
+            match &correction {
+                Some(c) => println!("correction: \"{c}\""),
+                None => println!("correction: none — the turn requested no action"),
+            }
         }
         PromiseKind::Action => {
             println!("verdict:  action promised AND artifact present → parity OK");
@@ -6223,6 +6290,61 @@ pub fn run_parity(reply_text: &str, human: Option<&str>, _dry_run: bool, json: b
 /// the ask's household domain, the single persona that owns it, and — with
 /// `--persona` — whether that voice would create the task or defer to the owner.
 /// No side effects: nothing is sent, no task created.
+/// The CAPABILITY act seam — the `wg telegram capability` command (see
+/// [`crate::cli::TelegramCommands::Capability`]).
+///
+/// Prints whether `text` is a bare capability ask and, when it is, the answer the
+/// configured household gives ([`worksgood::notify::capability`]). Also reports the
+/// promise audit of that answer, because the live-cert C011 failure was not the
+/// answer's content but the phantom promise appended to it. Side-effect-free.
+pub fn run_capability(text: &str, root: Option<&Path>, _dry_run: bool, json: bool) -> Result<()> {
+    use worksgood::notify::capability;
+    use worksgood::notify::ownership::OwnerMap;
+    use worksgood::notify::parity;
+
+    let is_ask = capability::is_capability_ask(text);
+    let map = match root {
+        Some(r) => OwnerMap::load(r),
+        None => OwnerMap::default(),
+    };
+    let answer = if is_ask {
+        capability::capability_answer(&map)
+    } else {
+        None
+    };
+    // The answer must never itself commit to work (that is the C011 defect).
+    let promised = answer
+        .as_deref()
+        .map(|a| parity::audit_promise_in_turn(text, a).kind.slug().to_string());
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "text": text,
+                "capabilityAsk": is_ask,
+                "answer": answer,
+                "promised": promised,
+                "requestedAction": parity::turn_requests_action(text),
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("capability ask: {}", if is_ask { "yes" } else { "no" });
+    match &answer {
+        Some(a) => {
+            println!("answer:  {a}");
+            println!("promised: {}", promised.as_deref().unwrap_or("none"));
+        }
+        None if is_ask => {
+            println!("answer:  none — this household declares no domain ownership");
+        }
+        None => println!("answer:  none — not a capability ask, the normal path owns it"),
+    }
+    Ok(())
+}
+
 pub fn run_owner(
     ask: &str,
     persona: Option<&str>,

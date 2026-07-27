@@ -3988,6 +3988,11 @@ fn main() -> Result<()> {
                 human,
                 dry_run,
             } => commands::telegram::run_parity(&reply_text, human.as_deref(), dry_run, cli.json),
+            TelegramCommands::Capability {
+                text,
+                root,
+                dry_run,
+            } => commands::telegram::run_capability(&text, root.as_deref(), dry_run, cli.json),
             TelegramCommands::Owner {
                 ask,
                 persona,

@@ -6996,9 +6996,37 @@ pub enum TelegramCommands {
         /// The composed reply text to audit.
         reply_text: String,
 
-        /// The original human ask, used only to preview the fallback task title.
+        /// The original human ask. With it, the audit is the INTENT-AWARE one the
+        /// live turn runs (conditional capability copy on a turn that requested
+        /// nothing is not a promise) and the output also says whether a correction
+        /// tail would be appended. Without it, the reply is audited alone.
         #[arg(long)]
         human: Option<String>,
+
+        /// Accepted for symmetry with the other seams; this command never has
+        /// side effects, so it is always effectively a dry run.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
+    /// The CAPABILITY act test seam: is this "what can you help with?", and what
+    /// does the household answer?
+    ///
+    /// Runs the exact pure classifier + composer the live conversational turn uses
+    /// ([`worksgood::notify::capability`]) over `<text>`: whether the turn is a bare
+    /// capability ask, and the answer assembled from `--root`'s `household.toml`
+    /// (every lane and every helper name comes from the configured `[[agent]]`
+    /// blocks — nothing shipped). Credential-free and side-effect-free: nothing is
+    /// sent, nothing is created. This is how "does a capability ask still invent
+    /// work?" is answerable without a live family group.
+    Capability {
+        /// The human turn to classify (and answer, when it is a capability ask).
+        text: String,
+
+        /// Project root holding `household.toml`. With no configured ownership
+        /// there is no honest answer, and the command says so.
+        #[arg(long)]
+        root: Option<PathBuf>,
 
         /// Accepted for symmetry with the other seams; this command never has
         /// side effects, so it is always effectively a dry run.

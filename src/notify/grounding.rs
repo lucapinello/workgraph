@@ -1345,6 +1345,13 @@ static OPS_SIGNALS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"(?i)\bdaemon\b",
         r"(?i)\bwg\s+\w+",
         r"(?i)\b\d+\s+(?:recurring|paused|blocked)\b",
+        // THE C011 LEAK (live-cert run 2): a promise-correction told the family
+        // "I've flagged it for the coordinator so it doesn't slip." The coordinator
+        // is a machine role no family asked about, and "flagged it for X" is how it
+        // reaches them. Both are refused here so no composed reply — or future
+        // correction copy — can carry them again.
+        r"(?i)\bcoordinator\b",
+        r"(?i)\bflagged\s+(?:it|that|this)\s+(?:for|with|to)\b",
     ]
     .into_iter()
     .map(|pattern| Regex::new(pattern).expect("valid operations-jargon regex"))

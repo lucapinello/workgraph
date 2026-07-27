@@ -2387,8 +2387,15 @@ async fn finalize_composed_reply(
 ) -> Result<TurnOutcome> {
     let directive = lifecycle::extract_task_directive(first_text.trim());
     let mut reply_text = directive.reply.clone();
-    // Audit the human-facing reply (with the machine tail already stripped).
-    let audit = parity::audit_promise(&reply_text);
+    // Audit the human-facing reply (with the machine tail already stripped) IN THE
+    // CONTEXT OF THE TURN. Conditional capability copy on a turn that asked for
+    // nothing ("if you need something done, just ask and I'll sort it") is an offer,
+    // not a promise — live-cert C011 turned exactly that sentence into a phantom task
+    // and a failure correction in the family group.
+    let audit = parity::audit_promise_in_turn(human_message, &reply_text);
+    // Was any work actually ASKED for on this turn? Nothing that follows may tell the
+    // family a promise was missed when they never requested one.
+    let asked_for_action = parity::turn_requests_action(human_message);
     let mut created: Option<String> = None;
     let mut authorized_handoff: Option<String> = None;
 
@@ -2490,12 +2497,24 @@ async fn finalize_composed_reply(
                     // fallback task from the promise text and correct the record honestly.
                     let title = parity::fallback_task_title(human_message, &reply_text);
                     created = try_create_origin_task(workgraph_dir, human_message, &title, origin);
-                    let correction = parity::correction_line();
-                    if reply_text.is_empty() {
-                        reply_text = correction;
+                    // CORRECTION COPY ONLY AFTER A GENUINE REQUESTED ACTION (live-cert
+                    // C011). A correction says "I said I'd do that and it hasn't happened
+                    // yet" — which is a lie, and reads as a malfunction, when the family
+                    // asked for nothing at all. The fallback task above still exists so no
+                    // real ask can be lost; only the apology is withheld.
+                    if asked_for_action {
+                        let correction = parity::correction_line();
+                        if reply_text.is_empty() {
+                            reply_text = correction;
+                        } else {
+                            reply_text.push_str("\n\n");
+                            reply_text.push_str(&correction);
+                        }
                     } else {
-                        reply_text.push_str("\n\n");
-                        reply_text.push_str(&correction);
+                        eprintln!(
+                            "[{}] parity: suppressed a correction tail for {agent_id} — the turn requested no action",
+                            chrono::Utc::now().format("%H:%M:%S"),
+                        );
                     }
                 }
             }
@@ -5030,10 +5049,78 @@ domains = ["calendar", "coordination"]
             .map(|e| e.3.clone())
             .or_else(|| sink.calls().last().map(|c| c.2.clone()))
             .unwrap();
-        assert!(
-            last.to_lowercase().contains("snag"),
-            "expected correction: {last}"
+        // The correction is honest and in plain family words — and carries none of
+        // the operations vocabulary the live-cert C011 correction leaked
+        // (task capability-answer-no-invented-work).
+        let low = last.to_lowercase();
+        assert!(low.contains("hasn't happened yet"), "expected correction: {last}");
+        for banned in ["coordinator", "flagged", "snag", "slip"] {
+            assert!(!low.contains(banned), "correction leaked {banned:?}: {last}");
+        }
+    }
+
+    /// PARITY, INTENT-AWARE (task capability-answer-no-invented-work, live-cert run 2
+    /// C011). The 2026-07-26 21:18 family-group failure end to end: Luca asked what the
+    /// house can help with, the composer answered with conditional capability copy
+    /// ("…just ask and I'll either sort it…") and emitted no directive. The old flat
+    /// audit read that as a broken promise, so the turn minted a task
+    /// (`follow-up-on-chat-request-2`) AND appended a correction about work that never
+    /// existed. Now: no retry, no task, no correction — just the answer.
+    #[tokio::test]
+    async fn a_capability_answer_creates_no_task_and_gets_no_correction() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "nora", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "nora");
+
+        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer = SequenceComposer::new(&[
+            "Oh, lots of things! I keep an eye on the calendar and let you know what's \
+             coming up. If you need something done or have a question about what's going \
+             on, just ask and I'll either sort it or let you know what we need to do. 🙂",
+        ]);
+
+        run_conversation_turn(
+            &wg,
+            &plan,
+            "What kinds of things can you help with?",
+            "req-parity-capability",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            composer.call_count(),
+            1,
+            "a capability answer owes no artifact, so there is nothing to retry",
         );
+        // No task at all — often not even a graph file, since nothing was written.
+        if let Ok(graph) = crate::parser::load_graph(wg.join("graph.jsonl")) {
+            assert!(
+                graph.tasks().all(|t| t.origin.is_none()),
+                "a capability ask must create NO task: {:?}",
+                graph.tasks().map(|t| t.title.clone()).collect::<Vec<_>>(),
+            );
+        }
+        let delivered = sink
+            .edits()
+            .last()
+            .map(|e| e.3.clone())
+            .or_else(|| sink.calls().last().map(|c| c.2.clone()))
+            .unwrap();
+        let low = delivered.to_lowercase();
+        for banned in ["hasn't happened yet", "coordinator", "flagged", "snag", "slip"] {
+            assert!(
+                !low.contains(banned),
+                "the capability answer carried correction/ops copy ({banned:?}): {delivered}",
+            );
+        }
     }
 
     /// PARITY, no false positive: a purely non-committal reply (no promise)

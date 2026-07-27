@@ -233,11 +233,57 @@ const STANDING_MARKERS: &[&str] = &[
     "weekdays",
 ];
 
+/// Markers that make whatever a clause promises HYPOTHETICAL — an offer of
+/// capability, not a commitment. "If you need something done, just ask and I'll
+/// sort it" describes what the persona *could* do; nothing is owed, so nothing
+/// may be created and no correction may ever be sent for it.
+///
+/// THE LIVE FAILURE (live-cert run 2, C011, 2026-07-26 21:18). Luca asked "What
+/// kinds of things can you help with?" The capability answer ended "…just ask and
+/// I'll either sort it or let you know what we need to do" — `i'll` + `sort` —
+/// which the flat whole-reply audit read as a one-off Action. No artifact existed
+/// (nothing had been requested), so the parity path created a fallback task
+/// (`follow-up-on-chat-request-2`) and appended a failure correction to a turn
+/// that had asked for no work at all.
+const CONDITIONAL_MARKERS: &[&str] = &[
+    "if you",
+    "if there's",
+    "if there is",
+    "if anything",
+    "if something",
+    "if that's",
+    "if it's",
+    "if we ever",
+    "if ever",
+    "whenever you",
+    "whenever there",
+    "whenever something",
+    "when you need",
+    "when you want",
+    "should you",
+    "in case you",
+    "just ask",
+    "just say",
+    "just tell me",
+    "just tell us",
+    "any time you",
+    "anytime you",
+    "feel free",
+    "want me to",
+    "would you like me to",
+    "happy to",
+];
+
 /// Audit a composed reply: does it commit the persona to an action or a standing
 /// preference? Pattern-based and case-insensitive; never calls a model, so the
 /// parity guarantee cannot itself silently fail. Preferences are matched before
 /// one-off actions so "from now on I'll skip weekday lunches" reads as a durable
 /// rule, not a single task.
+///
+/// Whole-reply and intent-blind: use [`audit_promise_in_turn`] on a real turn so
+/// conditional capability copy on a turn that asked for nothing cannot be read as
+/// a promise. This entry point stays for the CLI probe seam
+/// (`wg telegram parity --dry-run`) and for callers auditing reply text alone.
 pub fn audit_promise(reply: &str) -> PromiseAudit {
     let norm = normalize(reply);
     if norm.trim().is_empty() {
@@ -281,6 +327,128 @@ pub fn audit_promise(reply: &str) -> PromiseAudit {
     }
 
     PromiseAudit::none()
+}
+
+/// Words by which a HUMAN turn asks for something to be DONE — an imperative, a
+/// polite request, a memory instruction. Their absence means the turn asked a
+/// question or made small talk: nothing was requested, so nothing can have
+/// failed, so no correction copy may ever be appended to the answer
+/// ([`turn_requests_action`]).
+/// Deliberately NOT here: the polite question openers ("can you", "could you",
+/// "would you"). A capability ask is phrased exactly like a request — "What kinds
+/// of things **can you** help with?" — so treating the opener itself as a request
+/// is what made the C011 turn eligible for a correction in the first place. An
+/// opener only ever counts through the action verb it introduces ("can you **add**
+/// milk"), which the verb lists below already catch.
+const REQUEST_MARKERS: &[&str] = &[
+    "i need",
+    "we need",
+    "i'd like you to",
+    "we'd like you to",
+    "don't forget",
+    "dont forget",
+    "make sure",
+    "remember",
+    "keep in mind",
+    "buy",
+    "order",
+    "pick up",
+    "sign up",
+    "swap",
+    "cancel",
+    "remove",
+    "delete",
+    "cross off",
+    "cross out",
+    "sort out",
+    "take care of",
+];
+
+/// Did the HUMAN's turn ask for something to be done?
+///
+/// True when the message carries an action verb ([`ACTION_VERBS`] /
+/// [`ACTIVE_VERBS`]), a request marker ([`REQUEST_MARKERS`]), or a standing-rule
+/// marker ([`STANDING_MARKERS`], so "remember we work Mon–Fri" keeps its
+/// preference path). False for a pure question or a social line — "What kinds of
+/// things can you help with?", "What's for dinner?", "Hi there."
+///
+/// A CAPABILITY ask is checked first and is never a request, however it is
+/// phrased: it asks what the house *could* do, so no work has been ordered and
+/// nothing about the answer can have failed.
+///
+/// Deliberately generous in the TRUE direction: a false "yes" only means the turn
+/// keeps the behaviour it has always had, while a false "no" is what suppresses a
+/// correction. Nothing here decides whether an ask is *lost* — the fallback task
+/// is still created either way.
+pub fn turn_requests_action(human_message: &str) -> bool {
+    let norm = normalize(human_message);
+    if norm.trim().is_empty() {
+        return false;
+    }
+    if super::capability::is_capability_ask(human_message) {
+        return false;
+    }
+    REQUEST_MARKERS.iter().any(|m| contains_phrase(&norm, m))
+        || ACTIVE_VERBS.iter().any(|v| contains_phrase(&norm, v))
+        || ACTION_VERBS.iter().any(|v| contains_phrase(&norm, v))
+        || STANDING_MARKERS.iter().any(|m| contains_phrase(&norm, m))
+}
+
+/// Audit a composed reply IN THE CONTEXT OF THE TURN THAT PRODUCED IT —
+/// intent-aware and clause-local. This is the entry point every live path uses.
+///
+/// * The human ASKED for something ([`turn_requests_action`]) → audit the whole
+///   reply exactly as [`audit_promise`] always has. A soft "if you like, I'll add
+///   it" answering a real request is still a promise, and still owes an artifact.
+/// * The human asked for NOTHING (a capability ask, a plain question, small talk)
+///   → a hypothetical clause is capability copy, not a commitment. A standing
+///   preference is still read from the whole reply (a rule can be volunteered),
+///   but the one-off action check runs CLAUSE-LOCALLY and skips any sentence
+///   carrying a [`CONDITIONAL_MARKERS`] hit.
+///
+/// This is the fix for live-cert C011: the capability answer's closing "if you
+/// need something done … just ask and I'll either sort it" no longer classifies as
+/// an Action, so it creates no task, arms no watchdog, and can produce no failure
+/// correction.
+pub fn audit_promise_in_turn(human_message: &str, reply: &str) -> PromiseAudit {
+    if turn_requests_action(human_message) {
+        return audit_promise(reply);
+    }
+    let norm = normalize(reply);
+    if norm.trim().is_empty() {
+        return PromiseAudit::none();
+    }
+    // A volunteered standing rule survives on the whole reply — a durable
+    // preference is recorded, never "corrected", so reading it here is safe.
+    if let Some(m) = preference_match(&norm) {
+        return PromiseAudit {
+            kind: PromiseKind::Preference,
+            matched: Some(m),
+        };
+    }
+    for clause in unconditional_clauses(&norm) {
+        let audit = audit_promise(&clause);
+        if audit.commits_action() {
+            return audit;
+        }
+    }
+    PromiseAudit::none()
+}
+
+/// Split an already-[`normalize`]d reply into sentence-level clauses and drop
+/// every one that carries a [`CONDITIONAL_MARKERS`] hit.
+///
+/// Sentence granularity is deliberate: "I'll add it if you want" is ONE clause and
+/// is dropped whole. On a turn that requested nothing, an offer hedged with "if
+/// you want" is exactly the copy that must not mint work — keeping its leading
+/// half would re-create the C011 failure with one extra word.
+fn unconditional_clauses(norm: &str) -> Vec<String> {
+    norm.split(|c| matches!(c, '.' | '!' | '?' | ';' | '\n'))
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .filter(|clause| !CONDITIONAL_MARKERS.iter().any(|m| contains_phrase(clause, m)))
+        .map(str::to_string)
+        .collect()
 }
 
 fn action(matched: &str) -> PromiseAudit {
@@ -387,9 +555,18 @@ pub fn fallback_task_title(human_message: &str, reply: &str) -> String {
 /// The honest correction sent to the SAME chat when a promise could not be
 /// turned into an artifact even after a retry — never a silent drop, never a
 /// technical excuse. Family voice.
+///
+/// THE WORDS MATTER (live-cert run 2, C011). The old copy read "I said I'd set
+/// that up but hit a snag on my end — I've flagged it for the coordinator so it
+/// doesn't slip." Every one of `coordinator`, `flagged`, `slip` and `snag` is
+/// operations vocabulary the family never asked to hear, and it landed on a turn
+/// where nothing had been requested at all. The correction now says the one true
+/// thing in plain words — it hasn't happened yet, it is written down, we will come
+/// back to you — and [`crate::notify::grounding::has_ops_jargon`] refuses the old
+/// vocabulary outright so it cannot creep back through a composed reply.
 pub fn correction_line() -> String {
-    "I said I'd set that up but hit a snag on my end — I've flagged it for the \
-     coordinator so it doesn't slip. \u{1f64f}"
+    "I said I'd do that and it hasn't happened yet — sorry. It's written down so \
+     it isn't forgotten, and we'll come back to you on it. \u{1f64f}"
         .to_string()
 }
 
@@ -639,9 +816,148 @@ mod tests {
     #[test]
     fn correction_line_is_honest_and_jargon_free() {
         let c = correction_line();
-        assert!(c.to_lowercase().contains("snag"));
+        let low = c.to_lowercase();
+        // It admits the miss in plain words…
+        assert!(low.contains("hasn't happened yet"), "{c}");
+        assert!(low.contains("sorry"), "{c}");
+        // …and carries NONE of the operations vocabulary the live-cert C011
+        // correction leaked to the family group.
+        for banned in ["coordinator", "flagged", "slip", "snag", "escalat", "ticket"] {
+            assert!(!low.contains(banned), "correction copy leaked {banned:?}: {c}");
+        }
         assert!(!c.contains("TASK_CREATE"));
-        assert!(!c.to_lowercase().contains("task id"));
+        assert!(!low.contains("task id"));
+    }
+
+    // -- intent-aware + clause-local audit (live-cert C011) --------------------
+
+    /// The EXACT capability answer delivered to the family group at 21:18 on
+    /// 2026-07-26, minus the correction tail this fix removes.
+    const C011_CAPABILITY_REPLY: &str = "Oh, lots of things! I keep an eye on the calendar \
+        and let you know what's coming up. I plan dinners and let you know what's on the \
+        table. I can help you figure out the week ahead, keep track of what's needed for \
+        shopping, coordinate family stuff — basically anything that keeps the household \
+        running smooth. If you need something done or have a question about what's going \
+        on, just ask and I'll either sort it or let you know what we need to do. \u{1f642}";
+
+    #[test]
+    fn the_c011_capability_answer_promises_nothing() {
+        // The flat whole-reply audit read the conditional tail as an Action…
+        assert!(
+            audit_promise(C011_CAPABILITY_REPLY).commits_action(),
+            "the regression itself: the flat audit used to (and still does) see a promise here",
+        );
+        // …but in the turn that produced it — a capability ask — nothing is owed.
+        let a = audit_promise_in_turn(
+            "What kinds of things can you help with?",
+            C011_CAPABILITY_REPLY,
+        );
+        assert_eq!(
+            a.kind,
+            PromiseKind::None,
+            "a capability answer must promise nothing, matched={:?}",
+            a.matched,
+        );
+    }
+
+    #[test]
+    fn conditional_capability_copy_is_not_a_promise_on_a_no_request_turn() {
+        for (human, reply) in [
+            ("what can you do?", "If you need something added, I'll add it."),
+            ("what can you help with", "Just ask and I'll sort it out."),
+            ("hi there", "Whenever you want a hand with the list, I'll put things on it."),
+            ("how are you?", "All good! Happy to schedule anything you need."),
+        ] {
+            let a = audit_promise_in_turn(human, reply);
+            assert_eq!(
+                a.kind,
+                PromiseKind::None,
+                "expected no promise for ({human:?}, {reply:?}), got {a:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_request_still_owes_an_artifact_even_when_hedged() {
+        // The salad regression must NOT be weakened: when the human asked for the
+        // work, a conditional wrapper does not excuse the promise.
+        for (human, reply) in [
+            (
+                "add a green salad to Monday dinner",
+                "Sure! I'll add the salad to the list I'm sending Nora and Bruno.",
+            ),
+            (
+                "can you add milk to the shopping list?",
+                "If you like, I'll add milk to the list.",
+            ),
+            (
+                "please remind me Thursday to defrost the trout",
+                "Will do!",
+            ),
+        ] {
+            let a = audit_promise_in_turn(human, reply);
+            assert_eq!(
+                a.kind,
+                PromiseKind::Action,
+                "expected Action for ({human:?}, {reply:?}), got {a:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unconditional_promise_commits_even_on_an_unasked_turn() {
+        // Intent-awareness only excuses HYPOTHETICAL copy. A flat "I'll add it"
+        // volunteered on a question turn is still a promise, so the ask is never
+        // lost by the intent gate alone.
+        let a = audit_promise_in_turn(
+            "what's for dinner?",
+            "Risotto. I'll add the parmesan to the shopping list.",
+        );
+        assert_eq!(a.kind, PromiseKind::Action, "{a:?}");
+    }
+
+    #[test]
+    fn a_volunteered_standing_rule_survives_the_clause_filter() {
+        let a = audit_promise_in_turn(
+            "what kinds of things can you help with?",
+            "Lots! Noted, by the way — from now on, no weekday lunches.",
+        );
+        assert_eq!(a.kind, PromiseKind::Preference, "{a:?}");
+    }
+
+    #[test]
+    fn turn_requests_action_separates_asks_from_questions() {
+        for asked in [
+            "add milk to the list",
+            "can you book the table for seven?",
+            "please move Thursday's dinner to Friday",
+            "remember we work Mon-Fri",
+            "swap Friday to tacos",
+        ] {
+            assert!(turn_requests_action(asked), "should read as a request: {asked:?}");
+        }
+        for not_asked in [
+            "What kinds of things can you help with?",
+            "what can you do",
+            "what's for dinner tonight?",
+            "Hi there.",
+            "Good night, everyone.",
+            "thanks!",
+            "which one was Saturday?",
+        ] {
+            assert!(
+                !turn_requests_action(not_asked),
+                "should NOT read as a request: {not_asked:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn unconditional_clauses_drops_only_the_hypothetical_sentences() {
+        let got = unconditional_clauses(&normalize(
+            "Dinner is risotto. If you need something added, just ask. I'll tell Nora.",
+        ));
+        assert_eq!(got, vec!["dinner is risotto", "i'll tell nora"]);
     }
 
     // -- durable preference store ---------------------------------------------
