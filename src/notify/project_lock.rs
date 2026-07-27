@@ -1150,10 +1150,21 @@ pub fn with_project_lock<T>(
     f: impl FnOnce() -> T,
 ) -> Result<T, LockRefusal> {
     let lock = acquire(root, name, opts)?;
+    let path = lock.path().to_path_buf();
     let out = f();
     // §7: nothing is "finished up afterwards" — the caller's whole transaction is
     // inside `f`, and the lock is let go only once it has returned.
-    lock.release();
+    if let Release::Retained(reason) = lock.release() {
+        // We could not PROVE we let go. Ownership stays with us (§4) so the next
+        // acquire in this thread retries the release rather than deadlocking
+        // against our own file — and a human is told, because a release that never
+        // clears is a wedged week.
+        eprintln!(
+            "[project-lock] release of {} could not be verified ({reason}) — this process still \
+             owns it and will retry on the next acquire. The mutation itself completed.",
+            path.display()
+        );
+    }
     Ok(out)
 }
 
