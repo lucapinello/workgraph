@@ -3671,7 +3671,7 @@ Keep what I just asked for: \"Set Tuesday's dinner to homemade pizza.\"";
         let result = run_fast_lane(
             root.path(),
             "Please draft this week's family plan — start the week. Keep what I asked for: \
-             \"Rebalance the whole week around Nadin's travel.\"",
+             \"Rebalance the whole week around the travel.\"",
             monday_w31(),
         );
         assert!(

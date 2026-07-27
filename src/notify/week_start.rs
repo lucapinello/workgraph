@@ -945,7 +945,7 @@ mod tests {
     fn a_carried_request_that_cannot_land_writes_no_plan() {
         let dir = scratch(true);
         let ask = WeekStartAsk {
-            carried: vec!["Rebalance the whole week around Nadin's travel.".to_string()],
+            carried: vec!["Rebalance the whole week around the travel.".to_string()],
         };
         let err = draft_week(dir.path(), MON_W31(), &ask, None).unwrap_err();
         assert!(
