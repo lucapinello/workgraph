@@ -346,19 +346,35 @@ impl TelegramChannel {
         // NOT `.context(...)`: the request URL embeds the bot token, and a
         // `.context()`-wrapped reqwest error keeps that URL printable through
         // the anyhow source chain. See [`redacted_api_error`].
+        // TYPED OUTCOMES. A transport failure and a refusal are not the same
+        // fact, and the difference decides whether the turn may be re-sent:
+        //
+        //   · the request never completed — a timeout, a torn connection — so
+        //     Telegram may well have accepted and delivered it. UNPROVEN.
+        //   · the response body did not parse, so the answer is unreadable
+        //     rather than negative. UNPROVEN.
+        //   · Telegram answered with `ok:false`/an HTTP error and said why. That
+        //     is a PROVEN failure and the only one that may release a turn.
         let resp = self
             .client
             .post(self.api_url(method))
             .json(body)
             .send()
             .await
-            .map_err(|e| redacted_api_error("Telegram API request failed", e))?;
+            .map_err(|e| {
+                crate::notify::telegram_conversation::unproven_delivery(format!(
+                    "{}",
+                    redacted_api_error("the Telegram API request did not complete", e)
+                ))
+            })?;
 
         let status = resp.status();
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| redacted_api_error("failed to parse Telegram API response", e))?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            crate::notify::telegram_conversation::unproven_delivery(format!(
+                "{}",
+                redacted_api_error("the Telegram API response could not be read", e)
+            ))
+        })?;
 
         if !status.is_success() || json.get("ok") != Some(&serde_json::Value::Bool(true)) {
             let desc = json
@@ -440,13 +456,18 @@ impl TelegramChannel {
             .and_then(|m| m.as_i64());
         match mid {
             Some(id) if id > 0 => Ok(MessageId(id.to_string())),
-            Some(id) => anyhow::bail!(
-                "telegram accepted the call but returned a non-positive message_id ({id}) — \
-                 the send cannot be confirmed"
-            ),
-            None => anyhow::bail!(
-                "telegram response carried no readable message_id — the send cannot be confirmed"
-            ),
+            // ACCEPTED-BUT-UNCONFIRMABLE is the ambiguous case, not a proven
+            // failure: `ok:true` came back, so the message may be on the family's
+            // screen right now. Releasing the turn here sends it a second time.
+            Some(id) => Err(crate::notify::telegram_conversation::unproven_delivery(
+                format!(
+                    "telegram accepted the call but returned a non-positive message_id ({id}) — \
+                     the send cannot be confirmed"
+                ),
+            )),
+            None => Err(crate::notify::telegram_conversation::unproven_delivery(
+                "telegram response carried no readable message_id — the send cannot be confirmed",
+            )),
         }
     }
 
@@ -1390,7 +1411,12 @@ mod tests {
              operation timed out";
         let redacted = redact_bot_token(leaked);
         assert!(
-            !redacted.contains(concat!("123456789", ":", "AAE-ab", "c_DEF-gHIjkLmNoPqRstUvwx")),
+            !redacted.contains(concat!(
+                "123456789",
+                ":",
+                "AAE-ab",
+                "c_DEF-gHIjkLmNoPqRstUvwx"
+            )),
             "token must not survive redaction: {redacted}"
         );
         assert!(
@@ -1445,7 +1471,12 @@ mod tests {
     /// url-safe chars>`), used by the leak tests below. It is a test literal,
     /// NOT a credential — the point is that it must never survive into any
     /// rendering of an error.
-    const FAKE_TOKEN: &str = concat!("123456789", ":", "AAFake", "SecretForTestsOnly-xyz_0123456789");
+    const FAKE_TOKEN: &str = concat!(
+        "123456789",
+        ":",
+        "AAFake",
+        "SecretForTestsOnly-xyz_0123456789"
+    );
     /// The secret half — what a log line must never contain.
     const FAKE_SECRET: &str = "AAFakeSecretForTestsOnly-xyz_0123456789";
 
@@ -1461,11 +1492,7 @@ mod tests {
         let display = format!("{err}");
         let alternate = format!("{err:#}");
         let debug = format!("{err:?}"); // anyhow's `Caused by:` chain print
-        for (shape, rendered) in [
-            ("{}", &display),
-            ("{:#}", &alternate),
-            ("{:?}", &debug),
-        ] {
+        for (shape, rendered) in [("{}", &display), ("{:#}", &alternate), ("{:?}", &debug)] {
             assert!(
                 !rendered.contains(FAKE_SECRET),
                 "{label}: token leaked through `{shape}`: {rendered}"

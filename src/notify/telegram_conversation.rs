@@ -600,6 +600,100 @@ pub trait ReplySink: Send + Sync {
         let _ = message_id;
         self.send(bot_id, chat_id, text).await.map(|_| ())
     }
+
+    /// Send, saying WHICH PHASE OF THE TURN this line is.
+    ///
+    /// The phase is what decides whether a send consumes the turn's one final
+    /// reservation. The latency ack, the watchdog and the failure notice are all
+    /// physical sends, and none of them is the turn's answer: a reservation
+    /// consumed by the ack means a crash between the ack and the final leaves an
+    /// hourglass on the family's screen and a claim on disk saying the turn was
+    /// already delivered, so the final is suppressed FOREVER.
+    ///
+    /// The default delegates to [`send`](ReplySink::send), so every existing
+    /// sink keeps working; only the wrappers that care about phase override it.
+    async fn send_phase(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        text: &str,
+        phase: crate::notify::relay_receipt::ReplyPhase,
+    ) -> Result<Option<String>> {
+        let _ = phase;
+        self.send(bot_id, chat_id, text).await
+    }
+
+    /// Edit, saying WHICH PHASE OF THE TURN the new text is. Same rule as
+    /// [`send_phase`](ReplySink::send_phase): only a `final` consumes the turn's
+    /// one reservation.
+    async fn edit_phase(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        text: &str,
+        phase: crate::notify::relay_receipt::ReplyPhase,
+    ) -> Result<()> {
+        let _ = phase;
+        self.edit(bot_id, chat_id, message_id, text).await
+    }
+
+    /// TAKE the id of the message a fallback send created because an edit was
+    /// refused, if this sink made one.
+    ///
+    /// `edit` returns `Result<()>`, which is why the fallback's id used to be
+    /// dropped on the floor: the final answer was delivered as a NEW message
+    /// while the reservation, the row and any receipt all went on naming the old
+    /// ack. The record then points at a message that never held the answer.
+    fn take_fallback_message_id(&self) -> Option<String> {
+        None
+    }
+}
+
+/// A delivery whose outcome the transport did not PROVE either way.
+///
+/// The distinction this type carries is the whole of the audit's item 7. A
+/// transport error is not one thing:
+///
+///   · Telegram answered and the answer was "no" — the send PROVABLY failed, and
+///     the turn must be released so a retry can take it;
+///   · the request timed out, the connection tore, the body did not parse, or
+///     `ok:true` arrived with no readable positive message id — we do not know
+///     whether the family has the message.
+///
+/// Collapsing the second into the first is how a timeout AFTER Telegram accepted
+/// the message releases the reservation and posts the same answer twice. Wrapped
+/// in an error chain, this marker keeps "unproven" legible all the way out to the
+/// reservation, which then HOLDS instead of releasing.
+#[derive(Debug)]
+pub struct UnprovenDelivery {
+    pub detail: String,
+}
+
+impl std::fmt::Display for UnprovenDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the delivery is UNPROVEN — {} (the reservation stays held: a duplicate \
+             on the family's screen is worse than a gap an operator can see)",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for UnprovenDelivery {}
+
+/// Build an error that says "we could not prove this either way".
+pub fn unproven_delivery(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UnprovenDelivery {
+        detail: detail.into(),
+    })
+}
+
+/// Is this failure AMBIGUOUS rather than a proven failure? Checked through the
+/// whole chain, so a marker wrapped in later context is still legible.
+pub fn is_unproven(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| e.is::<UnprovenDelivery>())
 }
 
 // ---------------------------------------------------------------------------
@@ -723,6 +817,13 @@ struct TurnDeliverySink<'a> {
     claim_path: Option<PathBuf>,
     retry_path: Option<PathBuf>,
     state: Mutex<TurnDeliveryState>,
+    /// The message id of the latency ACK, which no longer lives in `state`:
+    /// the ack does not claim the turn (only a `final` does), so the id it
+    /// returned is remembered here instead. A turn that acked and then failed
+    /// still has to be resumable BY EDITING THAT ACK, or the retry composes a
+    /// second inbox turn and the family sees a stranded hourglass beside a new
+    /// answer.
+    ack_message_id: Mutex<Option<String>>,
 }
 
 impl<'a> TurnDeliverySink<'a> {
@@ -740,6 +841,7 @@ impl<'a> TurnDeliverySink<'a> {
             claim_path,
             retry_path,
             state: Mutex::new(TurnDeliveryState::Fresh),
+            ack_message_id: Mutex::new(None),
         }
     }
 
@@ -878,6 +980,24 @@ impl<'a> TurnDeliverySink<'a> {
         self.rearm(&format!("edit:{message_id}"));
     }
 
+    /// Write the retry marker WITHOUT touching the final reservation.
+    ///
+    /// A non-final phase never took the claim, so it has none to release — and
+    /// deleting the claim path here would delete a reservation this invocation
+    /// does not own. What it does still owe the next attempt is the fact that
+    /// this one failed, and which ack it should edit.
+    fn mark_retryable(&self, retry_state: &str) {
+        if let Some(retry_path) = self.retry_path.as_ref()
+            && let Err(error) =
+                crate::atomic_file::write_atomic(retry_path, format!("{retry_state}\n").as_bytes())
+        {
+            eprintln!(
+                "[{}] Telegram delivery ledger could not mark failed delivery retryable: {error}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+        }
+    }
+
     fn rearm_incomplete_ack(&self) {
         let state = self.state.lock().unwrap().clone();
         match state {
@@ -885,7 +1005,15 @@ impl<'a> TurnDeliverySink<'a> {
                 self.rearm_after_edit_failure(&message_id);
             }
             TurnDeliveryState::Owned(None) => self.rearm_after_send_failure(),
-            TurnDeliveryState::Fresh | TurnDeliveryState::Duplicate(_) => {}
+            // FRESH now means "the ack sent but the final never claimed" — the
+            // ordinary shape since the reservation became phase-aware. The turn
+            // must still be resumable, and it must resume by EDITING the ack
+            // rather than posting a second message beside it.
+            TurnDeliveryState::Fresh => match self.ack_message_id.lock().unwrap().clone() {
+                Some(message_id) => self.mark_retryable(&format!("edit:{message_id}")),
+                None => self.mark_retryable("send"),
+            },
+            TurnDeliveryState::Duplicate(_) => {}
         }
     }
 
@@ -932,7 +1060,9 @@ impl ReplySink for TurnDeliverySink<'_> {
             //     that may already be on their screen, and a duplicate is the
             //     one failure mode the family actually experiences.
             TurnDeliveryState::Owned(None) => match self.inner.send(bot_id, chat_id, text).await {
-                Ok(Some(message_id)) if !message_id.trim().is_empty() && message_id.trim() != "0" => {
+                Ok(Some(message_id))
+                    if !message_id.trim().is_empty() && message_id.trim() != "0" =>
+                {
                     self.persist_message_id(Some(&message_id));
                     *self.state.lock().unwrap() =
                         TurnDeliveryState::Owned(Some(message_id.clone()));
@@ -940,10 +1070,17 @@ impl ReplySink for TurnDeliverySink<'_> {
                 }
                 Ok(_ambiguous) => {
                     self.hold_ambiguous();
-                    Err(anyhow::anyhow!(
-                        "the transport accepted the reply but proved no message id — \
-                         the delivery is UNPROVEN and the turn's reservation is held closed"
+                    Err(unproven_delivery(
+                        "the transport accepted the reply but proved no message id",
                     ))
+                }
+                // A TYPED failure, not "any error". `Err` from the real stack is
+                // two different facts wearing one type: a proven refusal from
+                // Telegram, and an ambiguous timeout/torn body that may already
+                // have been delivered. Only the PROVEN one may release the turn.
+                Err(error) if is_unproven(&error) => {
+                    self.hold_ambiguous();
+                    Err(error)
                 }
                 Err(error) => {
                     self.rearm_after_send_failure();
@@ -954,6 +1091,67 @@ impl ReplySink for TurnDeliverySink<'_> {
         }
     }
 
+    /// PHASE-AWARE. Only a physical `final` consumes the turn's one reservation.
+    ///
+    /// The ack, the watchdog line and the failure notice all go straight to the
+    /// transport: they are real sends, but none of them is the turn's answer, and
+    /// a reservation consumed by one of them means the answer that follows is
+    /// suppressed as a duplicate of a message the family never received.
+    async fn send_phase(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        text: &str,
+        phase: crate::notify::relay_receipt::ReplyPhase,
+    ) -> Result<Option<String>> {
+        use crate::notify::relay_receipt::ReplyPhase;
+        match phase {
+            ReplyPhase::Final => self.send(bot_id, chat_id, text).await,
+            ReplyPhase::Ack | ReplyPhase::Watchdog | ReplyPhase::Failure => {
+                match self.inner.send_phase(bot_id, chat_id, text, phase).await {
+                    Ok(message_id) => {
+                        if let Some(id) = message_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty() && *id != "0")
+                        {
+                            *self.ack_message_id.lock().unwrap() = Some(id.to_string());
+                        }
+                        Ok(message_id)
+                    }
+                    Err(error) => {
+                        // The final was never reserved, so there is nothing to
+                        // release — but the next attempt still needs to know
+                        // this one failed, or it composes a second inbox turn.
+                        self.mark_retryable("send");
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same rule for an edit: a failure notice that REPLACES the ack in
+    /// place is still not the turn's answer, and must not consume finality.
+    async fn edit_phase(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        text: &str,
+        phase: crate::notify::relay_receipt::ReplyPhase,
+    ) -> Result<()> {
+        use crate::notify::relay_receipt::ReplyPhase;
+        match phase {
+            ReplyPhase::Final => self.edit(bot_id, chat_id, message_id, text).await,
+            ReplyPhase::Ack | ReplyPhase::Watchdog | ReplyPhase::Failure => {
+                self.inner
+                    .edit_phase(bot_id, chat_id, message_id, text, phase)
+                    .await
+            }
+        }
+    }
+
     async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
         let state = self.state.lock().unwrap().clone();
         match state {
@@ -961,10 +1159,25 @@ impl ReplySink for TurnDeliverySink<'_> {
             TurnDeliveryState::Owned(_) => {
                 match self.inner.edit(bot_id, chat_id, message_id, text).await {
                     Ok(()) => {
-                        self.persist_message_id(Some(message_id));
-                        *self.state.lock().unwrap() =
-                            TurnDeliveryState::Owned(Some(message_id.to_string()));
+                        // THE ID THAT ACTUALLY CARRIES THE ANSWER. If the edit
+                        // was refused and the sink fell back to a fresh send, the
+                        // final answer is in THAT message; persisting the ack's
+                        // id here is how the reservation came to name a message
+                        // the family never read the answer in.
+                        let delivered = self
+                            .inner
+                            .take_fallback_message_id()
+                            .unwrap_or_else(|| message_id.to_string());
+                        self.persist_message_id(Some(&delivered));
+                        *self.state.lock().unwrap() = TurnDeliveryState::Owned(Some(delivered));
                         Ok(())
+                    }
+                    // Same typed split as `send`: an AMBIGUOUS edit may already
+                    // have replaced the ack with the final answer, so releasing
+                    // the turn here is how the family gets the answer twice.
+                    Err(error) if is_unproven(&error) => {
+                        self.hold_ambiguous();
+                        Err(error)
                     }
                     Err(error) => {
                         self.rearm_after_edit_failure(message_id);
@@ -1014,6 +1227,23 @@ pub async fn send_reply_once(
 ) -> Result<Option<String>> {
     let guarded = TurnDeliverySink::new(workgraph_dir, delivery_id, bot_id, chat_id, sink);
     guarded.send(bot_id, chat_id, text).await
+}
+
+/// [`send_reply_once`], saying which PHASE of the turn these bytes are.
+///
+/// Only a `final` is sent at most once: the ack, the watchdog and the failure
+/// notice are not the turn's answer and must not consume its one reservation.
+pub async fn send_reply_once_phase(
+    workgraph_dir: &Path,
+    delivery_id: &str,
+    bot_id: &str,
+    chat_id: &str,
+    text: &str,
+    sink: &dyn ReplySink,
+    phase: crate::notify::relay_receipt::ReplyPhase,
+) -> Result<Option<String>> {
+    let guarded = TurnDeliverySink::new(workgraph_dir, delivery_id, bot_id, chat_id, sink);
+    guarded.send_phase(bot_id, chat_id, text, phase).await
 }
 
 /// Durable state for a family-visible reply whose exact guarded bytes are
@@ -1305,11 +1535,18 @@ pub async fn send_canonical_reply_once(
 /// logged.
 pub struct BotReplySink {
     config: TelegramConfig,
+    /// The id of the message a FALLBACK send created after a refused edit. The
+    /// final answer lives in that message, not in the ack the edit failed to
+    /// change, so the id has to travel back out of `edit`'s `Result<()>`.
+    fallback_message_id: Mutex<Option<String>>,
 }
 
 impl BotReplySink {
     pub fn new(config: TelegramConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            fallback_message_id: Mutex::new(None),
+        }
     }
 }
 
@@ -1351,25 +1588,48 @@ impl ReplySink for BotReplySink {
         Ok(Some(mid.0))
     }
 
+    fn take_fallback_message_id(&self) -> Option<String> {
+        self.fallback_message_id.lock().unwrap().take()
+    }
+
     async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
         let bots = self.config.all_bots();
         let (id, bot) = resolve_reply_bot(&bots, bot_id)
             .ok_or_else(|| anyhow::anyhow!("no Telegram bots configured — cannot edit"))?;
         let channel = TelegramChannel::from_bot(id.clone(), bot.clone());
-        // If the edit fails (e.g. message too old, or a non-numeric id), fall
-        // back to a fresh send so the human still gets the answer — never a
-        // stranded hourglass.
-        if let Err(e) = channel.edit_text(chat_id, message_id, text).await {
-            // `{e:#}` prints the full error chain, which for a transport
-            // failure embeds the request URL (and thus the bot token) — redact
-            // before logging. See `telegram::redact_bot_token`.
-            eprintln!(
-                "[convo] editMessageText failed ({}) — sending fresh message instead",
-                super::telegram::redact_bot_token(&format!("{e:#}"))
-            );
-            channel.send_text(chat_id, text).await?;
+        // THE FALLBACK IS FOR A PROVEN EDIT FAILURE, AND ONLY THAT.
+        //
+        // This used to catch EVERY edit error and immediately post a fresh
+        // message. An edit that timed out may already have replaced the ack with
+        // the final answer, so the unconditional fallback is a second copy of an
+        // answer the family already has — the exact duplicate the turn's
+        // reservation exists to prevent, produced inside the sink the
+        // reservation cannot see.
+        //
+        // So: Telegram said no (message too old, non-numeric id, `ok:false`) ⇒
+        // the edit provably did not apply ⇒ send a fresh message so the human is
+        // never stranded on an hourglass. Anything ambiguous ⇒ propagate the
+        // UNPROVEN marker and let the reservation stay held.
+        match channel.edit_text(chat_id, message_id, text).await {
+            Ok(()) => Ok(()),
+            Err(e) if is_unproven(&e) => Err(e),
+            Err(e) => {
+                // `{e:#}` prints the full error chain, which for a transport
+                // failure embeds the request URL (and thus the bot token) —
+                // redact before logging. See `telegram::redact_bot_token`.
+                eprintln!(
+                    "[convo] editMessageText was refused ({}) — sending fresh message instead",
+                    super::telegram::redact_bot_token(&format!("{e:#}"))
+                );
+                // The fallback's OWN message id is what actually carries the
+                // final answer. Losing it — as this path used to — leaves the
+                // reservation and every receipt naming the OLD ack id, so the
+                // record points at a message that never held the answer.
+                let fallback = channel.send_text(chat_id, text).await?;
+                self.fallback_message_id.lock().unwrap().replace(fallback.0);
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -2075,6 +2335,7 @@ async fn deliver_reply(
     text: &str,
     roster: &grounding::FamilyVoiceRoster,
     authorized_handoff: Option<&str>,
+    phase: crate::notify::relay_receipt::ReplyPhase,
 ) -> Result<()> {
     // Engine-originated replies never pass through the gateway finalizer:
     // The scoped family-reply sink mirrors the bytes sent here. Keep this as the single
@@ -2091,13 +2352,16 @@ async fn deliver_reply(
             chrono::Utc::now().format("%H:%M:%S"),
         );
     }
+    // THE PHASE TRAVELS WITH THE BYTES. Only a `final` consumes the turn's one
+    // reservation; a graceful failure notice does not, so the real answer can
+    // still be delivered later by a self-heal attempt.
     match ack_mid {
         Some(mid) if !mid.is_empty() => {
-            sink.edit(&route.bot_id, &route.chat_id, mid, &guarded)
+            sink.edit_phase(&route.bot_id, &route.chat_id, mid, &guarded, phase)
                 .await
         }
         _ => sink
-            .send(&route.bot_id, &route.chat_id, &guarded)
+            .send_phase(&route.bot_id, &route.chat_id, &guarded, phase)
             .await
             .map(|_| ()),
     }
@@ -2256,7 +2520,17 @@ async fn persist_and_deliver_glitch(
         sink.rearm_incomplete_ack();
         return Err(error);
     }
-    deliver_reply(sink, route, ack_mid, &reply, family_roster, None).await
+    // A graceful "it glitched" line is a FAILURE notice, not the turn's answer.
+    deliver_reply(
+        sink,
+        route,
+        ack_mid,
+        &reply,
+        family_roster,
+        None,
+        crate::notify::relay_receipt::ReplyPhase::Failure,
+    )
+    .await
 }
 
 /// Drive a bounded compose turn: race the composer against the ack/timeout
@@ -2298,7 +2572,16 @@ async fn run_composed_turn(
                     chat::append_inbox_ref(workgraph_dir, session_ref, human_message, request_id);
             }
             let _ = chat::append_outbox_ref(workgraph_dir, session_ref, &answer, request_id);
-            deliver_reply(sink, route, None, &answer, &family_roster, None).await?;
+            deliver_reply(
+                sink,
+                route,
+                None,
+                &answer,
+                &family_roster,
+                None,
+                crate::notify::relay_receipt::ReplyPhase::Final,
+            )
+            .await?;
             return Ok(TurnOutcome::Replied { acked: false });
         }
     }
@@ -2398,7 +2681,19 @@ async fn run_composed_turn(
             _ = tokio::time::sleep(sleep_for) => {
                 let elapsed = start.elapsed();
                 if !acked && elapsed >= timing.ack_after && elapsed < timing.reply_timeout {
-                    ack_mid = sink.send(&route.bot_id, &route.chat_id, &ack_line()).await?;
+                    // THE ACK IS NOT THE TURN'S ANSWER. It is stamped as the ack
+                    // phase, so it does not consume the turn's one final
+                    // reservation: a crash between this line and the final used
+                    // to leave the family with an hourglass and the turn marked
+                    // delivered, which suppressed the real answer forever.
+                    ack_mid = sink
+                        .send_phase(
+                            &route.bot_id,
+                            &route.chat_id,
+                            &ack_line(),
+                            crate::notify::relay_receipt::ReplyPhase::Ack,
+                        )
+                        .await?;
                     acked = true;
                 }
                 if start.elapsed() >= timing.reply_timeout {
@@ -2805,6 +3100,7 @@ async fn finalize_composed_reply(
         &reply_text,
         family_roster,
         authorized_handoff.as_deref(),
+        crate::notify::relay_receipt::ReplyPhase::Final,
     )
     .await?;
     Ok(TurnOutcome::Replied { acked })
@@ -3063,6 +3359,7 @@ async fn await_session_reply(
                 &guarded,
                 &family_roster,
                 None,
+                crate::notify::relay_receipt::ReplyPhase::Final,
             )
             .await?;
             return Ok(TurnOutcome::Replied { acked });
@@ -3071,7 +3368,12 @@ async fn await_session_reply(
         if !acked && elapsed >= timing.ack_after {
             // The turn is running long — break the silence immediately.
             ack_mid = sink
-                .send(&route.bot_id, &route.chat_id, &ack_line())
+                .send_phase(
+                    &route.bot_id,
+                    &route.chat_id,
+                    &ack_line(),
+                    crate::notify::relay_receipt::ReplyPhase::Ack,
+                )
                 .await?;
             acked = true;
         }
@@ -3215,13 +3517,8 @@ mod tests {
         let transport = RecSink::default();
 
         // The new attempt goes out first, through the second bot.
-        let attempt2 = TurnDeliverySink::new(
-            dir.path(),
-            CANON_TURN,
-            "second-bot",
-            "-100700",
-            &transport,
-        );
+        let attempt2 =
+            TurnDeliverySink::new(dir.path(), CANON_TURN, "second-bot", "-100700", &transport);
         let first = attempt2
             .send("second-bot", "-100700", "the answer")
             .await
@@ -3280,7 +3577,10 @@ mod tests {
         unsafe { std::env::remove_var("WG_TURN_ID") };
         let one = delivery_claim_path(dir.path(), "request-42", "bot-a", "-100").unwrap();
         let two = delivery_claim_path(dir.path(), "request-42", "bot-b", "-100").unwrap();
-        assert_ne!(one, two, "two voices suppressed one another on a legacy path");
+        assert_ne!(
+            one, two,
+            "two voices suppressed one another on a legacy path"
+        );
         assert_eq!(
             delivery_claim_path(dir.path(), "   ", "bot-a", "-100"),
             None,
@@ -3297,7 +3597,10 @@ mod tests {
         assert_eq!(canonical_turn_id(CANON_TURN).as_deref(), Some(CANON_TURN));
         assert_eq!(canonical_turn_id("request-42"), None);
         assert_eq!(canonical_turn_id("web-turn-not-a-uuid"), None);
-        assert_eq!(canonical_turn_id("web-turn---------------------------------"), None);
+        assert_eq!(
+            canonical_turn_id("web-turn---------------------------------"),
+            None
+        );
         assert_eq!(canonical_turn_id(""), None);
     }
 
@@ -3335,7 +3638,10 @@ mod tests {
         // one for the same turn, both make NO further API call.
         let _ = sink.send("bot", "-100", "the answer").await;
         let fresh = TurnDeliverySink::new(dir.path(), CANON_TURN, "other-bot", "-100", &transport);
-        assert!(fresh.already_claimed(), "the ambiguous send released the turn");
+        assert!(
+            fresh.already_claimed(),
+            "the ambiguous send released the turn"
+        );
         assert_eq!(
             *transport.calls.lock().unwrap(),
             1,
@@ -3372,7 +3678,10 @@ mod tests {
             !retry.already_claimed(),
             "a provably failed send wedged the turn — the self-heal retry can never take it",
         );
-        assert!(retry.has_failed_attempt(), "the retry marker was not written");
+        assert!(
+            retry.has_failed_attempt(),
+            "the retry marker was not written"
+        );
     }
 
     #[tokio::test]
@@ -5303,9 +5612,15 @@ domains = ["calendar", "coordination"]
         // the operations vocabulary the live-cert C011 correction leaked
         // (task capability-answer-no-invented-work).
         let low = last.to_lowercase();
-        assert!(low.contains("hasn't happened yet"), "expected correction: {last}");
+        assert!(
+            low.contains("hasn't happened yet"),
+            "expected correction: {last}"
+        );
         for banned in ["coordinator", "flagged", "snag", "slip"] {
-            assert!(!low.contains(banned), "correction leaked {banned:?}: {last}");
+            assert!(
+                !low.contains(banned),
+                "correction leaked {banned:?}: {last}"
+            );
         }
     }
 
@@ -5365,7 +5680,13 @@ domains = ["calendar", "coordination"]
             .or_else(|| sink.calls().last().map(|c| c.2.clone()))
             .unwrap();
         let low = delivered.to_lowercase();
-        for banned in ["hasn't happened yet", "coordinator", "flagged", "snag", "slip"] {
+        for banned in [
+            "hasn't happened yet",
+            "coordinator",
+            "flagged",
+            "snag",
+            "slip",
+        ] {
             assert!(
                 !low.contains(banned),
                 "the capability answer carried correction/ops copy ({banned:?}): {delivered}",
