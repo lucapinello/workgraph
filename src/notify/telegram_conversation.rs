@@ -641,20 +641,56 @@ pub fn durable_telegram_digest_v1(domain: &str, fields: &[&str]) -> String {
     )
 }
 
+/// The CANONICAL turn id this reply belongs to, if there is one.
+///
+/// `web-turn-<uuid v4>` is the id the gateway accepted the turn under and the
+/// id every row and receipt for that turn carries. It is resolved from the
+/// caller's own delivery id when that IS the turn id, else from `WG_TURN_ID`.
+/// Nothing else qualifies: a request id, a session ref or a digest are not the
+/// turn, and reserving on one of those is what let a turn be delivered twice.
+pub fn canonical_turn_id(delivery_id: &str) -> Option<String> {
+    let from_caller = delivery_id.trim();
+    if crate::notify::relay_receipt::is_valid_turn_id(from_caller) {
+        return Some(from_caller.to_string());
+    }
+    let env = std::env::var("WG_TURN_ID").ok()?;
+    let env = env.trim();
+    crate::notify::relay_receipt::is_valid_turn_id(env).then(|| env.to_string())
+}
+
 fn delivery_claim_path(
     workgraph_dir: &Path,
     delivery_id: &str,
     bot_id: &str,
     chat_id: &str,
 ) -> Option<PathBuf> {
-    if delivery_id.trim().is_empty() {
-        return None;
-    }
-    // The filename itself starts with `b3-v1-`, making its encoding version
-    // explicit on disk. Hash all routing fields with a length-delimited
-    // canonical encoding so the ledger exposes no household or bot ids.
-    let digest =
-        durable_telegram_digest_v1("telegram-delivery-claim", &[delivery_id, bot_id, chat_id]);
+    // THE FINAL RESERVATION IS ON THE TURN, AND ON NOTHING ELSE.
+    //
+    // This used to fold bot and chat into the claim, so that "two configured
+    // voices never suppress one another". That reasoning holds for two DIFFERENT
+    // turns; it is exactly wrong for one. An accepted turn has ONE final answer.
+    // Keyed on (delivery id, bot, chat), a late original and a fresh attempt
+    // routed through a second bot are two different claims — so both send, the
+    // family gets the answer twice, and the turn ends with two rows both calling
+    // themselves final. Keyed on the canonical turn id alone, the second caller
+    // finds the reservation already held and makes no API call at all.
+    //
+    // The old triple survives ONLY where there is no canonical turn id — a DM or
+    // a legacy path that never had one. Those callers keep exactly the guarantee
+    // they had; they simply cannot be part of a turn's final-answer race.
+    let digest = match canonical_turn_id(delivery_id) {
+        Some(turn) => durable_telegram_digest_v1("telegram-turn-final", &[&turn]),
+        None => {
+            if delivery_id.trim().is_empty() {
+                return None;
+            }
+            // The filename itself starts with `b3-v1-`, making its encoding
+            // version explicit on disk. Hash all routing fields with a
+            // length-delimited canonical encoding so the ledger exposes no
+            // household or bot ids.
+            durable_telegram_digest_v1("telegram-delivery-claim", &[delivery_id, bot_id, chat_id])
+        }
+    };
     Some(
         workgraph_dir
             .join("telegram-deliveries")
@@ -824,6 +860,20 @@ impl<'a> TurnDeliverySink<'a> {
         self.rearm("send");
     }
 
+    /// FAIL CLOSED. The transport answered without proving a delivery, so we do
+    /// not know whether the family already has this message. The reservation
+    /// stays HELD — no release, no retry marker — and the claim keeps its
+    /// pending marker so any later caller sees the turn as taken. An operator
+    /// clearing the claim is the deliberate way out; guessing is not.
+    fn hold_ambiguous(&self) {
+        *self.state.lock().unwrap() = TurnDeliveryState::Duplicate(None);
+        eprintln!(
+            "[{}] Telegram delivery UNPROVEN — the turn's reservation is held closed \
+             rather than re-sent (a duplicate is worse than a gap the operator can see)",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+    }
+
     fn rearm_after_edit_failure(&self, message_id: &str) {
         self.rearm(&format!("edit:{message_id}"));
     }
@@ -867,11 +917,33 @@ impl ReplySink for TurnDeliverySink<'_> {
             TurnDeliveryState::Duplicate(Some(message_id))
             | TurnDeliveryState::Owned(Some(message_id)) => Ok(Some(message_id)),
             TurnDeliveryState::Duplicate(None) => Ok(None),
+            // RESERVE-BEFORE-SEND, COMMIT-ON-PROVEN, RELEASE-ON-FAILURE, and
+            // FAIL CLOSED ON AMBIGUOUS. The reservation above is already held.
+            // What happens next depends on what the transport could PROVE:
+            //
+            //   · a positive message id → the send is proven; COMMIT it, so a
+            //     racing caller reuses the id instead of sending again;
+            //   · a transport error → the send provably failed; RELEASE, so the
+            //     self-heal retry can take the turn;
+            //   · anything else — accepted with no id, a torn answer, a body
+            //     that did not parse → we do NOT know whether the family got the
+            //     message. FAIL CLOSED: keep the reservation HELD and report the
+            //     failure. Releasing here would send a second copy of a message
+            //     that may already be on their screen, and a duplicate is the
+            //     one failure mode the family actually experiences.
             TurnDeliveryState::Owned(None) => match self.inner.send(bot_id, chat_id, text).await {
-                Ok(message_id) => {
-                    self.persist_message_id(message_id.as_deref());
-                    *self.state.lock().unwrap() = TurnDeliveryState::Owned(message_id.clone());
-                    Ok(message_id)
+                Ok(Some(message_id)) if !message_id.trim().is_empty() && message_id.trim() != "0" => {
+                    self.persist_message_id(Some(&message_id));
+                    *self.state.lock().unwrap() =
+                        TurnDeliveryState::Owned(Some(message_id.clone()));
+                    Ok(Some(message_id))
+                }
+                Ok(_ambiguous) => {
+                    self.hold_ambiguous();
+                    Err(anyhow::anyhow!(
+                        "the transport accepted the reply but proved no message id — \
+                         the delivery is UNPROVEN and the turn's reservation is held closed"
+                    ))
                 }
                 Err(error) => {
                     self.rearm_after_send_failure();
@@ -3123,6 +3195,184 @@ mod tests {
         fn edits(&self) -> Vec<(String, String, String, String)> {
             self.edited.lock().unwrap().clone()
         }
+    }
+
+    // ── the turn's final reservation (task week-start-engine-2, set 3) ──────
+
+    const CANON_TURN: &str = "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
+    /// THE BARRIER GATE, in full: a LATE ORIGINAL arriving after a NEW ATTEMPT
+    /// has been made, with the new attempt routed through a SECOND BOT.
+    ///
+    /// Keyed the old way — (delivery id, bot, chat) — these are two different
+    /// claims: both send, the family gets the answer twice, and the turn ends
+    /// with two rows both calling themselves the final. Keyed on the canonical
+    /// turn id ALONE there is one reservation, so: ONE API call, ONE final,
+    /// and (downstream) one receipt.
+    #[tokio::test]
+    async fn one_turn_reserves_once_across_attempts_bots_and_chats() {
+        let dir = tempdir().unwrap();
+        let transport = RecSink::default();
+
+        // The new attempt goes out first, through the second bot.
+        let attempt2 = TurnDeliverySink::new(
+            dir.path(),
+            CANON_TURN,
+            "second-bot",
+            "-100700",
+            &transport,
+        );
+        let first = attempt2
+            .send("second-bot", "-100700", "the answer")
+            .await
+            .unwrap();
+        assert!(first.is_some());
+
+        // …and the LATE ORIGINAL turns up afterwards, on the first bot, even in
+        // a different chat. It must make no API call at all.
+        let late_original =
+            TurnDeliverySink::new(dir.path(), CANON_TURN, "first-bot", "-100999", &transport);
+        assert!(
+            late_original.already_claimed(),
+            "the late original did not see the turn's reservation",
+        );
+        let second = late_original
+            .send("first-bot", "-100999", "the answer")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.calls().len(),
+            1,
+            "one accepted turn produced {} API calls — the family got the answer twice",
+            transport.calls().len(),
+        );
+        assert_eq!(
+            second, first,
+            "the late original invented a second message id for one turn",
+        );
+    }
+
+    /// The reservation is the TURN, not the words: two different turns with
+    /// identical text both send.
+    #[test]
+    fn two_turns_are_two_reservations() {
+        let dir = tempdir().unwrap();
+        let a = delivery_claim_path(dir.path(), CANON_TURN, "b", "-1").unwrap();
+        let b = delivery_claim_path(
+            dir.path(),
+            "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3302",
+            "b",
+            "-1",
+        )
+        .unwrap();
+        assert_ne!(a, b, "two turns collapsed onto one reservation");
+    }
+
+    /// …and a caller with NO canonical turn id keeps exactly the guarantee it
+    /// had: routing still separates it, because it cannot be part of a turn's
+    /// final-answer race in the first place.
+    #[test]
+    fn a_turnless_caller_keeps_the_legacy_routing_key() {
+        let dir = tempdir().unwrap();
+        // Belt and braces: a stray WG_TURN_ID in the environment must not
+        // silently re-key a legacy caller in this test.
+        unsafe { std::env::remove_var("WG_TURN_ID") };
+        let one = delivery_claim_path(dir.path(), "request-42", "bot-a", "-100").unwrap();
+        let two = delivery_claim_path(dir.path(), "request-42", "bot-b", "-100").unwrap();
+        assert_ne!(one, two, "two voices suppressed one another on a legacy path");
+        assert_eq!(
+            delivery_claim_path(dir.path(), "   ", "bot-a", "-100"),
+            None,
+            "an empty delivery id must not claim anything",
+        );
+    }
+
+    /// Only a canonical `web-turn-<uuid v4>` re-keys the reservation. A request
+    /// id, a digest or a placeholder is not the turn, and treating one as the
+    /// turn is how unrelated replies would suppress each other.
+    #[test]
+    fn only_a_canonical_turn_id_reserves_the_turn() {
+        unsafe { std::env::remove_var("WG_TURN_ID") };
+        assert_eq!(canonical_turn_id(CANON_TURN).as_deref(), Some(CANON_TURN));
+        assert_eq!(canonical_turn_id("request-42"), None);
+        assert_eq!(canonical_turn_id("web-turn-not-a-uuid"), None);
+        assert_eq!(canonical_turn_id("web-turn---------------------------------"), None);
+        assert_eq!(canonical_turn_id(""), None);
+    }
+
+    /// FAIL CLOSED ON AMBIGUOUS. A transport that accepts the reply but proves
+    /// no message id leaves us unable to say whether the family has it. The
+    /// reservation stays HELD and the call reports failure — a duplicate on the
+    /// family's screen is worse than a gap an operator can see.
+    #[tokio::test]
+    async fn an_unproven_send_holds_the_reservation_closed() {
+        #[derive(Default)]
+        struct NoIdSink {
+            calls: Mutex<usize>,
+        }
+        #[async_trait]
+        impl ReplySink for NoIdSink {
+            async fn send(&self, _b: &str, _c: &str, _t: &str) -> Result<Option<String>> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(None) // accepted, nothing proven
+            }
+            async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempdir().unwrap();
+        let transport = NoIdSink::default();
+        let sink = TurnDeliverySink::new(dir.path(), CANON_TURN, "bot", "-100", &transport);
+        let out = sink.send("bot", "-100", "the answer").await;
+        assert!(out.is_err(), "an unproven send was reported as delivered");
+        assert!(
+            out.unwrap_err().to_string().contains("UNPROVEN"),
+            "the failure did not say the delivery was unproven",
+        );
+
+        // The reservation is still held: a retry through this sink, and a fresh
+        // one for the same turn, both make NO further API call.
+        let _ = sink.send("bot", "-100", "the answer").await;
+        let fresh = TurnDeliverySink::new(dir.path(), CANON_TURN, "other-bot", "-100", &transport);
+        assert!(fresh.already_claimed(), "the ambiguous send released the turn");
+        assert_eq!(
+            *transport.calls.lock().unwrap(),
+            1,
+            "an unproven delivery was re-sent — the family may have it twice",
+        );
+    }
+
+    /// RELEASE ON FAILURE, the other direction: a transport that PROVABLY failed
+    /// must not leave the turn wedged. The self-heal retry has to be able to
+    /// take it.
+    #[tokio::test]
+    async fn a_proven_failure_releases_the_reservation_for_the_retry() {
+        #[derive(Default)]
+        struct FailingSink {
+            calls: Mutex<usize>,
+        }
+        #[async_trait]
+        impl ReplySink for FailingSink {
+            async fn send(&self, _b: &str, _c: &str, _t: &str) -> Result<Option<String>> {
+                *self.calls.lock().unwrap() += 1;
+                Err(anyhow::anyhow!("connection refused"))
+            }
+            async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempdir().unwrap();
+        let transport = FailingSink::default();
+        let sink = TurnDeliverySink::new(dir.path(), CANON_TURN, "bot", "-100", &transport);
+        assert!(sink.send("bot", "-100", "the answer").await.is_err());
+
+        let retry = TurnDeliverySink::new(dir.path(), CANON_TURN, "bot", "-100", &transport);
+        assert!(
+            !retry.already_claimed(),
+            "a provably failed send wedged the turn — the self-heal retry can never take it",
+        );
+        assert!(retry.has_failed_attempt(), "the retry marker was not written");
     }
 
     #[tokio::test]
