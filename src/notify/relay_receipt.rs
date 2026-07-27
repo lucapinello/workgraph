@@ -231,9 +231,15 @@ pub enum ReceiptError {
 impl std::fmt::Display for ReceiptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReceiptError::BadShape { field, value } => {
-                write!(f, "{field} is not a valid typed id: {value:?}")
-            }
+            // The VALUE is never rendered. A rejected id can be a token-shaped
+            // paste or a raw household identifier, and an operator log is the
+            // wrong place to reproduce one verbatim — the field and the shape it
+            // failed are what a human needs to fix it.
+            ReceiptError::BadShape { field, value } => write!(
+                f,
+                "{field} is not a valid typed id ({})",
+                shape_category(field, value)
+            ),
             ReceiptError::DeliveredWithoutMessageId => write!(
                 f,
                 "a receipt claimed delivered with no positive message id — the delivery is unproven"
@@ -266,6 +272,24 @@ impl std::fmt::Display for ReceiptError {
             ReceiptError::Io(m) => write!(f, "receipt ledger io: {m}"),
         }
     }
+}
+
+/// A safe description of WHY a typed id was rejected: the expected shape, plus a
+/// category for the value that never reproduces the value itself.
+fn shape_category(field: &str, value: &str) -> String {
+    let expected = match field {
+        "turnId" => "expected web-turn-<uuid v4>",
+        "receiptId" => "expected rcpt_<uuid v4>",
+        "transportScopeId" => "expected ts_<64 hex>",
+        "attemptId" => "expected attempt-<uuid v4>",
+        _ => "expected a typed id",
+    };
+    let got = if value.trim().is_empty() {
+        "got an empty value".to_string()
+    } else {
+        format!("got {} characters", value.chars().count())
+    };
+    format!("{expected}, {got}")
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +485,18 @@ pub fn replay_key(transport_scope_id: &str, message_id: i64) -> String {
     hex::encode(h.finalize())
 }
 
+/// `attempt-<uuid v4>` — the shape the gateway mints and passes on
+/// `WG_ATTEMPT_ID`.
+///
+/// A loose attempt id is not a small problem. The dedupe key is
+/// `(turn, attempt)`, so `"1"` and `"2"` from two unrelated processes collide by
+/// construction: one turn's second attempt is then read as another's refire and
+/// its receipt — the evidence for the send that actually reached the family — is
+/// suppressed. Only a minted id is unique enough to key on.
+pub fn is_valid_attempt_id(s: &str) -> bool {
+    s.strip_prefix("attempt-").is_some_and(is_uuid_v4)
+}
+
 /// `(turn, attempt)` from `WG_ATTEMPT_ID`, or the turn alone when the caller
 /// did not supply one. A retry after a genuine failure must not be suppressed
 /// as if it were a refire, which is what keying on the turn alone would do.
@@ -619,6 +655,14 @@ pub fn append_locked(
             value: receipt.transport_scope_id.clone(),
         });
     }
+    if let Some(attempt) = receipt.attempt_id.as_deref()
+        && !is_valid_attempt_id(attempt)
+    {
+        return Err(ReceiptError::BadShape {
+            field: "attemptId",
+            value: attempt.to_string(),
+        });
+    }
     if receipt.status == RelayStatus::Delivered && !receipt.message_id.is_some_and(|id| id > 0) {
         return Err(ReceiptError::DeliveredWithoutMessageId);
     }
@@ -760,6 +804,10 @@ mod tests {
 
     const TURN: &str = "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3301";
     const TURN2: &str = "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3302";
+    /// Attempt ids are MINTED, not counted: `"1"`/`"2"` from two unrelated
+    /// processes collide, and a collision suppresses a real retry's receipt.
+    const ATTEMPT_ONE: &str = "attempt-6ba7b810-9dad-41d1-80b4-00c04fd430c8";
+    const ATTEMPT_TWO: &str = "attempt-6ba7b810-9dad-41d1-80b4-00c04fd430c9";
 
     fn scratch() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -1099,11 +1147,11 @@ mod tests {
         let dir = scratch();
         let mut first = receipt(dir.path(), TURN, 1, None);
         first.status = RelayStatus::Failed;
-        first.attempt_id = Some("1".into());
+        first.attempt_id = Some(ATTEMPT_ONE.into());
         append(dir.path(), &first).unwrap();
 
         let mut retry = receipt(dir.path(), TURN, 2, Some(99));
-        retry.attempt_id = Some("2".into());
+        retry.attempt_id = Some(ATTEMPT_TWO.into());
         append(dir.path(), &retry).expect("the self-heal retry's receipt was suppressed");
 
         let all = read_all(dir.path());
@@ -1118,11 +1166,11 @@ mod tests {
     fn a_refire_of_the_same_attempt_is_refused() {
         let dir = scratch();
         let mut first = receipt(dir.path(), TURN, 1, Some(11));
-        first.attempt_id = Some("1".into());
+        first.attempt_id = Some(ATTEMPT_ONE.into());
         append(dir.path(), &first).unwrap();
 
         let mut refire = receipt(dir.path(), TURN, 2, Some(12));
-        refire.attempt_id = Some("1".into());
+        refire.attempt_id = Some(ATTEMPT_ONE.into());
         assert!(matches!(
             append(dir.path(), &refire),
             Err(ReceiptError::AttemptAlreadyRecorded { .. })
@@ -1339,6 +1387,69 @@ mod tests {
         assert_eq!(parsed[0].message_id, Some(4242));
     }
 
+    /// A COUNTED attempt id is refused. `"1"`/`"2"` are what the pre-fix retry
+    /// tests used, and they collide across unrelated processes by construction:
+    /// one turn's genuine second attempt then keys the same as another's first,
+    /// and its receipt — the evidence for the send that actually reached the
+    /// family — is suppressed as a refire.
+    #[test]
+    fn a_counted_or_malformed_attempt_id_is_refused_not_silently_keyed() {
+        for bad in [
+            "1",
+            "2",
+            "attempt-1",
+            "attempt-00000000-0000-0000-0000-000000000000",
+            "attempt-6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+        ] {
+            let dir = scratch();
+            let mut r = receipt(dir.path(), TURN, 1, Some(11));
+            r.attempt_id = Some(bad.to_string());
+            let err = append(dir.path(), &r).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ReceiptError::BadShape {
+                        field: "attemptId",
+                        ..
+                    }
+                ),
+                "attempt id {bad:?} must be refused, got {err:?}"
+            );
+            assert!(
+                !ledger_path_for(dir.path()).exists(),
+                "a refused attempt id must leave NO receipt"
+            );
+        }
+        // The positive control: a MINTED attempt is accepted.
+        let dir = scratch();
+        let mut good = receipt(dir.path(), TURN, 1, Some(11));
+        good.attempt_id = Some(ATTEMPT_ONE.to_string());
+        append(dir.path(), &good).unwrap();
+        assert_eq!(read_strict(dir.path()).unwrap().len(), 1);
+    }
+
+    /// A rejected id is NEVER echoed. The value can be a token-shaped paste or a
+    /// raw household identifier, and the refusal is often the thing that ends up
+    /// in an operator log — the field and the shape it failed are what a human
+    /// needs, and all they should get.
+    #[test]
+    fn a_refusal_names_the_field_and_the_shape_never_the_value() {
+        let secret = "web-turn-A_SECRET_LOOKING_VALUE_1234567890";
+        let rendered = ReceiptError::BadShape {
+            field: "turnId",
+            value: secret.to_string(),
+        }
+        .to_string();
+        assert!(
+            !rendered.contains("A_SECRET_LOOKING_VALUE"),
+            "the rejected value was reproduced verbatim: {rendered}"
+        );
+        assert!(rendered.contains("turnId"), "{rendered}");
+        assert!(rendered.contains("web-turn-<uuid v4>"), "{rendered}");
+        assert!(rendered.contains("characters"), "{rendered}");
+    }
+
     #[test]
     fn typed_outcomes_and_phases_are_closed_and_stable_on_the_wire() {
         let dir = scratch();
@@ -1354,7 +1465,10 @@ mod tests {
             let mut r = receipt(dir.path(), TURN, i as i64 + 1, Some(i as i64 + 100));
             r.outcome = *outcome;
             r.reply_phase = *phase;
-            r.attempt_id = Some(format!("{}", i + 1));
+            // A DISTINCT minted attempt per row: the dedupe key is
+            // `(turn, attempt)`, so reusing one here would refuse the later rows
+            // for the right reason and prove nothing about the wire shape.
+            r.attempt_id = Some(format!("attempt-6ba7b810-9dad-41d1-80b4-00c04fd430c{i}"));
             append(dir.path(), &r).unwrap();
         }
         let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
@@ -1382,12 +1496,12 @@ mod tests {
 
         // The accepted turn is delivered once, by attempt 1.
         let mut first = receipt(root, TURN, 1, Some(4242));
-        first.attempt_id = Some("attempt-1".to_string());
+        first.attempt_id = Some(ATTEMPT_ONE.to_string());
         append(root, &first).unwrap();
 
         // THE REFIRE. Same turn, same attempt — the dispatcher redelivering an
         // occurrence that was already answered.
-        let evidence = evidence_for_attempt(root, TURN, Some("attempt-1"))
+        let evidence = evidence_for_attempt(root, TURN, Some(ATTEMPT_ONE))
             .expect("a refire must FIND the original attempt's evidence");
         assert_eq!(evidence.receipt_id, first.receipt_id);
         assert_eq!(
@@ -1404,7 +1518,7 @@ mod tests {
         // Were the refire to try to relay anyway, the ledger refuses its receipt
         // rather than recording one delivery twice.
         let mut again = receipt(root, TURN, 2, Some(4243));
-        again.attempt_id = Some("attempt-1".to_string());
+        again.attempt_id = Some(ATTEMPT_ONE.to_string());
         assert!(matches!(
             append(root, &again),
             Err(ReceiptError::AttemptAlreadyRecorded { .. })
@@ -1426,20 +1540,20 @@ mod tests {
         let root = dir.path();
 
         let mut dead = receipt(root, TURN, 1, None);
-        dead.attempt_id = Some("attempt-1".to_string());
+        dead.attempt_id = Some(ATTEMPT_ONE.to_string());
         dead.status = RelayStatus::Failed;
         append(root, &dead).unwrap();
 
         assert!(
-            evidence_for_attempt(root, TURN, Some("attempt-2")).is_none(),
+            evidence_for_attempt(root, TURN, Some(ATTEMPT_TWO)).is_none(),
             "a NEW attempt on the same turn is not a refire and must not be suppressed"
         );
 
         // So it relays, and writes its own receipt for the delivery that worked.
         let mut healed = receipt(root, TURN, 2, Some(9001));
-        healed.attempt_id = Some("attempt-2".to_string());
+        healed.attempt_id = Some(ATTEMPT_TWO.to_string());
         append(root, &healed).unwrap();
-        let now = evidence_for_attempt(root, TURN, Some("attempt-2")).unwrap();
+        let now = evidence_for_attempt(root, TURN, Some(ATTEMPT_TWO)).unwrap();
         assert_eq!(now.message_id, Some(9001));
         assert_eq!(read_all(root).len(), 2);
     }
@@ -1449,7 +1563,7 @@ mod tests {
     #[test]
     fn an_unknown_turn_has_no_evidence() {
         let dir = scratch();
-        assert!(evidence_for_attempt(dir.path(), TURN, Some("attempt-1")).is_none());
+        assert!(evidence_for_attempt(dir.path(), TURN, Some(ATTEMPT_ONE)).is_none());
         assert!(evidence_for_attempt(dir.path(), TURN, None).is_none());
     }
 }

@@ -434,11 +434,16 @@ pub fn feed_path_for(project_root: &Path) -> PathBuf {
 
 /// Append one entry to the feed, creating `.casa/` on first write.
 ///
-/// Append-only: one compact JSON object per line plus a trailing newline. The
-/// caller (the listener) logs and swallows any error — a full disk or a
-/// read-only mount must never take the listener down; the pane simply stays
-/// where it was.
-pub fn append_entry(feed_path: &Path, entry: &FeedEntry) -> std::io::Result<()> {
+/// Append-only: one compact JSON object per line plus a trailing newline.
+///
+/// PRIVATE ON PURPOSE. This is the raw write: no lock, no causal validation, no
+/// global id, no receipt. A production caller reaching it would be an
+/// unserialised append that a concurrent rotation can destroy, and an unbound row
+/// nothing can ever prove — the two failures this module's transaction exists to
+/// remove. Every writer goes through [`append_entry_allocating`] or
+/// [`append_entry_proving`]; keeping this one private is the structural version
+/// of that rule, which a source-sweep guard could only approximate.
+fn append_entry(feed_path: &Path, entry: &FeedEntry) -> std::io::Result<()> {
     if let Some(parent) = feed_path.parent() {
         fs::create_dir_all(parent)?;
     }
