@@ -2658,3 +2658,12 @@ owners = [
 ]
 description = "Pins the requester-scoped reminder READ-BACK lane (live-cert C052) through the deployed binary's credential-free `wg telegram remind --ask \"…\" --as <member>` seam over an opaque scratch project. The poisoned prompt is the point: the question asserts a date the persisted store disagrees with, and the answer must carry the STORE's date and time, never the prompt's. Also pins cross-member privacy (another member is told nothing, not even that the reminder exists), the honest zero-match line, the brief ambiguous candidate list, fail-closed refusal when no requester is named, and ZERO WRITES — the reminder file is byte-identical after every read, including a cancel-shaped QUESTION that must be answered rather than executed. A binary without the seam FAILS rather than skipping, because a stale install is the exact state this pins."
 timeout_seconds = 30
+
+[[scenario]]
+name = "telegram_week_start"
+script = "scenarios/telegram_week_start.sh"
+owners = [
+    "week-start-engine",
+]
+description = "Pins the ENGINE half of the week-start promise through the deployed binary's credential-free `wg --json telegram week-start` seam over an opaque scratch project pinned to the Monday of an un-planned week. The gateway rewrites a bare \"yes\" to \"This week isn't set up yet — want me to start it?\" into an explicit ask carrying the refused request QUOTED in the message; this scenario proves the engine consumes it: the ask is recognized with its carriage, --apply really CREATES this week's plan (seven day rows, dated to the pinned week) with the requested Tuesday dinner in it, the week that already ENDED stays byte-identical (the carried quote reads exactly like a bare meal swap), the same turn id replays instead of drafting twice, and a second acceptance answers honestly without overwriting. NEGATIVES: a carried request the closed set cannot express drafts NO week at all rather than one that silently dropped it, and a QUESTION about the week creates nothing. A binary without the seam FAILS rather than skipping. No token, network, bot, model, or live plan is used."
+timeout_seconds = 60
