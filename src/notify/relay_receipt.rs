@@ -1135,6 +1135,151 @@ mod tests {
         assert_eq!(read_all(dir.path()).len(), 1);
     }
 
+    /// ITEM 4 — THE AUDIT'S CORRUPTION REPRO, as a permanent gate.
+    ///
+    /// `visible_before=0 duplicate_append_succeeded=true visible_after=1`: after
+    /// the one line proving feed row 7 / message 4242 was corrupted, an IDENTICAL
+    /// second proof was accepted. Damaged evidence had been read as no evidence,
+    /// so the delivery could be certified twice — and the second certificate
+    /// looked exactly as authoritative as the first.
+    #[test]
+    fn a_corrupted_proof_blocks_a_new_claim_instead_of_licensing_a_duplicate() {
+        let dir = scratch();
+        let first = receipt(dir.path(), TURN, 7, Some(4242));
+        append(dir.path(), &first).unwrap();
+
+        // Corrupt the proof exactly as the reproducer did: the row is still
+        // there, it just no longer parses.
+        let path = ledger_path_for(dir.path());
+        let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, body.replace("\"receiptId\"", "\"receipt")).unwrap();
+
+        // The lenient reader now sees NOTHING (this is the false-clean read that
+        // made the duplicate look legitimate)...
+        assert_eq!(read_all(dir.path()).len(), 0, "visible_before=0, as audited");
+
+        // ...and the strict one, which is what `append` uses, says DAMAGED.
+        assert!(matches!(
+            read_strict(dir.path()),
+            Err(ReceiptError::LedgerCorrupt { line: 1, .. })
+        ));
+
+        // So the second claim of the very same delivery is REFUSED.
+        let duplicate = receipt(dir.path(), TURN, 7, Some(4242));
+        let err = append(dir.path(), &duplicate).unwrap_err();
+        assert!(
+            matches!(err, ReceiptError::LedgerCorrupt { .. }),
+            "a duplicate was admitted over damaged evidence: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            1,
+            "the refusal left the ledger byte-identical"
+        );
+    }
+
+    /// Every damaged shape fails closed, and each names WHERE — an unreadable
+    /// file, a torn tail, a line that is JSON but not a receipt, a line of
+    /// nonsense. None of them may authorise a new receipt.
+    #[test]
+    fn every_damaged_ledger_shape_fails_closed_and_none_authorises_a_receipt() {
+        for (label, tail) in [
+            ("a torn tail", "{\"receiptId\":\"rcpt_3f2504e0-4f89-41d3-9a0"),
+            ("json that is not a receipt", "{\"hello\":\"world\"}"),
+            ("not json at all", "<<< a log line landed in the ledger"),
+            ("a stray NUL-ish blob", "\u{1}\u{2}\u{3}"),
+        ] {
+            let dir = scratch();
+            append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+            let path = ledger_path_for(dir.path());
+            let mut body = std::fs::read_to_string(&path).unwrap();
+            body.push_str(tail);
+            body.push('\n');
+            std::fs::write(&path, &body).unwrap();
+
+            assert!(
+                matches!(read_strict(dir.path()), Err(ReceiptError::LedgerCorrupt { line: 2, .. })),
+                "{label} was not reported as damage"
+            );
+            let err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap_err();
+            assert!(
+                matches!(err, ReceiptError::LedgerCorrupt { .. }),
+                "{label} still authorised a new receipt: {err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                body,
+                "{label}: the refusal must leave the ledger byte-identical"
+            );
+        }
+    }
+
+    /// A ledger that does not EXIST is not damage — an install with no receipts
+    /// yet is an ordinary fact, and refusing there would mean no first receipt
+    /// could ever be written.
+    #[test]
+    fn an_absent_ledger_is_empty_not_damaged() {
+        let dir = scratch();
+        assert_eq!(read_strict(dir.path()).unwrap().len(), 0);
+        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        assert_eq!(read_strict(dir.path()).unwrap().len(), 1);
+    }
+
+    /// THE AUDIT'S WRITE RACE, as a permanent gate. Sixty-four synchronised
+    /// writers submitted the same `feedId`, the same `(scope, messageId)` and the
+    /// same `(turn, attempt)` with unique receipt ids. TEN calls returned
+    /// success, the file held concatenated JSON that no longer parsed, and both
+    /// of the two rows still readable violated all three uniqueness rules.
+    ///
+    /// Under the shared lock and the single-write append: exactly ONE success,
+    /// every line parses, and the duplicate claims are refused.
+    #[test]
+    fn sixty_four_racing_duplicate_claims_admit_exactly_one() {
+        let dir = scratch();
+        let root = dir.path().to_path_buf();
+        // Mint the scope key first, so the race is over the LEDGER and not over
+        // the key (that race has its own test).
+        let scope = scope_id_for_bot(&root, "bot-one").unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(64));
+
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let root = root.clone();
+            let scope = scope.clone();
+            let gate = gate.clone();
+            handles.push(std::thread::spawn(move || {
+                let claim = engine_receipt(
+                    TURN,
+                    9,
+                    "agent",
+                    "the-helper-role",
+                    &scope,
+                    Some(4242),
+                    RelayStatus::Delivered,
+                    RelayOutcome::Send,
+                    ReplyPhase::Final,
+                    None,
+                    1_785_000_000_000,
+                );
+                gate.wait();
+                append(&root, &claim).is_ok()
+            }));
+        }
+        let successes = handles
+            .into_iter()
+            .filter(|_| true)
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+
+        assert_eq!(successes, 1, "one delivery, one receipt — got {successes}");
+        // EVERY line parses: no interleaved half-records.
+        let parsed = read_strict(&root).expect("the ledger must still be wholly readable");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].feed_id, 9);
+        assert_eq!(parsed[0].message_id, Some(4242));
+    }
+
     #[test]
     fn typed_outcomes_and_phases_are_closed_and_stable_on_the_wire() {
         let dir = scratch();
