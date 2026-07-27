@@ -261,4 +261,148 @@ if [[ -e "$q_scratch/plans/$this_code-family-plan.md" ]]; then
     loud_fail "asking whether the week was started CREATED a week"
 fi
 
+# ── NEGATIVE: A REFUSAL IS NOT AN INSTRUCTION ────────────────────────────────
+# The start phrases are matched as SUBSTRINGS, and "start the week" is a
+# substring of "Don't start the week." — so telling the house NOT to start the
+# week STARTED it, and wrote a plan of record the family had explicitly refused.
+# The loudest possible way to be ignored. Every phrasing below must write nothing.
+while IFS= read -r refusal; do
+    [[ -n "$refusal" ]] || continue
+    neg_dir="$(make_scratch)"
+    mkdir -p "$neg_dir/plans" "$neg_dir/.wg"
+    cp "$ended" "$neg_dir/plans/$ended_code-family-plan.md"
+    # Exit status is not the assertion — the ARTIFACT is. A refusal may exit
+    # either way (it is simply not this lane's message); what it may never do is
+    # leave a week on disk.
+    "$wg_bin" --json telegram week-start "$refusal" --root "$neg_dir" \
+        --now "$now" --apply --turn-id "turn-refusal" >/dev/null 2>&1 || true
+    if [[ -e "$neg_dir/plans/$this_code-family-plan.md" ]]; then
+        loud_fail "a REFUSAL created a plan of record: $refusal"
+    fi
+    recognize_is "$refusal" no
+done <<'REFUSALS'
+Don't start the week.
+Do not start the week yet.
+Never start the week without asking me.
+Not yet — don't set up this week.
+Stop — do not plan this week.
+Please cancel that, don't draft this week's family plan.
+Hold off, no need to start the week.
+REFUSALS
+
+# …and the negation gate did not eat the asks it sits next to. A "don't" inside
+# the QUOTED carriage is the family's EDIT, not a refusal of the ask carrying it.
+recognize_is "Please draft this week's family plan — start the week." yes
+recognize_is "Non-stop week ahead — start the week." yes
+recognize_is 'Please draft this week'"'"'s family plan — start the week. Keep what I just asked for: "Don'"'"'t put fish on Tuesday."' \
+    yes "Don't put fish on Tuesday."
+
+# ── SIDECAR: a parked-suggestions note is not a plan, and its dinners land ────
+# `plans/<week>-dinner-suggestions.md` is where the family's dinner choices are
+# parked for a week that has no plan yet. Its filename carries a week code, so
+# shape discovery read it AS the household's most recent plan: the drafted week
+# came out titled "Dinner suggestions for the week of …", with the household's
+# real headings gone AND the parked dinners dropped — the family's own choices
+# lost by the very draft that was supposed to honour them (docs/11 §0c).
+side="$(make_scratch)"
+mkdir -p "$side/plans" "$side/.wg"
+cp "$ended" "$side/plans/$ended_code-family-plan.md"
+cat >"$side/plans/$this_code-dinner-suggestions.md" <<'NOTE'
+# Dinner suggestions for the week of 2026-W31
+
+These are ideas the family added before the plan was drafted.
+
+- **Thursday** (2026-07-30) — Fish tacos · suggested by the household
+- **Friday** (2026-07-31) — Dining out
+NOTE
+note="$side/plans/$this_code-dinner-suggestions.md"
+side_drafted="$side/plans/$this_code-family-plan.md"
+
+if ! out="$("$wg_bin" --json telegram week-start \
+    "Please draft this week's family plan — start the week." --root "$side" \
+    --now "$now" --apply --turn-id "turn-sidecar" 2>/dev/null)"; then
+    loud_fail "the week-start seam exited nonzero over a project with a parked note"
+fi
+printf '%s' "$out" | python3 "$scratch/assert_applied.py" applied "$this_code" "Thu" "Fish tacos" \
+    || loud_fail "the parked Thursday dinner is not in the drafted week"
+[[ -f "$side_drafted" ]] || loud_fail "no plan was drafted alongside a parked note"
+
+# THE SHAPE came from the household's own plan, never from the note.
+if grep -q "Dinner suggestions for the week" "$side_drafted"; then
+    loud_fail "the drafted plan inherited the SIDECAR's shape — a note was read as a plan"
+fi
+grep -q "## 1. Dinners" "$side_drafted" \
+    || loud_fail "the drafted week has no dinners section — the shape source was not a plan"
+# THE CHOICES landed, on their nights, verbatim — and their provenance did not.
+grep -qi "Thu 07-30 .*Fish tacos" "$side_drafted" \
+    || loud_fail "the parked Thursday dinner was dropped from the draft"
+grep -qi "Fri 07-31 .*Dining out" "$side_drafted" \
+    || loud_fail "the parked non-cook Friday was dropped from the draft"
+if grep -q "suggested by" "$side_drafted"; then
+    loud_fail "the note's provenance leaked into the family's plan"
+fi
+
+# RETIREMENT IS IDEMPOTENT and destroys nothing: the family's own words stay in
+# the note, and a second draft over the same note re-applies nothing.
+grep -q "Fish tacos" "$note" || loud_fail "retiring the note deleted the family's own words"
+grep -q "folded into" "$note" || loud_fail "the folded note was not retired"
+side_sum="$(sha_of "$side_drafted")"
+note_sum="$(sha_of "$note")"
+"$wg_bin" --json telegram week-start "Please draft this week's family plan — start the week." \
+    --root "$side" --now "$now" --apply --turn-id "turn-sidecar-2" >/dev/null 2>&1 || true
+[[ "$(sha_of "$side_drafted")" == "$side_sum" ]] \
+    || loud_fail "a second draft over a folded note rewrote the week"
+[[ "$(sha_of "$note")" == "$note_sum" ]] \
+    || loud_fail "folding the note a second time was not a no-op"
+
+# ── LIVE SHAPE: a section companion is not a week of dinners ──────────────────
+# A `-workouts` / `-recipes` companion is a legitimate file for its week, but a
+# week drafted in ITS shape has no meals table at all — so nothing the family
+# asked for could land, and the report would be confident about an empty week.
+comp="$(make_scratch)"
+mkdir -p "$comp/plans" "$comp/.wg"
+cp "$ended" "$comp/plans/$ended_code-family-plan.md"
+cat >"$comp/plans/$this_code-workouts.md" <<'COMP'
+# Movement for the week
+
+## Moving
+
+| Day | Session |
+| --- | --- |
+| Mon | easy run |
+COMP
+if ! out="$("$wg_bin" --json telegram week-start "$dispatched" --root "$comp" \
+    --now "$now" --apply --turn-id "turn-companion" 2>/dev/null)"; then
+    loud_fail "the week-start seam exited nonzero over a project with a companion file"
+fi
+printf '%s' "$out" | python3 "$scratch/assert_applied.py" applied "$this_code" "Tue" "homemade pizza" \
+    || loud_fail "a companion file took over the drafted week's shape"
+if grep -q "Movement for the week" "$comp/plans/$this_code-family-plan.md"; then
+    loud_fail "the drafted plan inherited a COMPANION's shape"
+fi
+
+# ── A REPLAY MUST BE TRUE ────────────────────────────────────────────────────
+# The turn ledger says this week was drafted; the plan file is gone. Replaying a
+# stored "this week's plan is started" against an empty disk is the
+# dead-pipeline-claims-success failure arriving THROUGH the idempotency guard
+# rather than around it. The honest answer is to draft the week.
+rm -f "$drafted"
+apply_is "$dispatched" "turn-week-start-1" applied "$this_code" "Tue" "homemade pizza"
+[[ -f "$drafted" ]] \
+    || loud_fail "a replay whose plan had vanished reported success and wrote nothing"
+
+# …and two DIFFERENT projects never share one turn ledger: the same turn id in a
+# fresh project must draft that project's week, not replay another project's.
+twin="$(make_scratch)"
+mkdir -p "$twin/plans"
+cp "$ended" "$twin/plans/$ended_code-family-plan.md"
+if ! out="$("$wg_bin" --json telegram week-start "$dispatched" --root "$twin" \
+    --now "$now" --apply --turn-id "turn-week-start-1" 2>/dev/null)"; then
+    loud_fail "the week-start seam exited nonzero over a second project"
+fi
+printf '%s' "$out" | python3 "$scratch/assert_applied.py" applied "$this_code" "Tue" "homemade pizza" \
+    || loud_fail "a second project replayed the first project's outcome"
+[[ -f "$twin/plans/$this_code-family-plan.md" ]] \
+    || loud_fail "a second project inherited another project's turn ledger and got no week"
+
 echo "PASS: telegram_week_start"
