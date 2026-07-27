@@ -2277,6 +2277,17 @@ pub fn run_fast_lane_with_calendar_owner(
         }
     };
 
+    // THE READ-MODIFY-WRITE OF A PLAN FILE IS ONE TRANSACTION, and this process is
+    // not its only writer: the gateway's WeekAdapter, a second tab, and the Sunday
+    // draft integrator all rewrite the same bytes from other processes. Reading
+    // outside the section and writing inside it would still lose an update — the
+    // edit would be applied to a version of the week that no longer exists — so
+    // the read, the edit and the write are all inside it (docs/42 §1, §7).
+    //
+    // FAIL CLOSED (§3): a lock we could not take means nothing is written, and the
+    // family is told so plainly. Falling through to the heavy pipeline here would
+    // be a fail-open with extra steps.
+    let locked = super::project_lock::with_week_mutation_lock(root, || {
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
@@ -2322,6 +2333,23 @@ pub fn run_fast_lane_with_calendar_owner(
         },
         Err(e) => FastLaneResult::Fallback {
             reason: format!("direct edit refused ({e}) — deferring to full pipeline"),
+        },
+    }
+    });
+    match locked {
+        Ok(result) => result,
+        Err(refusal) => FastLaneResult::Answered {
+            // Nothing was saved, and saying so is the whole point: a refusal the
+            // family can see and repeat beats a write nobody serialised. This is
+            // NOT staleness — nothing was stale, the write simply did not happen.
+            reply: "Someone else is changing this week's plan right now, so I didn't save that. \
+                    Give it a moment and say it again."
+                .to_string(),
+            lane: if refusal.retryable() {
+                "week-lock-busy".to_string()
+            } else {
+                "week-lock-unavailable".to_string()
+            },
         },
     }
 }
@@ -3968,5 +3996,67 @@ Keep what I just asked for: \"Set Tuesday's dinner to homemade pizza.\"";
             },
         )
         .is_err());
+    }
+
+    /// THE OTHER ENGINE PATH THAT REWRITES A PLAN FILE (docs/42 §9(1)). The
+    /// conversational edit is a read-modify-write over bytes the gateway also
+    /// writes, so it takes the same `week-mutation` lock — and when it cannot,
+    /// the plan is left BYTE-IDENTICAL and the family is told nothing was saved.
+    /// Falling through to the heavy pipeline here would be a fail-open with extra
+    /// steps.
+    #[test]
+    #[serial_test::serial(project_lock)]
+    fn a_plan_edit_is_refused_and_writes_nothing_while_the_week_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = dir.path().join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan_path = plans.join("2026-W29-family-plan.md");
+        std::fs::write(&plan_path, W29).unwrap();
+
+        // Another writer — another thread, because re-entrancy is keyed per
+        // (thread, lock path), so a same-stack holder would be recognised as this
+        // very writer re-entering rather than as contention.
+        let root = dir.path().to_path_buf();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (holding, held) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            let lock = super::super::project_lock::acquire(
+                &root,
+                super::super::project_lock::WEEK_MUTATION,
+                &super::super::project_lock::Options::waiting(2_000),
+            )
+            .unwrap();
+            holding.send(()).unwrap();
+            let _ = wait.recv();
+            lock.release()
+        });
+        held.recv().unwrap();
+
+        match run_fast_lane(dir.path(), "make tuesday dinner homemade pizza", today()) {
+            FastLaneResult::Answered { reply, lane } => {
+                assert_eq!(lane, "week-lock-busy");
+                let low = reply.to_lowercase();
+                assert!(low.contains("didn't save"), "{reply:?}");
+                assert!(!low.starts_with("done"), "{reply:?}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&plan_path).unwrap(),
+            W29,
+            "NOT ONE BYTE MOVES while another process holds the week"
+        );
+
+        let _ = go.send(());
+        other.join().unwrap();
+        // And the same edit lands the moment the other writer lets go.
+        match run_fast_lane(dir.path(), "make tuesday dinner homemade pizza", today()) {
+            FastLaneResult::Applied { .. } => {}
+            other => panic!("expected the edit to apply once unlocked, got {other:?}"),
+        }
+        assert!(std::fs::read_to_string(&plan_path)
+            .unwrap()
+            .to_lowercase()
+            .contains("homemade pizza"));
     }
 }

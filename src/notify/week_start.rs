@@ -49,6 +49,7 @@ use chrono::{Datelike, Duration, NaiveDate, Weekday};
 
 use super::family_plan::{self, PlanDoc};
 use super::fast_lane::{self, Classification, FastLaneError, FastLaneOp};
+use super::project_lock;
 
 /// A recognized week-start ask, with the requests it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +117,11 @@ pub enum WeekStartError {
     /// The written file did not parse back to the week we drafted — a dead
     /// pipeline is never reported as a success.
     Unverified(String),
+    /// THE WEEK COULD NOT BE SERIALISED against the other writers, so nothing was
+    /// drafted (docs/42 §3). `retryable` distinguishes "someone else is changing
+    /// the week right now, try again in a moment" from "this needs a human" — and
+    /// neither is staleness: nothing was stale, the write simply did not happen.
+    LockUnavailable { detail: String, retryable: bool, cure: String },
 }
 
 impl std::fmt::Display for WeekStartError {
@@ -135,6 +141,17 @@ impl std::fmt::Display for WeekStartError {
             }
             WeekStartError::Io(m) => write!(f, "week-start io: {m}"),
             WeekStartError::Unverified(m) => write!(f, "drafted week failed verification: {m}"),
+            WeekStartError::LockUnavailable { detail, retryable, cure } => {
+                if *retryable {
+                    write!(
+                        f,
+                        "the week is being changed by someone else right now ({detail}) — \
+                         nothing was written"
+                    )
+                } else {
+                    write!(f, "the week could not be locked ({detail}) — nothing was written. {cure}")
+                }
+            }
         }
     }
 }
@@ -897,7 +914,45 @@ fn plan_covering(root: &Path, day: NaiveDate) -> Option<String> {
 /// and the file is created only when every carried request has provably landed.
 /// After the write the file is re-read and re-parsed, so success is a claim about
 /// bytes on disk rather than about control flow.
+/// THE ENGINE HALF OF THE CROSS-PROCESS LOCK (docs/42 §9, audit P0 #4). Until
+/// this wrapper existed, the gateway serialised every protected week mutation
+/// through `.casa/locks/week-mutation.lock` and `wg` — the process that actually
+/// writes a new week's plan file — took no lock at all, so a gateway mutation and
+/// an engine week-start could still interleave and lose an update. A protocol
+/// only one of two writers speaks is not a protocol.
+///
+/// The WHOLE of `draft_week_locked` is the critical section (docs/42 §7): the
+/// "is there already a plan of record?" read, the parked/carried edits, the
+/// write, and the read-back verification are one transaction, and a mutation
+/// landing between the check and the write is exactly the lost update the lock
+/// exists to prevent. Nothing is "finished up afterwards".
+///
+/// FAIL CLOSED (§3): a lock we could not take means the week is NOT drafted. The
+/// refusal is typed so the caller answers the family honestly — "someone else is
+/// changing that, try again in a moment", or a report naming the file a human
+/// must remove — never a silent unserialised write.
 pub fn draft_week(
+    root: &Path,
+    today: NaiveDate,
+    ask: &WeekStartAsk,
+    calendar_owner: Option<&str>,
+) -> Result<DraftedWeek, WeekStartError> {
+    match project_lock::with_week_mutation_lock(root, || {
+        draft_week_locked(root, today, ask, calendar_owner)
+    }) {
+        Ok(drafted) => drafted,
+        Err(refusal) => Err(WeekStartError::LockUnavailable {
+            detail: refusal.detail().to_string(),
+            retryable: refusal.retryable(),
+            cure: match &refusal {
+                project_lock::LockRefusal::Unavailable { cure, .. } => cure.clone(),
+                other => other.to_string(),
+            },
+        }),
+    }
+}
+
+fn draft_week_locked(
     root: &Path,
     today: NaiveDate,
     ask: &WeekStartAsk,
@@ -1130,6 +1185,7 @@ pub fn already_planned_line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     const W30: &str = "\
 # Family week · 2026-W30 · Week of Monday July 20 – Sunday July 26
@@ -1680,5 +1736,107 @@ These are ideas the family added before the plan was drafted.
         let line = report_line(&out);
         assert!(line.to_lowercase().contains("started"), "{line}");
         assert!(line.to_lowercase().contains("pizza"), "{line}");
+    }
+
+    // ── THE ENGINE HALF OF THE CROSS-PROCESS LOCK (docs/42 §9) ──────────────
+
+    fn week_ask() -> WeekStartAsk {
+        detect(
+            "Please draft this week's family plan. Keep what I asked for: \
+             \"Set Tuesday's dinner to homemade pizza.\"",
+        )
+        .unwrap()
+    }
+
+    /// The week-start plan writer TAKES THE LOCK. Before this, `wg` wrote the
+    /// weekly plan file directly and the gateway's `.casa/locks/week-mutation.lock`
+    /// bound only Node writers — so a gateway mutation and an engine week-start
+    /// could interleave and lose an update (audit P0 #4).
+    #[test]
+    #[serial(project_lock)]
+    fn the_week_writer_holds_the_week_mutation_lock_while_it_writes() {
+        let dir = scratch(true);
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watching = seen.clone();
+        let lock_path = project_lock::lock_path_for(dir.path(), project_lock::WEEK_MUTATION);
+        let plan = dir.path().join("plans/2026-W31-family-plan.md");
+        let watched = plan.clone();
+        // Watch the lock path for the whole write: the file must exist at some
+        // point while the plan does not yet.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let watcher = std::thread::spawn(move || {
+            while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
+                if lock_path.exists() && !watched.exists() {
+                    watching.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        draft_week(dir.path(), MON_W31(), &week_ask(), None).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        watcher.join().unwrap();
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            "the week-mutation lock was never held while the plan was being written"
+        );
+        assert!(plan.exists());
+        assert!(
+            !project_lock::lock_path_for(dir.path(), project_lock::WEEK_MUTATION).exists(),
+            "and it is let go afterwards"
+        );
+    }
+
+    /// FAIL CLOSED (docs/42 §3): the write is REFUSED while another process holds
+    /// the week, and not one byte moves. A second writer is driven from another
+    /// thread because re-entrancy is keyed per (thread, lock path) — a same-stack
+    /// holder would be recognised as this very writer re-entering.
+    #[test]
+    #[serial(project_lock)]
+    fn the_write_is_refused_while_another_process_holds_the_week() {
+        let dir = scratch(true);
+        let plan = dir.path().join("plans/2026-W31-family-plan.md");
+        let root = dir.path().to_path_buf();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (holding, held) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            let lock = project_lock::acquire(
+                &root,
+                project_lock::WEEK_MUTATION,
+                &project_lock::Options::waiting(2_000),
+            )
+            .unwrap();
+            holding.send(()).unwrap();
+            let _ = wait.recv();
+            lock.release()
+        });
+        held.recv().unwrap();
+
+        let refused = draft_week(
+            dir.path(),
+            MON_W31(),
+            &week_ask(),
+            None,
+        )
+        .unwrap_err();
+
+        match &refused {
+            WeekStartError::LockUnavailable { detail, retryable, .. } => {
+                assert_eq!(detail, "held");
+                assert!(retryable, "contention is the retryable answer");
+            }
+            other => panic!("expected a lock refusal, got {other:?}"),
+        }
+        assert!(!plan.exists(), "NOT ONE BYTE MOVES when the week is locked");
+        // The refusal the family sees says nothing was saved, and never blames
+        // staleness — nothing was stale, the write simply did not happen.
+        let said = refused.to_string();
+        assert!(said.contains("nothing was written"), "{said}");
+        assert!(!said.to_lowercase().contains("stale"), "{said}");
+
+        let _ = go.send(());
+        other.join().unwrap();
+        // And once the other writer lets go, the same ask lands.
+        let out = draft_week(dir.path(), MON_W31(), &week_ask(), None).unwrap();
+        assert!(out.path.exists());
     }
 }
