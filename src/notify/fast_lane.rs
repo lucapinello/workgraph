@@ -69,6 +69,16 @@ pub enum FastLaneOp {
         date: NaiveDate,
         time: Option<String>,
     },
+    /// START THIS WEEK: create the plan of record the calendar-current week does
+    /// not have yet, carrying the requests quoted in the ask (task
+    /// `week-start-engine`). This is the only op that CREATES a plan file rather
+    /// than editing one, and the only one whose failure mode is a week drafted
+    /// without the thing the family asked for — so it is applied by
+    /// [`super::week_start::draft_week`], which fails closed.
+    WeekStart {
+        /// The family's own words, quoted into the dispatched ask.
+        carried: Vec<String>,
+    },
     /// Cancel a pending reminder: "cancel the reminder about the dentist".
     /// NEVER a creation — a cancel phrase that matches nothing (or matches more
     /// than one pending reminder) falls back so the family is ASKED.
@@ -92,6 +102,7 @@ impl FastLaneOp {
             FastLaneOp::MealRemove { .. } => "meal-remove",
             FastLaneOp::ShoppingAdd { .. } => "shopping-add",
             FastLaneOp::ShoppingRemove { .. } => "shopping-remove",
+            FastLaneOp::WeekStart { .. } => "week-start",
             FastLaneOp::ReminderSet { .. } => "reminder-set",
             FastLaneOp::ReminderCancel { .. } => "reminder-cancel",
         }
@@ -198,6 +209,21 @@ pub fn classify(message: &str, today: NaiveDate) -> Classification {
     let text = message.trim();
     if text.is_empty() {
         return Classification::Fallback(FallbackReason::NotASimpleEdit);
+    }
+
+    // START THIS WEEK, FIRST (task `week-start-engine`). This must be tested
+    // BEFORE every other shape, for two reasons. The dispatched ask carries the
+    // family's original request QUOTED inside it — "…start the week. Keep what I
+    // asked for: \"Set Tuesday's dinner to homemade pizza.\"" — so the ordinary
+    // meal matcher would happily read that quote as a bare swap and apply it to
+    // the NEWEST plan on disk, which on this exact Monday is the week that has
+    // already ended: the archived-week write the offer exists to prevent. And
+    // "plan the week" sits in COMPLEX_MARKERS, so the ask would otherwise fall
+    // through to the composer, which cannot create a plan file at all.
+    if let Some(ask) = super::week_start::detect(text) {
+        return Classification::FastLane(FastLaneOp::WeekStart {
+            carried: ask.carried,
+        });
     }
     let s = normalize(text);
 
@@ -1314,6 +1340,10 @@ pub fn report_line(op: &FastLaneOp) -> String {
         FastLaneOp::ShoppingRemove { item } => {
             format!("Done — took {item} off the shopping list ✂️")
         }
+        // The week-drafting path reports with the real dates and everything it
+        // preserved ([`super::week_start::report_line`]); this is the shape-only
+        // line for a caller that has the op but not the drafted week.
+        FastLaneOp::WeekStart { .. } => "Done — this week's plan is started 🗓️".to_string(),
         FastLaneOp::ReminderSet {
             text, day, time, ..
         } => {
@@ -1381,6 +1411,16 @@ fn weekday_short(w: Weekday) -> &'static str {
         Weekday::Sat => "Sat",
         Weekday::Sun => "Sun",
     }
+}
+
+/// Does a plan's day-cell weekday WORD name `want`?
+///
+/// Households write both forms — `Mon 07-27` and `Monday July 27` — and both are
+/// this table's own day column, so an edit must find its row either way. Matched
+/// as a whole word against exactly the two spellings (never a prefix), so a first
+/// cell reading "Monthly total" is not mistaken for Monday.
+fn day_word_names(word: &str, want: Weekday) -> bool {
+    word.eq_ignore_ascii_case(weekday_short(want)) || word.eq_ignore_ascii_case(weekday_name(want))
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,6 +1529,14 @@ pub fn apply_to_content_with_calendar_owner(
             day,
             not_before,
         } => remove_reminder_row(week_code, content, target, *day, *not_before)?,
+        // Creating a week is a FILE-level draft, not a content edit — it has no
+        // document to transform. [`run_fast_lane_with_calendar_owner`] routes it
+        // to [`super::week_start::draft_week`] before ever reaching here.
+        FastLaneOp::WeekStart { .. } => {
+            return Err(FastLaneError::NotApplicable(
+                "starting a week creates a plan file; it is not a content edit".into(),
+            ));
+        }
     };
 
     // Round-trip: the edited document MUST parse back to the change we intended.
@@ -1506,7 +1554,7 @@ fn verify_round_trip(
     let dish_on = |wd: Weekday| -> Option<String> {
         doc.meals
             .iter()
-            .find(|m| m.weekday.eq_ignore_ascii_case(weekday_short(wd)))
+            .find(|m| day_word_names(&m.weekday, wd))
             .map(|m| m.dish.to_lowercase())
     };
     match op {
@@ -1598,6 +1646,11 @@ fn verify_round_trip(
                 ));
             }
         }
+        // A drafted week is verified against the file that was WRITTEN, by
+        // [`super::week_start::draft_week`] — including that every carried
+        // request survived into it. There is no in-document edit to re-check
+        // here; `apply_to_content` refuses this op before it can reach us.
+        FastLaneOp::WeekStart { .. } => {}
     }
     Ok(())
 }
@@ -1605,7 +1658,6 @@ fn verify_round_trip(
 /// Edit the dish cell of the first meal-table row whose day matches `day`.
 /// Returns `None` when there is no such row (or nothing to remove).
 fn edit_meal_dish(content: &str, day: Weekday, edit: &DishEdit) -> Option<String> {
-    let short = weekday_short(day).to_lowercase();
     let mut in_meals = false;
     let mut out: Vec<String> = Vec::new();
     let mut applied = false;
@@ -1620,8 +1672,12 @@ fn edit_meal_dish(content: &str, day: Weekday, edit: &DishEdit) -> Option<String
         if in_meals && !applied && trimmed.starts_with('|') {
             if let Some(cells) = split_cells(trimmed) {
                 let day_cell = cells.first().map(|c| c.to_lowercase()).unwrap_or_default();
-                let is_row =
-                    cells.len() >= 3 && day_cell.split_whitespace().next() == Some(short.as_str());
+                let is_row = cells.len() >= 3
+                    && day_cell
+                        .split_whitespace()
+                        .next()
+                        .map(|w| day_word_names(w, day))
+                        .unwrap_or(false);
                 if is_row {
                     let mut cells = cells;
                     let dish = cells[2].trim().to_string();
@@ -2079,6 +2135,40 @@ pub fn run_fast_lane_with_calendar_owner(
             };
         }
     };
+
+    // START THIS WEEK (task `week-start-engine`). The one op that CREATES a plan
+    // of record rather than editing one, so it runs before the current-plan
+    // lookup below — which on this exact Monday would hand back the week that has
+    // already ended. `draft_week` assembles, edits and verifies the document in
+    // memory and writes only when every carried request has landed, so a week is
+    // never drafted without the thing the family asked for.
+    if let FastLaneOp::WeekStart { carried } = &op {
+        use super::week_start::{self, WeekStartError};
+        let ask = week_start::WeekStartAsk {
+            carried: carried.clone(),
+        };
+        return match week_start::draft_week(root, today, &ask, calendar_owner) {
+            Ok(drafted) => FastLaneResult::Applied {
+                report: week_start::report_line(&drafted),
+                week_code: drafted.week_code.clone(),
+                op,
+            },
+            // Already set up: answer honestly and write nothing. Never an
+            // overwrite — a second "yes", or a dispatcher refire, must not erase
+            // a week the family has already filled in.
+            Err(WeekStartError::AlreadyPlanned { .. }) => FastLaneResult::Answered {
+                reply: week_start::already_planned_line(),
+                lane: "week-already-started".to_string(),
+            },
+            // The request the family carried could not be put into the new week.
+            // Nothing was written; the heavy planning pipeline takes the turn, so
+            // the ask is answered by something that CAN honour it — rather than a
+            // week landing on disk with the request silently dropped.
+            Err(e) => FastLaneResult::Fallback {
+                reason: format!("week-start not applied ({e}) — deferring to full pipeline"),
+            },
+        };
+    }
 
     // A cancel may match a reminder the DM path filed in the ad-hoc store rather
     // than a plan row, so it clears both surfaces.
@@ -3465,5 +3555,186 @@ domains = ["meals"]
             W29,
             "a read must never write a reminder row"
         );
+    }
+
+    // ── the week-start lane (task `week-start-engine`) ──────────────────────
+
+    /// The plan of a week that has ALREADY ENDED — the only thing on disk in the
+    /// Monday window the week-start offer is made in.
+    const ENDED_W30: &str = "\
+# Family week · 2026-W30 · Week of Monday July 20 – Sunday July 26
+
+**Week of Monday 2026-07-20 to Sunday 2026-07-26**
+**Status:** PUBLISHED
+
+## 1. Dinners (planner → cook)
+
+| Day | Slot | Dinner | Prep |
+|-----|------|--------|------|
+| Mon 07-20 | Vegetarian | Chickpea curry | ~35 min |
+| Tue 07-21 | Fish | Baked salmon | ~30 min |
+
+## 4. Shopping list — by store
+
+### Greengrocer / produce
+- Chard, 1 bunch
+";
+
+    /// The exact message the gateway dispatches when the family accepts the
+    /// offer, carrying the request that was refused.
+    const DISPATCHED: &str = "Please draft this week's family plan — start the week. \
+Keep what I just asked for: \"Set Tuesday's dinner to homemade pizza.\"";
+
+    fn monday_w31() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 7, 27).unwrap()
+    }
+
+    /// The dispatched ask is OWNED by the closed set — not handed to a composer
+    /// that has no way to create a plan file.
+    #[test]
+    fn the_dispatched_week_start_ask_is_classified_as_week_start() {
+        match classify(DISPATCHED, monday_w31()) {
+            Classification::FastLane(FastLaneOp::WeekStart { carried }) => {
+                assert_eq!(carried, vec!["Set Tuesday's dinner to homemade pizza."]);
+            }
+            other => panic!("the dispatched week-start ask was not owned: {other:?}"),
+        }
+    }
+
+    /// THE ARCHIVED-WEEK TRAP. The carried quote reads exactly like a bare meal
+    /// swap. If the ordinary matcher saw it first, the edit would land on the
+    /// newest plan on disk — which on this Monday is the week that has already
+    /// ended, the very write the offer exists to prevent.
+    #[test]
+    fn the_carried_quote_is_never_applied_to_the_week_that_ended() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("plans")).unwrap();
+        let ended = root.path().join("plans/2026-W30-family-plan.md");
+        std::fs::write(&ended, ENDED_W30).unwrap();
+
+        let result = run_fast_lane(root.path(), DISPATCHED, monday_w31());
+        let FastLaneResult::Applied { week_code, .. } = &result else {
+            panic!("the week-start ask was not fulfilled: {result:?}");
+        };
+        assert_eq!(week_code, "2026-W31");
+        assert_eq!(
+            std::fs::read_to_string(&ended).unwrap(),
+            ENDED_W30,
+            "the carried request was written into the week that had already ended",
+        );
+        let drafted =
+            std::fs::read_to_string(root.path().join("plans/2026-W31-family-plan.md")).unwrap();
+        let doc = PlanDoc::parse("2026-W31", &drafted);
+        assert!(
+            doc.meal_on(NaiveDate::from_ymd_opt(2026, 7, 28).unwrap())
+                .map(|m| m.dish.to_lowercase().contains("homemade pizza"))
+                .unwrap_or(false),
+            "the drafted week does not carry the requested edit:\n{drafted}",
+        );
+    }
+
+    /// Accepting the offer twice never erases the week the first yes created.
+    #[test]
+    fn a_second_yes_answers_honestly_and_overwrites_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("plans")).unwrap();
+        std::fs::write(root.path().join("plans/2026-W30-family-plan.md"), ENDED_W30).unwrap();
+
+        assert!(matches!(
+            run_fast_lane(root.path(), DISPATCHED, monday_w31()),
+            FastLaneResult::Applied { .. }
+        ));
+        let first = std::fs::read_to_string(root.path().join("plans/2026-W31-family-plan.md"))
+            .unwrap();
+
+        let again = run_fast_lane(root.path(), DISPATCHED, monday_w31());
+        let FastLaneResult::Answered { lane, reply } = &again else {
+            panic!("a second acceptance was not answered honestly: {again:?}");
+        };
+        assert_eq!(lane, "week-already-started");
+        assert!(!reply.to_lowercase().contains("started this week's plan"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("plans/2026-W31-family-plan.md")).unwrap(),
+            first,
+            "a repeated acceptance rewrote the week",
+        );
+    }
+
+    /// A carried request the closed set cannot express writes NO week — the
+    /// heavy pipeline takes the turn instead of a plan landing without it.
+    #[test]
+    fn a_week_is_never_drafted_without_the_request_it_carried() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("plans")).unwrap();
+        std::fs::write(root.path().join("plans/2026-W30-family-plan.md"), ENDED_W30).unwrap();
+
+        let result = run_fast_lane(
+            root.path(),
+            "Please draft this week's family plan — start the week. Keep what I asked for: \
+             \"Rebalance the whole week around Nadin's travel.\"",
+            monday_w31(),
+        );
+        assert!(
+            matches!(result, FastLaneResult::Fallback { .. }),
+            "an unfulfillable carry must defer, got {result:?}",
+        );
+        assert!(
+            !root.path().join("plans/2026-W31-family-plan.md").exists(),
+            "a week was drafted without the request the family carried into it",
+        );
+    }
+
+    /// A long-day-cell household (`Tuesday July 28`) is editable too — the shape
+    /// the kiosk's own writer produces.
+    #[test]
+    fn a_long_day_cell_row_is_editable() {
+        let long = "\
+# Family week · 2026-W29
+
+**Week of Monday 2026-07-13 to Sunday 2026-07-19**
+**Status:** PUBLISHED
+
+## 1. Meals (planner → cook)
+
+| Day | Kind | Dinner | Time at the stove |
+|-----|------|--------|-------------------|
+| Tuesday July 14 | Fish | Baked hake | ~25 min |
+";
+        let edited = apply_to_content(
+            "2026-W29",
+            long,
+            &FastLaneOp::MealSwap {
+                day: Weekday::Tue,
+                dish: "homemade pizza".into(),
+            },
+        )
+        .expect("a long day cell must be editable");
+        assert!(edited.contains("homemade pizza"), "{edited}");
+    }
+
+    /// …and a first cell that merely STARTS like a weekday is not a day row.
+    #[test]
+    fn a_lookalike_first_cell_is_not_a_day_row() {
+        let sneaky = "\
+# Family week · 2026-W29
+
+**Week of Monday 2026-07-13 to Sunday 2026-07-19**
+**Status:** PUBLISHED
+
+## 1. Meals (planner → cook)
+
+| Day | Kind | Dinner | Prep |
+|-----|------|--------|------|
+| Monthly total | — | 21 dinners | — |
+";
+        assert!(apply_to_content(
+            "2026-W29",
+            sneaky,
+            &FastLaneOp::MealSwap {
+                day: Weekday::Mon,
+                dish: "tacos".into(),
+            },
+        )
+        .is_err());
     }
 }

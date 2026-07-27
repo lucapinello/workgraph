@@ -3974,6 +3974,31 @@ fn main() -> Result<()> {
                 cli.json,
                 mock_send,
             ),
+            TelegramCommands::WeekStart {
+                message,
+                root,
+                now,
+                apply,
+                turn_id,
+                dry_run: _,
+            } => {
+                // Same transport as the live web turn: the gateway's occurrence
+                // id arrives on WG_TURN_ID unless the caller passed it here.
+                let turn_id = turn_id.or_else(|| {
+                    std::env::var("WG_TURN_ID")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                });
+                commands::telegram::run_week_start(
+                    &workgraph_dir,
+                    &message,
+                    root.as_deref(),
+                    now.as_deref(),
+                    apply,
+                    turn_id.as_deref(),
+                    cli.json,
+                )
+            }
             TelegramCommands::Shopping {
                 text,
                 root,

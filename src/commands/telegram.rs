@@ -6251,6 +6251,203 @@ fn resolve_reminder_target(
     resolve_dm_target(config, bindings, &rem.recipient, &rem.bot)
 }
 
+/// Fulfil an accepted week-start offer — the `wg telegram week-start` seam
+/// (see [`crate::cli::TelegramCommands::WeekStart`]).
+///
+/// Runs the exact lane the gateway's dispatched acceptance hits. Without
+/// `--apply` it only reports what the engine RECOGNIZES (is this a week-start
+/// ask, and what requests does it carry). With `--apply --root <scratch>` it
+/// really drafts the week: the plan is assembled, edited with every carried
+/// request and verified IN MEMORY, written only if all of that held, and then
+/// re-read from disk before this command reports success — so a dead pipeline
+/// cannot claim a week it never wrote.
+///
+/// The draft is journaled against the turn id exactly as the live web turn is,
+/// so a dispatcher refire carrying the SAME occurrence id replays the stored
+/// outcome instead of drafting twice. Credential-free throughout.
+pub fn run_week_start(
+    workgraph_dir: &Path,
+    message: &str,
+    root: Option<&Path>,
+    now: Option<&str>,
+    apply: bool,
+    turn_id: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use worksgood::notify::fast_lane::{self, FastLaneResult};
+    use worksgood::notify::telegram_occurrence::{OccurrenceJournal, OccurrenceState};
+    use worksgood::notify::week_start;
+
+    let today = match now {
+        Some(d) => {
+            // Accept both a bare date and the `--now` wall-clock form the other
+            // pinned seams take, so a scratch run can pin the same string.
+            let day = d.split(['T', ' ']).next().unwrap_or(d);
+            chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+                .with_context(|| format!("--now must be YYYY-MM-DD[THH:MM], got {d:?}"))?
+        }
+        None => chrono::Local::now().date_naive(),
+    };
+
+    let ask = week_start::detect(message);
+    let (week_code, monday, sunday) = week_start::iso_week_of(today);
+
+    // The correlation key the live turn builds. `--turn-id` (or WG_TURN_ID) is
+    // the gateway's opaque occurrence id; without one the words are the key, the
+    // same legacy fallback `web-inbound` keeps for older callers.
+    let physical_turn_key = web_physical_turn_key("web", message, turn_id);
+
+    let mut applied: Option<serde_json::Value> = None;
+    if apply {
+        let root = root.ok_or_else(|| anyhow::anyhow!("--apply needs --root <project dir>"))?;
+        if ask.is_none() {
+            anyhow::bail!("not a week-start ask — nothing to apply");
+        }
+        // The occurrence journal belongs to the PROJECT whose week is being
+        // drafted, not to whatever directory the command was invoked from —
+        // otherwise two scratch projects (or two runs of a test) would share one
+        // turn ledger and the second would replay the first one's outcome.
+        let journal_dir = root.join(".wg");
+        let journal_dir = if journal_dir.is_dir() {
+            journal_dir
+        } else {
+            workgraph_dir.to_path_buf()
+        };
+        let (journal, state) = OccurrenceJournal::<WebFastLaneOutcome>::claim(
+            &journal_dir,
+            WEB_FAST_LANE_OCCURRENCE_DOMAIN,
+            &physical_turn_key,
+        )?;
+        applied = Some(match state {
+            // The SAME accepted turn arriving again (a dispatcher refire): the
+            // durable outcome wins and nothing is drafted a second time.
+            OccurrenceState::Applied(prior) | OccurrenceState::Delivered(prior) => {
+                serde_json::json!({
+                    "outcome": "replayed",
+                    "already_delivered": true,
+                    "op": prior.op_kind,
+                    "report": prior.report,
+                })
+            }
+            OccurrenceState::Incomplete => serde_json::json!({
+                "outcome": "incomplete",
+                "already_delivered": false,
+            }),
+            OccurrenceState::PassedThrough => serde_json::json!({
+                "outcome": "passed-through",
+                "already_delivered": false,
+            }),
+            OccurrenceState::New => {
+                let owner_map = worksgood::notify::ownership::OwnerMap::load(root);
+                let owner = owner_map.owner_for_domain(worksgood::notify::ownership::Domain::Calendar);
+                match fast_lane::run_fast_lane_with_calendar_owner(
+                    root,
+                    message,
+                    today,
+                    owner.as_deref(),
+                ) {
+                    FastLaneResult::Applied {
+                        report,
+                        op,
+                        week_code,
+                    } => {
+                        let outcome = WebFastLaneOutcome {
+                            op_kind: op.kind_label().to_string(),
+                            report: report.clone(),
+                            bot_id: String::new(),
+                            chat_id: "web".to_string(),
+                        };
+                        journal.mark_applied(&outcome)?;
+                        // Report the PLAN THAT IS ON DISK, re-read here, rather
+                        // than the lane's own account of what it did.
+                        let path = root.join("plans").join(format!("{week_code}-family-plan.md"));
+                        let written = std::fs::read_to_string(&path).ok();
+                        let doc = written
+                            .as_deref()
+                            .map(|c| worksgood::notify::family_plan::PlanDoc::parse(&week_code, c));
+                        serde_json::json!({
+                            "outcome": "applied",
+                            "already_delivered": false,
+                            "report": report,
+                            "week": week_code,
+                            "plan_path": path.display().to_string(),
+                            "plan_exists": path.exists(),
+                            "day_rows": doc.as_ref().map(|d| d.meals.len()).unwrap_or(0),
+                            "dinners": doc
+                                .as_ref()
+                                .map(|d| d
+                                    .meals
+                                    .iter()
+                                    .map(|m| serde_json::json!({"day": m.weekday, "dish": m.dish}))
+                                    .collect::<Vec<_>>())
+                                .unwrap_or_default(),
+                        })
+                    }
+                    FastLaneResult::Answered { reply, lane } => {
+                        let outcome = WebFastLaneOutcome {
+                            op_kind: format!("ask-{lane}"),
+                            report: reply.clone(),
+                            bot_id: String::new(),
+                            chat_id: "web".to_string(),
+                        };
+                        journal.mark_applied(&outcome)?;
+                        serde_json::json!({
+                            "outcome": "answered",
+                            "already_delivered": false,
+                            "lane": lane,
+                            "reply": reply,
+                        })
+                    }
+                    FastLaneResult::Fallback { reason } => {
+                        journal.mark_passed_through()?;
+                        serde_json::json!({
+                            "outcome": "fallback",
+                            "already_delivered": false,
+                            "reason": reason,
+                        })
+                    }
+                }
+            }
+        });
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "message": message,
+                "lane": if ask.is_some() { "week-start" } else { "none" },
+                "recognized": ask.is_some(),
+                "carried": ask.as_ref().map(|a| a.carried.clone()).unwrap_or_default(),
+                "today": today.to_string(),
+                "week": week_code,
+                "week_start": monday.to_string(),
+                "week_end": sunday.to_string(),
+                "turn_id": turn_id,
+                "turn_key": physical_turn_key,
+                "applied": applied,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "lane:    {}",
+        if ask.is_some() { "week-start" } else { "none" }
+    );
+    if let Some(a) = &ask {
+        for c in &a.carried {
+            println!("carried: {c}");
+        }
+    }
+    println!("week:    {week_code} ({monday} – {sunday})");
+    println!("turn:    {physical_turn_key}");
+    if let Some(a) = &applied {
+        println!("apply:   {a}");
+    }
+    Ok(())
+}
+
 /// What does a shopping sentence DO? — the `wg telegram shopping` seam
 /// (see [`crate::cli::TelegramCommands::Shopping`]).
 ///

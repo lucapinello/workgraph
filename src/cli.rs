@@ -6962,6 +6962,51 @@ pub enum TelegramCommands {
         mock_send: bool,
     },
 
+    /// Fulfil an accepted WEEK-START offer: draft this week's plan (test seam)
+    ///
+    /// The engine half of the week-start promise (task `week-start-engine`).
+    /// When the calendar-current week has no plan of record, every write that
+    /// belongs to one is refused with an offer — "This week isn't set up yet —
+    /// want me to start it?" — and a bare "yes" is rewritten by the gateway into
+    /// an explicit ask that carries the family's original request QUOTED inside
+    /// it (production web inbound drops the structured continuation field, so
+    /// the words are all that survive). This command runs the exact lane that
+    /// ask hits ([`worksgood::notify::week_start`]): it prints whether the
+    /// message is recognized and what carriage it holds, and — with `--apply
+    /// --root <dir>` — really drafts the week under that project's `plans/`,
+    /// with every carried request applied and verified from disk.
+    ///
+    /// Credential-free: no bot, no token, no network, no model. Never point
+    /// `--apply` at the live family project.
+    WeekStart {
+        /// The dispatched message (the rewritten acceptance).
+        message: String,
+
+        /// Project root holding `plans/`. Required with `--apply`.
+        #[arg(long)]
+        root: Option<PathBuf>,
+
+        /// Override "today" as `YYYY-MM-DD` — which week gets drafted.
+        #[arg(long)]
+        now: Option<String>,
+
+        /// Really draft the week under `--root` (a scratch project).
+        #[arg(long)]
+        apply: bool,
+
+        /// The gateway's opaque occurrence id for this accepted turn. With
+        /// `--apply` the draft is journaled against it, so a dispatcher refire
+        /// carrying the SAME id reports the stored outcome instead of drafting
+        /// a second time. Falls back to `WG_TURN_ID`.
+        #[arg(long = "turn-id")]
+        turn_id: Option<String>,
+
+        /// Recognize only — the default. Accepted for symmetry with the other
+        /// seams.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
     /// What does a SHOPPING-LIST sentence do? (mutation-language test seam)
     ///
     /// Runs the exact shopping lane a family message hits
