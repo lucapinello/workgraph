@@ -611,7 +611,19 @@ fn match_reminder(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
         .find_map(|m| s.split_once(m).map(|(_, rest)| rest))
         .unwrap_or(s);
 
-    let (day, body) = pull_day(body, today);
+    // An EXPLICIT date outranks every weekday word beside it: "on Monday,
+    // August 3, 2026" means 3 August, and reading the "Monday" instead is how
+    // that ask once filed itself for today. Strip the phrase out of the body too,
+    // so the calendar row reads "Call the dentist", not the whole sentence.
+    let explicit = super::reminder::find_civil_date(body, today);
+    let body: String = match explicit {
+        Some(found) => format!("{} {}", &body[..found.start], &body[found.end..]),
+        None => body.to_string(),
+    };
+    // "next Monday" is the STRICTLY following Monday — never today, even at 03:20
+    // on a Monday with the clock still ahead of it.
+    let strict_next = super::reminder::names_next_weekday(&body);
+    let (day, body) = pull_day(&body, today);
     let (time, body) = pull_time(&body);
     let text = scrub_fillers(&body);
     if text.is_empty() {
@@ -620,7 +632,18 @@ fn match_reminder(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
     // The date is resolved here, FORWARD from today — a named weekday means its
     // next occurrence, a dayless ask means today. The plan week never anchors it
     // (that is what filed "Monday" on the week's already-elapsed Monday).
-    let date = day.map(|wd| upcoming_weekday(today, wd)).unwrap_or(today);
+    let date = match (explicit, strict_next) {
+        (Some(found), _) => found.date,
+        (None, Some(wd)) => super::reminder::next_weekday_strict(today, wd),
+        (None, None) => day.map(|wd| upcoming_weekday(today, wd)).unwrap_or(today),
+    };
+    // Report the day the resolved DATE actually falls on, so the confirmation
+    // never names a weekday the row was not written for.
+    let day = if explicit.is_some() || strict_next.is_some() {
+        Some(date.weekday())
+    } else {
+        day
+    };
     Some(FastLaneOp::ReminderSet {
         text,
         day,
@@ -974,14 +997,26 @@ fn pull_time(frag: &str) -> (Option<String>, String) {
     let words: Vec<&str> = frag.split_whitespace().collect();
     let mut out_words: Vec<String> = Vec::new();
     let mut time: Option<String> = None;
+    // A meridiem written as its own word belongs to the clock before it: "9:00 am"
+    // is one time, not a time plus the word "am" left behind in the row text (and
+    // "9:00 p.m." is 21:00, not 09:00).
+    let glued = |i: usize| -> Option<(String, usize)> {
+        let head = words.get(i)?;
+        match words.get(i + 1).and_then(|w| meridiem(w)) {
+            Some(m) if !head.ends_with("am") && !head.ends_with("pm") => {
+                parse_clock(&format!("{head}{m}")).map(|t| (t, 2))
+            }
+            _ => parse_clock(head).map(|t| (t, 1)),
+        }
+    };
     let mut i = 0;
     while i < words.len() {
         let w = words[i];
         // "at <time>" — drop the "at" if the next token parses as a time.
         if w == "at" && i + 1 < words.len() {
-            if let Some(t) = parse_clock(words[i + 1]) {
+            if let Some((t, used)) = glued(i + 1) {
                 time = Some(t);
-                i += 2;
+                i += 1 + used;
                 continue;
             }
             if words[i + 1] == "noon" {
@@ -995,15 +1030,26 @@ fn pull_time(frag: &str) -> (Option<String>, String) {
                 continue;
             }
         }
-        if let Some(t) = parse_clock(w) {
+        if let Some((t, used)) = glued(i) {
             time = Some(t);
-            i += 1;
+            i += used;
             continue;
         }
         out_words.push(w.to_string());
         i += 1;
     }
     (time, out_words.join(" "))
+}
+
+/// `"am"` / `"pm"` when a standalone token is a meridiem however it was typed
+/// ("am", "a.m.", "pm.").
+fn meridiem(tok: &str) -> Option<&'static str> {
+    let letters: String = tok.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    match letters.as_str() {
+        "am" => Some("am"),
+        "pm" => Some("pm"),
+        _ => None,
+    }
 }
 
 /// Parse a single time token: "5pm", "5:30pm", "17:00", "9am". Returns `HH:MM`.
@@ -2484,6 +2530,83 @@ mod tests {
                 date: today(),
                 time: None
             }
+        );
+    }
+
+    // ---- next-weekday-strict: bare vs "next" vs an explicit date -----------
+
+    #[test]
+    fn next_weekday_is_the_following_one_and_a_bare_weekday_is_not() {
+        // The live-cert C052 pin, on the fast lane: Monday 2026-07-27 03:20.
+        let monday = NaiveDate::from_ymd_opt(2026, 7, 27).unwrap();
+        assert_eq!(monday.weekday(), Weekday::Mon);
+        let aug3 = NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+
+        let classify_on = |msg: &str| match classify(msg, monday) {
+            Classification::FastLane(op) => op,
+            other => panic!("expected fast lane for {msg:?}, got {other:?}"),
+        };
+
+        // (1) An explicit civil date wins over the weekday word beside it, and
+        // the date phrase is stripped out of the row text.
+        assert_eq!(
+            classify_on("remind me to call the dentist on Monday, August 3, 2026 at 9:00 am"),
+            FastLaneOp::ReminderSet {
+                text: "call the dentist".into(),
+                day: Some(Weekday::Mon),
+                date: aug3,
+                time: Some("09:00".into()),
+            }
+        );
+        // (2) "next Monday" is the STRICTLY following Monday, never this one.
+        assert_eq!(
+            classify_on("remind me to call the dentist next Monday at 9:00 am"),
+            FastLaneOp::ReminderSet {
+                text: "call the dentist".into(),
+                day: Some(Weekday::Mon),
+                date: aug3,
+                time: Some("09:00".into()),
+            }
+        );
+        // (3) A BARE weekday keeps today-or-later — unchanged, and correct.
+        assert_eq!(
+            classify_on("remind me to call the dentist Monday at 9:00 am"),
+            FastLaneOp::ReminderSet {
+                text: "call the dentist".into(),
+                day: Some(Weekday::Mon),
+                date: monday,
+                time: Some("09:00".into()),
+            }
+        );
+        // A detached meridiem belongs to the clock beside it — "9:00 p.m." is
+        // 21:00 and leaves no "p.m." stranded in the row text.
+        assert_eq!(
+            classify_on("remind me to call the dentist next Monday at 9:00 p.m."),
+            FastLaneOp::ReminderSet {
+                text: "call the dentist".into(),
+                day: Some(Weekday::Mon),
+                date: aug3,
+                time: Some("21:00".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_next_weekday_reminder_writes_the_following_weeks_row() {
+        // The row the family actually gets: filed for Jul 20 (the Monday AFTER
+        // today's Tue Jul 14), not for the Monday inside this plan week.
+        let op = fast("remind me next Monday to take the bins out");
+        match &op {
+            FastLaneOp::ReminderSet { date, .. } => {
+                assert_eq!(*date, NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+        let edited = apply_to_content_with_calendar_owner("2026-W29", W29, &op, Some("otto"))
+            .expect("reminder row");
+        assert!(
+            edited.contains("Mon 07-20"),
+            "'next Monday' did not land on the following Monday:\n{edited}"
         );
     }
 

@@ -60,6 +60,16 @@ bindings:
     created_at: "2026-07-01T00:00:00Z"
 YAML
 
+# The row's Source column ("Otto") must resolve to ONE configured voice. Since
+# the fail-closed owner rule landed, an unknown source yields no reminder at all
+# — without this household the scenario went quietly green-to-red on step 1.
+cat > "$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "otto"
+name = "Otto"
+domains = ["coordination", "calendar"]
+TOML
+
 remind() { (cd "$scratch" && WG_DIR="$scratch/.wg" wg telegram remind "$@"); }
 
 echo "1. the plan reminder row is listed as one pending reminder:"

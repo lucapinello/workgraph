@@ -506,7 +506,7 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
         return None;
     }
 
-    let (date, day_label) = resolve_day(&low, now.date());
+    let (date, day_label, day_kind) = resolve_day(&low, now.date());
     let (time, time_label, had_time) = resolve_time(&low, now, date);
 
     // Require *some* time signal — a day word or an explicit clock — so bare
@@ -520,11 +520,15 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
     // tomorrow ("remind me at 7", said at 8pm, means the next 7). With a bare
     // weekday, roll a whole week — "remind me Monday at 8am", said on Monday
     // afternoon, means the UPCOMING Monday, never this morning.
+    //
+    // An EXPLICIT day never rolls: "next Monday" and "August 3" already point at
+    // one specific date, and silently adding a week to a date the family typed
+    // out is a worse lie than filing it as asked.
     let due = if due <= now {
-        match (&day_label, named_weekday(&low)) {
-            (None, _) => (date + Duration::days(1)).and_time(time),
-            (Some(_), Some(_)) => (date + Duration::days(7)).and_time(time),
-            (Some(_), None) => due,
+        match day_kind {
+            DayKind::None => (date + Duration::days(1)).and_time(time),
+            DayKind::BareWeekday => (date + Duration::days(7)).and_time(time),
+            DayKind::Relative | DayKind::NextWeekday | DayKind::CivilDate => due,
         }
     } else {
         due
@@ -715,23 +719,71 @@ fn scrub_cancel_noise(frag: &str) -> String {
         .join(" ")
 }
 
-/// Resolve the day part of a time expression. Returns the date and a friendly
-/// label (`Some("Thursday")`, `Some("tomorrow")`) when a day word was found;
-/// `None` label means "no day word — default to today".
-fn resolve_day(low: &str, today: NaiveDate) -> (NaiveDate, Option<String>) {
+/// How the day part of a time expression was resolved. The caller needs this to
+/// decide whether a due instant that has already passed may be rolled forward:
+/// a BARE weekday rolls a whole week, an EXPLICIT date never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DayKind {
+    /// No day word at all — the date defaulted to today.
+    None,
+    /// "today" / "tonight" / "tomorrow".
+    Relative,
+    /// A bare weekday name ("Monday") — today counts when today is that weekday.
+    BareWeekday,
+    /// "next Monday" — the STRICTLY following Monday, never today.
+    NextWeekday,
+    /// An explicit civil date ("Monday, August 3, 2026", "8/3/2026", "2026-08-03").
+    CivilDate,
+}
+
+/// Resolve the day part of a time expression. Returns the date, a friendly
+/// label (`Some("Thursday")`, `Some("tomorrow")`) when a day word was found
+/// (`None` label means "no day word — default to today"), and how it resolved.
+///
+/// Precedence, most specific first:
+///
+/// 1. an **explicit civil date** — when the family writes "Monday, August 3,
+///    2026" the DATE is what they mean; the weekday word beside it is prose, and
+///    resolving it as a weekday is how "August 3" once landed on July 27;
+/// 2. `today` / `tonight` / `tomorrow`;
+/// 3. `next <weekday>` — the strictly FOLLOWING occurrence, never today;
+/// 4. a bare `<weekday>` — the next occurrence on or after today.
+fn resolve_day(low: &str, today: NaiveDate) -> (NaiveDate, Option<String>, DayKind) {
+    if let Some(found) = find_civil_date(low, today) {
+        return (
+            found.date,
+            Some(long_weekday_name(found.date.weekday()).to_string()),
+            DayKind::CivilDate,
+        );
+    }
     if contains_word(low, "tomorrow") {
-        return (today + Duration::days(1), Some("tomorrow".to_string()));
+        return (
+            today + Duration::days(1),
+            Some("tomorrow".to_string()),
+            DayKind::Relative,
+        );
     }
     if contains_word(low, "today") || contains_word(low, "tonight") {
-        return (today, Some("today".to_string()));
+        return (today, Some("today".to_string()), DayKind::Relative);
+    }
+    if let Some(wd) = names_next_weekday(low) {
+        return (
+            next_weekday_strict(today, wd),
+            Some(long_weekday_name(wd).to_string()),
+            DayKind::NextWeekday,
+        );
     }
     for (names, wd) in WEEKDAYS {
         if names.iter().any(|n| contains_word(low, n)) {
             let date = next_weekday(today, *wd);
-            return (date, Some(long_weekday_name(*wd).to_string()));
+            return (
+                date,
+                Some(long_weekday_name(*wd).to_string()),
+                DayKind::BareWeekday,
+            );
         }
     }
-    (today, None)
+    (today, None, DayKind::None)
 }
 
 /// Weekday match table: (aliases, chrono weekday).
@@ -755,6 +807,246 @@ fn next_weekday(from: NaiveDate, wd: Weekday) -> NaiveDate {
     from + Duration::days(delta.rem_euclid(7))
 }
 
+/// The STRICTLY following occurrence of `wd` after `from` — today never counts.
+///
+/// This is what "next Monday" means and what [`next_weekday`] cannot express: its
+/// delta is modulo seven, so on a Monday it returns that same Monday. Said at
+/// 03:20 on Monday 27 July, "remind me next Monday at 9" meant 3 August; the
+/// modulo rule filed it for 09:00 that same morning, five hours later.
+pub(crate) fn next_weekday_strict(from: NaiveDate, wd: Weekday) -> NaiveDate {
+    let delta =
+        (wd.num_days_from_monday() as i64) - (from.weekday().num_days_from_monday() as i64);
+    let ahead = delta.rem_euclid(7);
+    from + Duration::days(if ahead == 0 { 7 } else { ahead })
+}
+
+/// The weekday of an explicit `next <weekday>` phrase, if the text carries one.
+///
+/// Only a weekday DIRECTLY introduced by "next" counts, so "next week's Monday
+/// plan" (no adjacency) and a bare "Monday" both fall through to the today-or-
+/// later rule, which is correct for them.
+pub(crate) fn names_next_weekday(low: &str) -> Option<Weekday> {
+    let words: Vec<&str> = low
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .collect();
+    for (i, w) in words.iter().enumerate() {
+        if !w.eq_ignore_ascii_case("next") {
+            continue;
+        }
+        let Some(after) = words.get(i + 1) else {
+            continue;
+        };
+        let after = after.to_ascii_lowercase();
+        if let Some((_, wd)) = WEEKDAYS.iter().find(|(names, _)| names.contains(&after.as_str())) {
+            return Some(*wd);
+        }
+    }
+    None
+}
+
+/// An explicit civil date found in a request, with the byte span it occupied so
+/// callers can strip the phrase out of the reminder body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FoundDate {
+    /// The resolved calendar date.
+    pub date: NaiveDate,
+    /// Byte range of the matched phrase within the searched string.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Month names and their common abbreviations.
+const MONTHS: &[(&[&str], u32)] = &[
+    (&["january", "jan"], 1),
+    (&["february", "feb"], 2),
+    (&["march", "mar"], 3),
+    (&["april", "apr"], 4),
+    (&["may"], 5),
+    (&["june", "jun"], 6),
+    (&["july", "jul"], 7),
+    (&["august", "aug"], 8),
+    (&["september", "sept", "sep"], 9),
+    (&["october", "oct"], 10),
+    (&["november", "nov"], 11),
+    (&["december", "dec"], 12),
+];
+
+/// The date an explicit civil date in `low` names, if any. See [`find_civil_date`].
+pub(crate) fn parse_civil_date(low: &str, today: NaiveDate) -> Option<NaiveDate> {
+    find_civil_date(low, today).map(|f| f.date)
+}
+
+/// Find an explicit civil date in `low` (already lowercased).
+///
+/// Four shapes, all anchored so ordinary prose cannot be mistaken for a date:
+///
+/// * `august 3`, `august 3, 2026`, `aug 3rd` — a month NAME with an adjacent
+///   day number. The adjacency requirement is what keeps the modal "may" and the
+///   verb "march" from reading as months.
+/// * `3 august 2026` — the day-first ordering.
+/// * `2026-08-03` — ISO, unambiguous, accepted anywhere.
+/// * `8/3/2026` — US month/day/year. The two-part `8/3` is accepted ONLY when
+///   introduced by "on"/"the", so "add 1/2 cup" stays a quantity, not 2 January.
+///
+/// With no year, the year is the one that puts the date on or after `today` —
+/// "remind me on January 4", said in December, means the January four weeks out,
+/// not the one ten months gone.
+pub(crate) fn find_civil_date(low: &str, today: NaiveDate) -> Option<FoundDate> {
+    // Word spans, so a match can be reported back as a byte range.
+    let spans: Vec<(usize, usize, &str)> = low
+        .split_whitespace()
+        .map(|w| {
+            let start = w.as_ptr() as usize - low.as_ptr() as usize;
+            (start, start + w.len(), w)
+        })
+        .collect();
+
+    for (i, (start, end, raw)) in spans.iter().enumerate() {
+        let word = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+
+        // ISO 2026-08-03.
+        if let Some(date) = parse_iso_date(word) {
+            return Some(FoundDate {
+                date,
+                start: *start,
+                end: *end,
+            });
+        }
+
+        // Numeric 8/3/2026, or 8/3 when introduced by "on"/"the".
+        if word.contains('/') {
+            let introduced = i > 0
+                && matches!(
+                    spans[i - 1]
+                        .2
+                        .trim_matches(|c: char| !c.is_ascii_alphanumeric()),
+                    "on" | "the"
+                );
+            if let Some(date) = parse_slash_date(word, today, introduced) {
+                return Some(FoundDate {
+                    date,
+                    start: *start,
+                    end: *end,
+                });
+            }
+        }
+
+        // Month name + adjacent day number, in either order, with an optional year.
+        let Some(month) = month_number(word) else {
+            continue;
+        };
+        // "august 3[, 2026]"
+        if let Some(day) = spans.get(i + 1).and_then(|(_, _, w)| day_number(w)) {
+            let (year, last) = match spans.get(i + 2).and_then(|(_, e, w)| year_number(w).map(|y| (y, *e))) {
+                Some((y, e)) => (y, e),
+                None => (infer_year(month, day, today), spans[i + 1].1),
+            };
+            if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+                return Some(FoundDate {
+                    date,
+                    start: *start,
+                    end: last,
+                });
+            }
+        }
+        // "3 august [2026]"
+        if i > 0 {
+            if let Some(day) = day_number(spans[i - 1].2) {
+                let (year, last) = match spans.get(i + 1).and_then(|(_, e, w)| year_number(w).map(|y| (y, *e))) {
+                    Some((y, e)) => (y, e),
+                    None => (infer_year(month, day, today), *end),
+                };
+                if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+                    return Some(FoundDate {
+                        date,
+                        start: spans[i - 1].0,
+                        end: last,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The month a word names, if it is a month name or a known abbreviation.
+fn month_number(word: &str) -> Option<u32> {
+    MONTHS
+        .iter()
+        .find(|(names, _)| names.contains(&word))
+        .map(|(_, m)| *m)
+}
+
+/// A day-of-month number, tolerating an ordinal suffix and trailing punctuation
+/// ("3", "3,", "3rd", "21st").
+fn day_number(word: &str) -> Option<u32> {
+    let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    let digits: String = w.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = &w[digits.len()..];
+    if !matches!(rest, "" | "st" | "nd" | "rd" | "th") {
+        return None;
+    }
+    let n: u32 = digits.parse().ok()?;
+    (1..=31).contains(&n).then_some(n)
+}
+
+/// A 4-digit calendar year, tolerating trailing punctuation.
+fn year_number(word: &str) -> Option<i32> {
+    let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if w.len() != 4 || !w.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let y: i32 = w.parse().ok()?;
+    (1900..=2200).contains(&y).then_some(y)
+}
+
+/// The year that puts `month`/`day` on or after `today` — this year when it has
+/// not yet passed, else next year.
+fn infer_year(month: u32, day: u32, today: NaiveDate) -> i32 {
+    match NaiveDate::from_ymd_opt(today.year(), month, day) {
+        Some(d) if d >= today => today.year(),
+        _ => today.year() + 1,
+    }
+}
+
+/// `2026-08-03`.
+fn parse_iso_date(word: &str) -> Option<NaiveDate> {
+    let parts: Vec<&str> = word.split('-').collect();
+    if parts.len() != 3 || parts[0].len() != 4 {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    )
+}
+
+/// `8/3/2026`, or `8/3` when `introduced` (directly after "on"/"the"). US
+/// month/day ordering — the families this ships to write dates that way.
+fn parse_slash_date(word: &str, today: NaiveDate, introduced: bool) -> Option<NaiveDate> {
+    let parts: Vec<&str> = word.split('/').collect();
+    if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    let month: u32 = parts.first()?.parse().ok()?;
+    let day: u32 = parts.get(1)?.parse().ok()?;
+    match parts.len() {
+        2 if introduced => NaiveDate::from_ymd_opt(infer_year(month, day, today), month, day),
+        3 => {
+            let raw = parts[2];
+            let year: i32 = raw.parse().ok()?;
+            let year = if raw.len() == 2 { 2000 + year } else { year };
+            NaiveDate::from_ymd_opt(year, month, day)
+        }
+        _ => None,
+    }
+}
+
 /// The weekday a bare day name in `low` refers to, if any.
 fn named_weekday(low: &str) -> Option<Weekday> {
     WEEKDAYS.iter().find_map(|(names, wd)| {
@@ -763,6 +1055,29 @@ fn named_weekday(low: &str) -> Option<Weekday> {
             .any(|n| contains_word(low, n))
             .then_some(*wd)
     })
+}
+
+/// "August 3" — the month/day half of a spelled-out date, for confirmations.
+fn month_day(date: NaiveDate) -> String {
+    const LONG: &[&str] = &[
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let name = LONG
+        .get(date.month0() as usize)
+        .copied()
+        .unwrap_or_default();
+    format!("{} {}", name, date.day())
 }
 
 fn long_weekday_name(wd: Weekday) -> &'static str {
@@ -821,18 +1136,52 @@ fn parse_explicit_time(low: &str) -> Option<(NaiveTime, String)> {
         // A token right after "at" is the strongest signal, but we also accept a
         // standalone clock token anywhere.
         let is_after_at = i > 0 && tokens[i - 1] == "at";
-        if let Some(t) = parse_time_token(tok) {
+        // A meridiem written as its own word — "9:00 a.m.", "7 p.m." — belongs to
+        // the clock before it. Without this, "9:00 p.m." parsed as 09:00 and the
+        // reminder fired twelve hours early.
+        let trailing = tokens.get(i + 1).and_then(|t| meridiem(t));
+        if let Some(t) = parse_time_token(&apply_meridiem(tok, trailing)) {
             // Guard bare integers (e.g. "3 eggs"): only accept a lone number when
-            // it directly followed "at".
-            let bare_int = !tok.contains(':') && !tok.contains("am") && !tok.contains("pm");
+            // it directly followed "at" or carries its own meridiem.
+            let bare_int = !tok.contains(':')
+                && !tok.contains("am")
+                && !tok.contains("pm")
+                && trailing.is_none();
             if bare_int && !is_after_at {
                 continue;
             }
-            let label = format!("at {}", tok);
+            let label = match trailing {
+                Some(m) => format!("at {}{}", tok, m),
+                None => format!("at {}", tok),
+            };
             return Some((t, label));
         }
     }
     None
+}
+
+/// `"am"` / `"pm"` when a standalone token is a meridiem in any of the ways a
+/// family types it ("am", "a.m.", "A.M.", "pm.").
+fn meridiem(tok: &str) -> Option<&'static str> {
+    let squashed: String = tok
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match squashed.as_str() {
+        "am" => Some("am"),
+        "pm" => Some("pm"),
+        _ => None,
+    }
+}
+
+/// Glue a detached meridiem onto a clock token so one parser handles both
+/// `"7pm"` and `"7 p.m."`.
+fn apply_meridiem(tok: &str, m: Option<&str>) -> String {
+    match m {
+        Some(m) if !tok.ends_with("am") && !tok.ends_with("pm") => format!("{tok}{m}"),
+        _ => tok.to_string(),
+    }
 }
 
 /// Parse one clock token: `7`, `7pm`, `7:30`, `19:30`, `7:30am`.
@@ -936,9 +1285,16 @@ fn strip_trailing_time(body: &str) -> String {
                 | "noon"
                 | "at"
                 | "on"
+                | "next"
         ) || WEEKDAYS
             .iter()
             .any(|(names, _)| names.contains(&w.as_str()))
+            // The pieces of a spelled-out date, so "call the dentist on Monday,
+            // August 3, 2026 at 9:00 a.m." files as "Call the dentist".
+            || month_number(&w).is_some()
+            || year_number(&w).is_some()
+            || day_number(&w).is_some()
+            || meridiem(&w).is_some()
             || parse_time_token(&w)
                 .is_some_and(|_| w.contains(':') || w.ends_with("am") || w.ends_with("pm"))
     };
@@ -977,6 +1333,14 @@ fn confirm_line(
             long_weekday_name(due.weekday()).to_string()
         }
     });
+    // A weekday name alone cannot identify a date more than a week out — "Monday"
+    // reads as the one a few days from now, which is exactly the confusion
+    // "next Monday" was filed under. Name the date when it is that far ahead.
+    let day = if (due.date() - now.date()).num_days() > 6 {
+        format!("{}, {}", day, month_day(due.date()))
+    } else {
+        day
+    };
     // With no explicit time word, describe the default slot by part-of-day
     // ("Thursday morning") so the confirmation reads like a human wrote it.
     let time_phrase = time_label
@@ -1365,6 +1729,129 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- next-weekday-strict: three phrasings, three DIFFERENT dates ---------
+
+    #[test]
+    fn next_weekday_is_strictly_after_today_and_a_bare_one_is_not() {
+        // The live-cert C052 probe, at its exact pin: Monday 2026-07-27 at 03:20,
+        // with 09:00 still five hours ahead. All three phrasings registered for
+        // TODAY; only the last one should have.
+        let now = dt(2026, 7, 27, 3, 20);
+        assert_eq!(now.weekday(), Weekday::Mon);
+
+        let civil = parse_reminder_intent(
+            "Remind me to call the dentist on Monday, August 3, 2026 at 9:00 a.m.",
+            now,
+        )
+        .expect("intent");
+        assert_eq!(civil.due, dt(2026, 8, 3, 9, 0), "an explicit date is the date");
+        assert_eq!(civil.text, "Call the dentist");
+
+        let next = parse_reminder_intent("Remind me to call the dentist next Monday at 9:00 a.m.", now)
+            .expect("intent");
+        assert_eq!(next.due, dt(2026, 8, 3, 9, 0), "'next Monday' is never today");
+
+        // The distinction: a BARE weekday keeps today-if-the-time-is-ahead.
+        let bare = parse_reminder_intent("Remind me to call the dentist Monday at 9:00 a.m.", now)
+            .expect("intent");
+        assert_eq!(bare.due, dt(2026, 7, 27, 9, 0), "a bare weekday still means today");
+        assert!(
+            bare.due < next.due,
+            "bare and 'next' must not resolve to the same day"
+        );
+    }
+
+    #[test]
+    fn next_weekday_never_lands_on_today_from_any_day_of_the_week() {
+        for offset in 0..7 {
+            let now = dt(2026, 7, 20, 12, 0) + Duration::days(offset);
+            for (word, wd) in [
+                ("monday", Weekday::Mon),
+                ("wednesday", Weekday::Wed),
+                ("friday", Weekday::Fri),
+                ("sunday", Weekday::Sun),
+            ] {
+                let intent =
+                    parse_reminder_intent(&format!("remind me next {word} at 9am to call the vet"), now)
+                        .expect("intent");
+                assert_eq!(intent.due.weekday(), wd);
+                assert!(
+                    intent.due.date() > now.date(),
+                    "next {word} from {now} must be strictly later, got {}",
+                    intent.due
+                );
+                assert!(
+                    (intent.due.date() - now.date()).num_days() <= 7,
+                    "next {word} from {now} skipped an occurrence: {}",
+                    intent.due
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_civil_dates_parse_in_the_shapes_families_type() {
+        let now = dt(2026, 7, 27, 3, 20);
+        for (msg, want) in [
+            ("remind me on august 3 at 9am to call", dt(2026, 8, 3, 9, 0)),
+            ("remind me on August 3, 2026 at 9am to call", dt(2026, 8, 3, 9, 0)),
+            ("remind me aug 3rd at 9am to call", dt(2026, 8, 3, 9, 0)),
+            ("remind me on 3 August 2026 at 9am to call", dt(2026, 8, 3, 9, 0)),
+            ("remind me on 2026-08-03 at 9am to call", dt(2026, 8, 3, 9, 0)),
+            ("remind me on 8/3/2026 at 9am to call", dt(2026, 8, 3, 9, 0)),
+            ("remind me on 8/3 at 9am to call", dt(2026, 8, 3, 9, 0)),
+            // A month/day already past this year rolls to next year, not backwards.
+            ("remind me on january 4 at 9am to call", dt(2027, 1, 4, 9, 0)),
+        ] {
+            let intent = parse_reminder_intent(msg, now).unwrap_or_else(|| panic!("no intent: {msg}"));
+            assert_eq!(intent.due, want, "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_quantity_is_not_a_date_and_a_modal_is_not_a_month() {
+        let now = dt(2026, 7, 27, 3, 20);
+        // "1/2 cup" is a fraction, not 2 January. It has no other day word, so the
+        // ask resolves to today's default slot — never to a spurious date.
+        let intent = parse_reminder_intent("remind me at 9am to buy 1/2 cup of cream", now)
+            .expect("intent");
+        assert_eq!(intent.due, dt(2026, 7, 27, 9, 0));
+        // A bare month word with no adjacent day number is prose, not a date.
+        let intent =
+            parse_reminder_intent("remind me at 9am to ask whether we may go", now).expect("intent");
+        assert_eq!(intent.due, dt(2026, 7, 27, 9, 0));
+    }
+
+    #[test]
+    fn a_detached_meridiem_is_read_as_pm_not_am() {
+        // "9:00 p.m." split into two tokens and only "9:00" parsed — the reminder
+        // was filed twelve hours early.
+        let now = dt(2026, 7, 27, 3, 20);
+        let intent = parse_reminder_intent("remind me next monday at 9:00 p.m. to call", now)
+            .expect("intent");
+        assert_eq!(intent.due, dt(2026, 8, 3, 21, 0));
+        let am = parse_reminder_intent("remind me next monday at 9:00 a.m. to call", now)
+            .expect("intent");
+        assert_eq!(am.due, dt(2026, 8, 3, 9, 0));
+    }
+
+    #[test]
+    fn a_date_more_than_a_week_out_is_named_in_the_confirmation() {
+        // "Will do — Monday at 9:00 ✓" for a date eight days away reads as the
+        // Monday three days from now. Name it.
+        let now = dt(2026, 7, 27, 3, 20);
+        let intent = parse_reminder_intent("remind me next monday at 9am to call the dentist", now)
+            .expect("intent");
+        assert_eq!(
+            intent.confirmation,
+            "Will do — Monday, August 3 at 9am \u{2713}"
+        );
+        // Inside the week, the short form is unchanged.
+        let near = parse_reminder_intent("Otto remind me Thursday to defrost the trout", dt(2026, 7, 12, 10, 0))
+            .expect("intent");
+        assert_eq!(near.confirmation, "Will do — Thursday morning \u{2713}");
     }
 
     #[test]
