@@ -4953,7 +4953,7 @@ async fn run_web_fast_lane_occurrence(
     );
     let classified_fast_lane = readback.is_some()
         || matches!(
-            fast_lane::classify(message, today),
+            fast_lane::classify_at(message, web_fast_lane_now(today)),
             Classification::FastLane(_) | Classification::Ask { .. }
         );
     let opened = if classified_fast_lane {
@@ -4987,8 +4987,12 @@ async fn run_web_fast_lane_occurrence(
                 journal.mark_applied(&outcome)?;
                 (outcome, false)
             } else {
-            match fast_lane::run_fast_lane_with_calendar_owner(root, message, today, calendar_owner)
-            {
+            match fast_lane::run_fast_lane_at(
+                root,
+                message,
+                web_fast_lane_now(today),
+                calendar_owner,
+            ) {
                 FastLaneResult::Fallback { .. } => {
                     // This closed-set classifier did not ultimately own the turn
                     // (for example, no current plan could be edited). Persist that
@@ -6741,10 +6745,10 @@ pub fn run_week_start(
             OccurrenceState::New => {
                 let owner_map = worksgood::notify::ownership::OwnerMap::load(root);
                 let owner = owner_map.owner_for_domain(worksgood::notify::ownership::Domain::Calendar);
-                match fast_lane::run_fast_lane_with_calendar_owner(
+                match fast_lane::run_fast_lane_at(
                     root,
                     message,
-                    today,
+                    web_fast_lane_now(today),
                     owner.as_deref(),
                 ) {
                     FastLaneResult::Applied {
@@ -6872,7 +6876,7 @@ pub fn run_shopping_language(
         None => chrono::Local::now().date_naive(),
     };
 
-    let (lane, item, reply, reason) = match fast_lane::classify(text, today) {
+    let (lane, item, reply, reason) = match fast_lane::classify_at(text, web_fast_lane_now(today)) {
         Classification::FastLane(op) => {
             let item = match &op {
                 fast_lane::FastLaneOp::ShoppingAdd { item }
@@ -6903,7 +6907,7 @@ pub fn run_shopping_language(
     // The real write, against a SCRATCH project — the live proof seam.
     let applied = if apply {
         let root = root.ok_or_else(|| anyhow::anyhow!("--apply needs --root <project dir>"))?;
-        match fast_lane::run_fast_lane(root, text, today) {
+        match fast_lane::run_fast_lane_at(root, text, web_fast_lane_now(today), None) {
             FastLaneResult::Applied {
                 report, week_code, ..
             } => Some(serde_json::json!({

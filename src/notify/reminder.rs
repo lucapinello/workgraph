@@ -507,6 +507,20 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
     }
 
     let (date, day_label, day_kind) = resolve_day(&low, now.date());
+
+    // FAIL CLOSED on a typed date that cannot be honoured as written: one already
+    // gone, or one its own weekday word contradicts ("Tuesday, August 3, 2026" —
+    // August 3 is a Monday). Which half the family meant is genuinely unknown,
+    // and guessing puts the reminder on the wrong day; the composer asks instead.
+    if day_kind == DayKind::CivilDate {
+        if date < now.date() {
+            return None;
+        }
+        if named_weekday(&low).is_some_and(|wd| wd != date.weekday()) {
+            return None;
+        }
+    }
+
     let (time, time_label, had_time) = resolve_time(&low, now, date);
 
     // Require *some* time signal — a day word or an explicit clock — so bare
@@ -1835,6 +1849,37 @@ mod tests {
         let am = parse_reminder_intent("remind me next monday at 9:00 a.m. to call", now)
             .expect("intent");
         assert_eq!(am.due, dt(2026, 8, 3, 9, 0));
+    }
+
+    #[test]
+    fn an_unhonourable_typed_date_asks_instead_of_guessing() {
+        let now = dt(2026, 7, 27, 3, 20);
+        // A date already gone cannot be scheduled — and must not silently roll a
+        // year forward either, which is what "file it anyway" would amount to.
+        assert!(
+            parse_reminder_intent("remind me on July 4, 2026 at 9am to call", now).is_none(),
+            "an elapsed typed date must not be filed"
+        );
+        // The weekday word and the date disagree: August 3 2026 is a MONDAY.
+        assert!(
+            parse_reminder_intent("remind me on Tuesday, August 3, 2026 at 9am to call", now)
+                .is_none(),
+            "a weekday/date disagreement must be asked about, not resolved"
+        );
+        // The agreeing form still files.
+        assert!(
+            parse_reminder_intent("remind me on Monday, August 3, 2026 at 9am to call", now)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_bare_weekday_whose_clock_has_passed_rolls_a_week() {
+        // The audit's second control: same Monday, but now PAST 09:00.
+        let now = dt(2026, 7, 27, 9, 30);
+        let intent = parse_reminder_intent("remind me Monday at 9am to call the dentist", now)
+            .expect("intent");
+        assert_eq!(intent.due, dt(2026, 8, 3, 9, 0));
     }
 
     #[test]
