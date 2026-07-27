@@ -6883,6 +6883,20 @@ pub enum TelegramCommands {
         #[arg(long)]
         recipient: Option<String>,
 
+        /// READ a reminder back: answer a question about what is already set,
+        /// e.g. `--ask "what date and time is the reminder to call the dentist
+        /// set for?" --as Luca`. The answer comes from the persisted plan rows +
+        /// ad-hoc list — never from the question — so a question asserting the
+        /// wrong date is corrected, not agreed with. Writes nothing.
+        #[arg(long)]
+        ask: Option<String>,
+
+        /// Who is asking, as a family display name. REQUIRED with `--ask`: the
+        /// answer is scoped to that person's own reminders (plus the ones
+        /// addressed to nobody), so one member can never read another's.
+        #[arg(long = "as")]
+        asker: Option<String>,
+
         /// Override "now" as `YYYY-MM-DDTHH:MM` (local wall clock) for
         /// deterministic tests; defaults to the system clock.
         #[arg(long)]

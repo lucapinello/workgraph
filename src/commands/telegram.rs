@@ -1600,14 +1600,31 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         // the dentist" carries the reminder verb and would otherwise
                         // be filed as a SECOND reminder (date-reminder-fail (c)).
                         let reminder_now = chrono::Local::now().naive_local();
-                        let short_circuit = try_cancel_reminder(
+                        // READ-BACK IS CHECKED FIRST (task reminder-readback-lane):
+                        // "what date is the reminder to call the dentist set for?"
+                        // is a question about what is already on file. Answered
+                        // deterministically from disk, scoped to the asker, writing
+                        // nothing — and ahead of the cancel lane, because "did you
+                        // cancel my dentist reminder?" carries the cancel verb and
+                        // would otherwise be answered by actually cancelling it.
+                        let short_circuit = try_reminder_readback(
                             &workgraph_dir,
                             &auth_sender,
                             &msg.sender,
                             &route_body,
                             reminder_now,
                         )
-                        .map(|reply| ("reminder-cancel", reply))
+                        .map(|reply| ("reminder-read", reply))
+                        .or_else(|| {
+                            try_cancel_reminder(
+                                &workgraph_dir,
+                                &auth_sender,
+                                &msg.sender,
+                                &route_body,
+                                reminder_now,
+                            )
+                            .map(|reply| ("reminder-cancel", reply))
+                        })
                         .or_else(|| {
                             try_register_reminder(
                                 &workgraph_dir,
@@ -2045,6 +2062,68 @@ fn try_capability_answer(workgraph_dir: &Path, body: &str) -> Option<(&'static s
     // Same guard every deterministic family-facing reply passes through.
     let roster = grounding::load_family_voice_roster(&root, workgraph_dir);
     Some(("capability", grounding::enforce_family_voice(&answer, &roster)))
+}
+
+/// Answer a reminder READ-BACK ("what date and time is the reminder to call the
+/// dentist set for?") from what is persisted, scoped to the person asking.
+///
+/// THE GAP THIS CLOSES (task reminder-readback-lane, live-cert C052). A reminder
+/// could be filed by three paths and read back by none: the grounded block reads
+/// the weekly plan model only — never the ad-hoc reminders this listener writes —
+/// and the fast lane hands every reminder read to the composer. So the answer was
+/// drafted with no reminder data in front of it and simply agreed with whatever
+/// date the QUESTION carried. Here the answer comes off disk instead: the same
+/// plan-rows + ad-hoc merge `wg telegram remind --list` shows, filtered to the
+/// asker's own reminders, rendered deterministically. Zero writes, one reply.
+///
+/// Returns `None` — leaving the turn exactly as it was — when the text is not a
+/// reminder read, or when the sender is not a confirmed human. The unconfirmed
+/// case matters for privacy as much as onboarding: without a resolved identity
+/// there is no one to scope the answer to, and an unscoped answer would disclose
+/// another member's reminder.
+///
+/// Checked BEFORE [`try_cancel_reminder`] and [`try_register_reminder`] on
+/// purpose: "did you cancel my dentist reminder?" is a QUESTION carrying a cancel
+/// verb, and the cancel lane would otherwise answer it by actually cancelling.
+fn try_reminder_readback(
+    workgraph_dir: &Path,
+    sender: &str,
+    sender_display: &str,
+    body: &str,
+    now: chrono::NaiveDateTime,
+) -> Option<String> {
+    use worksgood::agency::TelegramBindingMap;
+    use worksgood::notify::{grounding, reminder_readback};
+
+    // Cheap and pure first: a non-reminder turn costs nothing here.
+    reminder_readback::parse_readback(body)?;
+
+    let agency_dir = workgraph_dir.join("agency");
+    let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
+    let requester = match bindings.find_by_identity(Some(sender), Some(sender_display)) {
+        Some(b) if b.confirmed && !b.name.trim().is_empty() => b.name.clone(),
+        _ => return None,
+    };
+    let members: Vec<String> = bindings
+        .bindings
+        .iter()
+        .map(|b| b.name.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    let root = project_root(workgraph_dir);
+    let owner_map = ownership::OwnerMap::load(&root);
+    let answer = reminder_readback::answer_for(
+        &root,
+        body,
+        &requester,
+        &members,
+        &owner_map,
+        now,
+    )?;
+    // Same guard every deterministic family-facing reply passes through.
+    let roster = grounding::load_family_voice_roster(&root, workgraph_dir);
+    Some(grounding::enforce_family_voice(&answer, &roster))
 }
 
 /// Detect a "cancel the reminder about …" request and drop the ONE pending
@@ -4588,6 +4667,19 @@ fn web_fast_lane_delivery_id(physical_turn_key: &str) -> String {
 /// 4 leaves `applied`; the replay sends the stored bytes to the stored route
 /// without touching the plan again. The transport ledger itself claims before
 /// send, closing the send-success/journal-mark crash window.
+/// The wall clock to reason about reminders with on the web path, which is handed
+/// a DATE rather than an instant. The live clock when that date is really today;
+/// the start of the named day when a caller pinned `--today` for a test, so a
+/// pinned run sees that whole day's reminders as still ahead of it.
+fn web_fast_lane_now(today: chrono::NaiveDate) -> chrono::NaiveDateTime {
+    let live = chrono::Local::now().naive_local();
+    if live.date() == today {
+        live
+    } else {
+        today.and_hms_opt(0, 0, 0).unwrap_or(live)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_web_fast_lane_occurrence(
     workgraph_dir: &Path,
@@ -4614,10 +4706,23 @@ async fn run_web_fast_lane_occurrence(
     // it must be journaled and delivered exactly once, like an applied edit, or the
     // question would be dropped and the composer would answer in its place with a
     // confident fabrication (task engine-shopping-language).
-    let classified_fast_lane = matches!(
-        fast_lane::classify(message, today),
-        Classification::FastLane(_) | Classification::Ask { .. }
+    // REMINDER READ-BACK (task reminder-readback-lane). "What date and time is
+    // the reminder to call the dentist set for?" is a question about what is
+    // already on file — answered here, from disk, scoped to the person asking,
+    // writing nothing. It is journaled exactly like a safety-lane ASK so the one
+    // deterministic reply cannot double-post, and it never mints a graph node.
+    let readback = try_reminder_readback(
+        workgraph_dir,
+        auth_sender,
+        auth_sender,
+        message,
+        web_fast_lane_now(today),
     );
+    let classified_fast_lane = readback.is_some()
+        || matches!(
+            fast_lane::classify(message, today),
+            Classification::FastLane(_) | Classification::Ask { .. }
+        );
     let opened = if classified_fast_lane {
         Some(OccurrenceJournal::<WebFastLaneOutcome>::claim(
             workgraph_dir,
@@ -4637,6 +4742,18 @@ async fn run_web_fast_lane_occurrence(
 
     let (outcome, resumed_delivery) = match state {
         OccurrenceState::New => {
+            // The read-back answer is already family-voice guarded and derived
+            // wholly from persisted state; nothing was written to produce it.
+            if let Some(reply) = readback {
+                let outcome = WebFastLaneOutcome {
+                    op_kind: "reminder-read".to_string(),
+                    report: reply,
+                    bot_id: bot_id.to_string(),
+                    chat_id: chat_id.to_string(),
+                };
+                journal.mark_applied(&outcome)?;
+                (outcome, false)
+            } else {
             match fast_lane::run_fast_lane_with_calendar_owner(root, message, today, calendar_owner)
             {
                 FastLaneResult::Fallback { .. } => {
@@ -4693,6 +4810,7 @@ async fn run_web_fast_lane_occurrence(
                     journal.mark_applied(&outcome)?;
                     (outcome, false)
                 }
+            }
             }
         }
         OccurrenceState::Incomplete => {
@@ -5768,9 +5886,10 @@ pub fn run_command(
 ///
 /// Gathers the current plan's reminder rows plus the ad-hoc store, then either
 /// lists them (`--list`), shows what would fire at `--now` (`--dry-run`),
-/// registers a new ad-hoc reminder (`--add`), or — with no flag — fires the due
-/// ones for real, DMing each recipient via their bound bot and recording each in
-/// the persistent fired-log first so it fires exactly once.
+/// registers a new ad-hoc reminder (`--add`), READS one back for one family
+/// member (`--ask "…" --as <member>`), or — with no flag — fires the due ones for
+/// real, DMing each recipient via their bound bot and recording each in the
+/// persistent fired-log first so it fires exactly once.
 #[allow(clippy::too_many_arguments)]
 pub fn run_remind(
     workgraph_dir: &Path,
@@ -5778,6 +5897,8 @@ pub fn run_remind(
     dry_run: bool,
     add: Option<&str>,
     recipient: Option<&str>,
+    ask: Option<&str>,
+    asker: Option<&str>,
     now_override: Option<&str>,
     json: bool,
 ) -> Result<()> {
@@ -5805,6 +5926,57 @@ pub fn run_remind(
         .map(|b| b.name.clone())
         .filter(|n| !n.is_empty())
         .collect();
+
+    // --ask: READ a reminder back for ONE family member (task
+    // reminder-readback-lane). The same merge `--list` shows, filtered to the
+    // person asking, rendered as the single deterministic line the family sees on
+    // chat. Every date comes off disk, so a question that asserts the wrong date
+    // is corrected rather than echoed. Nothing is written, nothing is sent.
+    if let Some(question) = ask {
+        use worksgood::notify::reminder_readback;
+
+        let requester = asker.map(|s| s.trim()).unwrap_or_default();
+        if requester.is_empty() {
+            anyhow::bail!(
+                "--ask needs --as <family member>: the answer is scoped to one person's own \
+                 reminders, so there is no safe answer without knowing who is asking"
+            );
+        }
+        let query = match reminder_readback::parse_readback(question) {
+            Some(q) => q,
+            None => {
+                let msg = "That didn't look like a question about a reminder — try \
+                           \"when is my dentist reminder?\".";
+                if json {
+                    println!("{}", serde_json::json!({ "answered": false, "reason": msg }));
+                } else {
+                    println!("{msg}");
+                }
+                return Ok(());
+            }
+        };
+        let all = reminder_readback::load_all(&root, &members, &owner_map, now);
+        let visible = reminder_readback::visible_to(&all, requester).len();
+        let answer = reminder_readback::answer(&all, &query, requester, now);
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "answered": true,
+                    "lane": "reminder-read",
+                    "requester": requester,
+                    "question": question,
+                    "answer": answer,
+                    "visible": visible,
+                    "known": all.len(),
+                    "now": now.format("%Y-%m-%dT%H:%M").to_string(),
+                })
+            );
+        } else {
+            println!("{answer}");
+        }
+        return Ok(());
+    }
 
     // --add: register an ad-hoc reminder and print the confirmation.
     if let Some(request) = add {
@@ -10077,6 +10249,124 @@ domains = ["coordination"]
         );
     }
 
+    /// reminder-readback-lane: the DM seam must READ a filed reminder back from
+    /// what is on disk — with the date the STORE holds, never the one the
+    /// question asserts — scope it to the person asking, and write nothing.
+    #[test]
+    fn dm_reminder_readback_answers_from_the_store_and_never_across_members() {
+        use worksgood::notify::reminder::AdHocStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "garden-relay"
+name = "Garden Relay"
+domains = ["coordination"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-one", "Household Member");
+        seed_confirmed_binding(&wg, "7001002", "member-two", "Second Member");
+
+        // Friday morning; the reminder is filed for the UPCOMING Monday 09:00.
+        let now =
+            chrono::NaiveDateTime::parse_from_str("2026-07-24T10:00", "%Y-%m-%dT%H:%M").unwrap();
+        assert!(
+            try_register_reminder(
+                &wg,
+                "7001001",
+                "member-one-handle",
+                "remind me Monday at 9am to call the dentist",
+                now,
+            )
+            .is_some()
+        );
+        let filed = AdHocStore::load(&AdHocStore::path(root));
+        assert_eq!(filed.reminders.len(), 1);
+        assert_eq!(
+            filed.reminders[0].due.format("%Y-%m-%dT%H:%M").to_string(),
+            "2026-07-27T09:00",
+            "the fixture must really hold Jul 27 for the poisoned question to mean anything"
+        );
+        let before = std::fs::read(AdHocStore::path(root)).unwrap();
+
+        // THE POISONED QUESTION: it asserts Aug 3; the store says Jul 27.
+        let answer = try_reminder_readback(
+            &wg,
+            "7001001",
+            "member-one-handle",
+            "What exact date and time is the reminder to call the dentist set for — \
+             Monday, August 3, 2026 at 9:00 a.m.?",
+            now,
+        )
+        .expect("the read-back lane owns this turn");
+        assert!(
+            answer.contains("Jul 27") && answer.contains("9:00 am"),
+            "the answer must carry the PERSISTED date and time: {answer}"
+        );
+        assert!(
+            !answer.contains("Aug 3") && !answer.contains("August 3"),
+            "the answer must not echo the date the question asserted: {answer}"
+        );
+        assert!(
+            answer.to_lowercase().contains("call the dentist"),
+            "the answer names what the reminder is about: {answer}"
+        );
+
+        // ANOTHER MEMBER learns nothing — not the date, not that it exists.
+        let other = try_reminder_readback(
+            &wg,
+            "7001002",
+            "member-two-handle",
+            "What date and time is the reminder to call the dentist set for?",
+            now,
+        )
+        .expect("the lane still owns the turn");
+        assert_eq!(other, "You don't have a reminder set about that.");
+        for leak in ["Jul 27", "9:00", "Household Member"] {
+            assert!(
+                !other.contains(leak),
+                "leaked {leak:?} across members: {other}"
+            );
+        }
+
+        // A QUESTION carrying the cancel verb is answered, not executed — the
+        // read-back runs ahead of the cancel lane precisely for this shape.
+        let asked = try_reminder_readback(
+            &wg,
+            "7001001",
+            "member-one-handle",
+            "Did you cancel my dentist reminder?",
+            now,
+        )
+        .expect("a question about a cancellation is a read");
+        assert!(asked.contains("Jul 27"), "{asked}");
+
+        // A reminder WRITE is never stolen by the read lane.
+        assert!(
+            try_reminder_readback(
+                &wg,
+                "7001001",
+                "member-one-handle",
+                "remind me Tuesday at 8am to set out the bins",
+                now,
+            )
+            .is_none()
+        );
+
+        // ZERO WRITES: the store is byte-identical after every read.
+        assert_eq!(
+            before,
+            std::fs::read(AdHocStore::path(root)).unwrap(),
+            "a read-back must not touch the reminder file"
+        );
+    }
+
     #[test]
     fn proactive_messages_use_the_configured_coordination_owner() {
         use worksgood::notify::reminder::AdHocStore;
@@ -10120,6 +10410,8 @@ domains = ["cooking"]
             false,
             Some("remind me Tuesday at 8am to set out the bins"),
             Some("Household Member"),
+            None,
+            None,
             Some("2026-07-12T10:00"),
             false,
         )

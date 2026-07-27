@@ -3936,6 +3936,8 @@ fn main() -> Result<()> {
                 dry_run,
                 add,
                 recipient,
+                ask,
+                asker,
                 now,
             } => commands::telegram::run_remind(
                 &workgraph_dir,
@@ -3943,6 +3945,8 @@ fn main() -> Result<()> {
                 dry_run,
                 add.as_deref(),
                 recipient.as_deref(),
+                ask.as_deref(),
+                asker.as_deref(),
                 now.as_deref(),
                 cli.json,
             ),

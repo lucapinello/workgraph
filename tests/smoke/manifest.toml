@@ -2649,3 +2649,12 @@ owners = [
 ]
 description = "Pins the engine half of the live-cert P1 shopping mutation-language contract (C056–C064) through the deployed binary's credential-free `wg --json telegram shopping` seam over an opaque scratch plan. A nonsense item and a held ask are ANSWERED with a question and leave the plan byte-identical; the conversational removal and cancel phrasings really take the row off the file the family reads, while crossing an item off (= bought) never deletes anything; one sentence yields exactly one item; an unscoped action sentence (\"put the chicken in the oven\") is left to the composer instead of writing a junk row; a removal matching no row answers honestly instead of claiming success; and the meal ops keep the shared add/remove verbs. A binary without the seam FAILS rather than skipping, because a stale install is the exact state this pins. No token, network, bot, or live plan is used."
 timeout_seconds = 30
+
+[[scenario]]
+name = "reminder_readback_scoped"
+script = "scenarios/reminder_readback_scoped.sh"
+owners = [
+    "reminder-readback-lane",
+]
+description = "Pins the requester-scoped reminder READ-BACK lane (live-cert C052) through the deployed binary's credential-free `wg telegram remind --ask \"…\" --as <member>` seam over an opaque scratch project. The poisoned prompt is the point: the question asserts a date the persisted store disagrees with, and the answer must carry the STORE's date and time, never the prompt's. Also pins cross-member privacy (another member is told nothing, not even that the reminder exists), the honest zero-match line, the brief ambiguous candidate list, fail-closed refusal when no requester is named, and ZERO WRITES — the reminder file is byte-identical after every read, including a cancel-shaped QUESTION that must be answered rather than executed."
+timeout_seconds = 30

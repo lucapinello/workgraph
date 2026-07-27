@@ -80,6 +80,14 @@ const PLAN_TOPICS: &[&str] = &[
     "exercise",
     "training",
     "appointment",
+    // A reminder question is a READ of the family's own schedule — the plan's
+    // `⏰ Reminder:` calendar rows answer it. Its absence here is half of why
+    // "what date is the reminder to call the dentist set for?" was composed with
+    // nothing in front of it and echoed the date the question carried (task
+    // reminder-readback-lane). The NOUN only: the bare verb ("remind me to …")
+    // is a write, and the deterministic, requester-scoped answer for a reminder
+    // read lives in [`super::reminder_readback`].
+    "reminder",
     "week",
     "weekend",
     "tomorrow",
@@ -3137,6 +3145,29 @@ mod tests {
             "lol nice",
         ] {
             assert!(!is_read_shaped(ask), "should NOT be read-shaped: {ask:?}");
+        }
+    }
+
+    /// A reminder QUESTION is a read of the family's own schedule and must reach
+    /// the grounded block — the omission that let "what date is the reminder to
+    /// call the dentist set for?" be composed with no data in front of it (task
+    /// reminder-readback-lane). The reminder WRITE is untouched: it carries no
+    /// reminder noun and stays with the fast lane.
+    #[test]
+    fn ground_read_shaped_covers_reminder_questions_but_not_reminder_writes() {
+        for ask in [
+            "What exact date and time is the reminder to call the dentist set for?",
+            "When is my dentist reminder?",
+            "Do I have a reminder about the bins?",
+            "what reminders do I have",
+        ] {
+            assert!(is_read_shaped(ask), "should be read-shaped: {ask:?}");
+        }
+        for write in ["set a reminder for the dentist", "cancel the reminder"] {
+            assert!(
+                !is_read_shaped(write),
+                "a reminder write is not a read: {write:?}"
+            );
         }
     }
 
