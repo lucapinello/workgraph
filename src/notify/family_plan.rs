@@ -453,9 +453,26 @@ fn find_iso_dates(line: &str) -> Vec<NaiveDate> {
     out
 }
 
+/// A `plans/<week>-dinner-suggestions.md` note is a SIDE-CHANNEL, never a plan of
+/// record: it is where the family's dinner choices are parked for a week that has
+/// no plan file yet. Its filename stem carries a week code, so every "is this a
+/// plan for week W" test that looks only at the code sees it as one — which is how
+/// a parked-suggestions note became a phantom "plan" titled "Dinner suggestions for
+/// the week of …". The gateway has excluded the suffix since the note was
+/// introduced (`discoverPlanFiles`, claw3d-bridge/src/weekSource.mjs); this is the
+/// same rule on the engine side, in the one place both readers share.
+pub fn is_sidecar_stem(stem: &str) -> bool {
+    let low = stem.to_ascii_lowercase();
+    low.ends_with("-dinner-suggestions") || low.ends_with("-dinner-suggestion")
+}
+
 /// Extract the `YYYY-Wnn` week code from a filename stem like
-/// `2026-W29-family-plan`. Requires a 4-digit year followed by `W` + digits.
+/// `2026-W29-family-plan`. Requires a 4-digit year followed by `W` + digits, and
+/// refuses a side-channel note ([`is_sidecar_stem`]).
 fn week_code_from_stem(stem: &str) -> Option<String> {
+    if is_sidecar_stem(stem) {
+        return None;
+    }
     let mut it = stem.splitn(3, '-');
     let year = it.next()?;
     let week = it.next()?;
