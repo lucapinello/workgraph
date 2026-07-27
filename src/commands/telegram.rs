@@ -2080,7 +2080,10 @@ fn try_capability_answer(workgraph_dir: &Path, body: &str) -> Option<(&'static s
     let answer = capability::capability_answer(&OwnerMap::load(&root))?;
     // Same guard every deterministic family-facing reply passes through.
     let roster = grounding::load_family_voice_roster(&root, workgraph_dir);
-    Some(("capability", grounding::enforce_family_voice(&answer, &roster)))
+    Some((
+        "capability",
+        grounding::enforce_family_voice(&answer, &roster),
+    ))
 }
 
 /// Answer a reminder READ-BACK ("what date and time is the reminder to call the
@@ -2132,14 +2135,7 @@ fn try_reminder_readback(
 
     let root = project_root(workgraph_dir);
     let owner_map = ownership::OwnerMap::load(&root);
-    let answer = reminder_readback::answer_for(
-        &root,
-        body,
-        &requester,
-        &members,
-        &owner_map,
-        now,
-    )?;
+    let answer = reminder_readback::answer_for(&root, body, &requester, &members, &owner_map, now)?;
     // Same guard every deterministic family-facing reply passes through.
     let roster = grounding::load_family_voice_roster(&root, workgraph_dir);
     Some(grounding::enforce_family_voice(&answer, &roster))
@@ -4369,10 +4365,17 @@ impl FamilyReplyDelivery {
         text: &str,
         message_id: Option<&str>,
         outcome: relay_receipt::RelayOutcome,
-    ) {
+        phase: relay_receipt::ReplyPhase,
+    ) -> MirrorOutcome {
         use worksgood::notify::telegram_conversation as convo;
-        if scope != ReplyScope::Group || text == convo::ack_line() {
-            return;
+        // The ack is identified by the PHASE ITS WRITER STAMPED, not by
+        // comparing its text: a text comparison stops recognising the ack the
+        // moment the wording changes, and starts mis-recognising any line that
+        // happens to match. The text check survives only as a fallback for
+        // callers that have not yet been converted to the phased API.
+        let is_ack = phase == relay_receipt::ReplyPhase::Ack || text == convo::ack_line();
+        if scope != ReplyScope::Group || is_ack {
+            return MirrorOutcome::Skipped;
         }
         let agent_id = convo::agent_for_bot(&self.config, bot_id);
         let entry = casa_feed::agent_entry(&self.personas, &agent_id, text, casa_feed::now_ms());
@@ -4381,38 +4384,48 @@ impl FamilyReplyDelivery {
         // hashed key can never reach the causal position.
         let turn = self.canonical_turn();
         let entry = match turn.as_deref() {
-            // The transient ack is excluded above, so every row that reaches
-            // here is the turn's answer. The phase is stamped by the writer,
-            // which KNOWS which it is — never derived from the text later.
-            Some(turn) => entry.with_turn(turn, casa_feed::ReplyPhase::Final),
+            // The phase is stamped by the writer, which KNOWS which it is —
+            // never derived from the text later.
+            Some(turn) => entry.with_turn(turn, phase),
             None => entry,
         };
 
-        let feed_id = match casa_feed::append_entry_allocating(&self.feed_path, &entry) {
-            Ok(id) => id,
-            Err(e) => {
+        // ONE TRANSACTION. The row and the receipt that proves it land inside a
+        // single critical section, or neither does. Two transactions would let a
+        // refused or corrupt receipt leave behind exactly the unprovable row the
+        // whole contract exists to eliminate.
+        let written = casa_feed::append_entry_proving(&self.feed_path, &entry, |feed_id, lock| {
+            let Some(turn) = turn.as_deref() else {
+                // No canonical turn: a legacy or listener-initiated reply. It
+                // gets no receipt — inventing a turn would forge the very link a
+                // receipt exists to prove — and the row stands as unbound, which
+                // is precisely what a sealed run refuses.
+                return Ok(());
+            };
+            self.write_engine_receipt(
+                turn, feed_id, &agent_id, bot_id, message_id, outcome, phase, lock,
+            )
+        });
+
+        match written {
+            Ok(feed_id) => MirrorOutcome::Recorded {
+                feed_id,
+                proven: turn.is_some(),
+            },
+            Err(failure) => {
+                let detail = failure.to_string();
                 eprintln!(
-                    "[{}] casa feed: failed to mirror agent reply: {e}",
+                    "[{}] casa feed: the reply was sent but NOT recorded: {detail}",
                     chrono::Utc::now().format("%H:%M:%S"),
                 );
-                return;
+                MirrorOutcome::Failed(detail)
             }
-        };
-
-        let Some(turn) = turn else { return };
-        if let Err(e) = self.write_engine_receipt(&turn, feed_id, &agent_id, bot_id, message_id, outcome)
-        {
-            // A missing receipt must never take delivery down — the family has
-            // the answer either way. It DOES leave the row unproven, and saying
-            // so plainly is the point: an operator can see the gap.
-            eprintln!(
-                "[{}] casa receipts: reply row {feed_id} was delivered but not proven: {e}",
-                chrono::Utc::now().format("%H:%M:%S"),
-            );
         }
     }
 
-    /// Build and append the engine receipt for one relayed row.
+    /// Build and append the engine receipt for one relayed row, inside the feed
+    /// transaction that wrote it.
+    #[allow(clippy::too_many_arguments)]
     fn write_engine_receipt(
         &self,
         turn: &str,
@@ -4421,6 +4434,8 @@ impl FamilyReplyDelivery {
         bot_id: &str,
         message_id: Option<&str>,
         outcome: relay_receipt::RelayOutcome,
+        phase: relay_receipt::ReplyPhase,
+        lock: &worksgood::notify::feed_lock::FeedLock,
     ) -> Result<(), relay_receipt::ReceiptError> {
         write_engine_receipt_at(
             &self.project_root(),
@@ -4430,9 +4445,26 @@ impl FamilyReplyDelivery {
             bot_id,
             message_id,
             outcome,
-            relay_receipt::ReplyPhase::Final,
+            phase,
+            Some(lock),
         )
     }
+}
+
+/// What mirroring one delivered reply actually did.
+///
+/// A delivery that produced NO ROW is not a quiet log line: the family has an
+/// answer the house has no record of, and every later read — the pane, the
+/// audit, the join — will say it never happened. The caller surfaces this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MirrorOutcome {
+    /// Nothing to mirror: a DM, or the transient ack a later edit replaces.
+    Skipped,
+    /// The row is on disk. `proven` is false for a legacy reply with no
+    /// canonical turn, which can carry no receipt.
+    Recorded { feed_id: i64, proven: bool },
+    /// The row is NOT on disk, and the message may already be with the family.
+    Failed(String),
 }
 
 /// Append ONE engine receipt for a row that was just written and relayed.
@@ -4450,6 +4482,10 @@ fn write_engine_receipt_at(
     message_id: Option<&str>,
     outcome: relay_receipt::RelayOutcome,
     phase: relay_receipt::ReplyPhase,
+    // The held feed lock, when this receipt is being written inside the same
+    // transaction as the row it proves. `None` means "take the lock yourself" —
+    // the scripted `feed-write` seam, which has no surrounding transaction.
+    lock: Option<&worksgood::notify::feed_lock::FeedLock>,
 ) -> Result<(), relay_receipt::ReceiptError> {
     // WHICH BOT PHYSICALLY SENT THIS — not the semantic reply role. One role can
     // be spoken by different bots across a rotation, and "whose token sent it" is
@@ -4477,10 +4513,18 @@ fn write_engine_receipt_at(
         status,
         outcome,
         phase,
+        // ITEM 8 — the attempt the GATEWAY minted, read from the environment it
+        // dispatched us with. Without it every attempt of one turn keys the same,
+        // and a genuine self-heal retry is suppressed as though it were a refire
+        // of the first — erasing the evidence for the send that actually reached
+        // the family.
         std::env::var("WG_ATTEMPT_ID").ok().as_deref(),
         casa_feed::now_ms(),
     );
-    relay_receipt::append(root, &receipt)
+    match lock {
+        Some(held) => relay_receipt::append_locked(root, &receipt, held),
+        None => relay_receipt::append(root, &receipt),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4539,36 +4583,104 @@ where
     S: worksgood::notify::telegram_conversation::ReplySink,
 {
     async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
+        self.send_phase(bot_id, chat_id, text, relay_receipt::ReplyPhase::Final)
+            .await
+    }
+
+    async fn send_phase(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        text: &str,
+        phase: relay_receipt::ReplyPhase,
+    ) -> Result<Option<String>> {
         let guarded = self.guarded(text);
-        let mid = self.inner.send(bot_id, chat_id, &guarded).await?;
+        let mid = self
+            .inner
+            .send_phase(bot_id, chat_id, &guarded, phase)
+            .await?;
         // The transport's own answer travels with the row it proves: the receipt
         // is written from `mid`, never inferred from the row afterwards.
-        self.delivery.mirror(
+        let mirrored = self.delivery.mirror(
             self.scope,
             bot_id,
             &guarded,
             mid.as_deref(),
             relay_receipt::RelayOutcome::Send,
+            phase,
         );
+        surface_mirror_failure(mirrored)?;
         Ok(mid)
     }
 
     async fn edit(&self, bot_id: &str, chat_id: &str, message_id: &str, text: &str) -> Result<()> {
+        self.edit_phase(
+            bot_id,
+            chat_id,
+            message_id,
+            text,
+            relay_receipt::ReplyPhase::Final,
+        )
+        .await
+    }
+
+    async fn edit_phase(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        text: &str,
+        phase: relay_receipt::ReplyPhase,
+    ) -> Result<()> {
         let guarded = self.guarded(text);
         self.inner
-            .edit(bot_id, chat_id, message_id, &guarded)
+            .edit_phase(bot_id, chat_id, message_id, &guarded, phase)
             .await?;
         // An EDIT of the ack into the final answer is a different delivery from a
         // fresh SEND, with a different message id story — typed so a fallback
-        // send after a failed edit cannot be read as the edit that never applied.
-        self.delivery.mirror(
+        // send after a refused edit cannot be read as the edit that never
+        // applied. The FALLBACK's id is the one that carries the answer.
+        let fallback = self.inner.take_fallback_message_id();
+        let (delivered_id, outcome) = match fallback.as_deref() {
+            Some(id) => (id, relay_receipt::RelayOutcome::Fallback),
+            None => (message_id, relay_receipt::RelayOutcome::Edit),
+        };
+        let mirrored = self.delivery.mirror(
             self.scope,
             bot_id,
             &guarded,
-            Some(message_id),
-            relay_receipt::RelayOutcome::Edit,
+            Some(delivered_id),
+            outcome,
+            phase,
         );
+        surface_mirror_failure(mirrored)?;
         Ok(())
+    }
+
+    fn take_fallback_message_id(&self) -> Option<String> {
+        self.inner.take_fallback_message_id()
+    }
+}
+
+/// ITEM 6 — A DELIVERY THAT LEFT NO ROW IS NOT A SUCCESS.
+///
+/// The mirror used to log its failure and return, so the caller reported a
+/// delivered reply while the family's conversation held no record of it: the
+/// pane shows nothing, the audit counts nothing, and the join finds nothing —
+/// the "delivered, but absent everywhere" shape.
+///
+/// It is reported as UNPROVEN rather than as a proven failure, and that choice
+/// is load-bearing: the message really was accepted by Telegram, so the turn's
+/// reservation must stay HELD. Releasing it would answer the family twice to fix
+/// a bookkeeping problem.
+fn surface_mirror_failure(outcome: MirrorOutcome) -> Result<()> {
+    match outcome {
+        MirrorOutcome::Skipped | MirrorOutcome::Recorded { .. } => Ok(()),
+        MirrorOutcome::Failed(detail) => Err(
+            worksgood::notify::telegram_conversation::unproven_delivery(format!(
+                "the reply was accepted by Telegram but left NO row in the family's conversation: {detail}"
+            )),
+        ),
     }
 }
 
@@ -4987,63 +5099,71 @@ async fn run_web_fast_lane_occurrence(
                 journal.mark_applied(&outcome)?;
                 (outcome, false)
             } else {
-            match fast_lane::run_fast_lane_with_calendar_owner(root, message, today, calendar_owner)
-            {
-                FastLaneResult::Fallback { .. } => {
-                    // This closed-set classifier did not ultimately own the turn
-                    // (for example, no current plan could be edited). Persist that
-                    // decision so a dispatcher refire takes the same normal path.
-                    journal.mark_passed_through()?;
-                    return Ok(WebFastLaneDispatch::PassedThrough);
-                }
-                // A safety lane owned the turn and wrote NOTHING: the reply is a
-                // question ("I don't know what glorptwax is…") or an honest "that isn't
-                // on the list". Journaled and delivered exactly like an applied edit so
-                // it cannot double-post, but with NO graph node — nothing mutated.
-                FastLaneResult::Answered { reply, lane } => {
-                    let guarded =
-                        worksgood::notify::grounding::enforce_family_voice(&reply, family_roster);
-                    let outcome = WebFastLaneOutcome {
-                        op_kind: format!("ask-{lane}"),
-                        report: guarded,
-                        bot_id: bot_id.to_string(),
-                        chat_id: chat_id.to_string(),
-                    };
-                    journal.mark_applied(&outcome)?;
-                    (outcome, false)
-                }
-                FastLaneResult::Applied { report, op, .. } => {
-                    let guarded =
-                        worksgood::notify::grounding::enforce_family_voice(&report, family_roster);
-                    if guarded != report {
-                        eprintln!(
-                            "[{}] family-voice guard: cleaned a web fast-lane reply before journaling",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                        );
+                match fast_lane::run_fast_lane_with_calendar_owner(
+                    root,
+                    message,
+                    today,
+                    calendar_owner,
+                ) {
+                    FastLaneResult::Fallback { .. } => {
+                        // This closed-set classifier did not ultimately own the turn
+                        // (for example, no current plan could be edited). Persist that
+                        // decision so a dispatcher refire takes the same normal path.
+                        journal.mark_passed_through()?;
+                        return Ok(WebFastLaneDispatch::PassedThrough);
                     }
+                    // A safety lane owned the turn and wrote NOTHING: the reply is a
+                    // question ("I don't know what glorptwax is…") or an honest "that isn't
+                    // on the list". Journaled and delivered exactly like an applied edit so
+                    // it cannot double-post, but with NO graph node — nothing mutated.
+                    FastLaneResult::Answered { reply, lane } => {
+                        let guarded = worksgood::notify::grounding::enforce_family_voice(
+                            &reply,
+                            family_roster,
+                        );
+                        let outcome = WebFastLaneOutcome {
+                            op_kind: format!("ask-{lane}"),
+                            report: guarded,
+                            bot_id: bot_id.to_string(),
+                            chat_id: chat_id.to_string(),
+                        };
+                        journal.mark_applied(&outcome)?;
+                        (outcome, false)
+                    }
+                    FastLaneResult::Applied { report, op, .. } => {
+                        let guarded = worksgood::notify::grounding::enforce_family_voice(
+                            &report,
+                            family_roster,
+                        );
+                        if guarded != report {
+                            eprintln!(
+                                "[{}] family-voice guard: cleaned a web fast-lane reply before journaling",
+                                chrono::Utc::now().format("%H:%M:%S"),
+                            );
+                        }
 
-                    // Graph visibility belongs to the mutation stage. It is
-                    // intentionally never repeated from an `applied` replay.
-                    let origin = worksgood::graph::TaskOrigin::new(
-                        worksgood::graph::OriginChannel::Web,
-                        chat_id.to_string(),
-                        auth_sender.to_string(),
-                        persona.to_string(),
-                        Some(bot_id.to_string()),
-                    );
-                    fast_lane::stamp_graph_node(workgraph_dir, &origin, &op, &guarded);
+                        // Graph visibility belongs to the mutation stage. It is
+                        // intentionally never repeated from an `applied` replay.
+                        let origin = worksgood::graph::TaskOrigin::new(
+                            worksgood::graph::OriginChannel::Web,
+                            chat_id.to_string(),
+                            auth_sender.to_string(),
+                            persona.to_string(),
+                            Some(bot_id.to_string()),
+                        );
+                        fast_lane::stamp_graph_node(workgraph_dir, &origin, &op, &guarded);
 
-                    let outcome = WebFastLaneOutcome {
-                        op_kind: op.kind_label().to_string(),
-                        report: guarded,
-                        bot_id: bot_id.to_string(),
-                        chat_id: chat_id.to_string(),
-                    };
-                    // Persist canonical bytes and routing before the first send.
-                    journal.mark_applied(&outcome)?;
-                    (outcome, false)
+                        let outcome = WebFastLaneOutcome {
+                            op_kind: op.kind_label().to_string(),
+                            report: guarded,
+                            bot_id: bot_id.to_string(),
+                            chat_id: chat_id.to_string(),
+                        };
+                        // Persist canonical bytes and routing before the first send.
+                        journal.mark_applied(&outcome)?;
+                        (outcome, false)
+                    }
                 }
-            }
             }
         }
         OccurrenceState::Incomplete => {
@@ -5801,6 +5921,8 @@ pub fn run_feed_write(
                     "--reply-phase must be one of ack|final|watchdog|failure, got '{other}'"
                 ),
             };
+            // Row and receipt take the phase from the SAME flag, so the two can
+            // never disagree about what this line was.
             entry.with_turn(turn, phase)
         }
         None => entry,
@@ -5811,32 +5933,34 @@ pub fn run_feed_write(
     };
 
     let feed_path = casa_feed::feed_path_for(root);
+    let phase = match reply_phase.map(str::trim).unwrap_or("final") {
+        "ack" => relay_receipt::ReplyPhase::Ack,
+        "final" => relay_receipt::ReplyPhase::Final,
+        "watchdog" => relay_receipt::ReplyPhase::Watchdog,
+        "failure" => relay_receipt::ReplyPhase::Failure,
+        other => {
+            anyhow::bail!("--reply-phase must be one of ack|final|watchdog|failure, got '{other}'")
+        }
+    };
+    let role = agent_id.unwrap_or("unknown");
+
+    // ONE TRANSACTION, through the very same writer the listener's delivery seam
+    // uses — so a smoke test drives the production path rather than a look-alike
+    // that can drift away from it. A receipt needs both a causal turn to join on
+    // and a transport answer to record, so it is written only when the caller
+    // supplies a `--message-id`; without one there is no delivery to prove and
+    // inventing a receipt would forge exactly the link the ledger establishes.
+    //
     // The BOUND-OR-BLOCKED gate applies to this writer exactly as it does to the
     // listener's: a diagnostic is still a row the family's pane shows and an
     // auditor counts, and `feed-write --kind agent` is precisely the shape that
     // put unattributable helper rows into a certification run.
-    let feed_id = casa_feed::append_entry_allocating(&feed_path, &entry)
-        .with_context(|| format!("failed to append to feed {}", feed_path.display()))?;
-    // The written line is itself display-safe (the field allowlist), so echoing
-    // it back cannot leak a secret — handy for the smoke assertion. The global
-    // feed id goes with it: a caller that must later prove this row needs the id
-    // it was ACTUALLY allocated, never an ordinal it counted for itself.
-    println!("{}", entry.to_json_line());
-    println!("feedId={feed_id}");
-
-    // The RECEIPT half, through the very same writer the listener's delivery
-    // seam uses. A receipt needs both a causal turn to join on and a transport
-    // answer to record, so it is written only when the caller supplies a
-    // `--message-id`; without one there is no delivery to prove and inventing a
-    // receipt would forge exactly the link the ledger exists to establish.
-    if let (Some(turn), Some(mid)) = (turn_id.as_deref(), message_id) {
-        let phase = match reply_phase.map(str::trim).unwrap_or("final") {
-            "ack" => relay_receipt::ReplyPhase::Ack,
-            "watchdog" => relay_receipt::ReplyPhase::Watchdog,
-            "failure" => relay_receipt::ReplyPhase::Failure,
-            _ => relay_receipt::ReplyPhase::Final,
+    let mut proved = false;
+    let feed_id = casa_feed::append_entry_proving(&feed_path, &entry, |feed_id, lock| {
+        let (Some(turn), Some(mid)) = (turn_id.as_deref(), message_id) else {
+            return Ok(());
         };
-        let role = agent_id.unwrap_or("unknown");
+        proved = true;
         write_engine_receipt_at(
             root,
             turn,
@@ -5846,8 +5970,19 @@ pub fn run_feed_write(
             Some(mid),
             relay_receipt::RelayOutcome::Send,
             phase,
+            Some(lock),
         )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))
+    .with_context(|| format!("failed to append to feed {}", feed_path.display()))?;
+
+    // The written line is itself display-safe (the field allowlist), so echoing
+    // it back cannot leak a secret — handy for the smoke assertion. The global
+    // feed id goes with it: a caller that must later prove this row needs the id
+    // it was ACTUALLY allocated, never an ordinal it counted for itself.
+    println!("{}", entry.to_json_line());
+    println!("feedId={feed_id}");
+    if proved {
         println!("receipt=written");
     }
     Ok(())
@@ -6253,7 +6388,10 @@ pub fn run_remind(
                 let msg = "That didn't look like a question about a reminder — try \
                            \"when is my dentist reminder?\".";
                 if json {
-                    println!("{}", serde_json::json!({ "answered": false, "reason": msg }));
+                    println!(
+                        "{}",
+                        serde_json::json!({ "answered": false, "reason": msg })
+                    );
                 } else {
                     println!("{msg}");
                 }
@@ -6707,7 +6845,9 @@ pub fn run_week_start(
         // idempotency guard instead of around it. So a replay whose plan is gone
         // is not a replay: the week is drafted, which is what the family asked
         // for and what the ledger says already happened.
-        let plan_path = root.join("plans").join(format!("{week_code}-family-plan.md"));
+        let plan_path = root
+            .join("plans")
+            .join(format!("{week_code}-family-plan.md"));
         let replay_is_honest = plan_path.exists();
         let state = match state {
             OccurrenceState::Applied(prior) | OccurrenceState::Delivered(prior)
@@ -6740,7 +6880,8 @@ pub fn run_week_start(
             }),
             OccurrenceState::New => {
                 let owner_map = worksgood::notify::ownership::OwnerMap::load(root);
-                let owner = owner_map.owner_for_domain(worksgood::notify::ownership::Domain::Calendar);
+                let owner =
+                    owner_map.owner_for_domain(worksgood::notify::ownership::Domain::Calendar);
                 match fast_lane::run_fast_lane_with_calendar_owner(
                     root,
                     message,
@@ -6761,7 +6902,9 @@ pub fn run_week_start(
                         journal.mark_applied(&outcome)?;
                         // Report the PLAN THAT IS ON DISK, re-read here, rather
                         // than the lane's own account of what it did.
-                        let path = root.join("plans").join(format!("{week_code}-family-plan.md"));
+                        let path = root
+                            .join("plans")
+                            .join(format!("{week_code}-family-plan.md"));
                         let written = std::fs::read_to_string(&path).ok();
                         let doc = written
                             .as_deref()
@@ -7084,9 +7227,12 @@ pub fn run_capability(text: &str, root: Option<&Path>, _dry_run: bool, json: boo
         None
     };
     // The answer must never itself commit to work (that is the C011 defect).
-    let promised = answer
-        .as_deref()
-        .map(|a| parity::audit_promise_in_turn(text, a).kind.slug().to_string());
+    let promised = answer.as_deref().map(|a| {
+        parity::audit_promise_in_turn(text, a)
+            .kind
+            .slug()
+            .to_string()
+    });
 
     if json {
         println!(
@@ -9381,7 +9527,12 @@ mod tests {
     const DM_CHAT: &str = "-987654321";
     const SENDER_ID: &str = "6123456789";
     const MESSAGE_ID: &str = "48271";
-    const TOKEN_ISH: &str = concat!("8123456789", ":", "AAH_fa", "kefakefakefakefakefakefake-fake");
+    const TOKEN_ISH: &str = concat!(
+        "8123456789",
+        ":",
+        "AAH_fa",
+        "kefakefakefakefakefakefake-fake"
+    );
     const PRIVATE_BODY: &str =
         "Nadin is at the clinic on Thursday, don't tell the kids about the surprise";
 
@@ -9396,7 +9547,13 @@ mod tests {
 
     #[test]
     fn the_duplicate_drop_line_carries_no_raw_ids_or_body() {
-        let line = duplicate_drop_line(GROUP_CHAT, SENDER_ID, 1_784_500_000, MESSAGE_ID, PRIVATE_BODY);
+        let line = duplicate_drop_line(
+            GROUP_CHAT,
+            SENDER_ID,
+            1_784_500_000,
+            MESSAGE_ID,
+            PRIVATE_BODY,
+        );
         assert_opaque(
             &line,
             &[GROUP_CHAT, DM_CHAT, SENDER_ID, MESSAGE_ID, PRIVATE_BODY],
@@ -13156,7 +13313,10 @@ domains = ["calendar"]
         let lines = feed_lines(&feed);
         assert_eq!(lines.len(), 1);
         let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(row["turnId"], ENGINE_TURN, "the raw accepted turn, verbatim");
+        assert_eq!(
+            row["turnId"], ENGINE_TURN,
+            "the raw accepted turn, verbatim"
+        );
         assert_eq!(row["replyPhase"], "final");
         assert_eq!(row["kind"], "agent");
 
@@ -13164,7 +13324,10 @@ domains = ["calendar"]
         let receipts = relay_receipt::read_all(dir.path());
         assert_eq!(receipts.len(), 1, "the engine wrote exactly one receipt");
         let r = &receipts[0];
-        assert_eq!(r.provenance, "engine", "written BY the engine, not inferred");
+        assert_eq!(
+            r.provenance, "engine",
+            "written BY the engine, not inferred"
+        );
         assert_eq!(r.turn_id, ENGINE_TURN);
         assert_eq!(r.status, relay_receipt::RelayStatus::Delivered);
         assert_eq!(r.message_id, Some(501), "the transport's OWN answer");
@@ -13190,7 +13353,10 @@ domains = ["calendar"]
         );
         // And the key that makes it unreversible never reaches the ledger.
         let ledger = std::fs::read_to_string(relay_receipt::ledger_path_for(dir.path())).unwrap();
-        assert!(!ledger.contains("stub-token"), "no credential in the ledger");
+        assert!(
+            !ledger.contains("stub-token"),
+            "no credential in the ledger"
+        );
     }
 
     /// ITEM 3, the exact-row join under the condition that breaks an ordinal
@@ -13207,9 +13373,11 @@ domains = ["calendar"]
         // Two DIFFERENT accepted turns landing in the same instant — two
         // household members asking at once is not exotic.
         let second_turn = "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3302";
-        let first_sink = opaque_delivery(&feed)
-            .with_turn_override(ENGINE_TURN)
-            .wrap(NumberedReplySink::default(), ReplyScope::Group, GuardPolicy::AlreadyGuarded);
+        let first_sink = opaque_delivery(&feed).with_turn_override(ENGINE_TURN).wrap(
+            NumberedReplySink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
         rt.block_on(first_sink.send("harbor", "group-chat", "The FIRST answer."))
             .unwrap();
         let second_sink = opaque_delivery(&feed).with_turn_override(second_turn).wrap(
@@ -13301,9 +13469,11 @@ domains = ["calendar"]
             }
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let first = opaque_delivery(&feed)
-            .with_turn_override(ENGINE_TURN)
-            .wrap(FrozenIdSink, ReplyScope::Group, GuardPolicy::AlreadyGuarded);
+        let first = opaque_delivery(&feed).with_turn_override(ENGINE_TURN).wrap(
+            FrozenIdSink,
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
         rt.block_on(first.send("harbor", "group-chat", "First."))
             .unwrap();
         // A DIFFERENT turn, so nothing but the replay guard itself can refuse
@@ -13311,18 +13481,30 @@ domains = ["calendar"]
         let second = opaque_delivery(&feed)
             .with_turn_override("web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3309")
             .wrap(FrozenIdSink, ReplyScope::Group, GuardPolicy::AlreadyGuarded);
-        rt.block_on(second.send("harbor", "group-chat", "Second."))
-            .unwrap();
+        let refused = rt
+            .block_on(second.send("harbor", "group-chat", "Second."))
+            .expect_err("a replayed delivery claim must not report a clean success");
 
         assert_eq!(
             relay_receipt::read_all(dir.path()).len(),
             1,
             "the replayed claim of message 777 was refused"
         );
+        // ITEM 1, the transaction half: the refused receipt took its row WITH
+        // it. One physical Telegram message is one row and one receipt — a
+        // second row for the same message id would double the answer in the
+        // family's pane while proving nothing.
         assert_eq!(
             feed_lines(&feed).len(),
-            2,
-            "delivery is never held hostage to the ledger"
+            1,
+            "the rolled-back row must not survive its refused receipt"
+        );
+        // ITEM 6 — and it is REPORTED, not swallowed. The bytes did go to
+        // Telegram, so this is UNPROVEN (the turn's reservation stays held)
+        // rather than a proven failure that would license a second send.
+        assert!(
+            worksgood::notify::telegram_conversation::is_unproven(&refused),
+            "a delivery that left no row must surface as unproven: {refused:#}"
         );
     }
 
@@ -13334,8 +13516,7 @@ domains = ["calendar"]
     #[test]
     fn a_hashed_turn_id_in_the_environment_produces_no_receipt() {
         use worksgood::notify::telegram_conversation::ReplySink as _;
-        let hashed =
-            "web-turn-1e4d3c2b1a09f8e7d6c5b4a3928170695e4d3c2b1a09f8e7d6c5b4a392817069";
+        let hashed = "web-turn-1e4d3c2b1a09f8e7d6c5b4a3928170695e4d3c2b1a09f8e7d6c5b4a392817069";
 
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
@@ -13360,6 +13541,351 @@ domains = ["calendar"]
         );
     }
 
+    /// ITEM 5 — THE ACK DOES NOT CONSUME THE TURN'S FINAL.
+    ///
+    /// The latency ack is a physical send. When it claimed the turn's ONE final
+    /// reservation, a crash between the ack and the answer left the family with
+    /// an hourglass and the ledger saying the turn was delivered — so the real
+    /// answer was suppressed FOREVER on every later attempt.
+    ///
+    /// Here the ack is stamped as the ack phase, the process "crashes", and the
+    /// restarted attempt still delivers exactly one final.
+    #[test]
+    fn an_ack_leaves_the_final_unreserved_so_a_crash_between_them_still_answers() {
+        use worksgood::notify::relay_receipt::ReplyPhase;
+        use worksgood::notify::telegram_conversation::{self as convo, ReplySink as _};
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Attempt one: the ack goes out, then the process dies.
+        let acking = opaque_delivery(&feed).with_turn_override(ENGINE_TURN).wrap(
+            NumberedReplySink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        let ack = convo::ack_line();
+        rt.block_on(convo::send_reply_once_phase(
+            dir.path(),
+            ENGINE_TURN,
+            "harbor",
+            "group-chat",
+            &ack,
+            &acking,
+            ReplyPhase::Ack,
+        ))
+        .unwrap();
+
+        // Attempt two, after the "restart": the turn was NEVER claimed by the
+        // ack, so the final is free to be delivered.
+        let answering = opaque_delivery(&feed).with_turn_override(ENGINE_TURN).wrap(
+            NumberedReplySink::starting_at(40),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        rt.block_on(convo::send_reply_once_phase(
+            dir.path(),
+            ENGINE_TURN,
+            "harbor",
+            "group-chat",
+            "Dinner is pasta.",
+            &answering,
+            ReplyPhase::Final,
+        ))
+        .unwrap();
+
+        // ONE final row, and it is the answer — not the ack.
+        let rows: Vec<serde_json::Value> = feed_lines(&feed)
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let finals: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["replyPhase"] == "final").collect();
+        assert_eq!(finals.len(), 1, "exactly one final row: {rows:?}");
+        assert_eq!(finals[0]["text"], "Dinner is pasta.");
+        // The ack itself is transient: it is never mirrored at all.
+        assert!(
+            rows.iter().all(|r| r["text"] != ack.as_str()),
+            "the transient ack must not enter the record: {rows:?}"
+        );
+
+        // And a THIRD attempt is now suppressed — the final, and only the final,
+        // consumed the reservation.
+        let repeat_sink = NumberedReplySink::starting_at(90);
+        let repeat = opaque_delivery(&feed).with_turn_override(ENGINE_TURN).wrap(
+            repeat_sink,
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        rt.block_on(convo::send_reply_once_phase(
+            dir.path(),
+            ENGINE_TURN,
+            "harbor",
+            "group-chat",
+            "Dinner is pasta.",
+            &repeat,
+            ReplyPhase::Final,
+        ))
+        .unwrap();
+        assert_eq!(
+            feed_lines(&feed)
+                .iter()
+                .filter(|l| l.contains("Dinner is pasta."))
+                .count(),
+            1,
+            "the final was delivered twice"
+        );
+    }
+
+    /// ITEM 7 — AMBIGUOUS IS NOT FAILED, at the sink stack the production path
+    /// actually uses.
+    ///
+    /// `TurnDeliverySink` used to treat EVERY error as a proven failure: it
+    /// released the reservation and marked the turn retryable. A timeout AFTER
+    /// Telegram accepted the message therefore posted the same answer a second
+    /// time. Only a PROVEN failure may release.
+    #[test]
+    fn an_ambiguous_transport_holds_the_turn_while_a_proven_failure_releases_it() {
+        use worksgood::notify::telegram_conversation::{self as convo, ReplySink};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        /// The production ambiguity shapes, as they arrive at the sink: an
+        /// error carrying the UNPROVEN marker.
+        struct AmbiguousSink;
+        #[async_trait::async_trait]
+        impl ReplySink for AmbiguousSink {
+            async fn send(&self, _b: &str, _c: &str, _t: &str) -> Result<Option<String>> {
+                Err(convo::unproven_delivery("the request timed out"))
+            }
+            async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+                Err(convo::unproven_delivery("the edit timed out"))
+            }
+        }
+        /// Telegram answered, and the answer was "no".
+        struct RefusedSink;
+        #[async_trait::async_trait]
+        impl ReplySink for RefusedSink {
+            async fn send(&self, _b: &str, _c: &str, _t: &str) -> Result<Option<String>> {
+                Err(anyhow::anyhow!("Telegram API error (400): chat not found"))
+            }
+            async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+                Err(anyhow::anyhow!("Telegram API error (400): chat not found"))
+            }
+        }
+
+        /// Counts what actually reached the transport.
+        #[derive(Default)]
+        struct TallySink {
+            sends: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ReplySink for TallySink {
+            async fn send(&self, _b: &str, _c: &str, _t: &str) -> Result<Option<String>> {
+                self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some("7".to_string()))
+            }
+            async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // AMBIGUOUS: the reservation stays HELD, so a later attempt sends
+        // nothing at all.
+        let ambiguous_dir = tempfile::tempdir().unwrap();
+        let held = AmbiguousSink;
+        assert!(
+            rt.block_on(convo::send_reply_once(
+                ambiguous_dir.path(),
+                ENGINE_TURN,
+                "harbor",
+                "group-chat",
+                "Dinner is pasta.",
+                &held,
+            ))
+            .is_err()
+        );
+        let after_ambiguous = TallySink::default();
+        let _ = rt.block_on(convo::send_reply_once(
+            ambiguous_dir.path(),
+            ENGINE_TURN,
+            "harbor",
+            "group-chat",
+            "Dinner is pasta.",
+            &after_ambiguous,
+        ));
+        assert_eq!(
+            after_ambiguous
+                .sends
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an ambiguous delivery must NOT be re-sent — the family may already have it"
+        );
+
+        // PROVEN FAILURE: the turn is released, and the retry does send.
+        let refused_dir = tempfile::tempdir().unwrap();
+        let refused = RefusedSink;
+        assert!(
+            rt.block_on(convo::send_reply_once(
+                refused_dir.path(),
+                ENGINE_TURN,
+                "harbor",
+                "group-chat",
+                "Dinner is pasta.",
+                &refused,
+            ))
+            .is_err()
+        );
+        let after_refusal = TallySink::default();
+        rt.block_on(convo::send_reply_once(
+            refused_dir.path(),
+            ENGINE_TURN,
+            "harbor",
+            "group-chat",
+            "Dinner is pasta.",
+            &after_refusal,
+        ))
+        .unwrap();
+        assert_eq!(
+            after_refusal
+                .sends
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a PROVEN failure must release the turn so the answer can be retried"
+        );
+    }
+
+    /// ITEM 7, the edit half — A REFUSED EDIT'S FALLBACK IS A DIFFERENT MESSAGE.
+    ///
+    /// `edit` returns `Result<()>`, so the fallback send's message id used to be
+    /// discarded and the OLD ack id persisted as though the edit had applied.
+    /// The row, the receipt and the reservation then all named a message that
+    /// never held the answer.
+    #[test]
+    fn a_refused_edit_records_the_fallback_message_not_the_stale_ack() {
+        use worksgood::notify::telegram_conversation::ReplySink as _;
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+
+        /// Refuses every edit (Telegram said no) and answers a fresh send with
+        /// its own id — exactly what `BotReplySink` does on a refused edit.
+        #[derive(Default)]
+        struct RefusedEditSink {
+            fallback: std::sync::Mutex<Option<String>>,
+        }
+        #[async_trait::async_trait]
+        impl worksgood::notify::telegram_conversation::ReplySink for RefusedEditSink {
+            async fn send(&self, _b: &str, _c: &str, _t: &str) -> Result<Option<String>> {
+                Ok(Some("4242".to_string()))
+            }
+            async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+                // The refused edit falls back to a fresh send, and REMEMBERS the
+                // id that send returned.
+                *self.fallback.lock().unwrap() = Some("9001".to_string());
+                Ok(())
+            }
+            fn take_fallback_message_id(&self) -> Option<String> {
+                self.fallback.lock().unwrap().take()
+            }
+        }
+
+        let sink = opaque_delivery(&feed).with_turn_override(ENGINE_TURN).wrap(
+            RefusedEditSink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Edit the ack (message 111) into the final answer; the edit is refused.
+        rt.block_on(sink.edit("harbor", "group-chat", "111", "Dinner is pasta."))
+            .unwrap();
+
+        let receipts = relay_receipt::read_all(dir.path());
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].message_id,
+            Some(9001),
+            "the receipt must name the FALLBACK message that carries the answer, not the ack"
+        );
+        assert_eq!(
+            receipts[0].outcome,
+            relay_receipt::RelayOutcome::Fallback,
+            "a fallback send is not an edit that applied"
+        );
+    }
+
+    /// ITEM 8 — A SELF-HEAL RETRY IS NOT A REFIRE, at the engine seam.
+    ///
+    /// The dedupe key is `(turn, attempt)` and `WG_ATTEMPT_ID` is where the
+    /// attempt comes from. Reading it is what keeps attempt 2's receipt — the
+    /// evidence for the send that actually reached the family — from being
+    /// suppressed as a duplicate of attempt 1.
+    #[test]
+    fn a_second_attempt_of_one_turn_writes_its_own_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(casa_feed::feed_path_for(root).parent().unwrap()).unwrap();
+
+        let write = |feed_id: i64, mid: &str, attempt: Option<&str>| {
+            // The engine reads WG_ATTEMPT_ID at the write site, exactly as the
+            // production seam does.
+            match attempt {
+                Some(a) => unsafe { std::env::set_var("WG_ATTEMPT_ID", a) },
+                None => unsafe { std::env::remove_var("WG_ATTEMPT_ID") },
+            }
+            write_engine_receipt_at(
+                root,
+                ENGINE_TURN,
+                feed_id,
+                "harbor",
+                "harbor",
+                Some(mid),
+                relay_receipt::RelayOutcome::Send,
+                relay_receipt::ReplyPhase::Final,
+                None,
+            )
+        };
+
+        write(
+            1,
+            "501",
+            Some("attempt-3f2504e0-4f89-41d3-9a0c-0305e82c3301"),
+        )
+        .unwrap();
+        // A REFIRE of the same attempt is suppressed...
+        let refire = write(
+            2,
+            "502",
+            Some("attempt-3f2504e0-4f89-41d3-9a0c-0305e82c3301"),
+        );
+        assert!(
+            matches!(
+                refire,
+                Err(relay_receipt::ReceiptError::AttemptAlreadyRecorded { .. })
+            ),
+            "a refire of one attempt must not write a second receipt: {refire:?}"
+        );
+        // ...while a genuine SELF-HEAL RETRY writes its own.
+        write(
+            3,
+            "503",
+            Some("attempt-3f2504e0-4f89-41d3-9a0c-0305e82c3302"),
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("WG_ATTEMPT_ID") };
+
+        let receipts = relay_receipt::read_all(root);
+        assert_eq!(
+            receipts.len(),
+            2,
+            "attempt 1 and attempt 2, not one of them"
+        );
+        assert_eq!(
+            receipts[1].attempt_id.as_deref(),
+            Some("attempt-3f2504e0-4f89-41d3-9a0c-0305e82c3302"),
+            "the retry's receipt records WHICH attempt reached the family"
+        );
+        assert_eq!(receipts[1].message_id, Some(503));
+    }
+
     /// ITEM 7 — during a SEALED run an engine reply that carries no canonical
     /// turn is prevented from writing the certifying feed at all. The family's
     /// message still goes out over Telegram; what is refused is the
@@ -13381,15 +13907,26 @@ domains = ["calendar"]
             GuardPolicy::AlreadyGuarded,
         );
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(sink.send("harbor", "group-chat", "An untraceable report-back."))
-            .unwrap();
+        let refused = rt
+            .block_on(sink.send("harbor", "group-chat", "An untraceable report-back."))
+            .expect_err("a reply the seal refused to record is not a clean success");
 
-        assert_eq!(sink.inner.sends.lock().unwrap().len(), 1, "the send happened");
+        assert_eq!(
+            sink.inner.sends.lock().unwrap().len(),
+            1,
+            "the send happened"
+        );
         assert!(
             feed_lines(&feed).is_empty(),
             "no unbound row entered the certifying feed"
         );
         assert!(relay_receipt::read_all(dir.path()).is_empty());
+        // ITEM 6 — the caller is TOLD the row is missing instead of reporting a
+        // delivery the record does not contain.
+        assert!(
+            worksgood::notify::telegram_conversation::is_unproven(&refused),
+            "the missing row must surface as unproven: {refused:#}"
+        );
     }
 
     #[test]
