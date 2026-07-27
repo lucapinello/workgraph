@@ -24,6 +24,7 @@ pub mod matrix;
 pub mod meal_feedback;
 pub mod ownership;
 pub mod parity;
+pub mod project_lock;
 pub mod push;
 pub mod reminder;
 pub mod reminder_readback;
