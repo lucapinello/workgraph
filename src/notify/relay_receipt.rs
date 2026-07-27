@@ -200,6 +200,14 @@ pub enum ReceiptError {
     AttemptAlreadyRecorded { attempt_id: String, by: String },
     /// A receipt id was reused.
     ReceiptIdReused { receipt_id: String },
+    /// The ledger on disk is not wholly readable — an unreadable file, a line
+    /// that does not parse, a torn tail. The evidence is DAMAGED, which is a
+    /// different fact from "there is no evidence", and the difference decides
+    /// whether a second claim of the same delivery gets certified.
+    LedgerCorrupt { line: usize, detail: String },
+    /// The receipt could not be serialised against the feed transaction it
+    /// belongs to, so the row it proves was not written either.
+    NotSerialised(String),
     Io(String),
 }
 
@@ -229,6 +237,15 @@ impl std::fmt::Display for ReceiptError {
             ReceiptError::ReceiptIdReused { receipt_id } => {
                 write!(f, "receipt id {receipt_id} has already been used")
             }
+            ReceiptError::LedgerCorrupt { line, detail } => write!(
+                f,
+                "the receipt ledger is damaged at line {line} ({detail}) — refusing to certify \
+                 anything against evidence we cannot read in full"
+            ),
+            ReceiptError::NotSerialised(m) => write!(
+                f,
+                "the receipt could not be written inside its feed transaction: {m}"
+            ),
             ReceiptError::Io(m) => write!(f, "receipt ledger io: {m}"),
         }
     }
@@ -283,15 +300,28 @@ pub fn mint_receipt_id() -> String {
 // The transport scope id — WHICH BOT physically sent this
 // ---------------------------------------------------------------------------
 
-/// Read (or mint) the per-install scope key. 32 random bytes, `0600`, stored
-/// beside the ledger. It never appears in a receipt or a log — exposing it would
-/// turn every scope id back into a reversible digest of a short bot id.
+/// Read (or mint, EXACTLY ONCE) the per-install scope key. 32 random bytes,
+/// `0600`, stored beside the ledger. It never appears in a receipt or a log —
+/// exposing it would turn every scope id back into a reversible digest of a
+/// short bot id.
+///
+/// CREATE-ONCE, THEN READ THE WINNER. The obvious "read, else mint, else write"
+/// is a race with 64 losers: sixty-four first users each mint their own key,
+/// one atomic write wins the file, and every one of them returns the key it
+/// minted. The engine then represents ONE sending bot with sixty-four different
+/// transport scope ids, and the replay guard — which keys on
+/// `(transportScopeId, messageId)` — stops seeing a replayed Telegram message id
+/// as a replay at all, because the two claims sit under different scopes.
+///
+/// So the mint is a PUBLICATION, not a write: stage a private file, publish it
+/// with `link(2)` (EEXIST when someone else got there first), and then — win or
+/// lose — RE-READ the published file and return THAT. The value a caller gets
+/// back is always the persisted one, so concurrent first users converge on a
+/// single identity.
 fn scope_key(project_root: &Path) -> Result<Vec<u8>, ReceiptError> {
     let path = scope_key_path(project_root);
-    if let Ok(existing) = std::fs::read(&path) {
-        if existing.len() >= 32 {
-            return Ok(existing);
-        }
+    if let Some(existing) = read_scope_key(&path)? {
+        return Ok(existing);
     }
     let mut buf = [0u8; 32];
     if getrandom::getrandom(&mut buf).is_err() {
@@ -303,13 +333,67 @@ fn scope_key(project_root: &Path) -> Result<Vec<u8>, ReceiptError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ReceiptError::Io(e.to_string()))?;
     }
-    crate::atomic_file::write_atomic(&path, &buf).map_err(|e| ReceiptError::Io(e.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    // The staging file is created 0600 BEFORE any byte is written, so the key is
+    // never briefly readable at the ambient umask — a crash between publish and
+    // a later `chmod` cannot leave the identity secret world-readable.
+    let staging = path.with_extension(format!("new.{}", uuid::Uuid::new_v4().simple()));
+    let staged = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&staging)?;
+        file.write_all(&buf)?;
+        file.sync_all()
+    })();
+    let published = staged.and_then(|()| match std::fs::hard_link(&staging, &path) {
+        // Won the mint, or lost it to another first user — either way the
+        // authoritative bytes are now on disk and the re-read below decides.
+        Ok(()) | Err(_) => sync_dir(path.parent()),
+    });
+    let _ = std::fs::remove_file(&staging);
+    published.map_err(|e| ReceiptError::Io(e.to_string()))?;
+
+    // FAIL CLOSED rather than fall back to our own candidate: returning an
+    // unpersisted key is exactly the 64-identity bug in a different costume.
+    read_scope_key(&path)?.ok_or_else(|| {
+        ReceiptError::Io(format!(
+            "the transport scope key at {} could not be read back after minting",
+            path.display()
+        ))
+    })
+}
+
+/// The persisted key, or `None` when this install has none yet.
+///
+/// A file that EXISTS but is too short is not "no key": it is a key we cannot
+/// use, and silently minting a second one over it would orphan every scope id
+/// already written under the first. That fails CLOSED.
+fn read_scope_key(path: &Path) -> Result<Option<Vec<u8>>, ReceiptError> {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() >= 32 => Ok(Some(bytes)),
+        Ok(bytes) => Err(ReceiptError::Io(format!(
+            "the transport scope key at {} is {} bytes — refusing to mint a second identity over a damaged one",
+            path.display(),
+            bytes.len(),
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ReceiptError::Io(e.to_string())),
     }
-    Ok(buf.to_vec())
+}
+
+/// fsync a directory so a rename/link that "succeeded" survives a power loss.
+/// A missing directory handle is not fatal on platforms that refuse to open one.
+fn sync_dir(dir: Option<&Path>) -> std::io::Result<()> {
+    let Some(dir) = dir else { return Ok(()) };
+    match std::fs::File::open(dir) {
+        Ok(handle) => handle.sync_all().or(Ok(())),
+        Err(_) => Ok(()),
+    }
 }
 
 /// The transport scope id for the bot that ACTUALLY sent the message.
@@ -367,9 +451,12 @@ pub fn attempt_key(turn_id: &str, attempt_id: Option<&str>) -> String {
 // The ledger
 // ---------------------------------------------------------------------------
 
-/// Every receipt currently in the ledger. A missing or unreadable ledger reads
-/// as empty; a line that does not parse is SKIPPED rather than taken as a
-/// receipt, so a truncated tail cannot silently satisfy a join.
+/// Every receipt currently in the ledger, for DISPLAY and OBSERVATION only.
+///
+/// This reader is deliberately lenient — a caller rendering "what do we know"
+/// should show what is readable. It must NEVER be the basis for admitting a new
+/// receipt: leniency there turns damaged evidence into permission to certify a
+/// delivery twice. [`append`] uses [`read_strict`], which fails closed.
 pub fn read_all(project_root: &Path) -> Vec<Receipt> {
     let Ok(body) = std::fs::read_to_string(ledger_path_for(project_root)) else {
         return Vec::new();
@@ -378,6 +465,69 @@ pub fn read_all(project_root: &Path) -> Vec<Receipt> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Receipt>(l).ok())
         .collect()
+}
+
+/// The ledger, read WHOLE or not at all — the read every uniqueness check runs
+/// against.
+///
+/// FAILING OPEN HERE CERTIFIES DUPLICATES. The audit's reproduction is exact:
+/// corrupt the one line proving feed row 7 / message 4242, and an identical
+/// second proof is accepted (`visible_before=0 duplicate_append_succeeded=true`).
+/// Every uniqueness rule in [`append`] — one row one receipt, the replay guard,
+/// the attempt guard — is a search over THIS list, so a line silently dropped
+/// from it is a claim silently forgotten, and forgetting a claim is
+/// indistinguishable from never having had one.
+///
+/// So: a missing ledger is empty (an install with no receipts yet is a fact, not
+/// damage), and anything else — an unreadable file, a line that does not parse,
+/// a torn tail — is [`ReceiptError::LedgerCorrupt`]. The cure is an operator
+/// looking at the evidence, not a writer guessing past it.
+pub fn read_strict(project_root: &Path) -> Result<Vec<Receipt>, ReceiptError> {
+    let path = ledger_path_for(project_root);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ReceiptError::LedgerCorrupt {
+                line: 0,
+                detail: e.to_string(),
+            });
+        }
+    };
+    let mut receipts = Vec::new();
+    for (index, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Receipt>(line) {
+            Ok(receipt) => receipts.push(receipt),
+            // The value is NOT echoed: a damaged line can hold anything, and an
+            // operator log is the wrong place to reproduce it verbatim.
+            Err(e) => {
+                return Err(ReceiptError::LedgerCorrupt {
+                    line: index + 1,
+                    detail: e.classify_detail(),
+                });
+            }
+        }
+    }
+    Ok(receipts)
+}
+
+/// A safe, non-echoing description of why a ledger line did not parse.
+trait ClassifyDetail {
+    fn classify_detail(&self) -> String;
+}
+
+impl ClassifyDetail for serde_json::Error {
+    fn classify_detail(&self) -> String {
+        match self.classify() {
+            serde_json::error::Category::Eof => "a torn line — the write did not complete".into(),
+            serde_json::error::Category::Syntax => "not parseable as JSON".into(),
+            serde_json::error::Category::Data => "JSON, but not a receipt".into(),
+            serde_json::error::Category::Io => "unreadable".into(),
+        }
+    }
 }
 
 /// Append a receipt, refusing every shape the contract forbids.
@@ -394,7 +544,39 @@ pub fn read_all(project_root: &Path) -> Vec<Receipt> {
 ///      guard, so a re-read of an old response cannot re-certify it;
 ///   7. this (turn, attempt) has not already written — a refire is suppressed,
 ///      a genuine retry is NOT.
+///
+/// The whole check-and-append runs INSIDE the shared feed lock, because the
+/// checks are only worth what their atomicity is worth: read-then-append with no
+/// lock is a test whose answer is stale by the time it is used. Sixty-four
+/// synchronised writers submitting one duplicate claim got TEN successes and a
+/// ledger of concatenated JSON that no longer parsed. This entry point takes the
+/// lock; [`append_locked`] is the same body for a caller already inside the feed
+/// transaction (the lock is NOT reentrant).
 pub fn append(project_root: &Path, receipt: &Receipt) -> Result<(), ReceiptError> {
+    let ledger = ledger_path_for(project_root);
+    if let Some(parent) = ledger.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ReceiptError::Io(e.to_string()))?;
+    }
+    let lock = super::feed_lock::acquire(&ledger, super::feed_lock::DEFAULT_WAIT_MS)
+        .map_err(|refusal| ReceiptError::NotSerialised(refusal.to_string()))?;
+    let outcome = append_locked(project_root, receipt, &lock);
+    lock.release();
+    outcome
+}
+
+/// [`append`]'s body, for a caller that ALREADY HOLDS the feed lock — the
+/// delivery seam, which writes the row and its receipt in one transaction.
+///
+/// The `_lock` parameter is a witness, not a hint: a [`FeedLock`] can only be
+/// obtained by acquiring one, so a caller cannot reach this function without
+/// holding the mutex, and cannot deadlock by taking it twice.
+///
+/// [`FeedLock`]: super::feed_lock::FeedLock
+pub fn append_locked(
+    project_root: &Path,
+    receipt: &Receipt,
+    _lock: &super::feed_lock::FeedLock,
+) -> Result<(), ReceiptError> {
     if !is_valid_turn_id(&receipt.turn_id) {
         return Err(ReceiptError::BadShape {
             field: "turnId",
@@ -422,7 +604,8 @@ pub fn append(project_root: &Path, receipt: &Receipt) -> Result<(), ReceiptError
         return Err(ReceiptError::NoFeedId);
     }
 
-    let existing = read_all(project_root);
+    // STRICT: damaged evidence is not absent evidence. See [`read_strict`].
+    let existing = read_strict(project_root)?;
     if let Some(prior) = existing.iter().find(|r| r.receipt_id == receipt.receipt_id) {
         return Err(ReceiptError::ReceiptIdReused {
             receipt_id: prior.receipt_id.clone(),
@@ -462,8 +645,15 @@ pub fn append(project_root: &Path, receipt: &Receipt) -> Result<(), ReceiptError
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ReceiptError::Io(e.to_string()))?;
     }
-    let line =
+    // ONE record, ONE write. The line and its newline used to be two calls, and
+    // two `O_APPEND` writes from two writers interleave: the audit's race left a
+    // ledger of concatenated JSON objects in which the very claims that had just
+    // "succeeded" were no longer readable. A single buffer is a single atomic
+    // append for any record short enough to fit the pipe/file atomicity window,
+    // and the lock above covers the rest.
+    let mut line =
         serde_json::to_string(receipt).map_err(|e| ReceiptError::Io(e.to_string()))?;
+    line.push('\n');
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -471,9 +661,39 @@ pub fn append(project_root: &Path, receipt: &Receipt) -> Result<(), ReceiptError
         .open(&path)
         .map_err(|e| ReceiptError::Io(e.to_string()))?;
     file.write_all(line.as_bytes())
-        .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.sync_all())
-        .map_err(|e| ReceiptError::Io(e.to_string()))
+        .map_err(|e| ReceiptError::Io(e.to_string()))?;
+    // fsync the DIRECTORY too, or a ledger created by this very append can be
+    // absent after a power loss while the row it proves is durable — evidence
+    // that vanishes is worse than evidence that was never written.
+    sync_dir(path.parent()).map_err(|e| ReceiptError::Io(e.to_string()))
+}
+
+/// The EVIDENCE a prior attempt already recorded for this `(turn, attempt)`, if
+/// any — the durable refire bypass.
+///
+/// A dispatcher refire is a redelivery of an occurrence that was ALREADY
+/// accepted and answered. It must not re-relay: the family has the message, and
+/// sending it again is a duplicate on their screen. But "do nothing" is not
+/// enough either — the refire still has to be able to say what happened, and the
+/// only honest answer is the evidence the original attempt wrote. So a refire
+/// looks its own evidence up here and reuses it, rather than minting a second
+/// receipt (which [`append`] would refuse as [`ReceiptError::AttemptAlreadyRecorded`])
+/// or re-sending to manufacture a fresh one.
+///
+/// Keyed on `(turn, attempt)`, NOT the turn alone: a self-heal retry after a
+/// genuine failure is a DIFFERENT attempt, finds no evidence here, and correctly
+/// proceeds to relay. Keying on the turn alone would make the retry look like a
+/// refire and leave the household with the silence it was retrying.
+pub fn evidence_for_attempt(
+    project_root: &Path,
+    turn_id: &str,
+    attempt_id: Option<&str>,
+) -> Option<Receipt> {
+    let key = attempt_key(turn_id, attempt_id);
+    read_all(project_root)
+        .into_iter()
+        .find(|r| attempt_key(&r.turn_id, r.attempt_id.as_deref()) == key)
 }
 
 /// The engine-side builder. `provenance` is fixed: this writer speaks only for
@@ -600,6 +820,108 @@ mod tests {
         // says nothing about another's.
         let other = scratch();
         assert_ne!(a1, scope_id_for_bot(other.path(), "bot-one").unwrap());
+    }
+
+    /// ITEM 3 — THE 64-CALLER / 64-SCOPE RACE, from the audit, as a permanent
+    /// gate. Sixty-four synchronised first users of a FRESH install asked for
+    /// the scope of one stable bot and got sixty-four DIFFERENT ids back
+    /// (`distinct_returned_scopes=64`), because each minted its own key and
+    /// returned it even though only one write persisted.
+    ///
+    /// One bot represented by many scopes defeats the replay guard outright: it
+    /// keys on `(transportScopeId, messageId)`, so the SAME physical Telegram
+    /// message re-claimed under a second scope is not seen as a replay at all.
+    #[test]
+    fn sixty_four_concurrent_first_users_all_get_the_one_persisted_scope() {
+        let dir = scratch();
+        let root = dir.path().to_path_buf();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(64));
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let root = root.clone();
+            let gate = gate.clone();
+            handles.push(std::thread::spawn(move || {
+                // Synchronised, so they genuinely contend on the empty file.
+                gate.wait();
+                scope_id_for_bot(&root, "the-one-bot").unwrap()
+            }));
+        }
+        let returned: std::collections::HashSet<String> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            returned.len(),
+            1,
+            "one bot, one transport scope — got {} distinct scopes",
+            returned.len()
+        );
+        // And the id everyone got is the one the PERSISTED key produces: a
+        // caller must never return a candidate that lost the mint.
+        let persisted = scope_id_for_bot(&root, "the-one-bot").unwrap();
+        assert_eq!(returned.into_iter().next().unwrap(), persisted);
+    }
+
+    /// The mint is CREATE-ONCE. A second caller never rewrites the key, because
+    /// a rewrite would orphan every scope id already recorded under the first —
+    /// the ledger would hold two names for one bot with nothing saying so.
+    #[test]
+    fn the_scope_key_is_minted_once_and_never_rewritten() {
+        let dir = scratch();
+        let first = scope_id_for_bot(dir.path(), "bot-one").unwrap();
+        let key_after_first = std::fs::read(scope_key_path(dir.path())).unwrap();
+
+        for _ in 0..8 {
+            assert_eq!(scope_id_for_bot(dir.path(), "bot-one").unwrap(), first);
+        }
+        assert_eq!(
+            std::fs::read(scope_key_path(dir.path())).unwrap(),
+            key_after_first,
+            "the key bytes were rewritten by a later caller"
+        );
+    }
+
+    /// A DAMAGED key file fails CLOSED. Treating a short read as "no key yet"
+    /// mints a second identity over the first, and every receipt already written
+    /// under the old one silently stops joining.
+    #[test]
+    fn a_truncated_scope_key_fails_closed_instead_of_minting_a_second_identity() {
+        let dir = scratch();
+        let good = scope_id_for_bot(dir.path(), "bot-one").unwrap();
+        let path = scope_key_path(dir.path());
+        let damaged = std::fs::read(&path).unwrap()[..8].to_vec();
+        std::fs::write(&path, &damaged).unwrap();
+
+        let err = scope_id_for_bot(dir.path(), "bot-one").unwrap_err();
+        assert!(
+            matches!(err, ReceiptError::Io(ref m) if m.contains("refusing to mint a second identity")),
+            "expected a fail-closed refusal, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            damaged,
+            "the damaged key was overwritten — the old scope is now unjoinable"
+        );
+        // The cure is restoring the key, not minting a new one: once it is back,
+        // the ORIGINAL scope id is what callers get.
+        let _ = good;
+    }
+
+    /// The key is `0600` from the instant it exists — staged at that mode, not
+    /// chmodded after publication. A crash in the window between "published at
+    /// the ambient umask" and "chmod" would leave the one secret that keeps
+    /// scope ids unreversible readable by anything on the box.
+    #[cfg(unix)]
+    #[test]
+    fn the_scope_key_is_never_briefly_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch();
+        scope_id_for_bot(dir.path(), "bot-one").unwrap();
+        let mode = std::fs::metadata(scope_key_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the scope key must be owner-only");
     }
 
     #[test]
@@ -836,5 +1158,82 @@ mod tests {
             assert!(body.contains(token), "missing {token}: {body}");
         }
         assert_eq!(read_all(dir.path()).len(), 4);
+    }
+
+    /// ITEM 9 — THE DURABLE REFIRE BYPASS. A dispatcher refire of an ALREADY
+    /// ACCEPTED occurrence finds the original attempt's evidence and reuses it:
+    /// it does not re-relay, and it does not mint a second receipt.
+    #[test]
+    fn a_refire_reuses_the_accepted_attempts_evidence_and_does_not_relay_again() {
+        let dir = scratch();
+        let root = dir.path();
+
+        // The accepted turn is delivered once, by attempt 1.
+        let mut first = receipt(root, TURN, 1, Some(4242));
+        first.attempt_id = Some("attempt-1".to_string());
+        append(root, &first).unwrap();
+
+        // THE REFIRE. Same turn, same attempt — the dispatcher redelivering an
+        // occurrence that was already answered.
+        let evidence = evidence_for_attempt(root, TURN, Some("attempt-1"))
+            .expect("a refire must FIND the original attempt's evidence");
+        assert_eq!(evidence.receipt_id, first.receipt_id);
+        assert_eq!(
+            evidence.message_id,
+            Some(4242),
+            "the refire reports the message the family ACTUALLY got"
+        );
+        assert_eq!(evidence.status, RelayStatus::Delivered);
+        assert_eq!(
+            evidence.feed_id, 1,
+            "and the row it proves, so the refire needs no new row either"
+        );
+
+        // Were the refire to try to relay anyway, the ledger refuses its receipt
+        // rather than recording one delivery twice.
+        let mut again = receipt(root, TURN, 2, Some(4243));
+        again.attempt_id = Some("attempt-1".to_string());
+        assert!(matches!(
+            append(root, &again),
+            Err(ReceiptError::AttemptAlreadyRecorded { .. })
+        ));
+        assert_eq!(read_all(root).len(), 1, "still exactly one delivery on record");
+    }
+
+    /// The other side of the same key, and the reason it is a PAIR: a self-heal
+    /// retry after a delivery that genuinely died is a NEW attempt. It finds no
+    /// evidence, so it relays — rather than being suppressed as a refire and
+    /// leaving the household with the silence the retry existed to break.
+    #[test]
+    fn a_self_heal_retry_finds_no_evidence_and_therefore_relays() {
+        let dir = scratch();
+        let root = dir.path();
+
+        let mut dead = receipt(root, TURN, 1, None);
+        dead.attempt_id = Some("attempt-1".to_string());
+        dead.status = RelayStatus::Failed;
+        append(root, &dead).unwrap();
+
+        assert!(
+            evidence_for_attempt(root, TURN, Some("attempt-2")).is_none(),
+            "a NEW attempt on the same turn is not a refire and must not be suppressed"
+        );
+
+        // So it relays, and writes its own receipt for the delivery that worked.
+        let mut healed = receipt(root, TURN, 2, Some(9001));
+        healed.attempt_id = Some("attempt-2".to_string());
+        append(root, &healed).unwrap();
+        let now = evidence_for_attempt(root, TURN, Some("attempt-2")).unwrap();
+        assert_eq!(now.message_id, Some(9001));
+        assert_eq!(read_all(root).len(), 2);
+    }
+
+    /// Evidence for a turn that was never delivered is absent, not fabricated —
+    /// the caller must relay rather than claim a delivery that never happened.
+    #[test]
+    fn an_unknown_turn_has_no_evidence() {
+        let dir = scratch();
+        assert!(evidence_for_attempt(dir.path(), TURN, Some("attempt-1")).is_none());
+        assert!(evidence_for_attempt(dir.path(), TURN, None).is_none());
     }
 }

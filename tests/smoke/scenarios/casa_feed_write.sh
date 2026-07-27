@@ -32,6 +32,17 @@ command -v python3 >/dev/null 2>&1 \
 scratch="$(make_scratch)"           # the project root; `.casa/` is created under it
 feed="$scratch/.casa/group-feed.jsonl"
 
+# The presentation roster the writer maps an agent id through. Without it the
+# writer falls back to a neutral id-derived label with NO emoji — which is a
+# legitimate production behaviour, but it makes the roster-mapping legs below
+# vacuous, so the fixture supplies one.
+cat >"$scratch/household.toml" <<'TOML'
+[[agent]]
+id = "otto"
+name = "Otto"
+emoji = "\U0001FA90"
+TOML
+
 # The secrets a live listener handles but must NEVER write to the feed. These are
 # the real shapes from a Casa notify.toml: a bot token, the group chat id, and a
 # Telegram user id.
@@ -58,7 +69,7 @@ n=$(grep -c . "$feed")
 [ "$n" -eq 2 ] || loud_fail "expected 2 feed lines after agent write, got $n"
 echo "   → $(tail -n1 "$feed")"
 
-echo "3+4. PRIVACY (no token/chat id/user id) + both lines well-formed with the six fields:"
+echo "3+4. PRIVACY (no token/chat id/user id) + both lines well-formed with the full field contract:"
 # Both checks run in one python pass — reliable across hosts (some `grep` builds
 # on this fleet are SIGKILL-happy, and a killed grep would silently read as
 # "no leak", so the privacy gate must not lean on it).
@@ -74,7 +85,11 @@ with open(feed_path) as fh:
 for secret in secrets + ["bot_token", "chat_id", "user_id"]:
     assert secret not in raw, f"feed leaked secret substring: {secret!r}"
 
-want = {"ts", "sender", "agentId", "emoji", "kind", "text"}
+want = {
+    "ts", "sender", "agentId", "emoji", "kind", "text",   # display
+    "srcId", "origin",                                     # provenance (docs/20 §2)
+    "turnId", "replyPhase", "nonRelayType",                # causal settlement
+}
 lines = [ln for ln in raw.splitlines() if ln.strip()]
 
 assert len(lines) == 2, f"expected 2 lines, got {len(lines)}"
