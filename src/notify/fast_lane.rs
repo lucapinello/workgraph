@@ -159,7 +159,10 @@ pub enum Classification {
     /// the composer for these shapes is how "Done — glorptwax on the shopping list 🛒"
     /// happened: the model answers, sounding certain, and either writes junk or claims a
     /// write that never occurred.
-    Ask { reply: String, reason: AskReason },
+    Ask {
+        reply: String,
+        reason: AskReason,
+    },
     Fallback(FallbackReason),
 }
 
@@ -991,8 +994,8 @@ fn find_weekday(s: &str) -> Option<(Weekday, usize)> {
 /// said on a Monday morning, means today), so the resolution matches the
 /// gateway's `resolveUpcomingWeekday` and can never land in the past.
 fn upcoming_weekday(today: NaiveDate, wd: Weekday) -> NaiveDate {
-    let delta = (wd.num_days_from_monday() as i64)
-        - (today.weekday().num_days_from_monday() as i64);
+    let delta =
+        (wd.num_days_from_monday() as i64) - (today.weekday().num_days_from_monday() as i64);
     today + Duration::days(delta.rem_euclid(7))
 }
 
@@ -2208,8 +2211,10 @@ pub enum FastLaneResult {
 fn current_plan_file(root: &Path, today: NaiveDate) -> Option<(PathBuf, String, PlanDoc)> {
     let plans_dir = root.join("plans");
     // (path, week, doc) + the selection keys (content score, canonical?, mtime).
-    let mut best: Vec<((PathBuf, String, PlanDoc), (usize, bool, std::time::SystemTime))> =
-        Vec::new();
+    let mut best: Vec<(
+        (PathBuf, String, PlanDoc),
+        (usize, bool, std::time::SystemTime),
+    )> = Vec::new();
     for entry in std::fs::read_dir(&plans_dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -2244,7 +2249,8 @@ fn current_plan_file(root: &Path, today: NaiveDate) -> Option<(PathBuf, String, 
             None => best.push(((path, week_code, doc), keys)),
         }
     }
-    let mut candidates: Vec<(PathBuf, String, PlanDoc)> = best.into_iter().map(|(c, _)| c).collect();
+    let mut candidates: Vec<(PathBuf, String, PlanDoc)> =
+        best.into_iter().map(|(c, _)| c).collect();
     if candidates.is_empty() {
         return None;
     }
@@ -2417,53 +2423,53 @@ pub fn run_fast_lane_at(
     // family is told so plainly. Falling through to the heavy pipeline here would
     // be a fail-open with extra steps.
     let locked = super::project_lock::with_week_mutation_lock(root, || {
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            return FastLaneResult::Fallback {
-                reason: format!("read plan: {e}"),
-            };
-        }
-    };
-
-    match apply_to_content_with_calendar_owner(&week_code, &content, &op, calendar_owner) {
-        Ok(edited) => {
-            if let Err(e) = crate::atomic_file::write_atomic(&path, edited.as_bytes()) {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
                 return FastLaneResult::Fallback {
-                    reason: format!("write plan: {e}"),
+                    reason: format!("read plan: {e}"),
                 };
             }
-            FastLaneResult::Applied {
+        };
+
+        match apply_to_content_with_calendar_owner(&week_code, &content, &op, calendar_owner) {
+            Ok(edited) => {
+                if let Err(e) = crate::atomic_file::write_atomic(&path, edited.as_bytes()) {
+                    return FastLaneResult::Fallback {
+                        reason: format!("write plan: {e}"),
+                    };
+                }
+                FastLaneResult::Applied {
+                    report: report_line(&op),
+                    op,
+                    week_code,
+                }
+            }
+            // A cancel that found nothing in the plan still succeeded when it cleared
+            // the ad-hoc reminder the family meant.
+            Err(_) if adhoc_cleared > 0 => FastLaneResult::Applied {
                 report: report_line(&op),
                 op,
                 week_code,
-            }
+            },
+            // A removal that matched no row is ANSWERED honestly, not handed to the
+            // composer: "took it off" for a row that was never there is the same lie in the
+            // other direction (task engine-shopping-language).
+            Err(FastLaneError::NotApplicable(_)) => match &op {
+                FastLaneOp::ShoppingRemove { item } => FastLaneResult::Answered {
+                    reply: format!(
+                        "I don't see {item} on the shopping list — nothing to take off. Want me to add it instead?"
+                    ),
+                    lane: "nothing-to-remove".to_string(),
+                },
+                _ => FastLaneResult::Fallback {
+                    reason: "direct edit not applicable — deferring to full pipeline".to_string(),
+                },
+            },
+            Err(e) => FastLaneResult::Fallback {
+                reason: format!("direct edit refused ({e}) — deferring to full pipeline"),
+            },
         }
-        // A cancel that found nothing in the plan still succeeded when it cleared
-        // the ad-hoc reminder the family meant.
-        Err(_) if adhoc_cleared > 0 => FastLaneResult::Applied {
-            report: report_line(&op),
-            op,
-            week_code,
-        },
-        // A removal that matched no row is ANSWERED honestly, not handed to the
-        // composer: "took it off" for a row that was never there is the same lie in the
-        // other direction (task engine-shopping-language).
-        Err(FastLaneError::NotApplicable(_)) => match &op {
-            FastLaneOp::ShoppingRemove { item } => FastLaneResult::Answered {
-                reply: format!(
-                    "I don't see {item} on the shopping list — nothing to take off. Want me to add it instead?"
-                ),
-                lane: "nothing-to-remove".to_string(),
-            },
-            _ => FastLaneResult::Fallback {
-                reason: "direct edit not applicable — deferring to full pipeline".to_string(),
-            },
-        },
-        Err(e) => FastLaneResult::Fallback {
-            reason: format!("direct edit refused ({e}) — deferring to full pipeline"),
-        },
-    }
     });
     match locked {
         Ok(result) => result,
@@ -2781,14 +2787,12 @@ mod tests {
         // The audit gap: this lane got only a NaiveDate, so "Monday at 9am" typed
         // on a Monday at 09:30 filed a row half an hour in the PAST.
         let monday = NaiveDate::from_ymd_opt(2026, 7, 27).unwrap();
-        let at = |h, mi| {
-            match classify_at(
-                "remind me to call the dentist Monday at 9:00 am",
-                monday.and_time(NaiveTime::from_hms_opt(h, mi, 0).unwrap()),
-            ) {
-                Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => date,
-                other => panic!("expected a reminder, got {other:?}"),
-            }
+        let at = |h, mi| match classify_at(
+            "remind me to call the dentist Monday at 9:00 am",
+            monday.and_time(NaiveTime::from_hms_opt(h, mi, 0).unwrap()),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => date,
+            other => panic!("expected a reminder, got {other:?}"),
         };
         assert_eq!(at(3, 20), monday, "09:00 still ahead — today is right");
         assert_eq!(
@@ -2879,12 +2883,18 @@ mod tests {
             "remind me to call the vet on 2/30/2027 at 9:00 a.m.",
         ] {
             assert!(
-                matches!(classify_at(msg, monday_at(3, 20)), Classification::Fallback(_)),
+                matches!(
+                    classify_at(msg, monday_at(3, 20)),
+                    Classification::Fallback(_)
+                ),
                 "{msg:?} named an impossible date and was written anyway"
             );
         }
         // CONTROL: absent date syntax still resolves by weekday.
-        match classify_at("remind me to call the vet Monday at 9:00 a.m.", monday_at(3, 20)) {
+        match classify_at(
+            "remind me to call the vet Monday at 9:00 a.m.",
+            monday_at(3, 20),
+        ) {
             Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => {
                 assert_eq!(date, NaiveDate::from_ymd_opt(2026, 7, 27).unwrap())
             }
@@ -2989,7 +2999,10 @@ mod tests {
             explicit,
             "Done — I'll remind you to call the dentist Monday, August 3 at 09:00 ⏰"
         );
-        assert_eq!(next, explicit, "both name the same date and must read alike");
+        assert_eq!(
+            next, explicit,
+            "both name the same date and must read alike"
+        );
         assert_eq!(
             bare,
             "Done — I'll remind you to call the dentist Monday, July 27 at 09:00 ⏰"
@@ -3623,7 +3636,10 @@ domains = ["meals"]
 
     #[test]
     fn c058_a_nonsense_item_is_asked_about_never_written() {
-        for phrase in ["Add glorptwax to shopping.", "Add glorptwax to the shopping list."] {
+        for phrase in [
+            "Add glorptwax to shopping.",
+            "Add glorptwax to the shopping list.",
+        ] {
             assert_eq!(ask_reason(phrase), AskReason::UnknownItem);
             // And emphatically NOT a write.
             assert!(
@@ -3733,10 +3749,7 @@ domains = ["meals"]
             }
         );
         // An unscoped dish word is plan-OR-list: left to the composer, not applied.
-        assert_eq!(
-            fallback("remove the pasta"),
-            FallbackReason::NotASimpleEdit
-        );
+        assert_eq!(fallback("remove the pasta"), FallbackReason::NotASimpleEdit);
     }
 
     #[test]
@@ -3818,7 +3831,10 @@ domains = ["meals"]
             item: "glorptwax".into(),
         };
         let err = apply_to_content("2026-W29", W29, &op).expect_err("nothing to remove");
-        assert!(matches!(err, FastLaneError::NotApplicable(_)), "got {err:?}");
+        assert!(
+            matches!(err, FastLaneError::NotApplicable(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -3836,7 +3852,10 @@ domains = ["meals"]
                 "held-ask",
             ),
             // A removal that matches no row is answered honestly, not "done".
-            ("remove the pineapple from the shopping list", "nothing-to-remove"),
+            (
+                "remove the pineapple from the shopping list",
+                "nothing-to-remove",
+            ),
         ] {
             match run_fast_lane(&dir, phrase, today()) {
                 FastLaneResult::Answered { reply, lane } => {
@@ -3950,7 +3969,8 @@ domains = ["meals"]
 
     #[test]
     fn the_fast_lane_edits_the_family_plan_beside_a_sidecar() {
-        let dir = std::env::temp_dir().join(format!("fastlane-sidecar-pick-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("fastlane-sidecar-pick-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let plans = dir.join("plans");
         std::fs::create_dir_all(&plans).unwrap();
@@ -4262,8 +4282,8 @@ Keep what I just asked for: \"Set Tuesday's dinner to homemade pizza.\"";
             run_fast_lane(root.path(), DISPATCHED, monday_w31()),
             FastLaneResult::Applied { .. }
         ));
-        let first = std::fs::read_to_string(root.path().join("plans/2026-W31-family-plan.md"))
-            .unwrap();
+        let first =
+            std::fs::read_to_string(root.path().join("plans/2026-W31-family-plan.md")).unwrap();
 
         let again = run_fast_lane(root.path(), DISPATCHED, monday_w31());
         let FastLaneResult::Answered { lane, reply } = &again else {
@@ -4345,15 +4365,17 @@ Keep what I just asked for: \"Set Tuesday's dinner to homemade pizza.\"";
 |-----|------|--------|------|
 | Monthly total | — | 21 dinners | — |
 ";
-        assert!(apply_to_content(
-            "2026-W29",
-            sneaky,
-            &FastLaneOp::MealSwap {
-                day: Weekday::Mon,
-                dish: "tacos".into(),
-            },
-        )
-        .is_err());
+        assert!(
+            apply_to_content(
+                "2026-W29",
+                sneaky,
+                &FastLaneOp::MealSwap {
+                    day: Weekday::Mon,
+                    dish: "tacos".into(),
+                },
+            )
+            .is_err()
+        );
     }
 
     /// THE OTHER ENGINE PATH THAT REWRITES A PLAN FILE (docs/42 §9(1)). The
@@ -4412,9 +4434,11 @@ Keep what I just asked for: \"Set Tuesday's dinner to homemade pizza.\"";
             FastLaneResult::Applied { .. } => {}
             other => panic!("expected the edit to apply once unlocked, got {other:?}"),
         }
-        assert!(std::fs::read_to_string(&plan_path)
-            .unwrap()
-            .to_lowercase()
-            .contains("homemade pizza"));
+        assert!(
+            std::fs::read_to_string(&plan_path)
+                .unwrap()
+                .to_lowercase()
+                .contains("homemade pizza")
+        );
     }
 }

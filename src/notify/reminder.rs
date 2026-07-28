@@ -693,7 +693,9 @@ const CANCEL_VERBS: &[&str] = &[
 /// the memory/read ask that must never be filed as a reminder.
 pub fn is_reminder_read(low: &str) -> bool {
     for opener in ["remind me ", "remind us ", "reminder "] {
-        let Some(idx) = low.find(opener) else { continue };
+        let Some(idx) = low.find(opener) else {
+            continue;
+        };
         let rest = &low[idx + opener.len()..];
         let mut words = rest.split_whitespace().skip_while(|w| {
             REMIND_FILLERS.contains(&w.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
@@ -722,10 +724,7 @@ fn names_past_day(low: &str) -> bool {
                 .next()
                 .unwrap_or("")
                 .trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            if WEEKDAYS
-                .iter()
-                .any(|(names, _)| names.contains(&next))
-            {
+            if WEEKDAYS.iter().any(|(names, _)| names.contains(&next)) {
                 return true;
             }
             start = i;
@@ -898,8 +897,7 @@ const WEEKDAYS: &[(&[&str], Weekday)] = &[
 /// a whole week on when the resolved *instant* has already passed, so "remind me
 /// Monday at 8am" said on Monday afternoon lands next Monday, not this morning.
 fn next_weekday(from: NaiveDate, wd: Weekday) -> NaiveDate {
-    let delta =
-        (wd.num_days_from_monday() as i64) - (from.weekday().num_days_from_monday() as i64);
+    let delta = (wd.num_days_from_monday() as i64) - (from.weekday().num_days_from_monday() as i64);
     from + Duration::days(delta.rem_euclid(7))
 }
 
@@ -910,8 +908,7 @@ fn next_weekday(from: NaiveDate, wd: Weekday) -> NaiveDate {
 /// 03:20 on Monday 27 July, "remind me next Monday at 9" meant 3 August; the
 /// modulo rule filed it for 09:00 that same morning, five hours later.
 pub(crate) fn next_weekday_strict(from: NaiveDate, wd: Weekday) -> NaiveDate {
-    let delta =
-        (wd.num_days_from_monday() as i64) - (from.weekday().num_days_from_monday() as i64);
+    let delta = (wd.num_days_from_monday() as i64) - (from.weekday().num_days_from_monday() as i64);
     let ahead = delta.rem_euclid(7);
     from + Duration::days(if ahead == 0 { 7 } else { ahead })
 }
@@ -934,7 +931,10 @@ pub(crate) fn names_next_weekday(low: &str) -> Option<Weekday> {
             continue;
         };
         let after = after.to_ascii_lowercase();
-        if let Some((_, wd)) = WEEKDAYS.iter().find(|(names, _)| names.contains(&after.as_str())) {
+        if let Some((_, wd)) = WEEKDAYS
+            .iter()
+            .find(|(names, _)| names.contains(&after.as_str()))
+        {
             return Some(*wd);
         }
     }
@@ -1077,7 +1077,10 @@ pub(crate) fn scan_civil_date(low: &str, today: NaiveDate) -> CivilDateScan {
         };
         // "august 3[, 2026]"
         if let Some(day) = spans.get(i + 1).and_then(|(_, _, w)| day_number(w)) {
-            let (year, last) = match spans.get(i + 2).and_then(|(_, e, w)| year_number(w).map(|y| (y, *e))) {
+            let (year, last) = match spans
+                .get(i + 2)
+                .and_then(|(_, e, w)| year_number(w).map(|y| (y, *e)))
+            {
                 Some((y, e)) => (y, e),
                 None => (infer_year(month, day, today), spans[i + 1].1),
             };
@@ -1095,7 +1098,10 @@ pub(crate) fn scan_civil_date(low: &str, today: NaiveDate) -> CivilDateScan {
         // "3 august [2026]"
         if i > 0 {
             if let Some(day) = day_number(spans[i - 1].2) {
-                let (year, last) = match spans.get(i + 1).and_then(|(_, e, w)| year_number(w).map(|y| (y, *e))) {
+                let (year, last) = match spans
+                    .get(i + 1)
+                    .and_then(|(_, e, w)| year_number(w).map(|y| (y, *e)))
+                {
                     Some((y, e)) => (y, e),
                     None => (infer_year(month, day, today), *end),
                 };
@@ -1190,7 +1196,10 @@ fn parse_iso_date(word: &str) -> Shaped {
 /// A date-shaped word the calendar refuses ("2/30/2027") is `Impossible`.
 fn parse_slash_date(word: &str, today: NaiveDate, introduced: bool) -> Shaped {
     let parts: Vec<&str> = word.split('/').collect();
-    if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+    if !parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
         return Shaped::NotADate;
     }
     let (Some(Ok(month)), Some(Ok(day))) = (
@@ -1206,11 +1215,7 @@ fn parse_slash_date(word: &str, today: NaiveDate, introduced: bool) -> Shaped {
             let Ok(year) = raw.parse::<i32>() else {
                 return Shaped::NotADate;
             };
-            if raw.len() == 2 {
-                2000 + year
-            } else {
-                year
-            }
+            if raw.len() == 2 { 2000 + year } else { year }
         }
         _ => return Shaped::NotADate,
     };
@@ -1222,12 +1227,9 @@ fn parse_slash_date(word: &str, today: NaiveDate, introduced: bool) -> Shaped {
 
 /// The weekday a bare day name in `low` refers to, if any.
 fn named_weekday(low: &str) -> Option<Weekday> {
-    WEEKDAYS.iter().find_map(|(names, wd)| {
-        names
-            .iter()
-            .any(|n| contains_word(low, n))
-            .then_some(*wd)
-    })
+    WEEKDAYS
+        .iter()
+        .find_map(|(names, wd)| names.iter().any(|n| contains_word(low, n)).then_some(*wd))
 }
 
 /// "August 3" — the month/day half of a spelled-out date, for confirmations.
@@ -1604,7 +1606,11 @@ impl AdHocStore {
     ///
     /// `Ok(Some(r))` removed it; `Ok(None)` matched nothing; `Err(n)` matched `n`
     /// reminders and removed NOTHING — the caller asks which one was meant.
-    pub fn cancel(&mut self, req: &CancelRequest, now: NaiveDateTime) -> Result<Option<Reminder>, usize> {
+    pub fn cancel(
+        &mut self,
+        req: &CancelRequest,
+        now: NaiveDateTime,
+    ) -> Result<Option<Reminder>, usize> {
         let ids: Vec<String> = self
             .matching(req, now)
             .into_iter()
@@ -1919,17 +1925,32 @@ mod tests {
             now,
         )
         .expect("intent");
-        assert_eq!(civil.due, dt(2026, 8, 3, 9, 0), "an explicit date is the date");
+        assert_eq!(
+            civil.due,
+            dt(2026, 8, 3, 9, 0),
+            "an explicit date is the date"
+        );
         assert_eq!(civil.text, "Call the dentist");
 
-        let next = parse_reminder_intent("Remind me to call the dentist next Monday at 9:00 a.m.", now)
-            .expect("intent");
-        assert_eq!(next.due, dt(2026, 8, 3, 9, 0), "'next Monday' is never today");
+        let next = parse_reminder_intent(
+            "Remind me to call the dentist next Monday at 9:00 a.m.",
+            now,
+        )
+        .expect("intent");
+        assert_eq!(
+            next.due,
+            dt(2026, 8, 3, 9, 0),
+            "'next Monday' is never today"
+        );
 
         // The distinction: a BARE weekday keeps today-if-the-time-is-ahead.
         let bare = parse_reminder_intent("Remind me to call the dentist Monday at 9:00 a.m.", now)
             .expect("intent");
-        assert_eq!(bare.due, dt(2026, 7, 27, 9, 0), "a bare weekday still means today");
+        assert_eq!(
+            bare.due,
+            dt(2026, 7, 27, 9, 0),
+            "a bare weekday still means today"
+        );
         assert!(
             bare.due < next.due,
             "bare and 'next' must not resolve to the same day"
@@ -1946,9 +1967,11 @@ mod tests {
                 ("friday", Weekday::Fri),
                 ("sunday", Weekday::Sun),
             ] {
-                let intent =
-                    parse_reminder_intent(&format!("remind me next {word} at 9am to call the vet"), now)
-                        .expect("intent");
+                let intent = parse_reminder_intent(
+                    &format!("remind me next {word} at 9am to call the vet"),
+                    now,
+                )
+                .expect("intent");
                 assert_eq!(intent.due.weekday(), wd);
                 assert!(
                     intent.due.date() > now.date(),
@@ -1969,16 +1992,29 @@ mod tests {
         let now = dt(2026, 7, 27, 3, 20);
         for (msg, want) in [
             ("remind me on august 3 at 9am to call", dt(2026, 8, 3, 9, 0)),
-            ("remind me on August 3, 2026 at 9am to call", dt(2026, 8, 3, 9, 0)),
+            (
+                "remind me on August 3, 2026 at 9am to call",
+                dt(2026, 8, 3, 9, 0),
+            ),
             ("remind me aug 3rd at 9am to call", dt(2026, 8, 3, 9, 0)),
-            ("remind me on 3 August 2026 at 9am to call", dt(2026, 8, 3, 9, 0)),
-            ("remind me on 2026-08-03 at 9am to call", dt(2026, 8, 3, 9, 0)),
+            (
+                "remind me on 3 August 2026 at 9am to call",
+                dt(2026, 8, 3, 9, 0),
+            ),
+            (
+                "remind me on 2026-08-03 at 9am to call",
+                dt(2026, 8, 3, 9, 0),
+            ),
             ("remind me on 8/3/2026 at 9am to call", dt(2026, 8, 3, 9, 0)),
             ("remind me on 8/3 at 9am to call", dt(2026, 8, 3, 9, 0)),
             // A month/day already past this year rolls to next year, not backwards.
-            ("remind me on january 4 at 9am to call", dt(2027, 1, 4, 9, 0)),
+            (
+                "remind me on january 4 at 9am to call",
+                dt(2027, 1, 4, 9, 0),
+            ),
         ] {
-            let intent = parse_reminder_intent(msg, now).unwrap_or_else(|| panic!("no intent: {msg}"));
+            let intent =
+                parse_reminder_intent(msg, now).unwrap_or_else(|| panic!("no intent: {msg}"));
             assert_eq!(intent.due, want, "{msg}");
         }
     }
@@ -1988,12 +2024,12 @@ mod tests {
         let now = dt(2026, 7, 27, 3, 20);
         // "1/2 cup" is a fraction, not 2 January. It has no other day word, so the
         // ask resolves to today's default slot — never to a spurious date.
-        let intent = parse_reminder_intent("remind me at 9am to buy 1/2 cup of cream", now)
-            .expect("intent");
+        let intent =
+            parse_reminder_intent("remind me at 9am to buy 1/2 cup of cream", now).expect("intent");
         assert_eq!(intent.due, dt(2026, 7, 27, 9, 0));
         // A bare month word with no adjacent day number is prose, not a date.
-        let intent =
-            parse_reminder_intent("remind me at 9am to ask whether we may go", now).expect("intent");
+        let intent = parse_reminder_intent("remind me at 9am to ask whether we may go", now)
+            .expect("intent");
         assert_eq!(intent.due, dt(2026, 7, 27, 9, 0));
     }
 
@@ -2104,8 +2140,8 @@ mod tests {
         // The DM control the fast lane had to be brought level with: no day word,
         // a clock that has passed → the NEXT 2 a.m., never the one just gone.
         let now = dt(2026, 7, 27, 3, 20);
-        let intent =
-            parse_reminder_intent("remind me to call the dentist at 2:00 a.m.", now).expect("intent");
+        let intent = parse_reminder_intent("remind me to call the dentist at 2:00 a.m.", now)
+            .expect("intent");
         assert_eq!(intent.due, dt(2026, 7, 28, 2, 0));
         // A dayless clock still AHEAD stays today.
         let today = parse_reminder_intent("remind me to call the dentist at 9:00 a.m.", now)
@@ -2175,8 +2211,11 @@ mod tests {
             "Will do — Monday, August 3 at 9am \u{2713}"
         );
         // Inside the week, the short form is unchanged.
-        let near = parse_reminder_intent("Otto remind me Thursday to defrost the trout", dt(2026, 7, 12, 10, 0))
-            .expect("intent");
+        let near = parse_reminder_intent(
+            "Otto remind me Thursday to defrost the trout",
+            dt(2026, 7, 12, 10, 0),
+        )
+        .expect("intent");
         assert_eq!(near.confirmation, "Will do — Thursday morning \u{2713}");
     }
 
@@ -2240,7 +2279,10 @@ mod tests {
         }
 
         let req = parse_reminder_cancel("cancel the reminder about the dentist").unwrap();
-        let gone = store.cancel(&req, now).expect("unambiguous").expect("a hit");
+        let gone = store
+            .cancel(&req, now)
+            .expect("unambiguous")
+            .expect("a hit");
         assert_eq!(gone.text, "Book the dentist");
         assert_eq!(store.reminders.len(), 2);
 
@@ -2264,7 +2306,10 @@ mod tests {
     fn an_ambiguous_cancel_removes_nothing() {
         let now = dt(2026, 7, 12, 10, 0);
         let mut store = AdHocStore::default();
-        for (id, text) in [("a", "Call the dentist about Ada"), ("b", "Call the dentist back")] {
+        for (id, text) in [
+            ("a", "Call the dentist about Ada"),
+            ("b", "Call the dentist back"),
+        ] {
             store.add(Reminder {
                 id: id.into(),
                 due: dt(2026, 7, 16, 9, 0),
@@ -2276,7 +2321,11 @@ mod tests {
         }
         let req = parse_reminder_cancel("cancel the reminder about the dentist").unwrap();
         assert_eq!(store.cancel(&req, now), Err(2));
-        assert_eq!(store.reminders.len(), 2, "nothing may be dropped on a guess");
+        assert_eq!(
+            store.reminders.len(),
+            2,
+            "nothing may be dropped on a guess"
+        );
     }
 
     #[test]
