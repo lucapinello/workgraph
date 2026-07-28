@@ -491,22 +491,53 @@ pub struct AdHocIntent {
 /// Returns `None` for messages that are not reminder requests.
 pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocIntent> {
     let low = text.to_ascii_lowercase();
-    if !low.contains("remind") {
+    // Require reminder-REQUEST grammar, not the bare substring. "…this isn't a
+    // reminder request" mentions the noun and asks for nothing; filing it created
+    // a row titled "Er request." out of prose that declined a reminder.
+    if !is_reminder_request(&low) {
         return None;
     }
-    // FAIL CLOSED (date-reminder-fail). Three shapes carry the reminder verb and
+    // FAIL CLOSED (date-reminder-fail). Four shapes carry the reminder verb and
     // are emphatically NOT a request to schedule one:
     //   (a) an interrogative after "remind me" — "remind me what was in Monday's
     //       risotto" asks the family memory; it is answered, never filed;
     //   (b) a day already elapsed — "remind me last Monday …" cannot be honoured
     //       by scheduling anything, so the composer asks instead;
     //   (c) a cancellation — "cancel the reminder about the dentist" must never
-    //       create a second reminder (see [`parse_reminder_cancel`]).
-    if is_reminder_read(&low) || names_past_day(&low) || parse_reminder_cancel(text).is_some() {
+    //       create a second reminder (see [`parse_reminder_cancel`]);
+    //   (d) a NEGATED request — "do not remind me to call the dentist next
+    //       Monday" is the opposite of an ask, and filing it is the loudest
+    //       possible way to get it wrong.
+    if is_reminder_read(&low)
+        || names_past_day(&low)
+        || negates_creation(&low)
+        || parse_reminder_cancel(text).is_some()
+    {
+        return None;
+    }
+
+    // FAIL CLOSED on date SYNTAX the calendar refuses ("Monday, February 30,
+    // 2027"). Absent syntax falls through to the weekday rules, as it must; an
+    // impossible date must never do so, or the ask lands on a Monday nobody named.
+    if scan_civil_date(&low, now.date()) == CivilDateScan::Impossible {
         return None;
     }
 
     let (date, day_label, day_kind) = resolve_day(&low, now.date());
+
+    // FAIL CLOSED on a typed date that cannot be honoured as written: one already
+    // gone, or one its own weekday word contradicts ("Tuesday, August 3, 2026" —
+    // August 3 is a Monday). Which half the family meant is genuinely unknown,
+    // and guessing puts the reminder on the wrong day; the composer asks instead.
+    if day_kind == DayKind::CivilDate {
+        if date < now.date() {
+            return None;
+        }
+        if named_weekday(&low).is_some_and(|wd| wd != date.weekday()) {
+            return None;
+        }
+    }
+
     let (time, time_label, had_time) = resolve_time(&low, now, date);
 
     // Require *some* time signal — a day word or an explicit clock — so bare
@@ -523,12 +554,17 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
     //
     // An EXPLICIT day never rolls: "next Monday" and "August 3" already point at
     // one specific date, and silently adding a week to a date the family typed
-    // out is a worse lie than filing it as asked.
+    // out is a worse lie than filing it as asked. A typed date whose CLOCK has
+    // already gone is therefore refused outright rather than filed in the past:
+    // "call the dentist on Monday, July 27 at 2:00 a.m.", typed at 03:20 that
+    // same Monday, names a moment eighty minutes gone, and only the family knows
+    // whether they meant tomorrow, next week, or a typo. They are asked.
     let due = if due <= now {
         match day_kind {
             DayKind::None => (date + Duration::days(1)).and_time(time),
             DayKind::BareWeekday => (date + Duration::days(7)).and_time(time),
-            DayKind::Relative | DayKind::NextWeekday | DayKind::CivilDate => due,
+            DayKind::CivilDate => return None,
+            DayKind::Relative | DayKind::NextWeekday => due,
         }
     } else {
         due
@@ -574,11 +610,71 @@ const REMIND_INTERROGATIVES: &[&str] = &[
 /// Fillers between "remind me" and the interrogative ("remind me again what …").
 const REMIND_FILLERS: &[&str] = &["again", "please", "quickly", "quick", "once", "briefly"];
 
+/// Grammar that actually REQUESTS a reminder. The bare substring "remind" is
+/// not enough: prose mentions the noun ("this isn't a reminder request", "the
+/// reminder engine is noisy") without asking for anything, and a substring
+/// trigger filed those as rows.
+/// The NOUN forms. The verb form is handled separately, because "remind " with
+/// its trailing space already covers every person a family names ("remind me",
+/// "remind Luca to …", "please remind everyone") while excluding the noun
+/// "reminder", where the next letter is an "e", not a space.
+pub(crate) const REMINDER_REQUEST_FORMS: &[&str] = &[
+    "reminder to ",
+    "reminder for ",
+    "reminder about ",
+    "reminder: ",
+    "set a reminder",
+    "set me a reminder",
+    "set up a reminder",
+    "add a reminder",
+    "create a reminder",
+    "make a reminder",
+    "put a reminder",
+    "schedule a reminder",
+    "new reminder",
+];
+
+/// True when `low` (already lowercased) asks for a reminder in one of the shapes
+/// a family actually types. See [`REMINDER_REQUEST_FORMS`].
+pub(crate) fn is_reminder_request(low: &str) -> bool {
+    low.contains("remind ") || REMINDER_REQUEST_FORMS.iter().any(|f| low.contains(f))
+}
+
+/// Phrases that NEGATE a reminder request. Distinct from [`CANCEL_VERBS`]: a
+/// cancellation needs a target to act on, while a negation only has to stop a
+/// creation — "do not remind me at 9am" names nothing to cancel, and without
+/// this guard the creation gate happily filed it.
+pub(crate) const CREATION_NEGATIONS: &[&str] = &[
+    "do not remind",
+    "don't remind",
+    "dont remind",
+    "do not set a reminder",
+    "don't set a reminder",
+    "dont set a reminder",
+    "do not add a reminder",
+    "don't add a reminder",
+    "dont add a reminder",
+    "no need to remind",
+    "no need for a reminder",
+    "not a reminder",
+    "isn't a reminder",
+    "isnt a reminder",
+    "no reminder needed",
+    "without a reminder",
+];
+
+/// True when `low` (already lowercased) DECLINES a reminder rather than asking
+/// for one. See [`CREATION_NEGATIONS`].
+pub(crate) fn negates_creation(low: &str) -> bool {
+    CREATION_NEGATIONS.iter().any(|n| low.contains(n))
+}
+
 /// Verbs that cancel rather than create.
 const CANCEL_VERBS: &[&str] = &[
     "stop reminding",
     "don't remind",
     "dont remind",
+    "do not remind",
     "no longer need",
     "get rid of",
     "call off",
@@ -877,6 +973,32 @@ pub(crate) fn parse_civil_date(low: &str, today: NaiveDate) -> Option<NaiveDate>
     find_civil_date(low, today).map(|f| f.date)
 }
 
+/// What a search for explicit civil-date SYNTAX found — the distinction
+/// [`find_civil_date`]'s `Option` cannot carry.
+///
+/// "February 30, 2027" is unmistakably a typed date; the calendar simply has no
+/// such day. Reporting that as "no date here" sent both parsers on to the
+/// weekday word beside it, so "call the vet on Monday, February 30, 2027" was
+/// filed for the next Monday — a day the family never named. Absent syntax
+/// falls through (correct); IMPOSSIBLE syntax fails closed and is asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CivilDateScan {
+    /// No civil-date syntax in the text at all.
+    Absent,
+    /// A civil date the calendar has, with its byte span.
+    Found(FoundDate),
+    /// Date syntax naming a day that does not exist ("February 30", "2027-13-01").
+    Impossible,
+}
+
+/// One word's worth of date syntax: not a date at all, a real date, or a
+/// date-shaped tuple the calendar rejects.
+enum Shaped {
+    NotADate,
+    Date(NaiveDate),
+    Impossible,
+}
+
 /// Find an explicit civil date in `low` (already lowercased).
 ///
 /// Four shapes, all anchored so ordinary prose cannot be mistaken for a date:
@@ -893,6 +1015,15 @@ pub(crate) fn parse_civil_date(low: &str, today: NaiveDate) -> Option<NaiveDate>
 /// "remind me on January 4", said in December, means the January four weeks out,
 /// not the one ten months gone.
 pub(crate) fn find_civil_date(low: &str, today: NaiveDate) -> Option<FoundDate> {
+    match scan_civil_date(low, today) {
+        CivilDateScan::Found(found) => Some(found),
+        CivilDateScan::Absent | CivilDateScan::Impossible => None,
+    }
+}
+
+/// [`find_civil_date`], keeping the one distinction the caller must fail closed
+/// on: date syntax that names a day the calendar does not have.
+pub(crate) fn scan_civil_date(low: &str, today: NaiveDate) -> CivilDateScan {
     // Word spans, so a match can be reported back as a byte range.
     let spans: Vec<(usize, usize, &str)> = low
         .split_whitespace()
@@ -906,12 +1037,16 @@ pub(crate) fn find_civil_date(low: &str, today: NaiveDate) -> Option<FoundDate> 
         let word = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
 
         // ISO 2026-08-03.
-        if let Some(date) = parse_iso_date(word) {
-            return Some(FoundDate {
-                date,
-                start: *start,
-                end: *end,
-            });
+        match parse_iso_date(word) {
+            Shaped::Date(date) => {
+                return CivilDateScan::Found(FoundDate {
+                    date,
+                    start: *start,
+                    end: *end,
+                });
+            }
+            Shaped::Impossible => return CivilDateScan::Impossible,
+            Shaped::NotADate => {}
         }
 
         // Numeric 8/3/2026, or 8/3 when introduced by "on"/"the".
@@ -923,12 +1058,16 @@ pub(crate) fn find_civil_date(low: &str, today: NaiveDate) -> Option<FoundDate> 
                         .trim_matches(|c: char| !c.is_ascii_alphanumeric()),
                     "on" | "the"
                 );
-            if let Some(date) = parse_slash_date(word, today, introduced) {
-                return Some(FoundDate {
-                    date,
-                    start: *start,
-                    end: *end,
-                });
+            match parse_slash_date(word, today, introduced) {
+                Shaped::Date(date) => {
+                    return CivilDateScan::Found(FoundDate {
+                        date,
+                        start: *start,
+                        end: *end,
+                    });
+                }
+                Shaped::Impossible => return CivilDateScan::Impossible,
+                Shaped::NotADate => {}
             }
         }
 
@@ -942,13 +1081,16 @@ pub(crate) fn find_civil_date(low: &str, today: NaiveDate) -> Option<FoundDate> 
                 Some((y, e)) => (y, e),
                 None => (infer_year(month, day, today), spans[i + 1].1),
             };
-            if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
-                return Some(FoundDate {
+            // A month name with an adjacent day number IS a typed date, whether
+            // or not the calendar has that day (February 30 does not exist).
+            return match NaiveDate::from_ymd_opt(year, month, day) {
+                Some(date) => CivilDateScan::Found(FoundDate {
                     date,
                     start: *start,
                     end: last,
-                });
-            }
+                }),
+                None => CivilDateScan::Impossible,
+            };
         }
         // "3 august [2026]"
         if i > 0 {
@@ -957,17 +1099,18 @@ pub(crate) fn find_civil_date(low: &str, today: NaiveDate) -> Option<FoundDate> 
                     Some((y, e)) => (y, e),
                     None => (infer_year(month, day, today), *end),
                 };
-                if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
-                    return Some(FoundDate {
+                return match NaiveDate::from_ymd_opt(year, month, day) {
+                    Some(date) => CivilDateScan::Found(FoundDate {
                         date,
                         start: spans[i - 1].0,
                         end: last,
-                    });
-                }
+                    }),
+                    None => CivilDateScan::Impossible,
+                };
             }
         }
     }
-    None
+    CivilDateScan::Absent
 }
 
 /// The month a word names, if it is a month name or a known abbreviation.
@@ -1004,46 +1147,76 @@ fn year_number(word: &str) -> Option<i32> {
     (1900..=2200).contains(&y).then_some(y)
 }
 
-/// The year that puts `month`/`day` on or after `today` — this year when it has
-/// not yet passed, else next year.
+/// The year that puts `month`/`day` on or after `today`.
+///
+/// Searches FORWARD for a year that actually has the day: "February 29" typed
+/// in 2026 means the leap day in 2028, not a tuple the calendar refuses. For a
+/// tuple no year has ("February 30") it hands back next year, and the scan then
+/// reports [`CivilDateScan::Impossible`] rather than guessing a weekday.
 fn infer_year(month: u32, day: u32, today: NaiveDate) -> i32 {
-    match NaiveDate::from_ymd_opt(today.year(), month, day) {
-        Some(d) if d >= today => today.year(),
-        _ => today.year() + 1,
-    }
+    (today.year()..=today.year() + 8)
+        .find(|y| NaiveDate::from_ymd_opt(*y, month, day).is_some_and(|d| d >= today))
+        .unwrap_or(today.year() + 1)
 }
 
-/// `2026-08-03`.
-fn parse_iso_date(word: &str) -> Option<NaiveDate> {
+/// `2026-08-03`. `Impossible` when the word is ISO-SHAPED but names no real day
+/// ("2027-02-30"), so the caller can fail closed instead of reading past it.
+fn parse_iso_date(word: &str) -> Shaped {
     let parts: Vec<&str> = word.split('-').collect();
     if parts.len() != 3 || parts[0].len() != 4 {
-        return None;
+        return Shaped::NotADate;
     }
-    NaiveDate::from_ymd_opt(
-        parts[0].parse().ok()?,
-        parts[1].parse().ok()?,
-        parts[2].parse().ok()?,
-    )
+    if !parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Shaped::NotADate;
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (
+        parts[0].parse::<i32>(),
+        parts[1].parse::<u32>(),
+        parts[2].parse::<u32>(),
+    ) else {
+        return Shaped::NotADate;
+    };
+    match NaiveDate::from_ymd_opt(y, m, d) {
+        Some(date) => Shaped::Date(date),
+        None => Shaped::Impossible,
+    }
 }
 
 /// `8/3/2026`, or `8/3` when `introduced` (directly after "on"/"the"). US
 /// month/day ordering — the families this ships to write dates that way.
-fn parse_slash_date(word: &str, today: NaiveDate, introduced: bool) -> Option<NaiveDate> {
+/// A date-shaped word the calendar refuses ("2/30/2027") is `Impossible`.
+fn parse_slash_date(word: &str, today: NaiveDate, introduced: bool) -> Shaped {
     let parts: Vec<&str> = word.split('/').collect();
     if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
-        return None;
+        return Shaped::NotADate;
     }
-    let month: u32 = parts.first()?.parse().ok()?;
-    let day: u32 = parts.get(1)?.parse().ok()?;
-    match parts.len() {
-        2 if introduced => NaiveDate::from_ymd_opt(infer_year(month, day, today), month, day),
+    let (Some(Ok(month)), Some(Ok(day))) = (
+        parts.first().map(|p| p.parse::<u32>()),
+        parts.get(1).map(|p| p.parse::<u32>()),
+    ) else {
+        return Shaped::NotADate;
+    };
+    let year = match parts.len() {
+        2 if introduced => infer_year(month, day, today),
         3 => {
             let raw = parts[2];
-            let year: i32 = raw.parse().ok()?;
-            let year = if raw.len() == 2 { 2000 + year } else { year };
-            NaiveDate::from_ymd_opt(year, month, day)
+            let Ok(year) = raw.parse::<i32>() else {
+                return Shaped::NotADate;
+            };
+            if raw.len() == 2 {
+                2000 + year
+            } else {
+                year
+            }
         }
-        _ => None,
+        _ => return Shaped::NotADate,
+    };
+    match NaiveDate::from_ymd_opt(year, month, day) {
+        Some(date) => Shaped::Date(date),
+        None => Shaped::Impossible,
     }
 }
 
@@ -1058,7 +1231,7 @@ fn named_weekday(low: &str) -> Option<Weekday> {
 }
 
 /// "August 3" — the month/day half of a spelled-out date, for confirmations.
-fn month_day(date: NaiveDate) -> String {
+pub(crate) fn month_day(date: NaiveDate) -> String {
     const LONG: &[&str] = &[
         "January",
         "February",
@@ -1835,6 +2008,159 @@ mod tests {
         let am = parse_reminder_intent("remind me next monday at 9:00 a.m. to call", now)
             .expect("intent");
         assert_eq!(am.due, dt(2026, 8, 3, 9, 0));
+    }
+
+    #[test]
+    fn an_unhonourable_typed_date_asks_instead_of_guessing() {
+        let now = dt(2026, 7, 27, 3, 20);
+        // A date already gone cannot be scheduled — and must not silently roll a
+        // year forward either, which is what "file it anyway" would amount to.
+        assert!(
+            parse_reminder_intent("remind me on July 4, 2026 at 9am to call", now).is_none(),
+            "an elapsed typed date must not be filed"
+        );
+        // The weekday word and the date disagree: August 3 2026 is a MONDAY.
+        assert!(
+            parse_reminder_intent("remind me on Tuesday, August 3, 2026 at 9am to call", now)
+                .is_none(),
+            "a weekday/date disagreement must be asked about, not resolved"
+        );
+        // The agreeing form still files.
+        assert!(
+            parse_reminder_intent("remind me on Monday, August 3, 2026 at 9am to call", now)
+                .is_some()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The exact-tree audit's negative controls (task weekday-b-audit). Each of
+    // these was reproduced against the INSTALLED binary at 2026-07-27T03:20 and
+    // came back registered; they are pinned here so they cannot come back.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_typed_date_whose_clock_has_already_gone_is_asked_about() {
+        // 03:20 on Monday 27 July. "…on Monday, July 27, 2026 at 2:00 a.m." names
+        // an instant eighty minutes GONE. The date check alone (`date < today`)
+        // let it through and the row was filed in the past.
+        let now = dt(2026, 7, 27, 3, 20);
+        assert!(
+            parse_reminder_intent(
+                "remind me to call the dentist on Monday, July 27, 2026 at 2:00 a.m.",
+                now
+            )
+            .is_none(),
+            "an elapsed same-day civil instant must not be filed"
+        );
+        // A typed date with no clock defaults to 09:00 — still ahead at 03:20, so
+        // this one files. The refusal is about the INSTANT, not the date.
+        let ahead = parse_reminder_intent(
+            "remind me to call the dentist on Monday, July 27, 2026",
+            now,
+        )
+        .expect("09:00 today is still ahead at 03:20");
+        assert_eq!(ahead.due, dt(2026, 7, 27, 9, 0));
+        // …and the same ask, once 09:00 has passed, is refused rather than rolled:
+        // silently adding a day or a week to a date the family typed is a guess.
+        assert!(
+            parse_reminder_intent(
+                "remind me to call the dentist on Monday, July 27, 2026",
+                dt(2026, 7, 27, 10, 0)
+            )
+            .is_none(),
+            "a typed date whose default slot has passed must be asked about"
+        );
+    }
+
+    #[test]
+    fn an_impossible_typed_date_never_falls_through_to_the_weekday() {
+        // February 30 exists in no year. `find_civil_date` returned None for it,
+        // which reads identically to "no date here", so the parser resolved the
+        // adjacent "Monday" and filed the ask for a day nobody named.
+        let now = dt(2026, 7, 27, 3, 20);
+        for msg in [
+            "remind me to call the vet on Monday, February 30, 2027 at 9:00 a.m.",
+            "remind me to call the vet on 2027-02-30 at 9:00 a.m.",
+            "remind me to call the vet on 2/30/2027 at 9:00 a.m.",
+            "remind me to call the vet on Monday, April 31, 2027 at 9:00 a.m.",
+        ] {
+            assert!(
+                parse_reminder_intent(msg, now).is_none(),
+                "{msg:?} named an impossible date and was filed anyway"
+            );
+        }
+        // CONTROL: a leap day is a real date. Typed in 2026 it means 2028, and it
+        // must NOT be swept up as impossible.
+        let leap = parse_reminder_intent("remind me on February 29 at 9am to call", now)
+            .expect("29 February is a real day in 2028");
+        assert_eq!(leap.due, dt(2028, 2, 29, 9, 0));
+        // CONTROL: absent date syntax still falls through to the weekday rules.
+        let bare = parse_reminder_intent("remind me Monday at 9am to call", now).expect("intent");
+        assert_eq!(bare.due, dt(2026, 7, 27, 9, 0));
+    }
+
+    #[test]
+    fn a_dayless_elapsed_clock_rolls_to_tomorrow() {
+        // The DM control the fast lane had to be brought level with: no day word,
+        // a clock that has passed → the NEXT 2 a.m., never the one just gone.
+        let now = dt(2026, 7, 27, 3, 20);
+        let intent =
+            parse_reminder_intent("remind me to call the dentist at 2:00 a.m.", now).expect("intent");
+        assert_eq!(intent.due, dt(2026, 7, 28, 2, 0));
+        // A dayless clock still AHEAD stays today.
+        let today = parse_reminder_intent("remind me to call the dentist at 9:00 a.m.", now)
+            .expect("intent");
+        assert_eq!(today.due, dt(2026, 7, 27, 9, 0));
+    }
+
+    #[test]
+    fn a_negated_or_unrelated_mention_never_creates_a_reminder() {
+        let now = dt(2026, 7, 27, 3, 20);
+        for msg in [
+            // The cancellation vocabulary carried "don't remind" but not the
+            // spelled-out form, so this filed the very reminder it refused.
+            "Do not remind me to call the dentist next Monday at 9:00 a.m.",
+            "Don't remind me to call the dentist next Monday at 9:00 a.m.",
+            "Please do not set a reminder for next Monday at 9:00 a.m.",
+            "No need to remind me next Monday at 9:00 a.m.",
+            // Prose that merely MENTIONS the noun. The substring trigger filed a
+            // row titled "Er request." out of a sentence declining a reminder.
+            "Next Monday at 9:00 a.m. is unrelated; this isn't a reminder request.",
+            "The reminder engine was noisy on Monday at 9:00 a.m.",
+            "That reminder fired twice on Monday at 9:00 a.m.",
+        ] {
+            assert!(
+                parse_reminder_intent(msg, now).is_none(),
+                "{msg:?} is not a reminder request and must not be filed"
+            );
+        }
+        // CONTROL: the affirmative form still files, on the right day.
+        let ok = parse_reminder_intent(
+            "Remind me to call the dentist next Monday at 9:00 a.m.",
+            now,
+        )
+        .expect("intent");
+        assert_eq!(ok.due, dt(2026, 8, 3, 9, 0));
+        // CONTROL: naming the person is still a request — the grammar gate must
+        // not narrow the ask to "remind me".
+        let named = parse_reminder_intent(
+            "Otto, please remind Luca next Monday at 9:00 a.m. to call the dentist",
+            now,
+        )
+        .expect("naming who to remind is still a reminder request");
+        assert_eq!(named.due, dt(2026, 8, 3, 9, 0));
+        // CONTROL: an explicit cancellation is still recognised AS a cancellation.
+        let cancel = parse_reminder_cancel("Do not remind me about the dentist").expect("cancel");
+        assert_eq!(cancel.target, "dentist");
+    }
+
+    #[test]
+    fn a_bare_weekday_whose_clock_has_passed_rolls_a_week() {
+        // The audit's second control: same Monday, but now PAST 09:00.
+        let now = dt(2026, 7, 27, 9, 30);
+        let intent = parse_reminder_intent("remind me Monday at 9am to call the dentist", now)
+            .expect("intent");
+        assert_eq!(intent.due, dt(2026, 8, 3, 9, 0));
     }
 
     #[test]

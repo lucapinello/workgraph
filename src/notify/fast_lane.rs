@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{Datelike, Duration, NaiveDate, Weekday};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 
 use super::family_plan::{self, PlanDoc};
 
@@ -205,7 +205,26 @@ const COMPLEX_MARKERS: &[&str] = &[
 
 /// Classify a chat turn against the closed set. Pure; `today` anchors relative
 /// day words ("today", "tomorrow", "tonight").
+///
+/// A DATE alone cannot decide whether a reminder for "Monday at 9" is still
+/// ahead — see [`classify_at`], which callers with a real clock should use.
+/// This entry anchors at midnight, so a same-day reminder always reads as ahead
+/// (the behaviour every caller had before the clock was available).
 pub fn classify(message: &str, today: NaiveDate) -> Classification {
+    classify_at(
+        message,
+        today.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default()),
+    )
+}
+
+/// [`classify`] anchored at a wall-clock instant rather than a bare date.
+///
+/// The audit gap this closes: the fast lane received only a `NaiveDate`, so it
+/// could not tell that "remind me Monday at 9am", typed on a Monday at 09:30,
+/// names a moment thirty minutes GONE. It filed the row for that morning. The DM
+/// path has always rolled such an ask a whole week; now both do.
+pub fn classify_at(message: &str, now: NaiveDateTime) -> Classification {
+    let today = now.date();
     let text = message.trim();
     if text.is_empty() {
         return Classification::Fallback(FallbackReason::NotASimpleEdit);
@@ -264,7 +283,7 @@ pub fn classify(message: &str, today: NaiveDate) -> Classification {
         }
     }
 
-    match match_single_op(&s, today) {
+    match match_single_op(&s, now) {
         Some(op) => Classification::FastLane(op),
         None => Classification::Fallback(FallbackReason::NotASimpleEdit),
     }
@@ -505,6 +524,7 @@ const CANCEL_VERBS: &[&str] = &[
     "stop reminding",
     "don't remind",
     "dont remind",
+    "do not remind",
     "no longer need",
     "get rid of",
     "call off",
@@ -565,15 +585,23 @@ fn segment_is_edit(seg: &str) -> bool {
 /// Match exactly one operation, in priority order. Reminder and shopping are
 /// checked before the meal ops because they share verbs ("add") but are pinned
 /// by their own keywords ("remind", "list"/"shopping").
-fn match_single_op(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
+fn match_single_op(s: &str, now: NaiveDateTime) -> Option<FastLaneOp> {
+    let today = now.date();
     // Cancellation is checked BEFORE creation: "cancel the reminder about the
     // dentist" carries the reminder keyword and would otherwise be filed as a
     // brand-new reminder titled "dentist" (date-reminder-fail (c)).
     if is_reminder_ask(s) && names_cancel(s) {
         return match_reminder_cancel(s, today);
     }
-    if let Some(op) = match_reminder(s, today) {
+    if let Some(op) = match_reminder(s, now) {
         return Some(op);
+    }
+    // A turn that MENTIONS reminders without requesting one (or that negates the
+    // request) is not a meal or shopping edit either — "next Monday at 9:00 a.m.
+    // is unrelated; this isn't a reminder request" names a weekday and must not
+    // be handed to the day-word matchers below. The composer answers it.
+    if is_reminder_ask(s) {
+        return None;
     }
     // NB shopping is NOT matched here any more: `classify` decides the whole shopping
     // lane (add / remove / ask) in `shopping_turn` before reaching this point, because a
@@ -590,8 +618,16 @@ fn match_single_op(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
     None
 }
 
-fn match_reminder(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
-    if !contains_word(s, "remind") && !s.starts_with("reminder") && !s.contains("reminder") {
+fn match_reminder(s: &str, now: NaiveDateTime) -> Option<FastLaneOp> {
+    let today = now.date();
+    // Reminder-REQUEST grammar, not a bare mention of the noun: "next Monday at
+    // 9:00 a.m. is unrelated; this isn't a reminder request" contains "reminder"
+    // and asks for nothing. The substring trigger filed it as a row.
+    if !super::reminder::is_reminder_request(s) {
+        return None;
+    }
+    // A NEGATED request is the opposite of an ask (`do not remind me …`).
+    if super::reminder::negates_creation(s) {
         return None;
     }
     let markers = [
@@ -615,7 +651,14 @@ fn match_reminder(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
     // August 3, 2026" means 3 August, and reading the "Monday" instead is how
     // that ask once filed itself for today. Strip the phrase out of the body too,
     // so the calendar row reads "Call the dentist", not the whole sentence.
-    let explicit = super::reminder::find_civil_date(body, today);
+    // FAIL CLOSED on date SYNTAX the calendar refuses ("Monday, February 30,
+    // 2027"): absent syntax may fall through to the weekday rules, an impossible
+    // date may not, or the ask lands on a Monday the family never named.
+    let explicit = match super::reminder::scan_civil_date(body, today) {
+        super::reminder::CivilDateScan::Found(found) => Some(found),
+        super::reminder::CivilDateScan::Absent => None,
+        super::reminder::CivilDateScan::Impossible => return None,
+    };
     let body: String = match explicit {
         Some(found) => format!("{} {}", &body[..found.start], &body[found.end..]),
         None => body.to_string(),
@@ -637,6 +680,55 @@ fn match_reminder(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
         (None, Some(wd)) => super::reminder::next_weekday_strict(today, wd),
         (None, None) => day.map(|wd| upcoming_weekday(today, wd)).unwrap_or(today),
     };
+
+    // FAIL CLOSED on a typed date that cannot be honoured as written: one already
+    // gone, or one its own weekday word contradicts ("Tuesday, August 3, 2026" —
+    // August 3 is a Monday). Which half the family meant is genuinely unknown,
+    // and guessing puts the reminder on the wrong day; fall back so they are ASKED.
+    // The clock the row will carry — an explicit time, else the 9am default both
+    // parsers use. Resolved BEFORE the honourability check, because a typed date
+    // is honourable or not as an INSTANT, not as a bare date.
+    let clock = time
+        .as_deref()
+        .and_then(parse_hhmm)
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default());
+
+    if let Some(found) = explicit {
+        // A typed date whose instant has already gone is refused, never filed in
+        // the past: at 03:20 on Monday, "on Monday, July 27 at 2:00 a.m." names a
+        // moment eighty minutes behind. An explicit date must not be silently
+        // rolled either, so the only honest answer is to ask.
+        if found.date.and_time(clock) <= now {
+            return None;
+        }
+        if let Some((named, _)) = find_weekday(s) {
+            if named != found.date.weekday() {
+                return None;
+            }
+        }
+    }
+
+    // An elapsed clock rolls exactly as the DM path rolls it: a BARE weekday a
+    // whole week on ("remind me Monday at 9am" typed on a Monday at 09:30), and a
+    // DAYLESS ask to tomorrow ("remind me at 2:00 a.m." typed at 03:20 means the
+    // next 2am, never the one that just passed). This lane could not see the time
+    // of day until `classify_at`, and even then only rolled the weekday half.
+    let date = if explicit.is_some() || strict_next.is_some() {
+        date
+    } else if day.is_some() {
+        if date.and_time(clock) <= now {
+            date + Duration::days(7)
+        } else {
+            date
+        }
+    } else if time.is_some() && date.and_time(clock) <= now {
+        // Dayless and timed only: a dayless ask with NO clock ("remind me to buy
+        // milk") carries no moment to have missed and stays on today.
+        date + Duration::days(1)
+    } else {
+        date
+    };
+
     // Report the day the resolved DATE actually falls on, so the confirmation
     // never names a weekday the row was not written for.
     let day = if explicit.is_some() || strict_next.is_some() {
@@ -670,6 +762,11 @@ fn match_reminder_cancel(s: &str, today: NaiveDate) -> Option<FastLaneOp> {
         .min_by_key(|(i, _)| *i)?;
     let tail = &s[verb.0 + verb.1.len()..];
     let (day, tail) = pull_day(tail, today);
+    // The clock belongs to the reminder, not to its title: "do not remind me to
+    // call the dentist next Monday at 9:00 a.m." must look for "call dentist",
+    // never for "call dentist at 9:00 a.m" — which matches no row and reads back
+    // as gibberish in the confirmation.
+    let (_, tail) = pull_time(&tail);
     let target = scrub_reminder_words(&tail);
     if target.is_empty() && day.is_none() {
         return None;
@@ -1041,6 +1138,12 @@ fn pull_time(frag: &str) -> (Option<String>, String) {
     (time, out_words.join(" "))
 }
 
+/// Read back the `HH:MM` [`pull_time`] produces.
+fn parse_hhmm(t: &str) -> Option<NaiveTime> {
+    let (h, m) = t.split_once(':')?;
+    NaiveTime::from_hms_opt(h.parse().ok()?, m.parse().ok()?, 0)
+}
+
 /// `"am"` / `"pm"` when a standalone token is a meridiem however it was typed
 /// ("am", "a.m.", "pm.").
 fn meridiem(tok: &str) -> Option<&'static str> {
@@ -1390,14 +1493,22 @@ pub fn report_line(op: &FastLaneOp) -> String {
         // preserved ([`super::week_start::report_line`]); this is the shape-only
         // line for a caller that has the op but not the drafted week.
         FastLaneOp::WeekStart { .. } => "Done — this week's plan is started 🗓️".to_string(),
+        // NAME THE DATE. The weekday alone made three asks that mean two
+        // different days read back identically ("Monday at 09:00" for explicit
+        // 3 August, for "next Monday", and for today) — the very ambiguity the
+        // three-way parser fix exists to remove. The resolved date is what was
+        // written, so the resolved date is what the family is told.
         FastLaneOp::ReminderSet {
-            text, day, time, ..
+            text, date, time, ..
         } => {
-            let when = match (day, time) {
-                (Some(d), Some(t)) => format!(" {} at {}", weekday_name(*d), t),
-                (Some(d), None) => format!(" {}", weekday_name(*d)),
-                (None, Some(t)) => format!(" at {}", t),
-                (None, None) => String::new(),
+            let day = format!(
+                "{}, {}",
+                weekday_name(date.weekday()),
+                super::reminder::month_day(*date)
+            );
+            let when = match time {
+                Some(t) => format!(" {day} at {t}"),
+                None => format!(" {day}"),
             };
             format!("Done — I'll remind you to {text}{when} ⏰")
         }
@@ -2194,7 +2305,25 @@ pub fn run_fast_lane_with_calendar_owner(
     today: NaiveDate,
     calendar_owner: Option<&str>,
 ) -> FastLaneResult {
-    let op = match classify(message, today) {
+    run_fast_lane_at(
+        root,
+        message,
+        today.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default()),
+        calendar_owner,
+    )
+}
+
+/// [`run_fast_lane_with_calendar_owner`] anchored at a wall-clock instant, so a
+/// bare same-day reminder whose time has passed rolls instead of being filed in
+/// the past. Callers that have a real clock should use this.
+pub fn run_fast_lane_at(
+    root: &Path,
+    message: &str,
+    now: NaiveDateTime,
+    calendar_owner: Option<&str>,
+) -> FastLaneResult {
+    let today = now.date();
+    let op = match classify_at(message, now) {
         Classification::FastLane(op) => op,
         // A safety lane owns the turn and writes nothing (task engine-shopping-language).
         Classification::Ask { reply, reason } => {
@@ -2644,6 +2773,235 @@ mod tests {
                 date: aug3,
                 time: Some("21:00".into()),
             }
+        );
+    }
+
+    #[test]
+    fn the_fast_lane_sees_the_clock_and_rolls_an_elapsed_bare_weekday() {
+        // The audit gap: this lane got only a NaiveDate, so "Monday at 9am" typed
+        // on a Monday at 09:30 filed a row half an hour in the PAST.
+        let monday = NaiveDate::from_ymd_opt(2026, 7, 27).unwrap();
+        let at = |h, mi| {
+            match classify_at(
+                "remind me to call the dentist Monday at 9:00 am",
+                monday.and_time(NaiveTime::from_hms_opt(h, mi, 0).unwrap()),
+            ) {
+                Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => date,
+                other => panic!("expected a reminder, got {other:?}"),
+            }
+        };
+        assert_eq!(at(3, 20), monday, "09:00 still ahead — today is right");
+        assert_eq!(
+            at(9, 30),
+            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
+            "an elapsed bare Monday must roll a week, not file in the past"
+        );
+        // The date-only entry keeps its old midnight anchoring exactly.
+        match classify("remind me to call the dentist Monday at 9:00 am", monday) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => {
+                assert_eq!(date, monday)
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_fast_lane_asks_about_a_date_it_cannot_honour() {
+        let monday = NaiveDate::from_ymd_opt(2026, 7, 27).unwrap();
+        // August 3 2026 is a MONDAY — the "Tuesday" contradicts it.
+        assert!(
+            matches!(
+                classify(
+                    "remind me to call the dentist on Tuesday, August 3, 2026 at 9:00 am",
+                    monday
+                ),
+                Classification::Fallback(_)
+            ),
+            "a weekday/date disagreement must fall back, never write a guess"
+        );
+        // A typed date already gone is never written either.
+        assert!(matches!(
+            classify(
+                "remind me to call the dentist on July 4, 2026 at 9:00 am",
+                monday
+            ),
+            Classification::Fallback(_)
+        ));
+    }
+
+    // ---- the exact-tree audit's fast-lane controls (task weekday-b-audit) ---
+    //
+    // Each of these was reproduced against this lane's public `classify_at` API
+    // at 2026-07-27T03:20 and came back as a written row. They are pinned here,
+    // in the same shapes, so the lane cannot drift away from the DM parser again.
+
+    /// Monday 2026-07-27 at `h:mi` — the audit's pin.
+    fn monday_at(h: u32, mi: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 7, 27)
+            .unwrap()
+            .and_time(NaiveTime::from_hms_opt(h, mi, 0).unwrap())
+    }
+
+    #[test]
+    fn a_typed_date_whose_clock_has_already_gone_is_asked_about() {
+        // `date < today` alone let a same-day civil INSTANT through: at 03:20 the
+        // lane filed a row for 02:00 that same morning.
+        assert!(
+            matches!(
+                classify_at(
+                    "remind me to call the dentist on Monday, July 27, 2026 at 2:00 a.m.",
+                    monday_at(3, 20)
+                ),
+                Classification::Fallback(_)
+            ),
+            "an elapsed same-day civil instant must not be written"
+        );
+        // CONTROL: the same typed date with a clock still AHEAD is written.
+        match classify_at(
+            "remind me to call the dentist on Monday, July 27, 2026 at 9:00 a.m.",
+            monday_at(3, 20),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => {
+                assert_eq!(date, NaiveDate::from_ymd_opt(2026, 7, 27).unwrap())
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_impossible_typed_date_never_falls_through_to_the_weekday() {
+        // "February 30" is date SYNTAX naming a day no calendar has. Reading it
+        // as "no date here" sent the lane on to the adjacent "Monday" and it
+        // answered "Done — I'll remind you to call the vet … Monday at 09:00".
+        for msg in [
+            "remind me to call the vet on Monday, February 30, 2027 at 9:00 a.m.",
+            "remind me to call the vet on 2027-02-30 at 9:00 a.m.",
+            "remind me to call the vet on 2/30/2027 at 9:00 a.m.",
+        ] {
+            assert!(
+                matches!(classify_at(msg, monday_at(3, 20)), Classification::Fallback(_)),
+                "{msg:?} named an impossible date and was written anyway"
+            );
+        }
+        // CONTROL: absent date syntax still resolves by weekday.
+        match classify_at("remind me to call the vet Monday at 9:00 a.m.", monday_at(3, 20)) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => {
+                assert_eq!(date, NaiveDate::from_ymd_opt(2026, 7, 27).unwrap())
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dayless_elapsed_clock_rolls_to_tomorrow_exactly_as_the_dm_path_does() {
+        // The lane only rolled when a weekday was named, so a DAYLESS elapsed
+        // clock stayed on today while the DM parser rolled it — parser drift the
+        // two-parser contract does not allow.
+        match classify_at(
+            "remind me to call the dentist at 2:00 a.m.",
+            monday_at(3, 20),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, time, .. }) => {
+                assert_eq!(date, NaiveDate::from_ymd_opt(2026, 7, 28).unwrap());
+                assert_eq!(time.as_deref(), Some("02:00"));
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+        // A dayless clock still ahead stays today…
+        match classify_at(
+            "remind me to call the dentist at 9:00 a.m.",
+            monday_at(3, 20),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => {
+                assert_eq!(date, NaiveDate::from_ymd_opt(2026, 7, 27).unwrap())
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+        // …and a dayless ask with NO clock has no missed moment: it stays today.
+        match classify_at("remind me to call the plumber", monday_at(3, 20)) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, time, .. }) => {
+                assert_eq!(date, NaiveDate::from_ymd_opt(2026, 7, 27).unwrap());
+                assert_eq!(time, None);
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_negated_or_unrelated_mention_never_writes_a_reminder() {
+        for msg in [
+            "do not remind me to call the dentist next monday at 9:00 a.m.",
+            "please do not set a reminder for next monday at 9:00 a.m.",
+            "no need to remind me next monday at 9:00 a.m.",
+            "next monday at 9:00 a.m. is unrelated; this isn't a reminder request.",
+        ] {
+            assert!(
+                !matches!(
+                    classify_at(msg, monday_at(3, 20)),
+                    Classification::FastLane(FastLaneOp::ReminderSet { .. })
+                ),
+                "{msg:?} is not a reminder request and must not be written"
+            );
+        }
+        // CONTROL: the affirmative form still writes, on the following Monday.
+        match classify_at(
+            "remind me to call the dentist next monday at 9:00 a.m.",
+            monday_at(3, 20),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => {
+                assert_eq!(date, NaiveDate::from_ymd_opt(2026, 8, 3).unwrap())
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+        // CONTROL: an explicit cancellation is still a CANCELLATION, and its
+        // target is the TITLE — the clock belongs to the reminder, not its name.
+        match classify_at(
+            "do not remind me to call the dentist next monday at 9:00 a.m.",
+            monday_at(3, 20),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderCancel { target, .. }) => {
+                assert_eq!(target, "call dentist")
+            }
+            other => panic!("expected a cancellation, got {other:?}"),
+        }
+        assert!(matches!(
+            classify_at(
+                "do not remind me about the dentist any more",
+                monday_at(3, 20)
+            ),
+            Classification::FastLane(FastLaneOp::ReminderCancel { .. })
+        ));
+    }
+
+    #[test]
+    fn the_confirmation_names_the_resolved_date_not_just_a_weekday() {
+        // Three asks meaning two different days produced the IDENTICAL reply
+        // ("Done — I'll remind you to call the dentist Monday at 09:00 ⏰"),
+        // recreating the ambiguity the three-way parser fix removed.
+        let line = |msg: &str| match classify_at(msg, monday_at(3, 20)) {
+            Classification::FastLane(op) => report_line(&op),
+            other => panic!("expected a reminder for {msg:?}, got {other:?}"),
+        };
+        let explicit = line("remind me to call the dentist on Monday, August 3, 2026 at 9:00 a.m.");
+        let next = line("remind me to call the dentist next Monday at 9:00 a.m.");
+        let bare = line("remind me to call the dentist Monday at 9:00 a.m.");
+        assert_eq!(
+            explicit,
+            "Done — I'll remind you to call the dentist Monday, August 3 at 09:00 ⏰"
+        );
+        assert_eq!(next, explicit, "both name the same date and must read alike");
+        assert_eq!(
+            bare,
+            "Done — I'll remind you to call the dentist Monday, July 27 at 09:00 ⏰"
+        );
+        assert_ne!(
+            bare, explicit,
+            "two different dates must not read back identically"
+        );
+        // A dayless rolled ask says WHICH day it rolled to.
+        assert_eq!(
+            line("remind me to call the dentist at 2:00 a.m."),
+            "Done — I'll remind you to call the dentist Tuesday, July 28 at 02:00 ⏰"
         );
     }
 

@@ -71,7 +71,15 @@ got="$(due_for 'Remind me to call the dentist Monday at 9:00 a.m.')"
     || loud_fail "bare weekday resolved to $got, expected 2026-07-27T09:00 (today)"
 echo "   → $got"
 
-echo "4. a bare weekday whose time has PASSED still rolls a whole week:"
+echo "4a. the SAME bare weekday, once its clock has passed, rolls a whole week:"
+got="$( (cd "$scratch" && WG_DIR="$scratch/.wg" \
+    wg --json telegram remind --add 'Remind me to call the dentist Monday at 9:00 a.m.' \
+       --recipient Luca --now 2026-07-27T09:30) | tr ',' '\n' | grep '"due"' | sed 's/.*"due":"//; s/".*//')"
+[ "$got" = "2026-08-03T09:00" ] \
+    || loud_fail "at 09:30 a bare Monday resolved to $got, expected 2026-08-03T09:00"
+echo "   → $got"
+
+echo "4b. a bare weekday whose time has PASSED still rolls a whole week:"
 got="$( (cd "$scratch" && WG_DIR="$scratch/.wg" \
     wg --json telegram remind --add 'Remind me to move the car Monday at 2:00 a.m.' \
        --recipient Luca --now "$NOW") | tr ',' '\n' | grep '"due"' | sed 's/.*"due":"//; s/".*//')"
@@ -85,7 +93,20 @@ got="$(due_for 'Remind me to call the dentist next Monday at 9:00 p.m.')"
     || loud_fail "'9:00 p.m.' resolved to $got, expected 2026-08-03T21:00"
 echo "   → $got"
 
-echo "6. the three phrasings did not collapse into one date:"
+echo "6. a typed date the engine cannot honour is ASKED about, never filed:"
+for bad in 'Remind me to call the dentist on Tuesday, August 3, 2026 at 9:00 a.m.' \
+           'Remind me to call the dentist on July 4, 2026 at 9:00 a.m.'; do
+    # August 3 2026 is a MONDAY, so the first contradicts itself; the second is gone.
+    out="$( (cd "$scratch" && WG_DIR="$scratch/.wg" \
+        wg --json telegram remind --add "$bad" --recipient Luca --now "$NOW") )"
+    echo "$out" | grep -q '"registered":false' \
+        || loud_fail "an unhonourable date was filed anyway: $out"
+    echo "$out" | grep -q '"due"' \
+        && loud_fail "an unhonourable date resolved to a due time: $out"
+done
+echo "   → both fell back to be asked about"
+
+echo "7. the three phrasings did not collapse into one date:"
 [ -f "$scratch/.casa/reminders-adhoc.json" ] || loud_fail "ad-hoc store not written"
 grep -q '2026-08-03T09:00' "$scratch/.casa/reminders-adhoc.json" \
     || loud_fail "no reminder filed for 2026-08-03: $(cat "$scratch/.casa/reminders-adhoc.json")"

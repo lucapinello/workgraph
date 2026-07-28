@@ -5065,7 +5065,7 @@ async fn run_web_fast_lane_occurrence(
     );
     let classified_fast_lane = readback.is_some()
         || matches!(
-            fast_lane::classify(message, today),
+            fast_lane::classify_at(message, web_fast_lane_now(today)),
             Classification::FastLane(_) | Classification::Ask { .. }
         );
     let opened = if classified_fast_lane {
@@ -5099,10 +5099,15 @@ async fn run_web_fast_lane_occurrence(
                 journal.mark_applied(&outcome)?;
                 (outcome, false)
             } else {
-                match fast_lane::run_fast_lane_with_calendar_owner(
+                // The CLOCK, not just the date: a bare same-day reminder whose
+                // time has already gone rolls forward instead of being filed in
+                // the past (task next-weekday-strict). `calendar_owner` still
+                // rides along — the owner decides whether a reminder op may
+                // touch the plan at all.
+                match fast_lane::run_fast_lane_at(
                     root,
                     message,
-                    today,
+                    web_fast_lane_now(today),
                     calendar_owner,
                 ) {
                     FastLaneResult::Fallback { .. } => {
@@ -6882,10 +6887,10 @@ pub fn run_week_start(
                 let owner_map = worksgood::notify::ownership::OwnerMap::load(root);
                 let owner =
                     owner_map.owner_for_domain(worksgood::notify::ownership::Domain::Calendar);
-                match fast_lane::run_fast_lane_with_calendar_owner(
+                match fast_lane::run_fast_lane_at(
                     root,
                     message,
-                    today,
+                    web_fast_lane_now(today),
                     owner.as_deref(),
                 ) {
                     FastLaneResult::Applied {
@@ -7004,18 +7009,32 @@ pub fn run_shopping_language(
     text: &str,
     root: Option<&Path>,
     today: Option<&str>,
+    now: Option<&str>,
+    calendar_owner: Option<&str>,
     apply: bool,
     json: bool,
 ) -> Result<()> {
     use worksgood::notify::fast_lane::{self, Classification, FastLaneResult};
 
-    let today = match today {
-        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
-            .with_context(|| format!("--today must be YYYY-MM-DD, got {d:?}"))?,
-        None => chrono::Local::now().date_naive(),
+    // `--now` is the full wall-clock pin (the reminder lane's elapsed-clock
+    // contract cannot be tested without one); `--today` keeps the older
+    // date-only behaviour for every caller that has no clock to pin.
+    let now = match now {
+        Some(stamp) => Some(
+            chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M")
+                .with_context(|| format!("--now must be YYYY-MM-DDTHH:MM, got {stamp:?}"))?,
+        ),
+        None => None,
     };
+    let today = match (now, today) {
+        (Some(n), _) => n.date(),
+        (None, Some(d)) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .with_context(|| format!("--today must be YYYY-MM-DD, got {d:?}"))?,
+        (None, None) => chrono::Local::now().date_naive(),
+    };
+    let now = now.unwrap_or_else(|| web_fast_lane_now(today));
 
-    let (lane, item, reply, reason) = match fast_lane::classify(text, today) {
+    let (lane, item, reply, reason) = match fast_lane::classify_at(text, now) {
         Classification::FastLane(op) => {
             let item = match &op {
                 fast_lane::FastLaneOp::ShoppingAdd { item }
@@ -7046,7 +7065,7 @@ pub fn run_shopping_language(
     // The real write, against a SCRATCH project — the live proof seam.
     let applied = if apply {
         let root = root.ok_or_else(|| anyhow::anyhow!("--apply needs --root <project dir>"))?;
-        match fast_lane::run_fast_lane(root, text, today) {
+        match fast_lane::run_fast_lane_at(root, text, now, calendar_owner) {
             FastLaneResult::Applied {
                 report, week_code, ..
             } => Some(serde_json::json!({
@@ -7078,6 +7097,7 @@ pub fn run_shopping_language(
                 "reply": reply,
                 "reason": reason,
                 "today": today.to_string(),
+                "now": now.format("%Y-%m-%dT%H:%M").to_string(),
                 "applied": applied,
             }))?
         );
