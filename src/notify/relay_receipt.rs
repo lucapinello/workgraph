@@ -63,6 +63,58 @@ pub fn ledger_path_for(project_root: &Path) -> PathBuf {
     project_root.join(".casa").join("relay-receipts.jsonl")
 }
 
+/// The never-rotated correlation index, shared with the gateway twin
+/// (`receiptLedger.mjs` `receiptIndexPathFor`).
+///
+/// WHY A SECOND FILE AT ALL. Schema v9.1's `receipt_fields` is an EXHAUSTIVE
+/// object, and this writer used to put three keys of its own in the ledger:
+/// `outcome`, `replyPhase`, `attemptId`. That is not a naming quibble — the
+/// gateway twin validates every ledger line against the exact field set, so an
+/// engine receipt read as `malformed` from the other side, and a malformed line
+/// makes the twin's own `appendReceipt` refuse to write. The two writers were
+/// producing a ledger neither could fully read.
+///
+/// The correlation those keys carried is still needed (the refire guard keys on
+/// `(turn, attempt)`), so it lives HERE, out of the evidence and in the
+/// accelerator, exactly where the twin already keeps `replayKey`. The twin's
+/// index reader checks its own three fields and ignores the rest, so a line we
+/// write is a line it reads.
+pub fn index_path_for(project_root: &Path) -> PathBuf {
+    project_root.join(".casa").join("relay-receipt-index.jsonl")
+}
+
+/// One index line: the twin's three fields, plus the correlation this writer
+/// needs and the schema will not carry.
+///
+/// NOT `deny_unknown_fields`, unlike [`Receipt`], and the difference is the
+/// point: the ledger is EVIDENCE (a key we do not understand there is a claim we
+/// cannot evaluate), while this is an ACCELERATOR another implementation also
+/// appends to. A key the twin adds later must not stop us reading its lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptIndexEntry {
+    #[serde(rename = "receiptId")]
+    pub receipt_id: String,
+    #[serde(rename = "feedId")]
+    pub feed_id: i64,
+    /// `sha256(transportScopeId + NUL + messageId)`, or null when the attempt
+    /// had no positive message id to replay.
+    #[serde(rename = "replayKey")]
+    pub replay_key: Option<String>,
+    /// The correlation the v9.1 ledger may not carry.
+    #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(rename = "attemptId", default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(
+        rename = "replyPhase",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reply_phase: Option<ReplyPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RelayOutcome>,
+}
+
 /// Where the per-install transport-scope key lives. Never leaves the process;
 /// never appears in a receipt, a row, or a log.
 fn scope_key_path(project_root: &Path) -> PathBuf {
@@ -106,6 +158,15 @@ pub enum RelayOutcome {
     Fallback,
 }
 
+/// The value a deserialised receipt carries BEFORE the index refills it. `Send`
+/// is the least surprising placeholder — but nothing should ever read it: every
+/// reader in this module joins the index before returning.
+impl Default for RelayOutcome {
+    fn default() -> Self {
+        RelayOutcome::Send
+    }
+}
+
 impl RelayOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -127,6 +188,14 @@ pub enum ReplyPhase {
     Final,
     Watchdog,
     Failure,
+}
+
+/// See [`RelayOutcome::default`]. `Final` is the placeholder; the index is the
+/// answer.
+impl Default for ReplyPhase {
+    fn default() -> Self {
+        ReplyPhase::Final
+    }
 }
 
 impl ReplyPhase {
@@ -174,20 +243,38 @@ pub struct Receipt {
     #[serde(rename = "transportScopeId")]
     pub transport_scope_id: String,
     /// Positive integer from the Bot API. REQUIRED when status is delivered.
-    #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+    ///
+    /// ALWAYS SERIALISED, `null` when absent. The twin's field set has no
+    /// absentees either: a receipt that simply omits the key is one the other
+    /// implementation reads as malformed, and the two writers share this file.
+    #[serde(rename = "messageId")]
     pub message_id: Option<i64>,
     #[serde(rename = "acceptedAtMs")]
     pub accepted_at_ms: i64,
     pub status: RelayStatus,
     /// Always `engine` from this writer.
     pub provenance: String,
-    /// Which transport call this was.
+    // ── NOT LEDGER FIELDS ───────────────────────────────────────────────────
+    // The three below are `#[serde(skip)]`: they are this writer's correlation,
+    // not v9.1 receipt fields, and they now travel in [`ReceiptIndexEntry`].
+    // See [`index_path_for`] for why the difference is load-bearing rather than
+    // cosmetic. The serialised field order above is the twin's, so the two
+    // writers' lines are diffable byte for byte.
+    //
+    // They stay ON this struct because every caller that HAS a receipt has this
+    // correlation in hand at the same moment, and a second parameter threaded
+    // through eight call sites is one more place to pass the wrong phase. On the
+    // way back out they are refilled from the index by [`read_all`] /
+    // [`read_strict`], so a receipt read from disk still knows what it was.
+    /// Which transport call this was. Index-carried.
+    #[serde(skip)]
     pub outcome: RelayOutcome,
-    /// Which phase of the turn the proven row is.
-    #[serde(rename = "replyPhase")]
+    /// Which phase of the turn the proven row is. Index-carried.
+    #[serde(skip)]
     pub reply_phase: ReplyPhase,
     /// `(turn, attempt)` — present when the caller supplied `WG_ATTEMPT_ID`.
-    #[serde(rename = "attemptId", skip_serializing_if = "Option::is_none")]
+    /// Index-carried.
+    #[serde(skip)]
     pub attempt_id: Option<String>,
 }
 
@@ -446,12 +533,34 @@ fn read_scope_key(path: &Path) -> Result<Option<Vec<u8>>, ReceiptError> {
 }
 
 /// fsync a directory so a rename/link that "succeeded" survives a power loss.
-/// A missing directory handle is not fatal on platforms that refuse to open one.
+///
+/// THE `.or(Ok(()))` USED TO SWALLOW EVERYTHING. The comment above it promised
+/// durability while the code reported success whatever the device said, on both
+/// the scope-key publication and the receipt append — so "the receipt is
+/// durable" was a claim the writer had no evidence for. Three outcomes now, the
+/// gateway twin's taxonomy (`receiptLedger.mjs` §"DURABILITY IS A THREE-WAY
+/// ANSWER"):
+///
+/// * no directory handle at all — nothing here ever made a durability claim;
+/// * `ENOTSUP`/`EOPNOTSUPP`/`EINVAL`/`EPERM` — the filesystem saying it does not
+///   implement the call. Nothing failed;
+/// * anything else (`EIO`, `ENOSPC`, `EBADF`) is a device error on the bytes we
+///   are publishing, and it propagates.
 fn sync_dir(dir: Option<&Path>) -> std::io::Result<()> {
     let Some(dir) = dir else { return Ok(()) };
-    match std::fs::File::open(dir) {
-        Ok(handle) => handle.sync_all().or(Ok(())),
-        Err(_) => Ok(()),
+    let Ok(handle) = std::fs::File::open(dir) else {
+        return Ok(());
+    };
+    match handle.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.raw_os_error().is_some_and(|code| {
+                [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::EPERM].contains(&code)
+            }) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -519,6 +628,82 @@ pub fn attempt_key(turn_id: &str, attempt_id: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The correlation index
+// ---------------------------------------------------------------------------
+
+/// The index, read WHOLE or not at all — the same fail-closed rules the ledger
+/// gets, for the same reason: the refire guard is a search over THIS list, and a
+/// line silently dropped from it is a suppressed refire becoming a duplicate
+/// message on the family's screen.
+pub fn read_index_strict(project_root: &Path) -> Result<Vec<ReceiptIndexEntry>, ReceiptError> {
+    let path = index_path_for(project_root);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ReceiptError::LedgerCorrupt {
+                line: 0,
+                detail: format!("the receipt index is unreadable: {e}"),
+            });
+        }
+    };
+    if !body.is_empty() && !body.ends_with('\n') {
+        return Err(ReceiptError::LedgerCorrupt {
+            line: body.lines().count(),
+            detail: "the receipt index's final line has no terminating newline".into(),
+        });
+    }
+    let mut entries = Vec::new();
+    for (index, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ReceiptIndexEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                return Err(ReceiptError::LedgerCorrupt {
+                    line: index + 1,
+                    detail: format!("the receipt index is damaged: {}", e.classify_detail()),
+                });
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// The lenient index read, for the display path. Same leniency contract as
+/// [`read_all`]: never the basis for admitting a receipt.
+fn read_index_lenient(project_root: &Path) -> Vec<ReceiptIndexEntry> {
+    let Ok(body) = std::fs::read_to_string(index_path_for(project_root)) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<ReceiptIndexEntry>(l).ok())
+        .collect()
+}
+
+/// Refill the `#[serde(skip)]` correlation on receipts read from the ledger.
+///
+/// A receipt whose index line is missing keeps the placeholder defaults and
+/// `attempt_id: None` — which is what a receipt written by the GATEWAY twin
+/// legitimately looks like from here (it has no engine phase/outcome), so this
+/// is a join, not a validation.
+fn join_index(receipts: &mut [Receipt], index: &[ReceiptIndexEntry]) {
+    for receipt in receipts.iter_mut() {
+        if let Some(entry) = index.iter().find(|e| e.receipt_id == receipt.receipt_id) {
+            if let Some(outcome) = entry.outcome {
+                receipt.outcome = outcome;
+            }
+            if let Some(phase) = entry.reply_phase {
+                receipt.reply_phase = phase;
+            }
+            receipt.attempt_id = entry.attempt_id.clone();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The ledger
 // ---------------------------------------------------------------------------
 
@@ -532,10 +717,13 @@ pub fn read_all(project_root: &Path) -> Vec<Receipt> {
     let Ok(body) = std::fs::read_to_string(ledger_path_for(project_root)) else {
         return Vec::new();
     };
-    body.lines()
+    let mut receipts: Vec<Receipt> = body
+        .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Receipt>(l).ok())
-        .collect()
+        .collect();
+    join_index(&mut receipts, &read_index_lenient(project_root));
+    receipts
 }
 
 /// The ledger, read WHOLE or not at all — the read every uniqueness check runs
@@ -601,6 +789,10 @@ pub fn read_strict(project_root: &Path) -> Result<Vec<Receipt>, ReceiptError> {
             }
         }
     }
+    // The index is read STRICTLY too — a damaged accelerator is a damaged
+    // refire guard, and the refire guard's failure mode is a duplicate message
+    // on the family's screen.
+    join_index(&mut receipts, &read_index_strict(project_root)?);
     Ok(receipts)
 }
 
@@ -741,26 +933,66 @@ pub fn append_locked(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ReceiptError::Io(e.to_string()))?;
     }
+    // THE INDEX LINE GOES FIRST, matching the twin's order (`receiptLedger.mjs`
+    // appendReceipt: "the INDEX still goes first within the step"). It is the
+    // entry that reserves the feed id and the replay key, so an interruption
+    // between the two files leaves a RESERVATION with no receipt — a claim that
+    // refuses a duplicate — rather than a receipt no guard remembers.
+    let index_entry = ReceiptIndexEntry {
+        receipt_id: receipt.receipt_id.clone(),
+        feed_id: receipt.feed_id,
+        replay_key: receipt
+            .message_id
+            .filter(|id| *id > 0)
+            .map(|mid| replay_key(&receipt.transport_scope_id, mid)),
+        turn_id: Some(receipt.turn_id.clone()),
+        attempt_id: receipt.attempt_id.clone(),
+        reply_phase: Some(receipt.reply_phase),
+        outcome: Some(receipt.outcome),
+    };
+    append_line_durable(
+        &index_path_for(project_root),
+        &serde_json::to_string(&index_entry).map_err(|e| ReceiptError::Io(e.to_string()))?,
+    )?;
     // ONE record, ONE write. The line and its newline used to be two calls, and
     // two `O_APPEND` writes from two writers interleave: the audit's race left a
     // ledger of concatenated JSON objects in which the very claims that had just
     // "succeeded" were no longer readable. A single buffer is a single atomic
     // append for any record short enough to fit the pipe/file atomicity window,
     // and the lock above covers the rest.
-    let mut line = serde_json::to_string(receipt).map_err(|e| ReceiptError::Io(e.to_string()))?;
-    line.push('\n');
+    append_line_durable(
+        &path,
+        &serde_json::to_string(receipt).map_err(|e| ReceiptError::Io(e.to_string()))?,
+    )
+}
+
+/// Append ONE line, with its delimiter, durably.
+///
+/// The line and its newline are one buffer because two `O_APPEND` writes from
+/// two writers interleave: the audit's race left a ledger of concatenated JSON
+/// objects in which the very claims that had just "succeeded" were no longer
+/// readable. A single buffer is a single atomic append for any record short
+/// enough to fit the file atomicity window, and the feed lock covers the rest.
+///
+/// The DIRECTORY is fsynced too, or a ledger created by this very append can be
+/// absent after a power loss while the row it proves is durable — evidence that
+/// vanishes is worse than evidence that was never written.
+fn append_line_durable(path: &Path, line: &str) -> Result<(), ReceiptError> {
     use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ReceiptError::Io(e.to_string()))?;
+    }
+    let mut buffer = String::with_capacity(line.len() + 1);
+    buffer.push_str(line);
+    buffer.push('\n');
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| ReceiptError::Io(e.to_string()))?;
-    file.write_all(line.as_bytes())
+    file.write_all(buffer.as_bytes())
         .and_then(|_| file.sync_all())
         .map_err(|e| ReceiptError::Io(e.to_string()))?;
-    // fsync the DIRECTORY too, or a ledger created by this very append can be
-    // absent after a power loss while the row it proves is durable — evidence
-    // that vanishes is worse than evidence that was never written.
     sync_dir(path.parent()).map_err(|e| ReceiptError::Io(e.to_string()))
 }
 
@@ -1219,34 +1451,148 @@ mod tests {
 
     // ── what the ledger holds ───────────────────────────────────────────────
 
+    /// The keys of one serialised ledger line, in the order the BYTES carry
+    /// them. `serde_json::Map` is a `BTreeMap` here, so a re-parse sorts the
+    /// keys and cannot answer the ordering question at all — asking it would
+    /// have made this assertion quietly weaker than it reads.
+    fn wire_keys(line: &str) -> Vec<String> {
+        let parsed: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(line.trim()).expect("the ledger line parses as an object");
+        let mut keys: Vec<String> = parsed.into_iter().map(|(k, _)| k).collect();
+        keys.sort_by_key(|k| {
+            line.find(&format!("\"{k}\":"))
+                .expect("every parsed key appears in the bytes")
+        });
+        keys
+    }
+
+    /// `receipt-observe-schema-v9.1.json` `receipt_fields`, verbatim and in the
+    /// order the twin serialises them.
+    const V9_1_RECEIPT_FIELDS: [&str; 10] = [
+        "receiptId",
+        "turnId",
+        "feedId",
+        "feedKind",
+        "roleId",
+        "transportScopeId",
+        "messageId",
+        "acceptedAtMs",
+        "status",
+        "provenance",
+    ];
+
+    /// THE FIELD SET IS EXHAUSTIVE, both directions. This test used to require
+    /// `replyPhase` on the line — it was one of the tests the exact-tree audit
+    /// named as blessing schema drift rather than closing it. The schema's
+    /// `receipt_fields` is a closed object, and the gateway twin validates every
+    /// line against exactly this list, so a stranger key here is a line the twin
+    /// reads as malformed — which then makes the twin's own writer refuse to
+    /// append at all.
     #[test]
-    fn a_receipt_round_trips_with_the_schemas_field_names() {
+    fn the_ledger_line_carries_exactly_the_schemas_receipt_fields() {
         let dir = scratch();
         let r = receipt(dir.path(), TURN, 5, Some(11));
         append(dir.path(), &r).unwrap();
         let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
-        for key in [
-            "receiptId",
-            "turnId",
-            "feedId",
-            "feedKind",
-            "roleId",
-            "transportScopeId",
-            "messageId",
-            "acceptedAtMs",
-            "status",
-            "provenance",
-            "replyPhase",
-        ] {
+        let line: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(body.trim()).expect("the ledger line parses as an object");
+
+        assert_eq!(
+            wire_keys(&body),
+            V9_1_RECEIPT_FIELDS,
+            "no strangers, no absentees, and in the twin's order"
+        );
+        // The three the writer used to add. Named individually so a regression
+        // reads as what it is.
+        for stranger in ["outcome", "replyPhase", "attemptId"] {
             assert!(
-                body.contains(&format!("\"{key}\"")),
-                "missing {key}: {body}"
+                !line.contains_key(stranger),
+                "{stranger} is not a v9.1 receipt field: {body}"
             );
         }
+        // …and `messageId` is PRESENT, not omitted, even when there is none.
+        let unproven = receipt(dir.path(), TURN2, 6, None);
+        append(dir.path(), &unproven).unwrap();
+        let whole = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
+        let last = whole.lines().next_back().unwrap();
+        assert_eq!(wire_keys(last), V9_1_RECEIPT_FIELDS);
+        let last: serde_json::Map<String, serde_json::Value> = serde_json::from_str(last).unwrap();
+        assert!(last["messageId"].is_null());
+
         // The raw turn id is on the wire VERBATIM — a hashed one cannot join.
         assert!(body.contains(TURN), "{body}");
         assert!(body.contains("\"provenance\":\"engine\""), "{body}");
-        assert_eq!(read_all(dir.path()), vec![r]);
+        // And the round trip still yields the receipt we wrote, correlation and
+        // all: the phase/outcome/attempt came back from the index.
+        assert_eq!(read_all(dir.path())[0], r);
+    }
+
+    /// The correlation the ledger may not carry is IN THE INDEX, and the index
+    /// line is one the twin can read: its own three fields, correctly shaped.
+    #[test]
+    fn the_correlation_moves_to_the_index_in_a_shape_the_twin_reads() {
+        let dir = scratch();
+        let mut r = receipt(dir.path(), TURN, 5, Some(11));
+        r.outcome = RelayOutcome::Fallback;
+        r.reply_phase = ReplyPhase::Watchdog;
+        r.attempt_id = Some(ATTEMPT_ONE.to_string());
+        append(dir.path(), &r).unwrap();
+
+        let body = std::fs::read_to_string(index_path_for(dir.path())).unwrap();
+        let entry: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(body.trim()).unwrap();
+        // The twin's three, exactly as `readReceiptIndexFile` checks them.
+        assert_eq!(entry["receiptId"], serde_json::json!(r.receipt_id));
+        assert_eq!(entry["feedId"], serde_json::json!(5));
+        assert_eq!(
+            entry["replayKey"],
+            serde_json::json!(replay_key(&r.transport_scope_id, 11))
+        );
+        // …and ours.
+        assert_eq!(entry["replyPhase"], serde_json::json!("watchdog"));
+        assert_eq!(entry["outcome"], serde_json::json!("fallback"));
+        assert_eq!(entry["attemptId"], serde_json::json!(ATTEMPT_ONE));
+
+        // The join puts them back on the receipt.
+        let back = &read_all(dir.path())[0];
+        assert_eq!(back.outcome, RelayOutcome::Fallback);
+        assert_eq!(back.reply_phase, ReplyPhase::Watchdog);
+        assert_eq!(back.attempt_id.as_deref(), Some(ATTEMPT_ONE));
+    }
+
+    /// A damaged INDEX fails closed exactly like a damaged ledger. The refire
+    /// guard is a search over the index now, and a line silently dropped from it
+    /// is a suppressed refire becoming a second message on the family's screen.
+    #[test]
+    fn a_damaged_index_authorises_no_receipt() {
+        for (label, mutate) in [
+            (
+                "a torn tail",
+                Box::new(|b: String| b.trim_end_matches('\n').to_string())
+                    as Box<dyn Fn(String) -> String>,
+            ),
+            (
+                "a line that does not parse",
+                Box::new(|b: String| b.replace("\"receiptId\"", "\"receipt")),
+            ),
+        ] {
+            let dir = scratch();
+            append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+            let path = index_path_for(dir.path());
+            let before = mutate(std::fs::read_to_string(&path).unwrap());
+            std::fs::write(&path, &before).unwrap();
+
+            let err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap_err();
+            assert!(
+                matches!(err, ReceiptError::LedgerCorrupt { .. }),
+                "{label} in the index still authorised a receipt: {err:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "{label}: the refusal left the index byte-identical"
+            );
+        }
     }
 
     /// A torn tail must not satisfy a join. A half-written line is skipped, not
@@ -1594,7 +1940,10 @@ mod tests {
             r.attempt_id = Some(format!("attempt-6ba7b810-9dad-41d1-80b4-00c04fd430c{i}"));
             append(dir.path(), &r).unwrap();
         }
-        let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
+        // The tokens are stable on the wire — in the INDEX, which is where the
+        // correlation lives now. The LEDGER must not contain them: `"final"` in
+        // a receipt line is the schema drift the audit named.
+        let index = std::fs::read_to_string(index_path_for(dir.path())).unwrap();
         for token in [
             "\"send\"",
             "\"edit\"",
@@ -1604,9 +1953,18 @@ mod tests {
             "\"watchdog\"",
             "\"failure\"",
         ] {
-            assert!(body.contains(token), "missing {token}: {body}");
+            assert!(index.contains(token), "missing {token}: {index}");
         }
-        assert_eq!(read_all(dir.path()).len(), 4);
+        let ledger = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
+        for line in ledger.lines() {
+            assert_eq!(wire_keys(line), V9_1_RECEIPT_FIELDS);
+        }
+        // …and the round trip still knows every phase and outcome it wrote.
+        let back = read_all(dir.path());
+        assert_eq!(back.len(), 4);
+        assert_eq!(back[0].reply_phase, ReplyPhase::Ack);
+        assert_eq!(back[3].outcome, RelayOutcome::Send);
+        assert_eq!(back[3].reply_phase, ReplyPhase::Failure);
     }
 
     /// ITEM 9 — THE DURABLE REFIRE BYPASS. A dispatcher refire of an ALREADY
