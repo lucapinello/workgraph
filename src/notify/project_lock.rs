@@ -120,9 +120,26 @@
 //!    our lock has exactly one name of its own, so `nlink` must be ≥ 2 (the lock
 //!    path, plus the pin); `nlink < 2` PROVES the lock path is no longer a name for
 //!    our inode and that the unlink would land on somebody else's directory entry.
-//!    Then `unlink(lockPath)`, and confirm against the same descriptor that our
-//!    inode LOST a name — if it did not, what we removed was not ours: report
-//!    `displaced`, never a clean release.
+//!    Then the removal itself, which is `rename(lockPath → lockPath.detach.<hex>)`
+//!    — one atomic syscall that removes the entry AND HANDS BACK THE INODE IT
+//!    REMOVED, so "whose entry was that" is a fact rather than an inference from a
+//!    count read one syscall earlier. Ours ⇒ drop the detach name and confirm
+//!    against the same descriptor that our inode LOST a name. A successor's ⇒ put
+//!    it straight back with `link(detach → lockPath)`, and report `stolen`, never a
+//!    clean release.
+//!
+//!    **§4b STEP 5a — THE PATHNAME-TRANSITION GUARD.** The rename and the
+//!    restoring `link` are two syscalls, and between them the authority pathname
+//!    has no entry of its own. That window admitted a third writer while a LIVE
+//!    successor was inside its section (reviewer seq 250, 8/8), and the restoration
+//!    then lost `EEXIST`. So the transition is SERIALISED: the releaser holds
+//!    `flock(LOCK_EX)` on `lockPath.transition` across detach → judge → restore,
+//!    and EVERY acquisition takes that same guard before its
+//!    `link(staging → lockPath)`. No guard, no detach — a transition that cannot be
+//!    serialised is not performed, and the release is retained. And the detach name
+//!    is dropped ONLY when the restoring `link` has succeeded: a record we could
+//!    not put back is left on disk under its private name, named in an operator
+//!    report, never deleted along with the failure.
 //!
 //! §5 NO AUTOMATIC RECLAIM — NOT EVEN OF A PROVABLY DEAD OWNER. Acquisition
 //!    classifies and REPORTS; it never removes. `staleMs` exists only to tell
@@ -169,6 +186,11 @@ pub const DEFAULT_STALE_MS: u64 = 15000;
 /// How many times a release retries a TRANSIENT failure before handing the
 /// problem back with ownership still retained (§4).
 const RELEASE_ATTEMPTS: u32 = 5;
+/// How many times §4b step 5 retries the `link` that puts a detached entry back
+/// before it gives up and leaves that entry on disk under its private name. The
+/// pathname is guarded throughout, so a failure here is the filesystem's, not a
+/// race's — but a live holder's record is worth asking twice more for.
+const RESTORE_ATTEMPTS: u32 = 3;
 /// The twin's ~4 ms retry sleep.
 const SLEEP_MS: u64 = 4;
 
@@ -510,6 +532,19 @@ pub(crate) mod inject {
         /// so the gate has a build in which it FAILS — a gate whose control cannot
         /// fail is not a gate.
         pub static USE_BLIND_UNLINK: Cell<bool> = const { Cell::new(false) };
+        /// Put the REJECTED RESTORATION of candidate `9611c12b` back: step 5's
+        /// `rename` with NO transition guard around it, and a detach name dropped
+        /// UNCONDITIONALLY — before it is known whether the restoring `link`
+        /// succeeded. That build has the adjacent two-holder window the reviewer
+        /// reproduced 8/8 (a third writer admitted at the empty authority pathname
+        /// while a LIVE successor was inside, the restoration then losing EEXIST,
+        /// and the successor's only remaining directory entry deleted anyway). It
+        /// exists so `two_holder_window_closed` has a build in which it FAILS.
+        pub static USE_UNGUARDED_DETACH: Cell<bool> = const { Cell::new(false) };
+        /// Make the transition guard answer "this filesystem has no advisory
+        /// locking". The control for the fail-closed rule: a releaser that cannot
+        /// serialise the pathname transition must not perform it.
+        pub static GUARD_UNSUPPORTED: Cell<bool> = const { Cell::new(false) };
     }
 
     type Hook = Rc<dyn Fn()>;
@@ -535,10 +570,23 @@ pub(crate) mod inject {
         /// under §4b step 5 the rename identifies the entry it took and puts it
         /// back.
         static AFTER_LINK_COUNT_PROOF: RefCell<Option<Hook>> = const { RefCell::new(None) };
+
+        /// Fired IMMEDIATELY AFTER step 5's `rename(lockPath → detach)`, i.e. at
+        /// the one instant in the conforming build at which the authority
+        /// pathname has no entry of its own — the boundary the reviewer's
+        /// exact-tree STOP (seq 250) parked a third writer in. A writer driven in
+        /// HERE must not be able to acquire, because the releaser holds the
+        /// pathname-transition guard across the whole detach → judge → restore,
+        /// and every conforming acquisition takes that guard before it links.
+        static AFTER_DETACH: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
     pub fn arm_after_authority_reach(hook: impl Fn() + 'static) {
         AFTER_AUTHORITY_REACH.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+    }
+
+    pub fn arm_after_detach(hook: impl Fn() + 'static) {
+        AFTER_DETACH.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
     }
 
     pub fn arm_after_link_count_proof(hook: impl Fn() + 'static) {
@@ -562,6 +610,13 @@ pub(crate) mod inject {
         }
     }
 
+    pub(super) fn fire_after_detach() {
+        let hook = AFTER_DETACH.with(|h| h.borrow().clone());
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
     pub fn reset() {
         for flag in [
             &FAIL_RECORD_FSYNC,
@@ -570,11 +625,14 @@ pub(crate) mod inject {
             &SKIP_AUTHORITY_FLOCK,
             &USE_REJECTED_DETACH,
             &USE_BLIND_UNLINK,
+            &USE_UNGUARDED_DETACH,
+            &GUARD_UNSUPPORTED,
         ] {
             flag.with(|f| f.set(false));
         }
         AFTER_AUTHORITY_REACH.with(|h| *h.borrow_mut() = None);
         AFTER_LINK_COUNT_PROOF.with(|h| *h.borrow_mut() = None);
+        AFTER_DETACH.with(|h| *h.borrow_mut() = None);
     }
 
     pub fn arm(flag: &'static LocalKey<Cell<bool>>) {
@@ -620,6 +678,15 @@ fn after_link_count_proof() {
     }
 }
 
+/// The instant the authority pathname has no entry of its own (§4b step 5, under
+/// the transition guard). See `inject::AFTER_DETACH`.
+fn after_detach() {
+    #[cfg(test)]
+    {
+        inject::fire_after_detach();
+    }
+}
+
 fn precheck_enabled() -> bool {
     #[cfg(test)]
     {
@@ -628,6 +695,20 @@ fn precheck_enabled() -> bool {
     #[cfg(not(test))]
     {
         true
+    }
+}
+
+/// The REJECTED `9611c12b` restoration — no transition guard, and a detach name
+/// dropped whether or not the restoring `link` succeeded. `cfg(test)` only: a
+/// production build carries no switch that can reopen the two-holder window.
+fn unguarded_detach() -> bool {
+    #[cfg(test)]
+    {
+        inject::armed(&inject::USE_UNGUARDED_DETACH)
+    }
+    #[cfg(not(test))]
+    {
+        false
     }
 }
 
@@ -717,6 +798,190 @@ fn report_no_advisory_locking(lock_path: &Path, errno: i32) {
         "[project-lock] {}: this filesystem refused flock(LOCK_EX) (errno {errno}) — the lock \
          still excludes exactly as the gateway's does, but WITHOUT the kernel-enforced claim on \
          the published inode that docs/42 §4b asks the Rust twin for.",
+        lock_path.display()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §4b step 5a — THE PATHNAME-TRANSITION GUARD.
+//
+// Step 5 removes the lock entry with `rename(lockPath → *.detach.<hex>)` so that
+// "whose entry was that" is a fact rather than an inference, and puts a
+// successor's entry straight back with `link(detach → lockPath)`. Those are TWO
+// syscalls, and BETWEEN THEM THE AUTHORITY PATHNAME HAS NO ENTRY OF ITS OWN.
+// Reviewer seq 250 parked a third writer in exactly that instant, 8/8:
+//
+//     {"detachSeamFired":true,"predecessor":"Stolen",
+//      "successorRecordSurvived":false,"successorRelease":"Stolen",
+//      "successorWasInsideWhenThirdEntered":true,"third":"acquired"}
+//
+// The third writer's `link` won the empty pathname while the LIVE successor was
+// still inside its section — two holders, which is the safety violation itself —
+// and the restoration then lost EEXIST. Judging the inode correctly is not
+// enough: the WINDOW has to stop existing.
+//
+// So the transition is SERIALISED. A releaser takes `flock(LOCK_EX)` on a
+// dedicated sibling file — `<lockPath>.transition`, which is never a lock, never
+// read, never waited on and carries no record — and holds it across
+// detach → judge → restore. EVERY acquisition takes the same guard before its
+// `link(staging → lockPath)`. So an acquirer is either entirely before the
+// releaser's rename (it links, and the releaser's rename then hands back a
+// successor's inode, which goes back where it was published) or entirely after
+// its restoration (the pathname is occupied, or free because the release really
+// did complete) — never inside. There is no interleaving left in which a new
+// acquirer reaches an authority pathname a live holder is transiently detached
+// from.
+//
+// WHY `flock` AND NOT AN `O_EXCL` MARKER: the guard must not survive the death of
+// the process holding it. `flock` is released by the kernel when the descriptor
+// closes, including on a crash mid-transition; an `O_EXCL` marker would wedge
+// every future writer of that lock and would need exactly the stale-decision
+// machinery §5 rejects.
+//
+// AND IT IS FAIL-CLOSED. A releaser that cannot take the guard DOES NOT DETACH:
+// it returns a typed non-release and keeps the lock (the window is never opened
+// at all). An acquirer that cannot take it because the guard is BUSY reports
+// contention and waits, exactly like an occupied pathname. An acquirer on a
+// filesystem with no advisory locking says so once and proceeds — which is safe
+// precisely BECAUSE the releaser rule means no window can exist there to be
+// admitted into.
+//
+// `renameat2(RENAME_EXCHANGE)`/`renamex_np(RENAME_SWAP)` would close the same
+// window in one syscall, but they are Linux-only and darwin-only respectively —
+// two divergent primitives, neither available on the other's platform, and the
+// portable fallback would have to be this guard anyway.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How long a RELEASER may wait for the guard before refusing to detach. The
+/// guard is held for three syscalls by a releaser and for one `link` (plus the
+/// directory `fsync`) by an acquirer, so this is contention, not queueing: a
+/// releaser that still cannot have it retries the whole release, and eventually
+/// RETAINS the lock, which is the honest outcome.
+const TRANSITION_WAIT_ATTEMPTS: u32 = 100;
+const TRANSITION_WAIT_SLEEP_MS: u64 = 2;
+
+/// An acquirer does NOT queue on the guard: the acquire loop already has a
+/// deadline, a sleep and a classification for "somebody else has it".
+const TRANSITION_TRY_ONCE: u32 = 1;
+
+/// The guard, held for as long as this value lives. Dropping it hands the
+/// advisory claim back and closes the descriptor.
+struct Transition {
+    file: std::fs::File,
+}
+
+impl Drop for Transition {
+    fn drop(&mut self) {
+        // The same `flock(LOCK_UN)` the authority handle uses — handed back
+        // explicitly at the end of the transition rather than left to the close.
+        drop_authority_flock(&self.file);
+    }
+}
+
+/// What asking for the transition guard established.
+enum Guard {
+    /// It is ours until the value is dropped.
+    Held(Transition),
+    /// Somebody else is mid-transition. Retryable contention, never a reason to
+    /// proceed unguarded.
+    Busy,
+    /// This filesystem has no advisory locking at all.
+    Unsupported(i32),
+    /// The guard file itself could not be opened (read-only mount, ENOTDIR, no
+    /// space). A local failure; the caller fails closed.
+    Unavailable(String),
+}
+
+fn transition_guard_path(lock_path: &Path) -> PathBuf {
+    with_suffix(lock_path, "transition")
+}
+
+/// The guard file is created once and then LEFT IN PLACE. Removing it would be a
+/// hole, not tidiness: two processes holding `flock` on two different inodes that
+/// happened to share a pathname exclude nothing at all.
+#[cfg(unix)]
+fn take_transition_guard(lock_path: &Path, attempts: u32) -> Guard {
+    use std::os::unix::io::AsRawFd;
+    let path = transition_guard_path(lock_path);
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(false);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let file = match open.open(&path) {
+        Ok(f) => f,
+        // `flock` needs a DESCRIPTOR, not write access, so a guard file another
+        // user created is still usable as a guard. Only a pathname we can neither
+        // create nor open at all is a refusal.
+        Err(_) => match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => return Guard::Unavailable(e.to_string()),
+        },
+    };
+    #[cfg(test)]
+    if inject::armed(&inject::GUARD_UNSUPPORTED) {
+        return Guard::Unsupported(0);
+    }
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        // SAFETY: `fd` is owned by `file` and outlives the call; the only other
+        // argument is a constant flag pair.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Guard::Held(Transition { file });
+        }
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EINVAL);
+        if errno != libc::EWOULDBLOCK {
+            // Not contention — this filesystem does not implement `flock`.
+            return Guard::Unsupported(errno);
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_millis(TRANSITION_WAIT_SLEEP_MS));
+        }
+    }
+    Guard::Busy
+}
+
+#[cfg(not(unix))]
+fn take_transition_guard(_lock_path: &Path, _attempts: u32) -> Guard {
+    Guard::Unsupported(0)
+}
+
+/// Printed once per lock: the pathname transition cannot be serialised here, so
+/// step 5 refuses to perform it. The lock is RETAINED rather than released, which
+/// an operator should be able to read rather than infer from a stuck week.
+fn report_no_transition_guard(lock_path: &Path, detail: &str) {
+    let key = format!("{}|no-transition-guard", lock_path.display());
+    if !WARNED.with(|w| w.borrow_mut().insert(key)) {
+        return;
+    }
+    eprintln!(
+        "[project-lock] {}: the pathname-transition guard is unavailable ({detail}), so this \
+         release will NOT detach its lock entry — detaching without it would leave the authority \
+         pathname briefly free and a second writer could enter a section somebody else is inside. \
+         The lock is retained and retried. If this filesystem has no flock(2), move this \
+         household's directory onto one that does.",
+        lock_path.display()
+    );
+}
+
+/// Printed once: a detached entry could not be put back. **Its record still
+/// exists** — under the private detach name — so this is recoverable by hand.
+fn report_unrestored(lock_path: &Path, record: &Path, detail: &str) {
+    let key = format!("{}|unrestored", lock_path.display());
+    if !WARNED.with(|w| w.borrow_mut().insert(key)) {
+        return;
+    }
+    eprintln!(
+        "[project-lock] {}: this release detached a lock entry and could not put it back \
+         ({detail}). THE RECORD WAS NOT DESTROYED: it is on disk at {}. Stop the writers of this \
+         lock; if the process named in that record is still running, move the file back to {} \
+         before restarting anything, otherwise delete it.",
+        lock_path.display(),
+        record.display(),
         lock_path.display()
     );
 }
@@ -871,6 +1136,40 @@ fn try_publish(lock_path: &Path, token: &str, pid: u32, host: &str, now_ms: i64)
     // (d) THE ACQUISITION. `link(2)` fails EEXIST rather than clobbering, so it is
     //     exactly as exclusive as O_EXCL while making the visible transition go
     //     straight from "no lock" to "a whole, parseable lock".
+    //
+    //     UNDER THE TRANSITION GUARD (§4b step 5a). `link` is atomic against
+    //     another `link`, but it is NOT atomic against a releaser's
+    //     rename-then-restore: that leaves the pathname empty for one instant, and
+    //     an EEXIST-exclusive create walks straight into it while a live holder is
+    //     inside its section. Taking the guard here is what makes "the pathname
+    //     was free" mean "no holder was inside", 8/8 in the reviewer's boundary.
+    //     Held for the `link` AND for the directory `fsync` below, so the ONE
+    //     moment a failed acquisition may touch the lock path (step (e)) is also
+    //     inside it.
+    let _transition = match take_transition_guard(lock_path, TRANSITION_TRY_ONCE) {
+        Guard::Held(g) => Some(g),
+        // Somebody is mid-transition on this pathname. That is contention, and it
+        // is classified and waited on exactly like an occupied pathname — never
+        // resolved by publishing anyway.
+        Guard::Busy => {
+            scrub();
+            return Published::Held;
+        }
+        // No advisory locking here. Say so once and publish: a releaser on this
+        // filesystem refuses to detach at all (see `pin_and_decide` step 5), so
+        // there is no window for an unguarded acquisition to be admitted into.
+        Guard::Unsupported(errno) => {
+            report_no_advisory_locking(lock_path, errno);
+            None
+        }
+        Guard::Unavailable(error) => {
+            scrub();
+            return Published::Failed {
+                detail: "create-failed",
+                error,
+            };
+        }
+    };
     if let Err(e) = std::fs::hard_link(&staging, lock_path) {
         scrub();
         return if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -980,6 +1279,18 @@ enum Removal {
     /// else had already taken the pathname. Reported under its own name; it
     /// never passes for a clean release.
     Displaced,
+    /// A SUCCESSOR'S entry was detached and the restoring `link` failed — **and
+    /// its record was not destroyed**: it is still on disk under the private
+    /// detach name, which `report_unrestored` has told the operator about. We do
+    /// not hold this lock; a successor does, and it is recoverable by republishing
+    /// that record. Never a clean release.
+    Unrestored(String),
+    /// The detached entry could not be JUDGED and could not be put back. Whose it
+    /// was is unknown, so the strictest honest answer is the only one available:
+    /// ownership is RETAINED and the release is retried. The record survives under
+    /// the detach name (and this process still holds its descriptor), so a retry
+    /// has something to work with.
+    Unjudgeable(String),
     /// The `link` or the `unlink` failed (transient); nothing was removed.
     Failed(String),
 }
@@ -1146,6 +1457,53 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
     // one we have just proven we are entitled to free, and the single case in
     // which that proof turns out to have gone stale is the case this exists to
     // REPAIR rather than to report.
+    //
+    // AND THE PATHNAME IS SERIALISED WHILE IT HAPPENS (§4b step 5a). The rename
+    // and the restoring `link` are two syscalls, and between them the authority
+    // pathname has no entry of its own. Reviewer seq 250 drove a third writer
+    // into exactly that instant, 8/8: it acquired while the live successor was
+    // still inside, and the restoration then lost EEXIST. Judging the inode
+    // correctly does not help if the window is open, so the window is CLOSED —
+    // the guard below is taken by every conforming acquisition too, and it is
+    // held until the transition is finished, whichever way it ends.
+    //
+    // FAIL CLOSED: no guard, no detach. A transition we cannot serialise is one
+    // we do not perform — the release is retained and retried, and the pathname
+    // is never left free under a holder.
+    let _transition = if unguarded_detach() {
+        // THE REJECTED RESTORATION OF CANDIDATE `9611c12b`, WRITTEN OUT: step 5
+        // with no guard around it and, below, a detach name dropped whether or
+        // not the restoring `link` succeeded. Restoring it — rather than merely
+        // turning a check off — is what lets `two_holder_window_closed` have a
+        // build in which it FAILS, with the reviewer's exact 8/8 JSON. Nothing
+        // outside `cfg(test)` can reach it.
+        None
+    } else {
+        match take_transition_guard(lock_path, TRANSITION_WAIT_ATTEMPTS) {
+            Guard::Held(g) => Some(g),
+            Guard::Busy => {
+                drop_pin();
+                return Removal::Failed(
+                    "another writer is mid-transition on this lock pathname".to_string(),
+                );
+            }
+            Guard::Unsupported(errno) => {
+                report_no_transition_guard(lock_path, &format!("flock errno {errno}"));
+                drop_pin();
+                return Removal::Failed(format!(
+                    "the pathname-transition guard is unsupported here (errno {errno})"
+                ));
+            }
+            Guard::Unavailable(error) => {
+                report_no_transition_guard(lock_path, &error);
+                drop_pin();
+                return Removal::Failed(format!(
+                    "the pathname-transition guard could not be opened: {error}"
+                ));
+            }
+        }
+    };
+
     let detach = with_suffix(lock_path, &format!("detach.{}", mint_token()));
     if let Err(e) = std::fs::rename(lock_path, &detach) {
         drop_pin();
@@ -1155,6 +1513,11 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
             Removal::Failed(e.to_string())
         };
     }
+    // THE SEAM, at the reviewer's seq-250 boundary: the authority pathname has no
+    // entry of its own right now. A writer driven in HERE must not be able to
+    // acquire — the transition guard above is held, and every conforming
+    // acquisition takes it before it links.
+    after_detach();
     // WHOSE ENTRY DID WE JUST TAKE? Asked of a HANDLE on the detached inode, and
     // compared against the inode we pinned and proved at (2) — the one carrying
     // our token, kept alive (and therefore un-reissuable) by the descriptor `fd`.
@@ -1162,15 +1525,50 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
         .and_then(|f| f.metadata())
         .map(|m| ids_of(&m));
     let put_back = |detail: &str| -> Removal {
+        if unguarded_detach() {
+            // THE REJECTED RESTORATION, EXACTLY AS `9611c12b` WROTE IT: the detach
+            // name is dropped whether or not the `link` succeeded.
+            let restored = std::fs::hard_link(&detach, lock_path);
+            let _ = std::fs::remove_file(&detach);
+            return match restored {
+                Ok(()) => Removal::SuccessorPreserved,
+                Err(e) => Removal::Failed(format!("{detail}: {e}")),
+            };
+        }
         // Same inode, same bytes, under the name it was published at, and atomic
         // — `link` fails EEXIST rather than clobbering whatever arrived in the
-        // meantime. Only when it CANNOT go back is this a displacement.
-        let restored = std::fs::hard_link(&detach, lock_path);
-        let _ = std::fs::remove_file(&detach);
-        match restored {
-            Ok(()) => Removal::SuccessorPreserved,
-            Err(e) => Removal::Failed(format!("{detail}: {e}")),
+        // meantime.
+        //
+        // AND THE DETACH NAME GOES ONLY ON SUCCESS. Candidate `9611c12b` ran
+        // `let _ = remove_file(&detach)` UNCONDITIONALLY, so a restoration that
+        // failed also deleted the only directory entry a LIVE holder's record had
+        // left — the reviewer's `successorRecordSurvived: false`, and the reason
+        // a successor that held throughout was told `Stolen` at its own release.
+        // A record we could not put back is a record we LEAVE ON DISK: durable,
+        // discoverable, named in the operator report, and republishable by hand
+        // or by a retry.
+        let mut last = String::new();
+        for attempt in 0..RESTORE_ATTEMPTS {
+            match std::fs::hard_link(&detach, lock_path) {
+                Ok(()) => {
+                    // Published again under its own name; the private extra name
+                    // we made is now, and only now, safe to drop.
+                    let _ = std::fs::remove_file(&detach);
+                    return Removal::SuccessorPreserved;
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    if attempt + 1 < RESTORE_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            }
         }
+        // With the guard held, a conforming acquirer cannot have taken the
+        // pathname, so this is a filesystem failure rather than a race — but it is
+        // reported, and the record survives, either way.
+        report_unrestored(lock_path, &detach, &format!("{detail}: {last}"));
+        Removal::Unrestored(format!("{detail}: {last}"))
     };
     let ours_removed = match taken {
         Ok(ids) => ids == ids_of(&meta),
@@ -1184,6 +1582,10 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
                 Removal::SuccessorPreserved => {
                     Removal::Failed(format!("the detached entry could not be judged: {e}"))
                 }
+                // Neither judged nor put back. The record is still on disk under
+                // the detach name, and ownership stays with us until a retry can
+                // prove otherwise — "we do not know" is never a release.
+                Removal::Unrestored(detail) => Removal::Unjudgeable(detail),
                 other => other,
             };
         }
@@ -1195,10 +1597,15 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
         // of one.
         drop_pin();
         return match put_back("a successor's entry could not be put back") {
+            // The REJECTED restoration's shape: the record was deleted along with
+            // the failure, so there is nothing to point an operator at. Reachable
+            // only from the mutation control.
             Removal::Failed(detail) => {
                 report_displaced(lock_path, &detail);
                 Removal::Displaced
             }
+            // `Removal::Unrestored` — the record SURVIVED and `report_unrestored`
+            // has named the file. Either way this release let go of nothing.
             other => other,
         };
     }
@@ -1792,6 +2199,24 @@ fn release_locked(lock_path: &Path, name: &str, token: &str) -> Release {
                 let _ = name;
                 drop_held();
                 return Release::Stolen;
+            }
+            // The repair could not be made EITHER, but the record was not
+            // destroyed with it: it is on disk under the private detach name and
+            // `report_unrestored` has told the operator which file and what to do
+            // with it. The verdict for US is unchanged and unsoftened — we
+            // detached a successor's entry, so we never held this lock at the end
+            // and we say `Stolen`, never `Released`.
+            Removal::Unrestored(_) => {
+                drop_held();
+                return Release::Stolen;
+            }
+            // Neither judged nor restored: whose entry it was is unknown, and
+            // "unknown" is never a release (§4). Ownership STAYS with us —
+            // together with the authority handle keeping that inode alive — and
+            // the retained verdict travels to the certifying callers, which refuse
+            // it. This is the one detach outcome that is not a lost lock.
+            Removal::Unjudgeable(detail) => {
+                return retain(format!("unjudgeable-detach:{detail}"));
             }
             Removal::Gone => {
                 last = "gone".into();
@@ -2684,6 +3109,376 @@ mod tests {
         assert_eq!(verdict, Release::Released);
         assert!(!path.exists(), "the lock path is free");
         clean();
+    }
+
+    /// **§4b step 5a — THE DETACH → RESTORE TRANSITION.** Reviewer exact-tree STOP
+    /// seq 250 on fork `9611c12b` (tree `81097d54…`): the successor-preserving
+    /// removal above closes the pre-removal window and then opens an ADJACENT one.
+    /// Between `rename(lockPath → detach)` and the restoring `link`, the authority
+    /// pathname has no entry of its own, and a third writer driven into that
+    /// instant acquired 8/8 while a LIVE successor was still inside its section:
+    ///
+    /// ```json
+    /// {"detachSeamFired":true,"predecessor":"Stolen","successorRecordSurvived":false,
+    ///  "successorRelease":"Stolen","successorWasInsideWhenThirdEntered":true,
+    ///  "third":"acquired"}
+    /// ```
+    ///
+    /// Two holders in one week-mutation section is the safety violation itself,
+    /// and the restoration then lost EEXIST — after which `9611c12b` deleted the
+    /// detach name ANYWAY, destroying the only directory entry a live holder's
+    /// record had left. This module asserts every field of that JSON, inverted,
+    /// and keeps the rejected build beside it as the control.
+    mod detach_restore {
+        use super::*;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// The fixture both the gate and its control run: a predecessor releases,
+        /// an outsider clears the wedge between its link-count proof and its
+        /// removal, a REAL successor takes the lock and stays inside its section,
+        /// and a REAL third OS process tries to acquire at the instant the
+        /// authority pathname has been detached.
+        struct Boundary {
+            /// The verdict the predecessor's release returned.
+            predecessor: Release,
+            /// The live successor, still inside its section.
+            successor: Elsewhere,
+            /// What the third process wrote: `acquired` or `refused:<detail>`.
+            third: Option<String>,
+            /// The successor's record, read the moment it published.
+            successor_record: String,
+            /// The seam after the link-count proof fired (a successor really was
+            /// published) …
+            successor_seam_fired: bool,
+            /// … and the seam after the rename fired (the third process really
+            /// ran, at the real boundary).
+            detach_seam_fired: bool,
+            /// Was the authority pathname EMPTY when the third process ran? If it
+            /// was not, the third writer was refused by an occupied pathname and
+            /// this fixture would prove nothing about the window.
+            window_was_open: bool,
+        }
+
+        fn run_boundary(root: &Path, path: &Path) -> Boundary {
+            let successor_seam = std::sync::Arc::new(AtomicBool::new(false));
+            let detach_seam = std::sync::Arc::new(AtomicBool::new(false));
+            let window = std::sync::Arc::new(AtomicBool::new(false));
+            let live: Rc<RefCell<Option<Elsewhere>>> = Rc::new(RefCell::new(None));
+            let record: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+            let predecessor = acquire(root, WEEK_MUTATION, &opts(200)).unwrap();
+
+            {
+                let path = path.to_path_buf();
+                let root = root.to_path_buf();
+                let fired = successor_seam.clone();
+                let live = live.clone();
+                let record = record.clone();
+                inject::arm_after_link_count_proof(move || {
+                    if fired.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    // §5's human cure, and then a successor that legitimately
+                    // takes the free pathname and STAYS INSIDE.
+                    std::fs::remove_file(&path).unwrap();
+                    *live.borrow_mut() = Some(hold_elsewhere(&root, opts(200)));
+                    *record.borrow_mut() = std::fs::read_to_string(&path).unwrap();
+                });
+            }
+            {
+                let path = path.to_path_buf();
+                let root = root.to_path_buf();
+                let fired = detach_seam.clone();
+                let window = window.clone();
+                inject::arm_after_detach(move || {
+                    if fired.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    window.store(!path.exists(), Ordering::SeqCst);
+                    child_acquire(&root);
+                });
+            }
+
+            let verdict = predecessor.release();
+            inject::reset();
+
+            Boundary {
+                predecessor: verdict,
+                successor: live
+                    .borrow_mut()
+                    .take()
+                    .expect("the fixture must have published a live successor"),
+                third: read_third_process_verdict(root),
+                successor_record: record.borrow().clone(),
+                successor_seam_fired: successor_seam.load(Ordering::SeqCst),
+                detach_seam_fired: detach_seam.load(Ordering::SeqCst),
+                window_was_open: window.load(Ordering::SeqCst),
+            }
+        }
+
+        /// **THE GATE.** No interleaving admits a new acquirer to the authority
+        /// pathname while a live holder's entry is transiently detached: the
+        /// releaser holds the pathname-transition guard across
+        /// detach → judge → restore, and every conforming acquisition takes that
+        /// guard before its `link`. The third writer therefore finds the
+        /// transition in progress and is refused, even though the pathname it
+        /// would have created at is, at that exact instant, EMPTY — which is what
+        /// `window_was_open` proves, and what stops this gate from passing for the
+        /// trivial reason that something happened to be in the way.
+        #[test]
+        #[serial(project_lock)]
+        fn two_holder_window_closed() {
+            clean();
+            let dir = scratch();
+            let path = lock_path_for(dir.path(), WEEK_MUTATION);
+
+            let b = run_boundary(dir.path(), &path);
+
+            // ── NON-VACUITY: the fixture reached the reviewer's boundary ──────
+            assert!(
+                b.successor_seam_fired,
+                "no successor was published, so this proves nothing"
+            );
+            assert!(
+                b.detach_seam_fired,
+                "the seam must fire ON the rename the fixed primitive really calls, or this gate \
+                 is vacuous"
+            );
+            assert!(
+                b.window_was_open,
+                "the authority pathname must actually be EMPTY when the third writer runs — \
+                 otherwise it is refused by an occupied pathname and the guard is untested"
+            );
+            assert!(
+                transition_guard_path(&path).exists(),
+                "the transition guard file must exist — the releaser is supposed to have taken it"
+            );
+
+            // ── 1. `third:"acquired"` INVERTED: no second holder ──────────────
+            let third = b.third.clone().expect("the third process must have run");
+            assert_ne!(
+                third, "acquired",
+                "a third writer acquired the week while a live successor was inside it"
+            );
+            assert!(
+                third.starts_with("refused:"),
+                "the third writer must be REFUSED at the boundary, not fail for some other \
+                 reason: {third}"
+            );
+
+            // ── 2. `successorRecordSurvived:false` INVERTED ───────────────────
+            assert!(
+                path.exists(),
+                "the live successor's authority entry did not survive the restoration"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                b.successor_record,
+                "the record at the authority pathname is the successor's, byte for byte — not a \
+                 copy, not a rewrite, not the third writer's"
+            );
+            assert_eq!(
+                parse_record(&b.successor_record).unwrap().token,
+                b.successor.token,
+                "…and it is the record of the successor that is still INSIDE its section"
+            );
+
+            // ── 3. the predecessor never claims a clean release ───────────────
+            assert_eq!(
+                b.predecessor,
+                Release::Stolen,
+                "a release that detached somebody else's entry must never read as Released"
+            );
+
+            // ── 4. `successorRelease:"Stolen"` INVERTED — THE HONEST VERDICT ──
+            //     It held the lock continuously, from before the third writer ran
+            //     until now, so its own release is a plain `Released`. Telling a
+            //     continuous holder it was robbed is the lie this closes.
+            assert_eq!(
+                b.successor.release(),
+                Release::Released,
+                "the successor held its lock throughout; its release must not report Stolen"
+            );
+
+            // ── 5. and no debris: the detach name went with the restoration ───
+            assert_eq!(
+                debris(&path),
+                Vec::<String>::new(),
+                "the repair left temporary names behind"
+            );
+            assert!(!path.exists(), "the successor's own release completed");
+            clean();
+        }
+
+        /// **THE GATE'S CONTROL.** With candidate `9611c12b`'s restoration put
+        /// back — the rename unguarded, and the detach name dropped whether or not
+        /// the restoring `link` succeeded — the SAME fixture reproduces the
+        /// reviewer's 8/8 JSON exactly. Without this, "the third writer is
+        /// refused" would be satisfiable by a fixture that never reached the
+        /// window, and the gate above would be green while testing nothing.
+        #[test]
+        #[serial(project_lock)]
+        fn the_unguarded_restoration_still_admits_a_second_holder() {
+            clean();
+            let dir = scratch();
+            let path = lock_path_for(dir.path(), WEEK_MUTATION);
+
+            inject::arm(&inject::USE_UNGUARDED_DETACH);
+            let b = run_boundary(dir.path(), &path);
+
+            assert!(b.detach_seam_fired && b.successor_seam_fired);
+            assert!(
+                b.window_was_open,
+                "CONTROL: the rename leaves the authority pathname free"
+            );
+            assert_eq!(
+                b.third.as_deref(),
+                Some("acquired"),
+                "CONTROL: `third:\"acquired\"` — a third writer takes the week out of the gap the \
+                 rename opened while a LIVE successor is inside it"
+            );
+            assert_ne!(
+                std::fs::read_to_string(&path).unwrap(),
+                b.successor_record,
+                "CONTROL: `successorRecordSurvived:false` — the record at the pathname is the \
+                 third writer's"
+            );
+            assert_eq!(
+                b.predecessor,
+                Release::Stolen,
+                "CONTROL: `predecessor:\"Stolen\"` — honest, and still not exclusion"
+            );
+            assert_eq!(
+                b.successor.release(),
+                Release::Stolen,
+                "CONTROL: `successorRelease:\"Stolen\"` — a holder that never let go is told it \
+                 was robbed, because its record was deleted by the failed restoration"
+            );
+
+            // The control's third process is still "holding" a lock nobody will
+            // release.
+            let _ = std::fs::remove_file(&path);
+            clean();
+        }
+
+        /// **RESTORATION NEVER DESTROYS THE RECORD.** `9611c12b` ran
+        /// `let _ = remove_file(&detach)` unconditionally, so a restoring `link`
+        /// that failed took the live holder's last directory entry with it. Here
+        /// the pathname is taken by a NON-CONFORMING writer — one that does not
+        /// take the transition guard, i.e. a hand-written file, which is the only
+        /// way an EEXIST can still reach the restoration — and the assertion is
+        /// that the record is still on disk afterwards.
+        #[test]
+        #[serial(project_lock)]
+        fn a_failed_restoration_leaves_the_record_on_disk() {
+            clean();
+            let dir = scratch();
+            let path = lock_path_for(dir.path(), WEEK_MUTATION);
+            let holder = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
+
+            let successor_record = "{\"token\":\"".to_string()
+                + &"c".repeat(32)
+                + "\",\"pid\":1,\"host\":\"successor\",\"name\":\"week-mutation\",\"v\":1}\n";
+            let intruder = "{\"token\":\"".to_string()
+                + &"d".repeat(32)
+                + "\",\"pid\":1,\"host\":\"intruder\",\"name\":\"week-mutation\",\"v\":1}\n";
+            {
+                let path = path.clone();
+                let record = successor_record.clone();
+                inject::arm_after_link_count_proof(move || {
+                    let _ = std::fs::remove_file(&path);
+                    std::fs::write(&path, &record).unwrap();
+                });
+            }
+            {
+                let path = path.clone();
+                let intruder = intruder.clone();
+                inject::arm_after_detach(move || {
+                    // Nothing conforming can do this — it is here to force the
+                    // restoring `link` to fail, which is the branch under test.
+                    std::fs::write(&path, &intruder).unwrap();
+                });
+            }
+
+            let verdict = holder.release();
+            inject::reset();
+
+            assert_eq!(
+                verdict,
+                Release::Stolen,
+                "a release whose restoration failed never reads as Released"
+            );
+            let left = debris(&path);
+            let detached: Vec<&String> = left.iter().filter(|n| n.contains(".detach.")).collect();
+            assert_eq!(
+                detached.len(),
+                1,
+                "the detached record must SURVIVE under its private name, not be deleted with the \
+                 failure: {left:?}"
+            );
+            let survived = path.parent().unwrap().join(detached[0]);
+            assert_eq!(
+                std::fs::read_to_string(&survived).unwrap(),
+                successor_record,
+                "and it is the live holder's record, byte for byte, ready to be republished"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                intruder,
+                "the pathname still holds what took it — nothing was clobbered"
+            );
+
+            let _ = std::fs::remove_file(&survived);
+            let _ = std::fs::remove_file(&path);
+            clean();
+        }
+
+        /// **NO GUARD, NO DETACH.** On a filesystem that cannot serialise the
+        /// transition, the releaser does not perform it: the window is never
+        /// opened, the lock is RETAINED (a typed verdict a certifying caller
+        /// refuses), and the record stays exactly where it was. Acquisition still
+        /// works there — which is safe precisely BECAUSE no releaser can open a
+        /// window for it to be admitted into.
+        #[test]
+        #[serial(project_lock)]
+        fn a_release_that_cannot_guard_the_pathname_never_detaches() {
+            clean();
+            let dir = scratch();
+            let path = lock_path_for(dir.path(), WEEK_MUTATION);
+
+            inject::arm(&inject::GUARD_UNSUPPORTED);
+            let holder = acquire(dir.path(), WEEK_MUTATION, &opts(200)).expect(
+                "acquisition still works without advisory locking — the guard is not the exclusion",
+            );
+            let record = std::fs::read_to_string(&path).unwrap();
+            let verdict = holder.release();
+
+            assert!(
+                matches!(verdict, Release::Retained(_)),
+                "a transition that cannot be serialised is not performed, and the lock is retained: \
+                 {verdict:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                record,
+                "nothing was detached, so the record is untouched"
+            );
+            assert_eq!(
+                debris(&path),
+                Vec::<String>::new(),
+                "and nothing was left half-moved"
+            );
+
+            // …and it is RECOVERABLE: with the guard available again, the pending
+            // release finishes and the next writer gets the lock.
+            inject::reset();
+            let next = acquire(dir.path(), WEEK_MUTATION, &opts(200))
+                .expect("the retained release is retried on the next acquire");
+            assert_eq!(next.release(), Release::Released);
+            assert!(!path.exists());
+            clean();
+        }
     }
 
     /// **THE SWALLOWED VERDICT (bridge seq 214, 4/4).** Both public wrappers
