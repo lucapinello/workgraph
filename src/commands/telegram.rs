@@ -4368,15 +4368,34 @@ impl FamilyReplyDelivery {
         phase: relay_receipt::ReplyPhase,
     ) -> MirrorOutcome {
         use worksgood::notify::telegram_conversation as convo;
-        // The ack is identified by the PHASE ITS WRITER STAMPED, not by
-        // comparing its text: a text comparison stops recognising the ack the
-        // moment the wording changes, and starts mis-recognising any line that
-        // happens to match. The text check survives only as a fallback for
-        // callers that have not yet been converted to the phased API.
-        let is_ack = phase == relay_receipt::ReplyPhase::Ack || text == convo::ack_line();
-        if scope != ReplyScope::Group || is_ack {
+        // THE ACK IS MIRRORED LIKE EVERY OTHER DELIVERED ROW. It used to be
+        // dropped here — `is_ack` skipped both the feed row and the receipt —
+        // and the exact-tree audit named that a P0: the ack physically reaches
+        // the family, so a turn that crashes between ack and final produces a
+        // real, family-visible delivery that certification cannot observe at
+        // all. It has no global feed id and nothing proving it, and the turn's
+        // one-to-many delivery lifecycle cannot be reconstructed.
+        //
+        // What the ack must NOT do is reserve finality — and it does not: the
+        // reservation lives in `telegram_conversation`'s durable delivery guard,
+        // which reserves `ReplyPhase::Final` only, so a crash after the ack
+        // still leaves the turn answerable. Avoiding the reservation was always
+        // the right instinct; deleting the evidence was not the way to get it.
+        // v9.1's cardinality rule says the same in one line: "ack optional
+        // (heavy lane)... exactly one replyPhase:'final' per accepted turn".
+        if scope != ReplyScope::Group {
             return MirrorOutcome::Skipped;
         }
+        // A caller that has not been converted to the phased API and hands us
+        // the ack TEXT gets the phase corrected here, so the row it writes says
+        // `ack` rather than mis-stamping the turn's final answer. The phase is
+        // still writer-stamped wherever the writer knows it; this is the
+        // fallback, not the rule.
+        let phase = if phase == relay_receipt::ReplyPhase::Final && text == convo::ack_line() {
+            relay_receipt::ReplyPhase::Ack
+        } else {
+            phase
+        };
         let agent_id = convo::agent_for_bot(&self.config, bot_id);
         let entry = casa_feed::agent_entry(&self.personas, &agent_id, text, casa_feed::now_ms());
         // The turn is stamped RAW and verbatim, exactly as the gateway handed it
@@ -13623,10 +13642,27 @@ domains = ["calendar"]
             rows.iter().filter(|r| r["replyPhase"] == "final").collect();
         assert_eq!(finals.len(), 1, "exactly one final row: {rows:?}");
         assert_eq!(finals[0]["text"], "Dinner is pasta.");
-        // The ack itself is transient: it is never mirrored at all.
+        // …and the ack IS in the record, stamped `ack`, bound to the same turn.
+        // This assertion used to be its exact opposite ("the transient ack must
+        // not enter the record"), which is how a physically delivered message
+        // the family saw came to have no feed id and nothing proving it. The ack
+        // is transient to the CONVERSATION; it is not transient to the evidence.
+        let acks: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["replyPhase"] == "ack").collect();
+        assert_eq!(acks.len(), 1, "the delivered ack is recorded: {rows:?}");
+        assert_eq!(acks[0]["text"], ack.as_str());
+        assert_eq!(acks[0]["turnId"], ENGINE_TURN);
+        // Both deliveries are proven, and each receipt names its own row.
+        let receipts = relay_receipt::read_all(dir.path());
+        assert_eq!(receipts.len(), 2, "ack and final each carry a receipt");
+        let ack_receipt = receipts
+            .iter()
+            .find(|r| r.reply_phase == ReplyPhase::Ack)
+            .expect("the ack's receipt");
+        assert_eq!(ack_receipt.turn_id, ENGINE_TURN);
         assert!(
-            rows.iter().all(|r| r["text"] != ack.as_str()),
-            "the transient ack must not enter the record: {rows:?}"
+            ack_receipt.feed_id > 0 && ack_receipt.feed_id != receipts[1].feed_id,
+            "one receipt, one row: {receipts:?}"
         );
 
         // And a THIRD attempt is now suppressed — the final, and only the final,
@@ -13949,8 +13985,16 @@ domains = ["calendar"]
         );
     }
 
+    /// The heavy lane's ack-then-edit: TWO rows, one per physical delivery, and
+    /// the edit is mirrored exactly once.
+    ///
+    /// This test was `composed_ack_edit_mirrors_only_the_final_answer_once` and
+    /// asserted the ack produced no feed line at all — the exact-tree audit
+    /// named it as a green test around the wrong contract. What "only once"
+    /// legitimately means is that the EDIT does not mirror twice; it never meant
+    /// that a message the family received leaves no trace.
     #[test]
-    fn composed_ack_edit_mirrors_only_the_final_answer_once() {
+    fn composed_ack_edit_records_both_deliveries_and_mirrors_the_edit_once() {
         use worksgood::notify::telegram_conversation as convo;
         use worksgood::notify::telegram_conversation::ReplySink as _;
 
@@ -13966,19 +14010,36 @@ domains = ["calendar"]
 
         rt.block_on(sink.send("harbor", "group-chat", &convo::ack_line()))
             .unwrap();
-        assert!(
-            !feed.exists() || feed_lines(&feed).is_empty(),
-            "the transient acknowledgement is never a feed line"
+        let after_ack = feed_lines(&feed);
+        assert_eq!(
+            after_ack.len(),
+            1,
+            "the delivered ack is a row: {after_ack:?}"
         );
+        let acked: serde_json::Value = serde_json::from_str(&after_ack[0]).unwrap();
+        assert_eq!(acked["text"], convo::ack_line());
+        // This fixture's sink carries no canonical turn, so the row is the
+        // legacy unbound shape — the phase rides on a turn. The point being
+        // pinned here is that the DELIVERY leaves a row at all; the phased,
+        // turn-bound ack is pinned by
+        // `an_ack_leaves_the_final_unreserved_so_a_crash_between_them_still_answers`.
+        assert!(acked["turnId"].is_null(), "{acked:?}");
+
         rt.block_on(sink.edit("harbor", "group-chat", "message-1", "Dinner is ready."))
             .unwrap();
 
         assert_eq!(sink.inner.sends.lock().unwrap().len(), 1);
         assert_eq!(sink.inner.edits.lock().unwrap().len(), 1);
         let lines = feed_lines(&feed);
-        assert_eq!(lines.len(), 1, "the final edit mirrors exactly once");
-        let entry: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the final edit mirrors exactly once, on top of the ack: {lines:?}"
+        );
+        let entry: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(entry["text"], "Dinner is ready.");
+        // Turn-less fixture — see the note on the ack row above.
+        assert!(entry["turnId"].is_null(), "{entry:?}");
     }
 
     // --- lifecycle cross-surface delivery (lifecycle-messages-obey) --------

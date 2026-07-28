@@ -617,14 +617,25 @@ pub fn is_valid_attempt_id(s: &str) -> bool {
     s.strip_prefix("attempt-").is_some_and(is_uuid_v4)
 }
 
-/// `(turn, attempt)` from `WG_ATTEMPT_ID`, or the turn alone when the caller
-/// did not supply one. A retry after a genuine failure must not be suppressed
-/// as if it were a refire, which is what keying on the turn alone would do.
-pub fn attempt_key(turn_id: &str, attempt_id: Option<&str>) -> String {
-    match attempt_id.map(str::trim).filter(|a| !a.is_empty()) {
-        Some(attempt) => format!("{turn_id}\u{1f}{attempt}"),
-        None => format!("{turn_id}\u{1f}1"),
-    }
+/// `(turn, attempt, phase)` from `WG_ATTEMPT_ID`, with attempt `1` when the
+/// caller did not supply one.
+///
+/// A retry after a genuine failure must not be suppressed as if it were a
+/// refire, which is what keying on the turn alone would do.
+///
+/// AND THE PHASE IS PART OF THE KEY. It was not, and that was invisible while
+/// the ack wrote nothing: the moment a delivered ack started carrying its own
+/// receipt, the turn's FINAL was refused as a refire of its own ack — one
+/// physical delivery blocking a different one. v9.1 says the same in its join
+/// rule: `turnId` is ONE-TO-MANY across a turn's receipts, "gateway-human + each
+/// delivered helper ack/watchdog/final". Two deliveries of one attempt are two
+/// receipts; a refire is the same phase of the same attempt arriving twice.
+pub fn attempt_key(turn_id: &str, attempt_id: Option<&str>, phase: ReplyPhase) -> String {
+    let attempt = attempt_id
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("1");
+    format!("{turn_id}\u{1f}{attempt}\u{1f}{}", phase.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -918,10 +929,14 @@ pub fn append_locked(
             });
         }
     }
-    let key = attempt_key(&receipt.turn_id, receipt.attempt_id.as_deref());
+    let key = attempt_key(
+        &receipt.turn_id,
+        receipt.attempt_id.as_deref(),
+        receipt.reply_phase,
+    );
     if let Some(prior) = existing
         .iter()
-        .find(|r| attempt_key(&r.turn_id, r.attempt_id.as_deref()) == key)
+        .find(|r| attempt_key(&r.turn_id, r.attempt_id.as_deref(), r.reply_phase) == key)
     {
         return Err(ReceiptError::AttemptAlreadyRecorded {
             attempt_id: key,
@@ -1012,15 +1027,29 @@ fn append_line_durable(path: &Path, line: &str) -> Result<(), ReceiptError> {
 /// genuine failure is a DIFFERENT attempt, finds no evidence here, and correctly
 /// proceeds to relay. Keying on the turn alone would make the retry look like a
 /// refire and leave the household with the silence it was retrying.
+///
+/// The PHASE is deliberately not a parameter, and the FINAL is preferred when
+/// several phases of one attempt were delivered. A refire's question is "what
+/// did the family end up with", and the answer to that is the turn's answer —
+/// reporting its ack instead would say the household is still waiting for a
+/// message they already have.
 pub fn evidence_for_attempt(
     project_root: &Path,
     turn_id: &str,
     attempt_id: Option<&str>,
 ) -> Option<Receipt> {
-    let key = attempt_key(turn_id, attempt_id);
-    read_all(project_root)
+    let of_this_attempt = |r: &Receipt| {
+        attempt_key(&r.turn_id, r.attempt_id.as_deref(), r.reply_phase)
+            == attempt_key(turn_id, attempt_id, r.reply_phase)
+    };
+    let mine: Vec<Receipt> = read_all(project_root)
         .into_iter()
-        .find(|r| attempt_key(&r.turn_id, r.attempt_id.as_deref()) == key)
+        .filter(of_this_attempt)
+        .collect();
+    mine.iter()
+        .find(|r| r.reply_phase == ReplyPhase::Final)
+        .cloned()
+        .or_else(|| mine.into_iter().next_back())
 }
 
 /// The engine-side builder. `provenance` is fixed: this writer speaks only for
@@ -1444,9 +1473,52 @@ mod tests {
     /// not silently exempt from the refire guard.
     #[test]
     fn no_attempt_id_means_attempt_one() {
-        assert_eq!(attempt_key(TURN, None), attempt_key(TURN, Some("1")));
-        assert_eq!(attempt_key(TURN, Some("  ")), attempt_key(TURN, None));
-        assert_ne!(attempt_key(TURN, Some("2")), attempt_key(TURN, None));
+        let f = ReplyPhase::Final;
+        assert_eq!(attempt_key(TURN, None, f), attempt_key(TURN, Some("1"), f));
+        assert_eq!(attempt_key(TURN, Some("  "), f), attempt_key(TURN, None, f));
+        assert_ne!(attempt_key(TURN, Some("2"), f), attempt_key(TURN, None, f));
+    }
+
+    /// …and the PHASE is part of the key. Two phases of one attempt are two
+    /// physical deliveries, so they are two receipts — the ack does not make
+    /// the turn's own answer look like a refire of itself.
+    #[test]
+    fn each_delivered_phase_of_one_attempt_is_its_own_receipt() {
+        for (a, b) in [
+            (ReplyPhase::Ack, ReplyPhase::Final),
+            (ReplyPhase::Final, ReplyPhase::Watchdog),
+            (ReplyPhase::Watchdog, ReplyPhase::Failure),
+        ] {
+            assert_ne!(
+                attempt_key(TURN, Some(ATTEMPT_ONE), a),
+                attempt_key(TURN, Some(ATTEMPT_ONE), b)
+            );
+        }
+        let dir = scratch();
+        let mut ack = receipt(dir.path(), TURN, 1, Some(11));
+        ack.reply_phase = ReplyPhase::Ack;
+        ack.attempt_id = Some(ATTEMPT_ONE.to_string());
+        append(dir.path(), &ack).unwrap();
+
+        let mut answer = receipt(dir.path(), TURN, 2, Some(12));
+        answer.reply_phase = ReplyPhase::Final;
+        answer.attempt_id = Some(ATTEMPT_ONE.to_string());
+        append(dir.path(), &answer).expect("the final is not a refire of its own ack");
+
+        // …but the SAME phase twice still is one.
+        let mut refire = receipt(dir.path(), TURN, 3, Some(13));
+        refire.reply_phase = ReplyPhase::Final;
+        refire.attempt_id = Some(ATTEMPT_ONE.to_string());
+        assert!(matches!(
+            append(dir.path(), &refire),
+            Err(ReceiptError::AttemptAlreadyRecorded { .. })
+        ));
+
+        // The refire bypass reports the ANSWER, not the ack: what the family
+        // ended up with is the question a refire is asking.
+        let evidence = evidence_for_attempt(dir.path(), TURN, Some(ATTEMPT_ONE)).unwrap();
+        assert_eq!(evidence.reply_phase, ReplyPhase::Final);
+        assert_eq!(evidence.receipt_id, answer.receipt_id);
     }
 
     // ── what the ledger holds ───────────────────────────────────────────────
