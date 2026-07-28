@@ -459,80 +459,130 @@ fn real_kill(_pid: i64) -> Result<(), i32> {
 // production build must not carry a switch that can turn the protocol off.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// **EVERY SEAM HERE IS THREAD-LOCAL, AND THAT IS A CORRECTNESS PROPERTY OF THE
+/// TEST BINARY, NOT A STYLE CHOICE.** These were process-global statics. Every
+/// test in this module carries `#[serial(project_lock)]`, which keeps them from
+/// colliding with each OTHER — but `notify::casa_feed` and
+/// `notify::relay_receipt` also take this lock (through `feed_lock`, an adapter
+/// over it) and cannot reasonably all be serialised against it. A global
+/// `USE_REJECTED_DETACH` therefore put the REJECTED primitive under whichever
+/// unrelated append happened to be releasing at that instant, and a full
+/// `cargo test --lib` run reddened feed and receipt tests that are green in
+/// isolation — a suite that cries wolf is a suite a real regression walks
+/// through.
+///
+/// Thread-local is sound here because every fixture arms the seam and then
+/// performs the affected `acquire`/`release` ON ITS OWN STACK. The second role in
+/// a contention fixture is taken on a fresh thread or a real child process
+/// (`acquire_elsewhere` / `hold_elsewhere` / `child_acquire`), and that role is
+/// always the UNINSTRUMENTED one: it acquires before the seam is armed, or it is
+/// a separate process that must behave exactly as production does for the gate to
+/// mean anything. If a future fixture ever needs an armed seam on a helper
+/// thread, arm it from inside that thread.
 #[cfg(test)]
 pub(crate) mod inject {
-    use std::sync::atomic::AtomicBool;
-    /// Make the RECORD `fsync` fail with EIO (§2).
-    pub static FAIL_RECORD_FSYNC: AtomicBool = AtomicBool::new(false);
-    /// Make the CONTAINING DIRECTORY `fsync` fail with EIO (§2).
-    pub static FAIL_DIR_FSYNC: AtomicBool = AtomicBool::new(false);
-    /// Skip ALL of §4a's read-only evidence — the `nlink == 0` question put to the
-    /// authority handle AND the pathname pre-check. Kept only so the two-holder
-    /// negative has a control that proves it has teeth.
-    pub static SKIP_OWNERSHIP_PRECHECK: AtomicBool = AtomicBool::new(false);
-    /// Remove `flock(LOCK_EX)` from the authority handle — the control for the
-    /// half the JS twin cannot have (§4a). The lock still works without it; the
-    /// probe that proves the kernel is enforcing anything must go quiet.
-    pub static SKIP_AUTHORITY_FLOCK: AtomicBool = AtomicBool::new(false);
-    /// Put the REJECTED removal back: `rename(lockPath → quarantine)`, judge the
-    /// moved inode afterwards. This is detach-then-decide, written out exactly so
-    /// the negatives below have a build that REPRODUCES the audit's two-holder
-    /// outcome. Nothing outside `cfg(test)` can reach it.
-    pub static USE_REJECTED_DETACH: AtomicBool = AtomicBool::new(false);
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::thread::LocalKey;
+
     thread_local! {
+        /// Make the RECORD `fsync` fail with EIO (§2).
+        pub static FAIL_RECORD_FSYNC: Cell<bool> = const { Cell::new(false) };
+        /// Make the CONTAINING DIRECTORY `fsync` fail with EIO (§2).
+        pub static FAIL_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
+        /// Skip ALL of §4a's read-only evidence — the `nlink == 0` question put to
+        /// the authority handle AND the pathname pre-check. Kept only so the
+        /// two-holder negative has a control that proves it has teeth.
+        pub static SKIP_OWNERSHIP_PRECHECK: Cell<bool> = const { Cell::new(false) };
+        /// Remove `flock(LOCK_EX)` from the authority handle — the control for the
+        /// half the JS twin cannot have (§4a). The lock still works without it;
+        /// the probe that proves the kernel is enforcing anything must go quiet.
+        pub static SKIP_AUTHORITY_FLOCK: Cell<bool> = const { Cell::new(false) };
+        /// Put the REJECTED removal back: `rename(lockPath → quarantine)`, judge
+        /// the moved inode afterwards. This is detach-then-decide, written out
+        /// exactly so the negatives below have a build that REPRODUCES the audit's
+        /// two-holder outcome. Nothing outside `cfg(test)` can reach it.
+        pub static USE_REJECTED_DETACH: Cell<bool> = const { Cell::new(false) };
         /// Put the REJECTED REMOVAL of candidate `7da0c79a` back: a blind
         /// `unlink(lockPath)` justified only by the link count read one syscall
         /// earlier, confirmed only by the DELTA of that count. This is what the
         /// reviewer's boundary control drove a successor through, 4/4. It exists
-        /// so the gate above has a build in which it FAILS — a gate whose control
-        /// cannot fail is not a gate. Nothing outside `cfg(test)` can reach it.
-        ///
-        /// THREAD-LOCAL, unlike the flags above. Those must reach the helper
-        /// threads a contention fixture takes its second role on; this one only
-        /// ever has to reach `holder.release()` on the arming test's own stack,
-        /// and a process-global would put the rejected primitive under every
-        /// unrelated append running concurrently in the same test binary.
-        pub static USE_BLIND_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// so the gate has a build in which it FAILS — a gate whose control cannot
+        /// fail is not a gate.
+        pub static USE_BLIND_UNLINK: Cell<bool> = const { Cell::new(false) };
     }
 
-    pub fn blind_unlink_armed() -> bool {
-        USE_BLIND_UNLINK.with(|f| f.get())
+    type Hook = Rc<dyn Fn()>;
+
+    thread_local! {
+        /// Fired at the exact instant removal has reached for the authority
+        /// pathname: after `link(lockPath → pin)` in the conforming build (where
+        /// the pathname is still TAKEN), and after `rename(lockPath → quarantine)`
+        /// in the rejected one (where it is EMPTY). Arming it on the syscall the
+        /// fixed primitive actually calls FIRST is the whole point: the conforming
+        /// build reaches for the authority pathname with a `link` that adds a name
+        /// and frees none, and a gate armed on the rejected build's opening move
+        /// would be VACUOUS — green while testing nothing. (§4b step 5 does
+        /// rename, much later and only once the lock has been proven ours; that is
+        /// a different instant and has its own seam below.)
+        static AFTER_AUTHORITY_REACH: RefCell<Option<Hook>> = const { RefCell::new(None) };
+
+        /// Fired between the LINK-COUNT PROOF and the removal that acts on it. A
+        /// successor driven in HERE is the reviewer's second repro: the
+        /// predecessor has already proved the pathname was its own, and by the
+        /// time it removes, the entry there is somebody else's. Under the blind
+        /// unlink this cost the successor its lock and still read as `Released`;
+        /// under §4b step 5 the rename identifies the entry it took and puts it
+        /// back.
+        static AFTER_LINK_COUNT_PROOF: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
-    type Hook = Box<dyn Fn() + Send + Sync>;
-    /// Fired at the exact instant removal has reached for the authority pathname:
-    /// after `link(lockPath → pin)` in the conforming build (where the pathname is
-    /// still TAKEN), and after `rename(lockPath → quarantine)` in the rejected one
-    /// (where it is EMPTY). Arming it on the syscall the fixed primitive actually
-    /// calls FIRST is the whole point: the conforming build reaches for the
-    /// authority pathname with a `link` that adds a name and frees none, and a gate
-    /// armed on the rejected build's opening move would be VACUOUS — green while
-    /// testing nothing. (§4b step 5 does rename, much later and only once the lock
-    /// has been proven ours; that is a different instant and has its own seam
-    /// below.)
-    pub static AFTER_AUTHORITY_REACH: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+    pub fn arm_after_authority_reach(hook: impl Fn() + 'static) {
+        AFTER_AUTHORITY_REACH.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+    }
 
-    /// Fired between the LINK-COUNT PROOF and the removal that acts on it. A
-    /// successor driven in HERE is the reviewer's second repro: the predecessor
-    /// has already proved the pathname was its own, and by the time it removes,
-    /// the entry there is somebody else's. Under the blind unlink this cost the
-    /// successor its lock and still read as `Released`; under §4b step 5 the
-    /// rename identifies the entry it took and puts it back.
-    pub static AFTER_LINK_COUNT_PROOF: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+    pub fn arm_after_link_count_proof(hook: impl Fn() + 'static) {
+        AFTER_LINK_COUNT_PROOF.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+    }
+
+    /// The hook is CLONED OUT before it runs, so the cell is not borrowed while
+    /// the fixture's closure is on the stack — a hook that re-enters the lock (or
+    /// re-arms itself) must not panic on a `RefCell` we are still holding.
+    pub(super) fn fire_after_authority_reach() {
+        let hook = AFTER_AUTHORITY_REACH.with(|h| h.borrow().clone());
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
+    pub(super) fn fire_after_link_count_proof() {
+        let hook = AFTER_LINK_COUNT_PROOF.with(|h| h.borrow().clone());
+        if let Some(h) = hook {
+            h();
+        }
+    }
 
     pub fn reset() {
-        FAIL_RECORD_FSYNC.store(false, std::sync::atomic::Ordering::SeqCst);
-        FAIL_DIR_FSYNC.store(false, std::sync::atomic::Ordering::SeqCst);
-        SKIP_OWNERSHIP_PRECHECK.store(false, std::sync::atomic::Ordering::SeqCst);
-        SKIP_AUTHORITY_FLOCK.store(false, std::sync::atomic::Ordering::SeqCst);
-        USE_REJECTED_DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
-        USE_BLIND_UNLINK.with(|f| f.set(false));
-        *AFTER_AUTHORITY_REACH.lock().unwrap() = None;
-        *AFTER_LINK_COUNT_PROOF.lock().unwrap() = None;
+        for flag in [
+            &FAIL_RECORD_FSYNC,
+            &FAIL_DIR_FSYNC,
+            &SKIP_OWNERSHIP_PRECHECK,
+            &SKIP_AUTHORITY_FLOCK,
+            &USE_REJECTED_DETACH,
+            &USE_BLIND_UNLINK,
+        ] {
+            flag.with(|f| f.set(false));
+        }
+        AFTER_AUTHORITY_REACH.with(|h| *h.borrow_mut() = None);
+        AFTER_LINK_COUNT_PROOF.with(|h| *h.borrow_mut() = None);
     }
 
-    pub fn armed(flag: &AtomicBool) -> bool {
-        flag.load(std::sync::atomic::Ordering::SeqCst)
+    pub fn arm(flag: &'static LocalKey<Cell<bool>>) {
+        flag.with(|f| f.set(true));
+    }
+
+    pub fn armed(flag: &'static LocalKey<Cell<bool>>) -> bool {
+        flag.with(|f| f.get())
     }
 }
 
@@ -559,20 +609,14 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 fn after_authority_reach() {
     #[cfg(test)]
     {
-        let hook = inject::AFTER_AUTHORITY_REACH.lock().unwrap();
-        if let Some(h) = hook.as_ref() {
-            h();
-        }
+        inject::fire_after_authority_reach();
     }
 }
 
 fn after_link_count_proof() {
     #[cfg(test)]
     {
-        let hook = inject::AFTER_LINK_COUNT_PROOF.lock().unwrap();
-        if let Some(h) = hook.as_ref() {
-            h();
-        }
+        inject::fire_after_link_count_proof();
     }
 }
 
@@ -1053,7 +1097,7 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
     // is what makes the gate's control able to fail: the same fixture, the same
     // seam, the reviewer's exact JSON.
     #[cfg(test)]
-    if inject::blind_unlink_armed() {
+    if inject::armed(&inject::USE_BLIND_UNLINK) {
         if let Err(e) = std::fs::remove_file(lock_path) {
             drop_pin();
             return if e.kind() == std::io::ErrorKind::NotFound {
@@ -2269,7 +2313,7 @@ mod tests {
             clean();
             let dir = scratch();
             let path = lock_path_for(dir.path(), WEEK_MUTATION);
-            flag.store(true, Ordering::SeqCst);
+            inject::arm(flag);
 
             let mut ran = false;
             let refused =
@@ -2343,7 +2387,7 @@ mod tests {
         let holder = acquire(dir2.path(), WEEK_MUTATION, &opts(200)).unwrap();
         let fired2 = std::sync::Arc::new(AtomicBool::new(false));
         arm_third_process_hook(dir2.path(), &fired2);
-        inject::USE_REJECTED_DETACH.store(true, Ordering::SeqCst);
+        inject::arm(&inject::USE_REJECTED_DETACH);
         let _ = holder.release();
         let third2 = read_third_process_verdict(dir2.path());
         inject::reset();
@@ -2420,8 +2464,8 @@ mod tests {
 
         let fired2 = std::sync::Arc::new(AtomicBool::new(false));
         arm_third_process_hook(dir2.path(), &fired2);
-        inject::SKIP_OWNERSHIP_PRECHECK.store(true, Ordering::SeqCst);
-        inject::USE_REJECTED_DETACH.store(true, Ordering::SeqCst);
+        inject::arm(&inject::SKIP_OWNERSHIP_PRECHECK);
+        inject::arm(&inject::USE_REJECTED_DETACH);
         let _ = predecessor.release();
         let third2 = read_third_process_verdict(dir2.path());
         inject::reset();
@@ -2492,13 +2536,13 @@ mod tests {
             let path = path.clone();
             let fired = fired.clone();
             let record = successor_record.clone();
-            *inject::AFTER_LINK_COUNT_PROOF.lock().unwrap() = Some(Box::new(move || {
+            inject::arm_after_link_count_proof(move || {
                 if fired.swap(true, Ordering::SeqCst) {
                     return;
                 }
                 let _ = std::fs::remove_file(&path);
                 std::fs::write(&path, &record).unwrap();
-            }));
+            });
         }
 
         let verdict = holder.release();
@@ -2575,7 +2619,7 @@ mod tests {
         let dir = scratch();
         let path = lock_path_for(dir.path(), WEEK_MUTATION);
 
-        inject::USE_BLIND_UNLINK.with(|f| f.set(true));
+        inject::arm(&inject::USE_BLIND_UNLINK);
         let holder = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
 
         let fired = std::sync::Arc::new(AtomicBool::new(false));
@@ -2586,13 +2630,13 @@ mod tests {
             let path = path.clone();
             let fired = fired.clone();
             let record = successor_record.clone();
-            *inject::AFTER_LINK_COUNT_PROOF.lock().unwrap() = Some(Box::new(move || {
+            inject::arm_after_link_count_proof(move || {
                 if fired.swap(true, Ordering::SeqCst) {
                     return;
                 }
                 let _ = std::fs::remove_file(&path);
                 std::fs::write(&path, &record).unwrap();
-            }));
+            });
         }
 
         let verdict = holder.release();
@@ -2630,8 +2674,7 @@ mod tests {
         let fired = std::sync::Arc::new(AtomicBool::new(false));
         {
             let fired = fired.clone();
-            *inject::AFTER_LINK_COUNT_PROOF.lock().unwrap() =
-                Some(Box::new(move || fired.store(true, Ordering::SeqCst)));
+            inject::arm_after_link_count_proof(move || fired.store(true, Ordering::SeqCst));
         }
         let holder = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
         let verdict = holder.release();
@@ -2737,7 +2780,7 @@ mod tests {
         clean();
         let dir2 = scratch();
         let path2 = lock_path_for(dir2.path(), WEEK_MUTATION);
-        inject::SKIP_AUTHORITY_FLOCK.store(true, Ordering::SeqCst);
+        inject::arm(&inject::SKIP_AUTHORITY_FLOCK);
         let held = acquire(dir2.path(), WEEK_MUTATION, &opts(200)).unwrap();
         assert_eq!(
             probe_flock(&path2),
@@ -2774,10 +2817,10 @@ mod tests {
     fn arm_third_process_hook(root: &Path, fired: &std::sync::Arc<AtomicBool>) {
         let root = root.to_path_buf();
         let fired = fired.clone();
-        *inject::AFTER_AUTHORITY_REACH.lock().unwrap() = Some(Box::new(move || {
+        inject::arm_after_authority_reach(move || {
             fired.store(true, Ordering::SeqCst);
             child_acquire(&root);
-        }));
+        });
     }
 
     fn read_third_process_verdict(root: &Path) -> Option<String> {
