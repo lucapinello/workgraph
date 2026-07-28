@@ -6865,18 +6865,32 @@ pub fn run_shopping_language(
     text: &str,
     root: Option<&Path>,
     today: Option<&str>,
+    now: Option<&str>,
+    calendar_owner: Option<&str>,
     apply: bool,
     json: bool,
 ) -> Result<()> {
     use worksgood::notify::fast_lane::{self, Classification, FastLaneResult};
 
-    let today = match today {
-        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
-            .with_context(|| format!("--today must be YYYY-MM-DD, got {d:?}"))?,
-        None => chrono::Local::now().date_naive(),
+    // `--now` is the full wall-clock pin (the reminder lane's elapsed-clock
+    // contract cannot be tested without one); `--today` keeps the older
+    // date-only behaviour for every caller that has no clock to pin.
+    let now = match now {
+        Some(stamp) => Some(
+            chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M")
+                .with_context(|| format!("--now must be YYYY-MM-DDTHH:MM, got {stamp:?}"))?,
+        ),
+        None => None,
     };
+    let today = match (now, today) {
+        (Some(n), _) => n.date(),
+        (None, Some(d)) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .with_context(|| format!("--today must be YYYY-MM-DD, got {d:?}"))?,
+        (None, None) => chrono::Local::now().date_naive(),
+    };
+    let now = now.unwrap_or_else(|| web_fast_lane_now(today));
 
-    let (lane, item, reply, reason) = match fast_lane::classify_at(text, web_fast_lane_now(today)) {
+    let (lane, item, reply, reason) = match fast_lane::classify_at(text, now) {
         Classification::FastLane(op) => {
             let item = match &op {
                 fast_lane::FastLaneOp::ShoppingAdd { item }
@@ -6907,7 +6921,7 @@ pub fn run_shopping_language(
     // The real write, against a SCRATCH project — the live proof seam.
     let applied = if apply {
         let root = root.ok_or_else(|| anyhow::anyhow!("--apply needs --root <project dir>"))?;
-        match fast_lane::run_fast_lane_at(root, text, web_fast_lane_now(today), None) {
+        match fast_lane::run_fast_lane_at(root, text, now, calendar_owner) {
             FastLaneResult::Applied {
                 report, week_code, ..
             } => Some(serde_json::json!({
@@ -6939,6 +6953,7 @@ pub fn run_shopping_language(
                 "reply": reply,
                 "reason": reason,
                 "today": today.to_string(),
+                "now": now.format("%Y-%m-%dT%H:%M").to_string(),
                 "applied": applied,
             }))?
         );

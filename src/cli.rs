@@ -7029,6 +7029,11 @@ pub enum TelegramCommands {
     /// project's `plans/` so a scratch project can prove end-to-end that a removal
     /// phrasing really removes and an ask writes nothing. Never point `--apply` at
     /// the live family project.
+    ///
+    /// It is the whole fast lane, not only the shopping half: with `--now
+    /// YYYY-MM-DDTHH:MM` and `--calendar-owner <name>` it is the credential-free
+    /// REAL-BINARY seam for the reminder lane too — the verdict, the family-voice
+    /// reply, and (with `--apply`) the calendar row that was actually written.
     Shopping {
         /// The family sentence to classify.
         text: String,
@@ -7040,6 +7045,20 @@ pub enum TelegramCommands {
         /// Override "today" as `YYYY-MM-DD` for deterministic runs.
         #[arg(long)]
         today: Option<String>,
+
+        /// Override "now" as `YYYY-MM-DDTHH:MM` — the full wall-clock pin the
+        /// lane needs to decide whether a reminder for "Monday at 9" is still
+        /// AHEAD. `--today` alone anchors at the live clock (or midnight for
+        /// another day), which cannot express "03:20 on that Monday"; a
+        /// scripted test of the elapsed-clock contract must use this.
+        #[arg(long)]
+        now: Option<String>,
+
+        /// Family display name to file a reminder row under, as the household's
+        /// configured calendar owner. Required for `--apply` to write a reminder;
+        /// without it a reminder falls back and the plan is left untouched.
+        #[arg(long = "calendar-owner")]
+        calendar_owner: Option<String>,
 
         /// Run the real plan write/removal against `--root` (a scratch project).
         #[arg(long)]
