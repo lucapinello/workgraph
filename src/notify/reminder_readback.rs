@@ -149,14 +149,94 @@ const WRITE_VERBS: &[&str] = &[
 /// Noise words stripped from the question to leave the subject: everything that
 /// is grammar, reminder vocabulary, or a question word.
 const NOISE: &[&str] = &[
-    "a", "about", "again", "all", "am", "an", "and", "any", "anything", "are", "at", "be", "been",
-    "by", "can", "could", "date", "day", "did", "do", "does", "exact", "exactly", "for", "from",
-    "get", "got", "have", "hey", "hi", "how", "i", "is", "it", "just", "know", "list", "many",
-    "me", "mine", "moment", "my", "of", "off", "ok", "okay", "on", "one", "or", "our", "please",
-    "remind", "reminded", "reminder", "reminders", "reminding", "scheduled", "set", "show",
-    "still", "tell", "that", "the", "there", "these", "they", "this", "those", "time", "to",
-    "told", "up", "us", "was", "we", "were", "what", "whats", "when", "whens", "where", "which",
-    "who", "will", "with", "you", "your", "yours",
+    "a",
+    "about",
+    "again",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "anything",
+    "are",
+    "at",
+    "be",
+    "been",
+    "by",
+    "can",
+    "could",
+    "date",
+    "day",
+    "did",
+    "do",
+    "does",
+    "exact",
+    "exactly",
+    "for",
+    "from",
+    "get",
+    "got",
+    "have",
+    "hey",
+    "hi",
+    "how",
+    "i",
+    "is",
+    "it",
+    "just",
+    "know",
+    "list",
+    "many",
+    "me",
+    "mine",
+    "moment",
+    "my",
+    "of",
+    "off",
+    "ok",
+    "okay",
+    "on",
+    "one",
+    "or",
+    "our",
+    "please",
+    "remind",
+    "reminded",
+    "reminder",
+    "reminders",
+    "reminding",
+    "scheduled",
+    "set",
+    "show",
+    "still",
+    "tell",
+    "that",
+    "the",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "time",
+    "to",
+    "told",
+    "up",
+    "us",
+    "was",
+    "we",
+    "were",
+    "what",
+    "whats",
+    "when",
+    "whens",
+    "where",
+    "which",
+    "who",
+    "will",
+    "with",
+    "you",
+    "your",
+    "yours",
 ];
 
 /// Weekday words → [`Weekday`], for a question that names a day.
@@ -408,7 +488,11 @@ pub fn answer(
 /// prompt can never carry another member's reminder.
 ///
 /// `None` when the person has nothing upcoming to ground on.
-pub fn grounding_block(reminders: &[Reminder], requester: &str, now: NaiveDateTime) -> Option<String> {
+pub fn grounding_block(
+    reminders: &[Reminder],
+    requester: &str,
+    now: NaiveDateTime,
+) -> Option<String> {
     let visible = visible_to(reminders, requester);
     let mut pending: Vec<&Reminder> = visible.into_iter().filter(|r| r.due > now).collect();
     if pending.is_empty() {
@@ -510,10 +594,7 @@ mod tests {
             "Did you cancel my dentist reminder?",
             "Tell me when the dentist reminder is",
         ] {
-            assert!(
-                parse_readback(q).is_some(),
-                "should read back: {q:?}"
-            );
+            assert!(parse_readback(q).is_some(), "should read back: {q:?}");
         }
     }
 
@@ -535,17 +616,15 @@ mod tests {
             "What's for dinner on Friday?",
             "",
         ] {
-            assert!(
-                parse_readback(q).is_none(),
-                "must NOT read back: {q:?}"
-            );
+            assert!(parse_readback(q).is_none(), "must NOT read back: {q:?}");
         }
     }
 
     #[test]
     fn the_subject_survives_and_the_grammar_does_not() {
-        let q = parse_readback("What exact date and time is the reminder to call the dentist set for?")
-            .expect("a read");
+        let q =
+            parse_readback("What exact date and time is the reminder to call the dentist set for?")
+                .expect("a read");
         assert_eq!(q.target, vec!["call".to_string(), "dentist".to_string()]);
         assert!(q.day.is_none());
 
@@ -619,9 +698,18 @@ mod tests {
         ];
         let q = parse_readback("When is my call reminder?").expect("a read");
         let line = answer(&store, &q, "Luca", at(2026, 7, 27, 3, 20));
-        assert!(line.starts_with("You've got 2 reminders that could be it:"), "{line}");
-        assert!(line.contains("call the dentist — Monday, Jul 27 at 9:00 am"), "{line}");
-        assert!(line.contains("call the vet — Tuesday, Jul 28 at 10:00 am"), "{line}");
+        assert!(
+            line.starts_with("You've got 2 reminders that could be it:"),
+            "{line}"
+        );
+        assert!(
+            line.contains("call the dentist — Monday, Jul 27 at 9:00 am"),
+            "{line}"
+        );
+        assert!(
+            line.contains("call the vet — Tuesday, Jul 28 at 10:00 am"),
+            "{line}"
+        );
         assert!(line.ends_with("Which one did you mean?"), "{line}");
     }
 
@@ -633,8 +721,14 @@ mod tests {
         ];
         let q = parse_readback("What reminders do I have?").expect("a read");
         let line = answer(&store, &q, "Luca", at(2026, 7, 27, 3, 20));
-        assert!(line.starts_with("You've got 2 reminders coming up:"), "{line}");
-        assert!(!line.contains("Which one"), "a broad list asks nothing back: {line}");
+        assert!(
+            line.starts_with("You've got 2 reminders coming up:"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("Which one"),
+            "a broad list asks nothing back: {line}"
+        );
     }
 
     #[test]
@@ -697,7 +791,10 @@ mod tests {
         ];
         let now = at(2026, 7, 27, 3, 20);
         let block = grounding_block(&store, "Luca", now).expect("a block");
-        assert!(block.contains("call the dentist — Monday, Jul 27 at 9:00 am"), "{block}");
+        assert!(
+            block.contains("call the dentist — Monday, Jul 27 at 9:00 am"),
+            "{block}"
+        );
         assert!(!block.contains("physio"), "another member leaked: {block}");
         assert!(grounding_block(&[], "Luca", now).is_none());
     }

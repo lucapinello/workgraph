@@ -273,7 +273,11 @@ mod tests {
     fn hold_elsewhere(
         feed_path: &Path,
         wait_ms: u64,
-    ) -> (String, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<Release>) {
+    ) -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<Release>,
+    ) {
         let feed_path = feed_path.to_path_buf();
         let (tok_tx, tok_rx) = std::sync::mpsc::channel::<String>();
         let (go, wait) = std::sync::mpsc::channel::<()>();
@@ -334,9 +338,11 @@ mod tests {
         assert!(parsed["acquiredMs"].is_i64());
         let token = parsed["token"].as_str().unwrap();
         assert_eq!(token.len(), 32, "16 crypto-random bytes as hex");
-        assert!(token
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
         assert_eq!(token, lock.token());
         lock.release();
     }
@@ -350,10 +356,16 @@ mod tests {
 
         // FAIL CLOSED (§3): the second taker does not get the lock, and its
         // caller's work therefore does not run.
-        assert_eq!(acquire_elsewhere(&feed, 20).unwrap_err(), LockRefusal::Timeout);
+        assert_eq!(
+            acquire_elsewhere(&feed, 20).unwrap_err(),
+            LockRefusal::Timeout
+        );
 
         assert_eq!(first.release(), Release::Released);
-        assert_eq!(acquire_elsewhere(&feed, DEFAULT_WAIT_MS), Ok(Release::Released));
+        assert_eq!(
+            acquire_elsewhere(&feed, DEFAULT_WAIT_MS),
+            Ok(Release::Released)
+        );
     }
 
     /// docs/42 §5, the decision the twin may not soften. A lock whose owner is
@@ -385,7 +397,9 @@ mod tests {
                 "record {record:?} is unbreakable and needs a HUMAN, not a retry: {refused}"
             );
             assert!(
-                refused.to_string().contains(&lock_path.display().to_string()),
+                refused
+                    .to_string()
+                    .contains(&lock_path.display().to_string()),
                 "the report must name the file a human removes: {refused}"
             );
             assert_eq!(

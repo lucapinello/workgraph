@@ -703,9 +703,34 @@ pub const GRATITUDE_OPENERS: &[&str] = &[
 /// requires that EVERY token in the message be social, which is what keeps
 /// "see you at the dentist" and "movie night with the guys" out.
 pub const FAREWELL_TOKENS: &[&str] = &[
-    "bye", "byebye", "byee", "goodbye", "goodnite", "farewell", "cya", "ttyl", "l8r", "adios",
-    "arrivederci", "notte", "dreams", "sleep", "asleep", "bed", "bedtime", "see", "care", "later",
-    "laters", "tomorrow", "soon", "night", "nite", "nighty", "tschuss", "buonanotte",
+    "bye",
+    "byebye",
+    "byee",
+    "goodbye",
+    "goodnite",
+    "farewell",
+    "cya",
+    "ttyl",
+    "l8r",
+    "adios",
+    "arrivederci",
+    "notte",
+    "dreams",
+    "sleep",
+    "asleep",
+    "bed",
+    "bedtime",
+    "see",
+    "care",
+    "later",
+    "laters",
+    "tomorrow",
+    "soon",
+    "night",
+    "nite",
+    "nighty",
+    "tschuss",
+    "buonanotte",
 ];
 
 /// Well-wish markers ("hope everyone is well", "wishing you all a good night"). A
@@ -728,16 +753,102 @@ pub const WELLWISH_TOKENS: &[&str] = &["hope", "hopes", "hoping", "wish", "wishe
 /// otherwise fuzzy-match "and" and turn a shopping ask into a greeting).
 pub const SOCIAL_FILLER_TOKENS: &[&str] = &[
     // connectives / articles / pronouns
-    "a", "an", "the", "to", "and", "so", "of", "is", "are", "am", "be", "been", "was", "it", "it's",
-    "its", "im", "i'm", "i", "me", "my", "our", "your", "you", "u", "ya", "this", "that", "there",
-    "here", "at", "on", "in", "up", "yet", "still", "again", "now", "today", "tonight", "lately",
-    "around", "about", "just", "very", "much", "too", "also", "but",
+    "a",
+    "an",
+    "the",
+    "to",
+    "and",
+    "so",
+    "of",
+    "is",
+    "are",
+    "am",
+    "be",
+    "been",
+    "was",
+    "it",
+    "it's",
+    "its",
+    "im",
+    "i'm",
+    "i",
+    "me",
+    "my",
+    "our",
+    "your",
+    "you",
+    "u",
+    "ya",
+    "this",
+    "that",
+    "there",
+    "here",
+    "at",
+    "on",
+    "in",
+    "up",
+    "yet",
+    "still",
+    "again",
+    "now",
+    "today",
+    "tonight",
+    "lately",
+    "around",
+    "about",
+    "just",
+    "very",
+    "much",
+    "too",
+    "also",
+    "but",
     // mood / politeness / small-talk verbs — none of them a request
-    "good", "great", "well", "fine", "ok", "okay", "cool", "nice", "chill", "chillin", "chilling",
-    "relaxing", "bored", "sleepy", "tired", "please", "welcome", "doing", "going",
-    "goes", "gone", "off", "heading", "headed", "head", "turning", "saying", "said", "checking",
-    "how", "how's", "hows", "what's", "whats", "wassup", "wasup", "everything", "all's", "alls",
-    "yes", "yeah", "yep", "take", "takes", "sweet", "rest",
+    "good",
+    "great",
+    "well",
+    "fine",
+    "ok",
+    "okay",
+    "cool",
+    "nice",
+    "chill",
+    "chillin",
+    "chilling",
+    "relaxing",
+    "bored",
+    "sleepy",
+    "tired",
+    "please",
+    "welcome",
+    "doing",
+    "going",
+    "goes",
+    "gone",
+    "off",
+    "heading",
+    "headed",
+    "head",
+    "turning",
+    "saying",
+    "said",
+    "checking",
+    "how",
+    "how's",
+    "hows",
+    "what's",
+    "whats",
+    "wassup",
+    "wasup",
+    "everything",
+    "all's",
+    "alls",
+    "yes",
+    "yeah",
+    "yep",
+    "take",
+    "takes",
+    "sweet",
+    "rest",
 ];
 
 /// Endearment verbs ("love you all", "miss you guys"). When one *opens* the
@@ -1253,7 +1364,8 @@ pub fn is_social_courtesy(text: &str) -> bool {
     // one-character neighbour ("add" vs the filler "and").
     let filler_matches = |w: &str| {
         SOCIAL_FILLER_TOKENS.iter().any(|t| {
-            *t == w || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
+            *t == w
+                || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
         })
     };
     // The farewell set holds several short, everyday words ("see", "care", "bed"), so
@@ -1262,7 +1374,8 @@ pub fn is_social_courtesy(text: &str) -> bool {
     // would read as a sign-off.
     let farewell_matches = |w: &str| {
         FAREWELL_TOKENS.iter().any(|t| {
-            *t == w || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
+            *t == w
+                || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
         })
     };
     for w in &tokens {
@@ -1294,7 +1407,8 @@ fn is_social_marker_token(w: &str) -> bool {
     GREETING_TOKENS.iter().any(|t| fuzzy_token_matches(w, t))
         || TIME_OF_DAY_WORDS.iter().any(|t| fuzzy_token_matches(w, t))
         || FAREWELL_TOKENS.iter().any(|t| {
-            *t == w || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
+            *t == w
+                || (t.chars().count() >= 5 && w.chars().count() >= 5 && edit_distance_le_1(w, t))
         })
         || WELLWISH_TOKENS.iter().any(|t| fuzzy_token_matches(w, t))
         || GRATITUDE_OPENERS.iter().any(|t| fuzzy_token_matches(w, t))
@@ -3981,7 +4095,11 @@ domains = ["coordination", "calendar"]
         // Fuzzy trigger phrase ("hi guyz") and fuzzy greeting-question openers: the
         // typo tolerance still fires (never silence) and the answer is ONE voice
         // (task social-closers-single-voice).
-        for t in ["hi guyz!", "hey are you all aroind?", "helo everyone up yet?"] {
+        for t in [
+            "hi guyz!",
+            "hey are you all aroind?",
+            "helo everyone up yet?",
+        ] {
             assert_one(&elect(t, &[], None), "otto", AddressedBy::Concierge);
         }
     }
@@ -4108,7 +4226,10 @@ domains = ["coordination", "calendar"]
             "are you all good",
             "can you guys discuss this and find consensus",
         ] {
-            assert!(!is_social_courtesy(t), "{t:?} must not read as pure courtesy");
+            assert!(
+                !is_social_courtesy(t),
+                "{t:?} must not read as pure courtesy"
+            );
         }
         // A REAL broadcast ask still fans out — All is kept for exactly this.
         assert!(matches!(
@@ -4124,7 +4245,11 @@ domains = ["coordination", "calendar"]
         // returns None by design — the courtesy-wearing ask must land on the point of
         // contact, NOT fall through to a broadcast.
         assert_one(
-            &elect("good night everyone and add milk to the shopping list", &[], None),
+            &elect(
+                "good night everyone and add milk to the shopping list",
+                &[],
+                None,
+            ),
             "otto",
             AddressedBy::Concierge,
         );
@@ -4371,7 +4496,10 @@ domains = ["coordination", "calendar"]
              holiday plan and what we should do next",
             "",
         ] {
-            assert!(!is_social_courtesy(t), "{t:?} must NOT read as pure courtesy");
+            assert!(
+                !is_social_courtesy(t),
+                "{t:?} must NOT read as pure courtesy"
+            );
         }
     }
 
@@ -4538,7 +4666,10 @@ domains = ["cooking"]
         // `[collective]` for "Good night, everyone." was the visible fingerprint of
         // the four-persona pile-on; it must never read that way for courtesy again.
         let courtesy = decision("hey guys, how's it going?", &[], None);
-        assert_eq!(courtesy, "msg=42 chat=supergroup rule=concierge target=otto");
+        assert_eq!(
+            courtesy,
+            "msg=42 chat=supergroup rule=concierge target=otto"
+        );
         let signoff = decision("Good night, everyone.", &[], None);
         assert_eq!(signoff, "msg=42 chat=supergroup rule=concierge target=otto");
     }

@@ -446,7 +446,11 @@ fn unconditional_clauses(norm: &str) -> Vec<String> {
     norm.split(|c| matches!(c, '.' | '!' | '?' | ';' | '\n'))
         .map(str::trim)
         .filter(|clause| !clause.is_empty())
-        .filter(|clause| !CONDITIONAL_MARKERS.iter().any(|m| contains_phrase(clause, m)))
+        .filter(|clause| {
+            !CONDITIONAL_MARKERS
+                .iter()
+                .any(|m| contains_phrase(clause, m))
+        })
         .map(str::to_string)
         .collect()
 }
@@ -822,8 +826,18 @@ mod tests {
         assert!(low.contains("sorry"), "{c}");
         // …and carries NONE of the operations vocabulary the live-cert C011
         // correction leaked to the family group.
-        for banned in ["coordinator", "flagged", "slip", "snag", "escalat", "ticket"] {
-            assert!(!low.contains(banned), "correction copy leaked {banned:?}: {c}");
+        for banned in [
+            "coordinator",
+            "flagged",
+            "slip",
+            "snag",
+            "escalat",
+            "ticket",
+        ] {
+            assert!(
+                !low.contains(banned),
+                "correction copy leaked {banned:?}: {c}"
+            );
         }
         assert!(!c.contains("TASK_CREATE"));
         assert!(!low.contains("task id"));
@@ -863,10 +877,19 @@ mod tests {
     #[test]
     fn conditional_capability_copy_is_not_a_promise_on_a_no_request_turn() {
         for (human, reply) in [
-            ("what can you do?", "If you need something added, I'll add it."),
+            (
+                "what can you do?",
+                "If you need something added, I'll add it.",
+            ),
             ("what can you help with", "Just ask and I'll sort it out."),
-            ("hi there", "Whenever you want a hand with the list, I'll put things on it."),
-            ("how are you?", "All good! Happy to schedule anything you need."),
+            (
+                "hi there",
+                "Whenever you want a hand with the list, I'll put things on it.",
+            ),
+            (
+                "how are you?",
+                "All good! Happy to schedule anything you need.",
+            ),
         ] {
             let a = audit_promise_in_turn(human, reply);
             assert_eq!(
@@ -890,10 +913,7 @@ mod tests {
                 "can you add milk to the shopping list?",
                 "If you like, I'll add milk to the list.",
             ),
-            (
-                "please remind me Thursday to defrost the trout",
-                "Will do!",
-            ),
+            ("please remind me Thursday to defrost the trout", "Will do!"),
         ] {
             let a = audit_promise_in_turn(human, reply);
             assert_eq!(
@@ -934,7 +954,10 @@ mod tests {
             "remember we work Mon-Fri",
             "swap Friday to tacos",
         ] {
-            assert!(turn_requests_action(asked), "should read as a request: {asked:?}");
+            assert!(
+                turn_requests_action(asked),
+                "should read as a request: {asked:?}"
+            );
         }
         for not_asked in [
             "What kinds of things can you help with?",

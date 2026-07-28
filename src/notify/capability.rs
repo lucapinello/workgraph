@@ -220,7 +220,9 @@ fn join_lanes(lanes: &[&str]) -> String {
 /// U+2019 in "what's"), and collapse whitespace — the same normalization the
 /// promise audit uses, for the same reason.
 fn normalize(s: &str) -> String {
-    let lowered = s.to_lowercase().replace(['\u{2019}', '\u{02bc}', '\u{2032}'], "'");
+    let lowered = s
+        .to_lowercase()
+        .replace(['\u{2019}', '\u{02bc}', '\u{2032}'], "'");
     lowered.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -305,7 +307,10 @@ mod tests {
             "add milk to the list",
             "hi there",
         ] {
-            assert!(!is_capability_ask(m), "should NOT be a capability ask: {m:?}");
+            assert!(
+                !is_capability_ask(m),
+                "should NOT be a capability ask: {m:?}"
+            );
         }
     }
 
@@ -320,10 +325,16 @@ mod tests {
     fn the_answer_names_every_configured_lane_and_helper() {
         let answer = capability_answer(&configured()).expect("a configured household answers");
         for lane in ["dinner", "calendar", "shopping list", "workouts"] {
-            assert!(answer.to_lowercase().contains(lane), "missing {lane:?}: {answer}");
+            assert!(
+                answer.to_lowercase().contains(lane),
+                "missing {lane:?}: {answer}"
+            );
         }
         for name in ["Wren", "Tally", "Coach Brindle"] {
-            assert!(answer.contains(name), "missing configured helper {name:?}: {answer}");
+            assert!(
+                answer.contains(name),
+                "missing configured helper {name:?}: {answer}"
+            );
         }
         // Grouped, so the helper who owns two lanes is named once.
         assert_eq!(answer.matches("Tally").count(), 1, "{answer}");
@@ -335,18 +346,33 @@ mod tests {
         let answer = capability_answer(&configured()).unwrap();
         // The C011 failure, made structurally impossible: the answer promises
         // nothing, so no artifact is owed and no correction can follow.
-        let audit = parity::audit_promise_in_turn("What kinds of things can you help with?", &answer);
-        assert!(!audit.commits(), "the capability answer promised something: {audit:?}");
+        let audit =
+            parity::audit_promise_in_turn("What kinds of things can you help with?", &answer);
+        assert!(
+            !audit.commits(),
+            "the capability answer promised something: {audit:?}"
+        );
         // …and it is a promise under NO reading, not merely under the turn-aware one.
         assert!(
             !parity::audit_promise(&answer).commits(),
             "even the flat audit must see no promise: {answer}",
         );
         let low = answer.to_lowercase();
-        for banned in ["coordinator", "flagged", "snag", "slip", "task", "agent", "dispatcher"] {
+        for banned in [
+            "coordinator",
+            "flagged",
+            "snag",
+            "slip",
+            "task",
+            "agent",
+            "dispatcher",
+        ] {
             assert!(!low.contains(banned), "answer leaked {banned:?}: {answer}");
         }
-        assert!(!crate::notify::grounding::has_ops_jargon(&answer), "{answer}");
+        assert!(
+            !crate::notify::grounding::has_ops_jargon(&answer),
+            "{answer}"
+        );
     }
 
     #[test]
@@ -362,7 +388,10 @@ mod tests {
             assert!(answer.contains(name), "{answer}");
         }
         for shipped in ["Wren", "Tally", "Brindle"] {
-            assert!(!answer.contains(shipped), "a foreign cast leaked in: {answer}");
+            assert!(
+                !answer.contains(shipped),
+                "a foreign cast leaked in: {answer}"
+            );
         }
     }
 

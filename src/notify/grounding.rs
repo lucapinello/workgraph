@@ -2198,7 +2198,11 @@ impl WeekContext {
             .filter(|(day, _)| !self.non_cook.contains(*day))
             .map(|(day, dish)| (day, dish, "dinner"))
             .collect();
-        out.extend(self.lunch_by_day.iter().map(|(day, dish)| (day, dish, "lunch")));
+        out.extend(
+            self.lunch_by_day
+                .iter()
+                .map(|(day, dish)| (day, dish, "lunch")),
+        );
         out
     }
 }
@@ -2578,16 +2582,7 @@ const PLACEMENT_PROPOSAL_PHRASES: &[&str] = &[
 /// Single-word proposal cues, matched as WHOLE words (not substrings) so a dish like
 /// "pork cutlets" cannot exempt itself by containing "lets".
 const PLACEMENT_PROPOSAL_WORDS: &[&str] = &[
-    "maybe",
-    "lets",
-    "instead",
-    "moving",
-    "move",
-    "swap",
-    "swapping",
-    "again",
-    "could",
-    "might",
+    "maybe", "lets", "instead", "moving", "move", "swap", "swapping", "again", "could", "might",
     "would",
 ];
 
@@ -2655,7 +2650,12 @@ fn split_sentences_with_spans(draft: &str) -> Vec<SpannedSentence> {
             let raw = &draft[start..end];
             let norm = normalize(raw);
             if !norm.is_empty() {
-                out.push(SpannedSentence { norm, asks: raw.contains('?'), start, end });
+                out.push(SpannedSentence {
+                    norm,
+                    asks: raw.contains('?'),
+                    start,
+                    end,
+                });
             }
             seg_start = None;
             idx = j;
@@ -2670,7 +2670,12 @@ fn split_sentences_with_spans(draft: &str) -> Vec<SpannedSentence> {
         let raw = &draft[start..end];
         let norm = normalize(raw);
         if !norm.is_empty() {
-            out.push(SpannedSentence { norm, asks: raw.contains('?'), start, end });
+            out.push(SpannedSentence {
+                norm,
+                asks: raw.contains('?'),
+                start,
+                end,
+            });
         }
     }
     out
@@ -2705,9 +2710,9 @@ fn dish_content_tokens(dish: &str) -> Vec<String> {
 /// plural/possessive form counts too: normalisation drops apostrophes, so "that
 /// frittata's tomorrow" arrives as the token "frittatas".
 fn sentence_names_dish(sentence: &str, dish: &str) -> bool {
-    dish_content_tokens(dish).iter().any(|t| {
-        norm_has_word(sentence, t) || norm_has_word(sentence, &format!("{t}s"))
-    })
+    dish_content_tokens(dish)
+        .iter()
+        .any(|t| norm_has_word(sentence, t) || norm_has_word(sentence, &format!("{t}s")))
 }
 
 /// Every weekday the normalised `sentence` places something on, in the order the
@@ -2826,7 +2831,11 @@ pub fn misplaced_week_claims(draft: &str, wc: &WeekContext) -> Vec<MisplacedWeek
 /// The truthful placement sentence for one misplaced claim — the same shape the
 /// never-claim-empty rewrite uses, so both guards speak with one voice.
 pub fn week_placement_truth_line(claim: &MisplacedWeekClaim) -> String {
-    let slot = if claim.true_slot.is_empty() { "dinner" } else { claim.true_slot.as_str() };
+    let slot = if claim.true_slot.is_empty() {
+        "dinner"
+    } else {
+        claim.true_slot.as_str()
+    };
     format!("{}'s {} is {}.", claim.true_day, slot, claim.dish)
 }
 
@@ -4376,10 +4385,22 @@ label = "Fallback Member"
         let wc = parse_week_context(&c004_week_context());
         let draft = "Hope the weekend's treating you well, Luca. Enjoy that frittata tomorrow — perfect for lunch! 🍳";
         let claims = misplaced_week_claims(draft, &wc);
-        assert_eq!(claims.len(), 1, "expected one misplaced claim, got {claims:?}");
+        assert_eq!(
+            claims.len(),
+            1,
+            "expected one misplaced claim, got {claims:?}"
+        );
         assert_eq!(claims[0].true_day, "Sunday");
-        assert_eq!(claims[0].claimed_day.as_deref(), Some("Monday"), "{claims:?}");
-        assert_eq!(claims[0].claimed_slot.as_deref(), Some("lunch"), "{claims:?}");
+        assert_eq!(
+            claims[0].claimed_day.as_deref(),
+            Some("Monday"),
+            "{claims:?}"
+        );
+        assert_eq!(
+            claims[0].claimed_slot.as_deref(),
+            Some("lunch"),
+            "{claims:?}"
+        );
         let fixed = week_placement_rewrite(draft, &claims);
         assert!(
             fixed.contains("Sunday's dinner is Zucchini & potato frittata."),
@@ -4613,8 +4634,14 @@ label = "Fallback Member"
             wc.lunch_by_day.get("sunday").map(String::as_str),
             Some("a simple soup or a cheese-and-tomato toastie")
         );
-        assert!(!wc.lunch_by_day.contains_key("wednesday"), "no lunch may be invented");
-        assert!(wc.non_cook.contains("wednesday"), "the no-cook night is marked");
+        assert!(
+            !wc.lunch_by_day.contains_key("wednesday"),
+            "no lunch may be invented"
+        );
+        assert!(
+            wc.non_cook.contains("wednesday"),
+            "the no-cook night is marked"
+        );
         assert_eq!(wc.today.as_deref(), Some("sunday"));
         assert_eq!(wc.tomorrow.as_deref(), Some("monday"));
         // FORWARD COMPATIBILITY IN BOTH DIRECTIONS: the dinner-only block an older

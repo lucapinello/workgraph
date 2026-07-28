@@ -26,6 +26,7 @@ pub mod ownership;
 pub mod parity;
 pub mod project_lock;
 pub mod push;
+pub mod relay_receipt;
 pub mod reminder;
 pub mod reminder_readback;
 pub mod shopping_language;
@@ -45,7 +46,6 @@ pub mod telegram_standup;
 pub mod telegram_voice;
 pub mod voice;
 pub mod webhook;
-pub mod relay_receipt;
 pub mod week_start;
 
 use std::fmt;

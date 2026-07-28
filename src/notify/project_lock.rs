@@ -392,7 +392,10 @@ fn parse_record(text: &str) -> Option<OwnerRecord> {
         return None;
     }
     let token = v.get("token")?.as_str()?.to_string();
-    if token.len() != 32 || !token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    if token.len() != 32
+        || !token
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     {
         return None;
     }
@@ -704,7 +707,7 @@ fn try_publish(lock_path: &Path, token: &str, pid: u32, host: &str, now_ms: i64)
                     return Published::Failed {
                         detail: "create-failed",
                         error: e2.to_string(),
-                    }
+                    };
                 }
             }
         }
@@ -712,7 +715,7 @@ fn try_publish(lock_path: &Path, token: &str, pid: u32, host: &str, now_ms: i64)
             return Published::Failed {
                 detail: "create-failed",
                 error: e.to_string(),
-            }
+            };
         }
     };
 
@@ -1582,10 +1585,7 @@ pub fn with_project_lock<T>(
 
 /// The week lock, at the default wait. Every engine path that rewrites a plan
 /// file, the shopping overlay, the carry or a parked dinner goes through here.
-pub fn with_week_mutation_lock<T>(
-    root: &Path,
-    f: impl FnOnce() -> T,
-) -> Result<T, LockRefusal> {
+pub fn with_week_mutation_lock<T>(root: &Path, f: impl FnOnce() -> T) -> Result<T, LockRefusal> {
     with_project_lock(root, WEEK_MUTATION, &Options::default(), f)
 }
 
@@ -1689,7 +1689,10 @@ mod tests {
         let held_a = acquire(a.path(), WEEK_MUTATION, &opts(200)).unwrap();
         // House B's lock is a DIFFERENT lock: taking it while A's is held must not
         // block, and must not be mistaken for re-entering A's.
-        assert_eq!(acquire_elsewhere(b.path(), opts(200)), Ok(Release::Released));
+        assert_eq!(
+            acquire_elsewhere(b.path(), opts(200)),
+            Ok(Release::Released)
+        );
         assert!(lock_path_for(a.path(), WEEK_MUTATION).exists());
         assert!(!lock_path_for(b.path(), WEEK_MUTATION).exists());
         assert_ne!(
@@ -1719,7 +1722,11 @@ mod tests {
         assert_eq!(parsed["v"], 1);
         let token = parsed["token"].as_str().unwrap();
         assert_eq!(token.len(), 32);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         assert_eq!(token, lock.token());
         assert_eq!(parsed["pid"].as_i64().unwrap(), std::process::id() as i64);
         assert!(parsed["host"].is_string());
@@ -1861,7 +1868,10 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(!ran, "the callback MUST NOT run when the lock was not taken");
+        assert!(
+            !ran,
+            "the callback MUST NOT run when the lock was not taken"
+        );
         assert!(!target.exists(), "no bytes move");
         assert_eq!(refused.detail(), "create-failed");
         assert!(!refused.retryable(), "retrying an ENOTDIR root cannot help");
@@ -1977,8 +1987,8 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
 
             let mut ran = false;
-            let refused = with_project_lock(dir.path(), WEEK_MUTATION, &opts(30), || ran = true)
-                .unwrap_err();
+            let refused =
+                with_project_lock(dir.path(), WEEK_MUTATION, &opts(30), || ran = true).unwrap_err();
 
             assert!(!ran, "{label} EIO must not run the mutation");
             assert_eq!(refused.detail(), "record-write-failed", "{label}");

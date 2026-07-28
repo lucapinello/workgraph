@@ -121,7 +121,11 @@ pub enum WeekStartError {
     /// drafted (docs/42 §3). `retryable` distinguishes "someone else is changing
     /// the week right now, try again in a moment" from "this needs a human" — and
     /// neither is staleness: nothing was stale, the write simply did not happen.
-    LockUnavailable { detail: String, retryable: bool, cure: String },
+    LockUnavailable {
+        detail: String,
+        retryable: bool,
+        cure: String,
+    },
 }
 
 impl std::fmt::Display for WeekStartError {
@@ -141,7 +145,11 @@ impl std::fmt::Display for WeekStartError {
             }
             WeekStartError::Io(m) => write!(f, "week-start io: {m}"),
             WeekStartError::Unverified(m) => write!(f, "drafted week failed verification: {m}"),
-            WeekStartError::LockUnavailable { detail, retryable, cure } => {
+            WeekStartError::LockUnavailable {
+                detail,
+                retryable,
+                cure,
+            } => {
                 if *retryable {
                     write!(
                         f,
@@ -149,7 +157,10 @@ impl std::fmt::Display for WeekStartError {
                          nothing was written"
                     )
                 } else {
-                    write!(f, "the week could not be locked ({detail}) — nothing was written. {cure}")
+                    write!(
+                        f,
+                        "the week could not be locked ({detail}) — nothing was written. {cure}"
+                    )
                 }
             }
         }
@@ -766,7 +777,9 @@ fn sidecar_path(root: &Path, week_code: &str) -> PathBuf {
 /// both sides excludes `-dinner-suggestions.md` by SUFFIX, and a renamed note
 /// would stop being excluded and start looking like a plan.
 fn fold_marker(week_code: &str) -> String {
-    format!("<!-- folded into {week_code}-family-plan.md — the lines above are already in the plan -->")
+    format!(
+        "<!-- folded into {week_code}-family-plan.md — the lines above are already in the plan -->"
+    )
 }
 
 fn is_fold_marker(line: &str) -> bool {
@@ -967,7 +980,9 @@ fn draft_week_locked(
             week_code: existing,
         });
     }
-    let path = root.join("plans").join(format!("{week_code}-family-plan.md"));
+    let path = root
+        .join("plans")
+        .join(format!("{week_code}-family-plan.md"));
     if path.exists() {
         return Err(WeekStartError::AlreadyPlanned { week_code });
     }
@@ -985,17 +1000,19 @@ fn draft_week_locked(
             day: entry.weekday,
             dish: entry.dish.clone(),
         };
-        content =
-            fast_lane::apply_to_content_with_calendar_owner(&week_code, &content, &op, calendar_owner)
-                .map_err(|e| WeekStartError::ParkedLost {
-                    dish: entry.dish.clone(),
-                    reason: match &e {
-                        FastLaneError::DayNotFound => {
-                            "the drafted week has no row for that day".into()
-                        }
-                        other => other.to_string(),
-                    },
-                })?;
+        content = fast_lane::apply_to_content_with_calendar_owner(
+            &week_code,
+            &content,
+            &op,
+            calendar_owner,
+        )
+        .map_err(|e| WeekStartError::ParkedLost {
+            dish: entry.dish.clone(),
+            reason: match &e {
+                FastLaneError::DayNotFound => "the drafted week has no row for that day".into(),
+                other => other.to_string(),
+            },
+        })?;
     }
 
     // Apply the carried requests to the DRAFT, in the family's own words, through
@@ -1123,7 +1140,11 @@ fn verify_preserved(doc: &PlanDoc, edit: &PreservedEdit) -> Result<(), WeekStart
         }
     };
     let present = match &op {
-        FastLaneOp::MealSwap { day, dish } | FastLaneOp::MealAdd { day, addition: dish } => doc
+        FastLaneOp::MealSwap { day, dish }
+        | FastLaneOp::MealAdd {
+            day,
+            addition: dish,
+        } => doc
             .meals
             .iter()
             .filter(|m| same_weekday(&m.weekday, *day))
@@ -1318,7 +1339,10 @@ mod tests {
              \"Set Tuesday's dinner to homemade pizza.\"",
         )
         .expect("the quoted-carriage ask stopped being recognized");
-        assert_eq!(carried.carried, vec!["Set Tuesday's dinner to homemade pizza."]);
+        assert_eq!(
+            carried.carried,
+            vec!["Set Tuesday's dinner to homemade pizza."]
+        );
     }
 
     /// A "don't" inside the QUOTED carriage is the family's EDIT, not a refusal of
@@ -1340,7 +1364,10 @@ mod tests {
     fn negation_words_match_as_words_not_substrings() {
         assert!(contains_word_phrase("don't start the week", "don't"));
         assert!(contains_word_phrase("stop the week", "stop"));
-        assert!(!contains_word_phrase("nonstop planning, start the week", "stop"));
+        assert!(!contains_word_phrase(
+            "nonstop planning, start the week",
+            "stop"
+        ));
         assert!(!contains_word_phrase("cancellation policy", "cancel"));
         assert!(detect("Non-stop week ahead — start the week.").is_some());
     }
@@ -1377,7 +1404,10 @@ mod tests {
         assert!(out.path.exists(), "no plan file was written");
         let written = std::fs::read_to_string(&out.path).unwrap();
         let doc = PlanDoc::parse("2026-W31", &written);
-        assert!(doc.covers(MON_W31()), "the drafted week does not cover today");
+        assert!(
+            doc.covers(MON_W31()),
+            "the drafted week does not cover today"
+        );
         assert_eq!(doc.meals.len(), 7, "a week has seven nights");
         let tue = doc
             .meal_on(NaiveDate::from_ymd_opt(2026, 7, 28).unwrap())
@@ -1399,10 +1429,19 @@ mod tests {
         let ask = detect("Please draft this week's family plan.").unwrap();
         let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
         let written = std::fs::read_to_string(&out.path).unwrap();
-        assert!(written.contains("## 1. Dinners (planner → cook)"), "{written}");
-        assert!(written.contains("## 4. Shopping list — by store"), "{written}");
+        assert!(
+            written.contains("## 1. Dinners (planner → cook)"),
+            "{written}"
+        );
+        assert!(
+            written.contains("## 4. Shopping list — by store"),
+            "{written}"
+        );
         assert!(written.contains("### Greengrocer / produce"), "{written}");
-        assert!(written.contains("| Day | Slot | Dinner | Prep |"), "{written}");
+        assert!(
+            written.contains("| Day | Slot | Dinner | Prep |"),
+            "{written}"
+        );
         assert!(written.contains("| Mon 07-27 |"), "{written}");
         // …and it never copies last week's CONTENT into this week.
         assert!(!written.contains("Chickpea curry"), "{written}");
@@ -1431,7 +1470,10 @@ mod tests {
         let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
         let written = std::fs::read_to_string(&out.path).unwrap();
         assert!(written.contains("| Tuesday July 28 |"), "{written}");
-        assert!(written.to_lowercase().contains("homemade pizza"), "{written}");
+        assert!(
+            written.to_lowercase().contains("homemade pizza"),
+            "{written}"
+        );
     }
 
     /// NO PREVIOUS PLAN — a brand new household still gets a real week.
@@ -1484,7 +1526,10 @@ mod tests {
         )
         .unwrap();
         let err = draft_week(dir.path(), MON_W31(), &ask, None).unwrap_err();
-        assert!(matches!(err, WeekStartError::AlreadyPlanned { .. }), "{err}");
+        assert!(
+            matches!(err, WeekStartError::AlreadyPlanned { .. }),
+            "{err}"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
     }
 
@@ -1501,15 +1546,17 @@ mod tests {
         let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
         let written = std::fs::read_to_string(&out.path).unwrap();
         let doc = PlanDoc::parse("2026-W31", &written);
-        assert!(doc
-            .meal_on(NaiveDate::from_ymd_opt(2026, 7, 28).unwrap())
-            .map(|m| m.dish.to_lowercase().contains("homemade pizza"))
-            .unwrap_or(false));
-        assert!(doc
-            .shopping
-            .iter()
-            .flat_map(|s| s.items.iter())
-            .any(|i| i.to_lowercase().contains("olive oil")));
+        assert!(
+            doc.meal_on(NaiveDate::from_ymd_opt(2026, 7, 28).unwrap())
+                .map(|m| m.dish.to_lowercase().contains("homemade pizza"))
+                .unwrap_or(false)
+        );
+        assert!(
+            doc.shopping
+                .iter()
+                .flat_map(|s| s.items.iter())
+                .any(|i| i.to_lowercase().contains("olive oil"))
+        );
         assert_eq!(out.preserved.len(), 2);
     }
 
@@ -1547,7 +1594,10 @@ These are ideas the family added before the plan was drafted.
             "the drafted plan inherited the SIDECAR's shape:\n{written}",
         );
         // …it inherited the household's real plan instead.
-        assert!(written.contains("## 1. Dinners (planner → cook)"), "{written}");
+        assert!(
+            written.contains("## 1. Dinners (planner → cook)"),
+            "{written}"
+        );
         assert_eq!(PlanDoc::parse("2026-W31", &written).meals.len(), 7);
     }
 
@@ -1669,11 +1719,19 @@ These are ideas the family added before the plan was drafted.
         draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
 
         let note = std::fs::read_to_string(
-            dir.path().join("plans").join("2026-W31-dinner-suggestions.md"),
+            dir.path()
+                .join("plans")
+                .join("2026-W31-dinner-suggestions.md"),
         )
         .unwrap();
-        assert!(note.contains("Fish tacos"), "the family's own words were deleted:\n{note}");
-        assert!(note.contains("<!-- folded into"), "the note was not retired:\n{note}");
+        assert!(
+            note.contains("Fish tacos"),
+            "the family's own words were deleted:\n{note}"
+        );
+        assert!(
+            note.contains("<!-- folded into"),
+            "the note was not retired:\n{note}"
+        );
         assert_eq!(
             read_parked(
                 dir.path(),
@@ -1688,7 +1746,9 @@ These are ideas the family added before the plan was drafted.
 
         // A dinner typed AFTER the fold is still fresh.
         std::fs::write(
-            dir.path().join("plans").join("2026-W31-dinner-suggestions.md"),
+            dir.path()
+                .join("plans")
+                .join("2026-W31-dinner-suggestions.md"),
             format!("{note}- **Saturday** (2026-08-01) — Pancakes\n"),
         )
         .unwrap();
@@ -1721,7 +1781,10 @@ These are ideas the family added before the plan was drafted.
         let out = draft_week(dir.path(), MON_W31(), &ask, None).unwrap();
         let written = std::fs::read_to_string(&out.path).unwrap();
         assert!(!written.contains("Workouts for the week"), "{written}");
-        assert!(written.contains("## 1. Dinners (planner → cook)"), "{written}");
+        assert!(
+            written.contains("## 1. Dinners (planner → cook)"),
+            "{written}"
+        );
     }
 
     #[test]
@@ -1811,16 +1874,12 @@ These are ideas the family added before the plan was drafted.
         });
         held.recv().unwrap();
 
-        let refused = draft_week(
-            dir.path(),
-            MON_W31(),
-            &week_ask(),
-            None,
-        )
-        .unwrap_err();
+        let refused = draft_week(dir.path(), MON_W31(), &week_ask(), None).unwrap_err();
 
         match &refused {
-            WeekStartError::LockUnavailable { detail, retryable, .. } => {
+            WeekStartError::LockUnavailable {
+                detail, retryable, ..
+            } => {
                 assert_eq!(detail, "held");
                 assert!(retryable, "contention is the retryable answer");
             }

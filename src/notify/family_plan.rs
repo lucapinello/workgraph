@@ -933,11 +933,17 @@ mod tests {
         );
 
         let mut docs = Vec::new();
-        for entry in std::fs::read_dir(dir.path().join("plans")).unwrap().flatten() {
+        for entry in std::fs::read_dir(dir.path().join("plans"))
+            .unwrap()
+            .flatten()
+        {
             let path = entry.path();
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if let Some(week) = week_code_from_stem(stem) {
-                docs.push(PlanDoc::parse(&week, &std::fs::read_to_string(&path).unwrap()));
+                docs.push(PlanDoc::parse(
+                    &week,
+                    &std::fs::read_to_string(&path).unwrap(),
+                ));
             }
         }
         let stale = current_plan(&docs, date(2026, 7, 28)).expect("the pre-fix hazard");
