@@ -788,59 +788,74 @@ pub fn append_entry_proving<E>(
         fs::create_dir_all(parent)
             .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
     }
-    super::feed_lock::with_feed_lock(feed_path, super::feed_lock::DEFAULT_WAIT_MS, |lock| {
-        // THE ARCHIVE IS COUNTED BEFORE OUR BYTES LAND. It cannot change while
-        // we hold the lock, and asking first means an unreadable archive costs
-        // nothing: no row is written, no id is issued, and the refusal is a
-        // typed unknown rather than a silent zero.
-        let archived = archived_count_from_bytes(feed_path).map_err(ProveFailure::Feed)? as i64;
-        let before = match fs::metadata(feed_path) {
-            Ok(m) => m.len(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(e) => {
-                return Err(ProveFailure::Feed(FeedWriteError::ReadUnknown {
-                    what: "live feed",
-                    detail: e.to_string(),
-                }));
-            }
-        };
-        append_entry_durable(feed_path, entry)
-            .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
-        // Our bytes have landed, so our row is the LAST live line at this
-        // instant — no counter is needed and none can drift. A live file we
-        // cannot read back is the same unknown as an unreadable archive, so it
-        // rolls our row back out instead of counting as an empty feed.
-        let live = match fs::read_to_string(feed_path) {
-            Ok(body) => count_entries(&body),
-            Err(e) => {
-                let unknown = FeedWriteError::ReadUnknown {
-                    what: "live feed",
-                    detail: e.to_string(),
-                };
-                return Err(match roll_back(feed_path, before, 0) {
-                    Ok(()) => ProveFailure::Feed(unknown),
-                    Err(orphan) => ProveFailure::Feed(orphan),
-                });
-            }
-        };
-        let feed_id = archived + live as i64;
+    let completed =
+        super::feed_lock::with_feed_lock(feed_path, super::feed_lock::DEFAULT_WAIT_MS, |lock| {
+            // THE ARCHIVE IS COUNTED BEFORE OUR BYTES LAND. It cannot change while
+            // we hold the lock, and asking first means an unreadable archive costs
+            // nothing: no row is written, no id is issued, and the refusal is a
+            // typed unknown rather than a silent zero.
+            let archived = archived_count_from_bytes(feed_path).map_err(ProveFailure::Feed)? as i64;
+            let before = match fs::metadata(feed_path) {
+                Ok(m) => m.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => {
+                    return Err(ProveFailure::Feed(FeedWriteError::ReadUnknown {
+                        what: "live feed",
+                        detail: e.to_string(),
+                    }));
+                }
+            };
+            append_entry_durable(feed_path, entry)
+                .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
+            // Our bytes have landed, so our row is the LAST live line at this
+            // instant — no counter is needed and none can drift. A live file we
+            // cannot read back is the same unknown as an unreadable archive, so it
+            // rolls our row back out instead of counting as an empty feed.
+            let live = match fs::read_to_string(feed_path) {
+                Ok(body) => count_entries(&body),
+                Err(e) => {
+                    let unknown = FeedWriteError::ReadUnknown {
+                        what: "live feed",
+                        detail: e.to_string(),
+                    };
+                    return Err(match roll_back(feed_path, before, 0) {
+                        Ok(()) => ProveFailure::Feed(unknown),
+                        Err(orphan) => ProveFailure::Feed(orphan),
+                    });
+                }
+            };
+            let feed_id = archived + live as i64;
 
-        match prove(feed_id, lock) {
-            Ok(()) => Ok(feed_id),
-            Err(proof_error) => {
-                // ROLL BACK. An unprovable row must not survive the attempt to
-                // prove it — and a rollback that did not happen is REPORTED,
-                // not printed past: the caller learns "there is an orphan row on
-                // disk", which is a different instruction to an operator than
-                // "your receipt was refused".
-                match roll_back(feed_path, before, feed_id) {
-                    Ok(()) => Err(ProveFailure::Proof(proof_error)),
-                    Err(orphan) => Err(ProveFailure::Feed(orphan)),
+            match prove(feed_id, lock) {
+                Ok(()) => Ok(feed_id),
+                Err(proof_error) => {
+                    // ROLL BACK. An unprovable row must not survive the attempt to
+                    // prove it — and a rollback that did not happen is REPORTED,
+                    // not printed past: the caller learns "there is an orphan row on
+                    // disk", which is a different instruction to an operator than
+                    // "your receipt was refused".
+                    match roll_back(feed_path, before, feed_id) {
+                        Ok(()) => Err(ProveFailure::Proof(proof_error)),
+                        Err(orphan) => Err(ProveFailure::Feed(orphan)),
+                    }
                 }
             }
-        }
-    })
-    .map_err(|refusal| ProveFailure::Feed(FeedWriteError::NotSerialised(refusal)))?
+        })
+        .map_err(|refusal| ProveFailure::Feed(FeedWriteError::NotSerialised(refusal)))?;
+    // THE RELEASE VERDICT IS READ, not dropped on the wrapper's floor. The row
+    // and its receipt are certification evidence, and a section whose release
+    // could not be PROVEN is a section a human has to look at — the transaction
+    // itself stands (our bytes are on disk, our id was allocated under the
+    // held lock), but the wedged lock is named rather than left on stderr as
+    // the only trace.
+    if let super::feed_lock::Release::Retained(reason) = &completed.release {
+        eprintln!(
+            "[{}] casa feed: the row was written under the lock, but the release could not be \
+             verified ({reason}) — this process still owns it and retries on the next acquire.",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+    }
+    completed.out
 }
 
 /// Append one row and make it DURABLE — one write, then fsync of the file and of

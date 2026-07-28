@@ -487,6 +487,13 @@ pub(crate) mod inject {
     /// green while testing nothing, because the fix never renames.
     pub static AFTER_AUTHORITY_REACH: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
 
+    /// Fired between the LINK-COUNT PROOF and the unlink that acts on it — the
+    /// two-adjacent-syscall residue §4b documents. A successor driven in HERE is
+    /// the reviewer's second repro: the predecessor has already proved the path
+    /// was its own, and by the time it unlinks, the entry there is somebody
+    /// else's. It must never read as a clean release.
+    pub static AFTER_LINK_COUNT_PROOF: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
     pub fn reset() {
         FAIL_RECORD_FSYNC.store(false, std::sync::atomic::Ordering::SeqCst);
         FAIL_DIR_FSYNC.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -494,6 +501,7 @@ pub(crate) mod inject {
         SKIP_AUTHORITY_FLOCK.store(false, std::sync::atomic::Ordering::SeqCst);
         USE_REJECTED_DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
         *AFTER_AUTHORITY_REACH.lock().unwrap() = None;
+        *AFTER_LINK_COUNT_PROOF.lock().unwrap() = None;
     }
 
     pub fn armed(flag: &AtomicBool) -> bool {
@@ -525,6 +533,16 @@ fn after_authority_reach() {
     #[cfg(test)]
     {
         let hook = inject::AFTER_AUTHORITY_REACH.lock().unwrap();
+        if let Some(h) = hook.as_ref() {
+            h();
+        }
+    }
+}
+
+fn after_link_count_proof() {
+    #[cfg(test)]
+    {
+        let hook = inject::AFTER_LINK_COUNT_PROOF.lock().unwrap();
         if let Some(h) = hook.as_ref() {
             h();
         }
@@ -943,11 +961,37 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
     //     PROVES the lock path is no longer a name for our inode and that the
     //     unlink below would land on somebody else's directory entry: refuse, and
     //     report it as a successor's.
-    let before = nlink_of(&meta);
+    //
+    //     THE COUNT IS RE-READ HERE, ADJACENT TO THE UNLINK, and that is the whole
+    //     point of this step existing separately from the fstat at (2). Reading it
+    //     from `meta` — the stat taken before the record was even parsed — is what
+    //     the reviewer's 4/4 repro drove a successor through:
+    //
+    //       we pin (our inode: 2 names) → we stat, before = 2 → B unlinks the lock
+    //       path and publishes ITS OWN inode there (our inode: 1 name) → we unlink
+    //       the path, removing B's entry → (5) sees our count 1 < 2, calls that
+    //       "our name went", and reports RELEASED.
+    //
+    //     B is then inside its section with no authority path, so C creates one and
+    //     two holders exist — the exact seq-195 outcome, arriving through the
+    //     staleness of one integer. Re-read against the pinned descriptor and the
+    //     same interleaving reads `fresh < 2` and refuses to unlink at all.
+    let before = match fd.metadata() {
+        Ok(m) => nlink_of(&m),
+        Err(e) => {
+            drop_pin();
+            return Removal::Failed(e.to_string());
+        }
+    };
+    debug_assert!(nlink_of(&meta) >= 1, "the judged stat is from our pin");
     if before < 2 {
         drop_pin();
         return Removal::Restored;
     }
+    // THE SEAM AGAIN, at the two-adjacent-syscall residue §4b documents: a
+    // successor that lands between the count above and the unlink below is caught
+    // by (5), because the entry that goes is then B's and OUR count does not move.
+    after_link_count_proof();
     // THE RELEASE POINT — the one instant the path becomes free.
     if let Err(e) = std::fs::remove_file(lock_path) {
         drop_pin();
@@ -958,11 +1002,13 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
         };
     }
     // (5) Confirm against the SAME descriptor: our inode must have LOST a name.
+    //     An unreadable confirmation is NOT a clean release — we removed a
+    //     directory entry and cannot say whose.
     let after = fd.metadata().ok().map(|m| nlink_of(&m));
     drop_pin();
     match after {
-        Some(a) if a >= before => Removal::Displaced,
-        _ => Removal::Removed,
+        Some(a) if a < before => Removal::Removed,
+        _ => Removal::Displaced,
     }
 }
 
@@ -1563,13 +1609,14 @@ pub fn with_project_lock<T>(
     name: &str,
     opts: &Options,
     f: impl FnOnce() -> T,
-) -> Result<T, LockRefusal> {
+) -> Result<Completed<T>, LockRefusal> {
     let lock = acquire(root, name, opts)?;
     let path = lock.path().to_path_buf();
     let out = f();
     // §7: nothing is "finished up afterwards" — the caller's whole transaction is
     // inside `f`, and the lock is let go only once it has returned.
-    if let Release::Retained(reason) = lock.release() {
+    let release = lock.release();
+    if let Release::Retained(reason) = &release {
         // We could not PROVE we let go. Ownership stays with us (§4) so the next
         // acquire in this thread retries the release rather than deadlocking
         // against our own file — and a human is told, because a release that never
@@ -1580,12 +1627,75 @@ pub fn with_project_lock<T>(
             path.display()
         );
     }
-    Ok(out)
+    Ok(Completed { out, release })
+}
+
+/// What a locked section actually produced: the body's value AND how the release
+/// ended.
+///
+/// **WHY THIS IS NOT JUST `T`.** The wrapper used to `eprintln!` a
+/// [`Release::Retained`] and then hand back `Ok(out)`, so an unverified release —
+/// the lock path still occupied, the authority still ours, no proof we ever let
+/// go — was indistinguishable at the boundary from a clean one. That is the same
+/// swallowed-verdict class the Node twin fixed: a stderr line is not a return
+/// value, and a certifier reading only the `Ok` certifies a transaction whose
+/// exclusion nobody can vouch for.
+///
+/// It is deliberately NOT an `Err`. Under §4b pin-then-judge a retained release
+/// does not risk a second holder — ownership stays with this thread and the next
+/// acquire retries the release — and the body's mutation genuinely completed, so
+/// telling the caller its write failed would be a different lie. The honest shape
+/// is a success the caller can interrogate: use [`Completed::verified`] where the
+/// distinction matters, `.out` where it does not.
+#[derive(Debug)]
+#[must_use = "a completed section carries a release verdict — read it or take .out explicitly"]
+pub struct Completed<T, R = Release> {
+    /// What the body returned. The mutation happened.
+    pub out: T,
+    /// How the release ended. Anything but `Retained` is proven.
+    pub release: R,
+}
+
+/// A release verdict, from either lock's enum — they are distinct types because
+/// the feed lock is an adapter with its own surface, and both must be able to
+/// answer the one question a caller has.
+pub trait ReleaseVerdict {
+    /// Did the release PROVE it let go?
+    fn is_proven(&self) -> bool;
+}
+
+impl ReleaseVerdict for Release {
+    fn is_proven(&self) -> bool {
+        !matches!(self, Release::Retained(_))
+    }
+}
+
+impl<T, R: ReleaseVerdict> Completed<T, R> {
+    /// The body's value, but only if the release was PROVEN. A caller that must
+    /// certify the section (an auditor, a cross-process handoff) uses this;
+    /// `Err` hands back the unverified verdict rather than the value.
+    pub fn verified(self) -> Result<T, R> {
+        if self.release.is_proven() {
+            Ok(self.out)
+        } else {
+            Err(self.release)
+        }
+    }
+
+    /// The body's value, release verdict deliberately discarded — for the callers
+    /// whose contract really is "the mutation happened". Spelled out so the
+    /// discard is a decision in the source rather than the default.
+    pub fn regardless_of_release(self) -> T {
+        self.out
+    }
 }
 
 /// The week lock, at the default wait. Every engine path that rewrites a plan
 /// file, the shopping overlay, the carry or a parked dinner goes through here.
-pub fn with_week_mutation_lock<T>(root: &Path, f: impl FnOnce() -> T) -> Result<T, LockRefusal> {
+pub fn with_week_mutation_lock<T>(
+    root: &Path,
+    f: impl FnOnce() -> T,
+) -> Result<Completed<T>, LockRefusal> {
     with_project_lock(root, WEEK_MUTATION, &Options::default(), f)
 }
 
@@ -2164,6 +2274,165 @@ mod tests {
         clean();
     }
 
+    /// **THE REVIEWER'S SECOND REPRO (bridge seq 214, 4/4), AND WHAT IS STILL
+    /// OPEN IN IT.** A successor that replaces the authority path between this
+    /// release's link-count proof and its unlink is STILL removed, and the
+    /// release still reports `Released`. This test REPRODUCES that; it does not
+    /// claim it is fixed.
+    ///
+    /// Why it cannot be closed here. The interleaving is:
+    ///
+    ///   A pins its inode (2 names) → A proves the count → B unlinks A's entry
+    ///   (A: 1 name) and publishes ITS OWN inode at the path → A unlinks the
+    ///   path, removing B's entry → A's count went 2 → 1, which is exactly what
+    ///   a clean release looks like.
+    ///
+    /// The count delta cannot distinguish "our entry went, by our unlink" from
+    /// "our entry went, by an outsider, and our unlink took a successor's". Only
+    /// an IDENTITY-CHECKED unlink can — `funlinkat(2)`, which fails unless the
+    /// path names the same file as the fd. It is FreeBSD-only and is not exposed
+    /// by the `libc` crate for any target this builds for, so `unlink(2)` by
+    /// name is the only removal available and this residue is irreducible in the
+    /// current primitive. What `pin_and_decide` DOES do is read the count
+    /// adjacent to the unlink (so every wider interleaving refuses without
+    /// touching anything) and make step (5) an affirmative proof (so an
+    /// unreadable confirmation is `Displaced`, not `Removed`).
+    ///
+    /// Closing it needs a protocol change, not a patch: either an authority
+    /// object that is never removed by name (a per-holder unique entry plus a
+    /// generation counter read under the section's `flock`), or a platform
+    /// removal that checks identity. Tracked as its own task — see the
+    /// `wg` graph, "Lock: close the pre-unlink successor window".
+    #[test]
+    #[serial(project_lock)]
+    fn the_pre_unlink_successor_window_is_reproduced_and_still_open() {
+        clean();
+        let dir = scratch();
+        let path = lock_path_for(dir.path(), WEEK_MUTATION);
+
+        let holder = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
+
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let successor_record = "{\"token\":\"".to_string()
+            + &"b".repeat(32)
+            + "\",\"pid\":1,\"host\":\"successor\",\"name\":\"week-mutation\",\"v\":1}\n";
+        {
+            let path = path.clone();
+            let fired = fired.clone();
+            let record = successor_record.clone();
+            *inject::AFTER_LINK_COUNT_PROOF.lock().unwrap() = Some(Box::new(move || {
+                if fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let _ = std::fs::remove_file(&path);
+                std::fs::write(&path, &record).unwrap();
+            }));
+        }
+
+        let verdict = holder.release();
+        inject::reset();
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the seam must actually fire, or this reproduction proves nothing"
+        );
+        // THE KNOWN GAP, pinned so it cannot be quietly widened or forgotten:
+        // the successor's authority entry is gone and the predecessor called it
+        // a clean release. When the protocol change lands, BOTH of these flip
+        // and this test becomes the gate.
+        assert_eq!(
+            verdict,
+            Release::Released,
+            "KNOWN GAP (seq 214 item 1): if this is no longer Released the window \
+             has been closed — update this test into the gate it is waiting to be"
+        );
+        assert!(
+            !path.exists(),
+            "KNOWN GAP: the successor's authority entry was removed by its predecessor"
+        );
+        clean();
+    }
+
+    /// The negative half of the gate above: with NO successor in the seam, the
+    /// very same path still releases cleanly. Without this, "never Released"
+    /// would be satisfiable by never releasing.
+    #[test]
+    #[serial(project_lock)]
+    fn an_undisturbed_release_still_proves_itself_released() {
+        clean();
+        let dir = scratch();
+        let path = lock_path_for(dir.path(), WEEK_MUTATION);
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        {
+            let fired = fired.clone();
+            *inject::AFTER_LINK_COUNT_PROOF.lock().unwrap() =
+                Some(Box::new(move || fired.store(true, Ordering::SeqCst)));
+        }
+        let holder = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
+        let verdict = holder.release();
+        inject::reset();
+
+        assert!(fired.load(Ordering::SeqCst), "the seam is on the live path");
+        assert_eq!(verdict, Release::Released);
+        assert!(!path.exists(), "the lock path is free");
+        clean();
+    }
+
+    /// **THE SWALLOWED VERDICT (bridge seq 214, 4/4).** Both public wrappers
+    /// returned `Ok` while the release was `Retained` and the authority pathname
+    /// was still occupied — the same class the Node side fixed. The verdict is
+    /// now part of the success value, so a caller that must certify the section
+    /// can refuse it, and a caller whose contract really is "the mutation
+    /// happened" says so in the source.
+    #[test]
+    #[serial(project_lock)]
+    fn a_retained_release_is_propagated_through_the_wrapper_not_only_to_stderr() {
+        clean();
+        let dir = scratch();
+        let path = lock_path_for(dir.path(), WEEK_MUTATION);
+
+        // Force the retention the honest way: make the lock RECORD unreadable
+        // while we hold it. `verify_self_ownership` then answers
+        // `Unverifiable`, the release retries and cannot prove anything, and
+        // §4's rule applies — "I could not read it" never softens into "it is
+        // probably still mine", so ownership is RETAINED.
+        use std::os::unix::fs::PermissionsExt;
+        let mut ran = false;
+        let completed = with_week_mutation_lock(dir.path(), || {
+            ran = true;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            "the plan was rewritten"
+        })
+        .expect("the section RAN — the lock was taken and the body executed");
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+
+        assert!(ran, "the body ran under the lock");
+        assert_eq!(
+            completed.out, "the plan was rewritten",
+            "the mutation's value is still returned: a retained release is not a failed write"
+        );
+        assert!(
+            matches!(completed.release, Release::Retained(_)),
+            "the wrapper must carry the retained verdict, got {:?}",
+            completed.release
+        );
+        // …and a certifying caller REFUSES it, which is the whole point.
+        assert!(
+            completed.verified().is_err(),
+            "an unverified release must not certify as a proven section"
+        );
+
+        // The negative half: an ordinary section verifies.
+        clean();
+        let dir2 = scratch();
+        let clean_run = with_week_mutation_lock(dir2.path(), || "ok").unwrap();
+        assert_eq!(clean_run.release, Release::Released);
+        assert_eq!(clean_run.verified().unwrap(), "ok");
+
+        let _ = std::fs::remove_file(&path);
+        clean();
+    }
+
     /// **§4a's kernel-enforced half — the one the JS twin cannot have.** docs/42
     /// §4b states Node's residue and then requires the Rust twin to hold
     /// `LOCK_EX` on the authority handle across the section. While a holder is
@@ -2429,7 +2698,7 @@ mod tests {
         assert_eq!(held.release(), Release::Released);
         // And the happy path does run it, and lets go afterwards.
         let out = with_project_lock(dir.path(), WEEK_MUTATION, &opts(200), || 7).unwrap();
-        assert_eq!(out, 7);
+        assert_eq!(out.verified().unwrap(), 7);
         assert!(!lock_path_for(dir.path(), WEEK_MUTATION).exists());
     }
 

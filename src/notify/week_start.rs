@@ -953,7 +953,10 @@ pub fn draft_week(
     match project_lock::with_week_mutation_lock(root, || {
         draft_week_locked(root, today, ask, calendar_owner)
     }) {
-        Ok(drafted) => drafted,
+        // See fast_lane: the draft stands; the retained release is reported by
+        // the wrapper, and discarding the verdict here is a decision, not a
+        // default.
+        Ok(completed) => completed.regardless_of_release(),
         Err(refusal) => Err(WeekStartError::LockUnavailable {
             detail: refusal.detail().to_string(),
             retryable: refusal.retryable(),

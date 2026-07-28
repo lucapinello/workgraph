@@ -2472,7 +2472,10 @@ pub fn run_fast_lane_at(
         }
     });
     match locked {
-        Ok(result) => result,
+        // A retained release does not undo the edit — the plan was rewritten
+        // under the held lock — and `with_project_lock` has already named it for
+        // a human. The discard is spelled out rather than implicit.
+        Ok(completed) => completed.regardless_of_release(),
         Err(refusal) => FastLaneResult::Answered {
             // Nothing was saved, and saying so is the whole point: a refusal the
             // family can see and repeat beats a write nobody serialised. This is

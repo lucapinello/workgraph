@@ -127,6 +127,9 @@ fn refusal_of(refusal: project_lock::LockRefusal) -> LockRefusal {
 }
 
 /// What a release PROVED. Ownership is dropped only on proof (docs/42 §4).
+///
+/// See [`super::project_lock::Completed`]: this verdict is returned to the
+/// caller now, not dropped on the floor of the wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Release {
     /// The unlink provably hit the inode carrying our token.
@@ -143,6 +146,12 @@ pub enum Release {
     Reentrant,
     /// A transient failure. We STILL OWN the lock and may call release again.
     Retained(String),
+}
+
+impl project_lock::ReleaseVerdict for Release {
+    fn is_proven(&self) -> bool {
+        !matches!(self, Release::Retained(_))
+    }
 }
 
 fn release_of(release: project_lock::Release) -> Release {
@@ -224,15 +233,20 @@ pub fn acquire(feed_path: &Path, wait_ms: u64) -> Result<FeedLock, LockRefusal> 
 /// inside the section (appending the receipt that proves the row we just wrote)
 /// takes `&FeedLock` as a parameter, so it cannot be called from outside the
 /// transaction.
+/// The release verdict is PROPAGATED, not dropped. `lock.release();` on its own
+/// line discarded it, so a retained release — the lock path still occupied, no
+/// proof we let go — returned `Ok(out)` exactly like a clean one. See
+/// [`super::project_lock::Completed`] for why this is a success the caller can
+/// interrogate rather than an `Err`.
 pub fn with_feed_lock<T>(
     feed_path: &Path,
     wait_ms: u64,
     f: impl FnOnce(&FeedLock) -> T,
-) -> Result<T, LockRefusal> {
+) -> Result<super::project_lock::Completed<T, Release>, LockRefusal> {
     let lock = acquire(feed_path, wait_ms)?;
     let out = f(&lock);
-    lock.release();
-    Ok(out)
+    let release = lock.release();
+    Ok(super::project_lock::Completed { out, release })
 }
 
 #[cfg(test)]
@@ -498,7 +512,7 @@ mod tests {
         let dir = scratch();
         let feed = feed(&dir);
         let out = with_feed_lock(&feed, DEFAULT_WAIT_MS, |_| 42).unwrap();
-        assert_eq!(out, 42);
+        assert_eq!(out.verified().unwrap(), 42);
         assert!(
             !lock_path_for(&feed).exists(),
             "the lock is released before the result is handed back"
