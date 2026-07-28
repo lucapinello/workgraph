@@ -53,21 +53,74 @@
 //! §3 FAIL CLOSED, ALWAYS. Not acquired ⇒ the caller's work does NOT run. Not for
 //!    a read-only mount, not for an `ENOTDIR` root, not for a full disk.
 //!
-//! §4 REMOVAL IS ALWAYS DETACH-THEN-DECIDE. `read` → compare → `unlink` touches a
-//!    PATHNAME, not the inode that was judged. So: `rename` to a private
-//!    quarantine (one atomic syscall), inspect ONLY the moved inode, unlink it if
-//!    it carries our token, and otherwise `link` it straight back (and leave it
-//!    quarantined as evidence if the path was retaken).
+//! §4 REMOVAL IS ALWAYS PIN-THEN-JUDGE. `read` → compare → `unlink` touches a
+//!    PATHNAME, not the inode that was judged. **Detach-then-decide was the
+//!    rejected cure** — `rename` the lock path to a private quarantine and judge
+//!    the moved inode afterwards. It is one atomic syscall, and it is safe for the
+//!    inode it moves and NOT safe for the pathname it frees: between the rename
+//!    and the restoring link the authority pathname is EMPTY. Audits drove a third
+//!    process into that gap and came out with two holders — first from a bare
+//!    release, and then, after a `(dev, ino)` pre-check was added in FRONT of it,
+//!    from the POST-VERIFICATION window, 4/4 (reviewer seq 195, task
+//!    `receipt-s1c-atomic`):
 //!
-//! §4a OWNERSHIP IS ESTABLISHED BEFORE THE PATHNAME MOVES. Detach-then-decide is
-//!    safe for the inode it moves and NOT safe for the pathname it frees: between
-//!    the rename and the restoring link the authority pathname is EMPTY, and an
-//!    audit drove a third process into that gap and came out with two holders. So
-//!    release `stat`s the lock path first and compares it against the `(dev, ino)`
-//!    captured at §2 — the kernel's own answer to "which lock is mine". A
-//!    different inode means a successor owns it: report `stolen` and touch
-//!    NOTHING. Both halves are required; the pre-check alone is a
-//!    compare-then-unlink race, and detach-then-decide alone is the successor gap.
+//!        A verifies the pathname against a descriptor — it IS our inode, then.
+//!        A closes the descriptor.
+//!        A human clears the lock file (§5's documented cure); B legitimately acquires.
+//!        A's already-approved decision fires and RENAMES: B's live authority path is
+//!          moved away and the pathname is empty for the length of an inspection.
+//!        C creates there and acquires. B and C are both inside the section.
+//!
+//!    A check on a closed descriptor and an action on a pathname are two decisions
+//!    with a gap between them, so judging harder or checking sooner cannot close
+//!    it. **The authority pathname must never be freed by a decision that can have
+//!    gone stale.** So removal never detaches. It PINS — see §4b. `rename` does not
+//!    appear in removal at all, and neither does `.reclaim.` quarantine: there is
+//!    nothing to quarantine when nothing is ever moved.
+//!
+//! §4a THE HELD AUTHORITY HANDLE. Acquisition keeps the descriptor of the inode it
+//!    published OPEN for the whole critical section, and release closes it only
+//!    where ownership is genuinely given up. Two things depend on it and neither
+//!    can be obtained from a pathname: `(dev, ino)` is unforgeable only while a
+//!    reference to the inode is alive (once it is freed those numbers can be
+//!    REISSUED, and an identity check against a reused inode says "ours" about
+//!    somebody else's lock), and `fstat(handle).nlink == 0` is a path-free, atomic
+//!    proof that our record has no name left on disk — it was cleared while we
+//!    held it, whatever is at the lock path now is not ours, and release must touch
+//!    NOTHING. That check runs before any pathname lookup.
+//!
+//!    **AND, BECAUSE RUST HAS `flock` AND NODE DOES NOT**, that handle also carries
+//!    `flock(LOCK_EX)` for the whole section (docs/42 §4b's residue paragraph, and
+//!    the §8 checklist item that names this implementation). It is the half the JS
+//!    twin cannot have: a kernel-enforced, path-independent claim on the published
+//!    inode. No second holder can be inside a section on that inode by ANY route —
+//!    a leftover `.pin.` name, a hard-linked copy of the record, a `link` that put
+//!    it back — and the claim cannot be forged by inode reuse, because it lives
+//!    with the open file description and dies with it. What it does NOT close, said
+//!    plainly: §4b step 4's link-count proof and its `unlink` are still two
+//!    adjacent syscalls, and a successor that publishes a DIFFERENT inode at the
+//!    lock path in that window is not covered by a lock on ours. That residue
+//!    needs an outsider mutating the lock path during a live hold (§5) and is
+//!    reported as `displaced`, never as a clean release.
+//!
+//!    A read-only pre-check of the pathname (`open` ONCE, `read` + `fstat` that
+//!    descriptor, compare token AND inode) still runs first, because a successor
+//!    that is already visible can be reported without even pinning. It is not the
+//!    exclusion decision — that one is §4b's.
+//!
+//! §4b THE PRIMITIVE. `link(lockPath, lockPath.pin.<hex>)` — one atomic syscall
+//!    that ADDS a directory entry and removes none, so the lock path keeps its own
+//!    entry throughout and there is no instant in which a third process can create
+//!    on it. Judge through a HANDLE ON THE PIN, never a second lookup of the lock
+//!    path, and require BOTH halves: our token in the record AND our `(dev, ino)`
+//!    from the kernel. Not ours ⇒ `unlink(pin)` and stop — only the extra name we
+//!    made is removed. Ours ⇒ the removal, guarded by the kernel's own link count:
+//!    our lock has exactly one name of its own, so `nlink` must be ≥ 2 (the lock
+//!    path, plus the pin); `nlink < 2` PROVES the lock path is no longer a name for
+//!    our inode and that the unlink would land on somebody else's directory entry.
+//!    Then `unlink(lockPath)`, and confirm against the same descriptor that our
+//!    inode LOST a name — if it did not, what we removed was not ours: report
+//!    `displaced`, never a clean release.
 //!
 //! §5 NO AUTOMATIC RECLAIM — NOT EVEN OF A PROVABLY DEAD OWNER. Acquisition
 //!    classifies and REPORTS; it never removes. `staleMs` exists only to tell
@@ -185,9 +238,10 @@ pub enum Release {
     /// An inner frame of a re-entrant acquisition exited; the outermost holder
     /// still owns the lock.
     Reentrant,
-    /// A successor owns the lock now. We touched nothing (§4a) or put the record
-    /// straight back (§4d). A slow holder can lose the lock; it can never take
-    /// its successor's lock away.
+    /// A successor owns the lock now, and we touched NOTHING (§4a/§4b): a record
+    /// that is not ours is left exactly where it is, because nothing of a
+    /// successor's is ever moved. A slow holder can lose the lock; it can never
+    /// take its successor's lock away.
     Stolen,
     /// The lock path was already empty and stayed empty.
     Gone,
@@ -210,6 +264,13 @@ struct Holder {
     /// The `(dev, ino)` of the inode we published — §4a's grounded identity.
     dev: u64,
     ino: u64,
+    /// **THE AUTHORITY HANDLE (§4a).** The descriptor of the inode we published,
+    /// held open for the WHOLE critical section and carrying `flock(LOCK_EX)`.
+    /// It is dropped only where ownership is genuinely given up: a RETAINED
+    /// release still owns the lock, and therefore still owns the evidence it will
+    /// need on the retry. `Arc` because the holder record is cloned out of the
+    /// thread-local map — every clone is the same descriptor, never a `dup`.
+    handle: Option<std::sync::Arc<std::fs::File>>,
 }
 
 #[derive(Debug, Clone)]
@@ -400,20 +461,36 @@ pub(crate) mod inject {
     pub static FAIL_RECORD_FSYNC: AtomicBool = AtomicBool::new(false);
     /// Make the CONTAINING DIRECTORY `fsync` fail with EIO (§2).
     pub static FAIL_DIR_FSYNC: AtomicBool = AtomicBool::new(false);
-    /// Skip §4a's ownership pre-check — the REJECTED build, kept only so the
-    /// §4a negative has a control that proves it has teeth.
+    /// Skip ALL of §4a's read-only evidence — the `nlink == 0` question put to the
+    /// authority handle AND the pathname pre-check. Kept only so the two-holder
+    /// negative has a control that proves it has teeth.
     pub static SKIP_OWNERSHIP_PRECHECK: AtomicBool = AtomicBool::new(false);
+    /// Remove `flock(LOCK_EX)` from the authority handle — the control for the
+    /// half the JS twin cannot have (§4a). The lock still works without it; the
+    /// probe that proves the kernel is enforcing anything must go quiet.
+    pub static SKIP_AUTHORITY_FLOCK: AtomicBool = AtomicBool::new(false);
+    /// Put the REJECTED removal back: `rename(lockPath → quarantine)`, judge the
+    /// moved inode afterwards. This is detach-then-decide, written out exactly so
+    /// the negatives below have a build that REPRODUCES the audit's two-holder
+    /// outcome. Nothing outside `cfg(test)` can reach it.
+    pub static USE_REJECTED_DETACH: AtomicBool = AtomicBool::new(false);
 
     type Hook = Box<dyn Fn() + Send + Sync>;
-    /// Fired at the exact instant the authority pathname is EMPTY — after
-    /// `rename(lockPath → quarantine)` and before anything is put back.
-    pub static AFTER_DETACH_RENAME: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+    /// Fired at the exact instant removal has reached for the authority pathname:
+    /// after `link(lockPath → pin)` in the conforming build (where the pathname is
+    /// still TAKEN), and after `rename(lockPath → quarantine)` in the rejected one
+    /// (where it is EMPTY). Arming it on the syscall the fixed primitive actually
+    /// calls is the whole point: armed on `rename`, this gate would be VACUOUS —
+    /// green while testing nothing, because the fix never renames.
+    pub static AFTER_AUTHORITY_REACH: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
 
     pub fn reset() {
         FAIL_RECORD_FSYNC.store(false, std::sync::atomic::Ordering::SeqCst);
         FAIL_DIR_FSYNC.store(false, std::sync::atomic::Ordering::SeqCst);
         SKIP_OWNERSHIP_PRECHECK.store(false, std::sync::atomic::Ordering::SeqCst);
-        *AFTER_DETACH_RENAME.lock().unwrap() = None;
+        SKIP_AUTHORITY_FLOCK.store(false, std::sync::atomic::Ordering::SeqCst);
+        USE_REJECTED_DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
+        *AFTER_AUTHORITY_REACH.lock().unwrap() = None;
     }
 
     pub fn armed(flag: &AtomicBool) -> bool {
@@ -441,10 +518,10 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     fd.sync_all()
 }
 
-fn after_detach_rename() {
+fn after_authority_reach() {
     #[cfg(test)]
     {
-        let hook = inject::AFTER_DETACH_RENAME.lock().unwrap();
+        let hook = inject::AFTER_AUTHORITY_REACH.lock().unwrap();
         if let Some(h) = hook.as_ref() {
             h();
         }
@@ -462,6 +539,96 @@ fn precheck_enabled() -> bool {
     }
 }
 
+fn flock_enabled() -> bool {
+    #[cfg(test)]
+    {
+        !inject::armed(&inject::SKIP_AUTHORITY_FLOCK)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §4a — the kernel-enforced half of the authority handle. THIS IS THE PART THE
+// NODE TWIN CANNOT HAVE: Node has no `flock`/`lockf` binding, so docs/42 §4b
+// states its residue and then requires the Rust twin to take `LOCK_EX` here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What happened when we asked the kernel for the exclusive advisory lock.
+enum Advisory {
+    /// We hold `LOCK_EX` on the published inode for the rest of the section.
+    Held,
+    /// This filesystem has no advisory locking (`ENOTSUP`/`ENOSYS`/`EINVAL` — some
+    /// network mounts). We degrade to exactly what the JS twin does and say so
+    /// once; the protocol's exclusion never depended on `flock`, which is an
+    /// ADDITIONAL narrowing, not the lock itself.
+    Unsupported(i32),
+    /// `EWOULDBLOCK` on a file that is still PRIVATE to this acquisition, i.e. an
+    /// inode nobody else can have opened yet. Something is badly wrong; the honest
+    /// answer is to fail the acquisition closed rather than publish a record whose
+    /// exclusion we could not establish.
+    Contended,
+}
+
+#[cfg(unix)]
+fn take_authority_flock(file: &std::fs::File) -> Advisory {
+    if !flock_enabled() {
+        return Advisory::Unsupported(0);
+    }
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `fd` is owned by `file` and outlives the call; the only other
+    // argument is a constant flag pair.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Advisory::Held;
+    }
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EINVAL);
+    if errno == libc::EWOULDBLOCK {
+        Advisory::Contended
+    } else {
+        Advisory::Unsupported(errno)
+    }
+}
+
+#[cfg(not(unix))]
+fn take_authority_flock(_file: &std::fs::File) -> Advisory {
+    Advisory::Unsupported(0)
+}
+
+/// Give the advisory claim back explicitly at the moment ownership is given up,
+/// rather than waiting for the last `Arc` clone of the handle to go out of scope.
+#[cfg(unix)]
+fn drop_authority_flock(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: as above.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+#[cfg(not(unix))]
+fn drop_authority_flock(_file: &std::fs::File) {}
+
+/// Printed once per process: a filesystem with no `flock` leaves the twin exactly
+/// as strong as the JS implementation, which is a fact an operator should be able
+/// to read rather than infer.
+fn report_no_advisory_locking(lock_path: &Path, errno: i32) {
+    let key = format!("{}|no-flock", lock_path.display());
+    if !WARNED.with(|w| w.borrow_mut().insert(key)) {
+        return;
+    }
+    eprintln!(
+        "[project-lock] {}: this filesystem refused flock(LOCK_EX) (errno {errno}) — the lock \
+         still excludes exactly as the gateway's does, but WITHOUT the kernel-enforced claim on \
+         the published inode that docs/42 §4b asks the Rust twin for.",
+        lock_path.display()
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // §2 — publish.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,10 +644,32 @@ fn ids_of(_meta: &std::fs::Metadata) -> (u64, u64) {
     (0, 0)
 }
 
+/// How many names this inode has on disk. `nlink == 0` is a path-free proof that
+/// our record was cleared while we held it (§4a); `nlink >= 2` is the proof the
+/// lock path is still one of its names (§4b step 4).
+#[cfg(unix)]
+fn nlink_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink()
+}
+
+/// Off Unix there is no link count to ask for, so there is no proof either way —
+/// `u64::MAX` is "unknown", which is never `0` and never `< 2`.
+#[cfg(not(unix))]
+fn nlink_of(_meta: &std::fs::Metadata) -> u64 {
+    u64::MAX
+}
+
 /// What `try_publish` proved.
 enum Published {
-    /// We hold the lock; carries the identity release checks against (§4a).
-    Took { dev: u64, ino: u64 },
+    /// We hold the lock; carries the identity release checks against (§4a) and
+    /// the AUTHORITY HANDLE — an open descriptor on the published inode, holding
+    /// `flock(LOCK_EX)`, which the holder keeps for the whole critical section.
+    Took {
+        dev: u64,
+        ino: u64,
+        handle: std::fs::File,
+    },
     /// `EEXIST` at the link — somebody holds it. Classify and wait (§5).
     Held,
     /// A LOCAL failure. Retrying cannot help; fail closed with the typed reason.
@@ -545,7 +734,27 @@ fn try_publish(lock_path: &Path, token: &str, pid: u32, host: &str, now_ms: i64)
             };
         }
     };
-    drop(file);
+    // THE HANDLE IS NOT CLOSED HERE (§4a). This descriptor is on the inode we are
+    // about to publish; `link(staging, lockPath)` makes the lock path a second
+    // name for THIS inode, so the descriptor stays valid — and stays the only
+    // unforgeable answer to "which lock is mine" — for the whole section.
+    //
+    // And the half the Node twin cannot have: an EXCLUSIVE ADVISORY LOCK on it.
+    // The file is still private to this acquisition, so `EWOULDBLOCK` here is not
+    // contention, it is a broken invariant; fail closed rather than publish a
+    // record whose exclusion we could not establish.
+    match take_authority_flock(&file) {
+        Advisory::Held => {}
+        Advisory::Unsupported(errno) => report_no_advisory_locking(lock_path, errno),
+        Advisory::Contended => {
+            scrub();
+            return Published::Failed {
+                detail: "record-write-failed",
+                error: "flock(LOCK_EX) on a staging file nobody else can hold reported EWOULDBLOCK"
+                    .to_string(),
+            };
+        }
+    }
 
     let mut back = Vec::new();
     if let Err(e) = std::fs::File::open(&staging).and_then(|mut f| f.read_to_end(&mut back)) {
@@ -594,6 +803,9 @@ fn try_publish(lock_path: &Path, token: &str, pid: u32, host: &str, now_ms: i64)
                 }
             }
             scrub();
+            // Ownership was never established, so the handle and its advisory
+            // claim go with the failure.
+            drop_authority_flock(&file);
             return Published::Failed {
                 detail: "record-write-failed",
                 error: e.to_string(),
@@ -604,6 +816,7 @@ fn try_publish(lock_path: &Path, token: &str, pid: u32, host: &str, now_ms: i64)
     Published::Took {
         dev: identity.0,
         ino: identity.1,
+        handle: file,
     }
 }
 
@@ -628,59 +841,159 @@ fn with_suffix(lock_path: &Path, suffix: &str) -> PathBuf {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// §4 — detach then decide.
+// §4b — PIN THEN JUDGE. The ONLY way this module removes a lock file.
+//
+// It never detaches anything: the authority pathname is never freed by a decision
+// that can have gone stale, and every removal is guarded by the kernel's own link
+// count on an inode we hold open. `rename` does not appear here, and neither does
+// `.reclaim.` quarantine — there is nothing to quarantine when nothing is moved.
+// A `*.pin.<hex>` file is a dead extra NAME for a record, never a lock: nothing
+// waits on it, acquisition never reads it, and it is removed on every exit path.
 // ─────────────────────────────────────────────────────────────────────────────
 
-enum Detached {
-    /// The inode we judged is gone; the lock path is free.
+enum Removal {
+    /// The inode we judged has lost the lock path; the path is free.
     Removed,
-    /// There was nothing to detach.
+    /// There was nothing to pin.
     Gone,
-    /// Not ours — the record is back at the lock path, untouched.
+    /// Not ours. Nothing of theirs was moved, quarantined or briefly unreachable —
+    /// only the extra name WE made was removed.
     Restored,
-    /// Not ours, and a NEW lock appeared while the path was empty: the record is
-    /// left in quarantine as evidence and nothing was destroyed.
-    Displaced(PathBuf),
-    /// The rename itself failed (transient); nothing moved.
+    /// §4b step 5: the entry we removed proved not to have been ours after all.
+    /// Reported under its own name; it never passes for a clean release.
+    Displaced,
+    /// The `link` or the `unlink` failed (transient); nothing was removed.
     Failed(String),
 }
 
-fn detach_and_decide(lock_path: &Path, our_token: &str) -> Detached {
-    let quarantine = with_suffix(lock_path, &format!("reclaim.{}", mint_token()));
-    // (a) ONE atomic syscall. The path is now free and we hold a private handle
-    //     on exactly one inode.
-    if let Err(e) = std::fs::rename(lock_path, &quarantine) {
+fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> Removal {
+    #[cfg(test)]
+    if inject::armed(&inject::USE_REJECTED_DETACH) {
+        return rejected_detach_then_decide(lock_path, our_token);
+    }
+
+    let pin = with_suffix(lock_path, &format!("pin.{}", mint_token()));
+    let drop_pin = || {
+        let _ = std::fs::remove_file(&pin);
+    };
+
+    // (1) ONE atomic syscall that ADDS a directory entry and removes none. The
+    //     lock path keeps its own entry throughout, so there is no instant at
+    //     which it is free and therefore no instant in which a third process can
+    //     create on it. ENOENT ⇒ there was nothing to pin; we changed nothing.
+    if let Err(e) = std::fs::hard_link(lock_path, &pin) {
         return if e.kind() == std::io::ErrorKind::NotFound {
-            Detached::Gone
+            Removal::Gone
         } else {
-            Detached::Failed(e.to_string())
+            Removal::Failed(e.to_string())
         };
     }
-    // THE GAP. Everything between here and the unlink/link below runs with the
-    // authority pathname EMPTY. §4a exists so we only ever get here having proved
-    // the pathname was ours; the seam lets a test drive a third process into the
-    // window and show that it never opens.
-    after_detach_rename();
+    // THE SEAM, on the syscall the fixed primitive actually calls. A test drives a
+    // real third process in HERE — at the instant removal has reached for the
+    // authority pathname — and it must find the path still taken.
+    after_authority_reach();
 
-    // (b) inspect ONLY the moved inode.
-    let raw = std::fs::read_to_string(&quarantine).unwrap_or_default();
-    let ours = parse_record(&raw).map(|r| r.token == our_token).unwrap_or(false);
-    if ours {
-        // (c) the removal provably hit the inode we judged, and nothing else.
-        if std::fs::remove_file(&quarantine).is_ok() {
-            return Detached::Removed;
+    // (2) Judge through a HANDLE ON THE PIN, never a second lookup of the lock
+    //     path: bytes and identity from `read`/`fstat` of ONE descriptor belong to
+    //     one file, whatever the pathname does next.
+    let mut fd = match std::fs::File::open(&pin) {
+        Ok(f) => f,
+        Err(e) => {
+            drop_pin();
+            return Removal::Failed(e.to_string());
         }
-        // fall through and put it back rather than leave the week unlocked
+    };
+    let mut raw = String::new();
+    if let Err(e) = fd.read_to_string(&mut raw) {
+        drop_pin();
+        return Removal::Failed(e.to_string());
     }
-    // (d) we moved somebody else's live lock. Put it back.
+    let meta = match fd.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            drop_pin();
+            return Removal::Failed(e.to_string());
+        }
+    };
+
+    // BOTH HALVES, AND THEY MUST AGREE. The RECORD proves intent — only the holder
+    // knows the token. The INODE proves identity — `(dev, ino)` cannot be forged
+    // or reused while the handle acquisition holds is alive. Our token on somebody
+    // else's inode is not our lock (a restored copy of our record); somebody
+    // else's token on our inode is not our lock either (our file overwritten in
+    // place, and removing it would delete a record we cannot attribute).
+    let token_ours = parse_record(&raw)
+        .map(|r| r.token == our_token)
+        .unwrap_or(false);
+    let ours = match mine {
+        Some(m) => token_ours && ids_of(&meta) == (m.dev, m.ino),
+        None => token_ours,
+    };
+    // (3) NOT OURS ⇒ only the extra name we just made goes.
+    if !ours {
+        drop_pin();
+        return Removal::Restored;
+    }
+
+    // (4) THE LINK-COUNT PROOF. Our lock has exactly one name of its own (acquire
+    //     scrubs the staging link), so with the pin it must be ≥ 2. Less than that
+    //     PROVES the lock path is no longer a name for our inode and that the
+    //     unlink below would land on somebody else's directory entry: refuse, and
+    //     report it as a successor's.
+    let before = nlink_of(&meta);
+    if before < 2 {
+        drop_pin();
+        return Removal::Restored;
+    }
+    // THE RELEASE POINT — the one instant the path becomes free.
+    if let Err(e) = std::fs::remove_file(lock_path) {
+        drop_pin();
+        return if e.kind() == std::io::ErrorKind::NotFound {
+            Removal::Gone
+        } else {
+            Removal::Failed(e.to_string())
+        };
+    }
+    // (5) Confirm against the SAME descriptor: our inode must have LOST a name.
+    let after = fd.metadata().ok().map(|m| nlink_of(&m));
+    drop_pin();
+    match after {
+        Some(a) if a >= before => Removal::Displaced,
+        _ => Removal::Removed,
+    }
+}
+
+/// **THE REJECTED PRIMITIVE, WRITTEN OUT.** Not reachable outside `cfg(test)` and
+/// never called by the module: it exists so the negatives below have a build that
+/// REPRODUCES the audit's two-holder outcome, exactly as the Node guard ships a
+/// detach-then-decide stand-in beside its reproductions. A gate whose control
+/// cannot fail is not a gate.
+#[cfg(test)]
+fn rejected_detach_then_decide(lock_path: &Path, our_token: &str) -> Removal {
+    let quarantine = with_suffix(lock_path, &format!("reclaim.{}", mint_token()));
+    if let Err(e) = std::fs::rename(lock_path, &quarantine) {
+        return if e.kind() == std::io::ErrorKind::NotFound {
+            Removal::Gone
+        } else {
+            Removal::Failed(e.to_string())
+        };
+    }
+    // THE GAP: from here until the unlink/link below, the authority pathname is
+    // EMPTY. This is the window reviewer seq 195 drove a third process into.
+    after_authority_reach();
+    let raw = std::fs::read_to_string(&quarantine).unwrap_or_default();
+    let ours = parse_record(&raw)
+        .map(|r| r.token == our_token)
+        .unwrap_or(false);
+    if ours && std::fs::remove_file(&quarantine).is_ok() {
+        return Removal::Removed;
+    }
     match std::fs::hard_link(&quarantine, lock_path) {
         Ok(()) => {
             let _ = std::fs::remove_file(&quarantine);
-            Detached::Restored
+            Removal::Restored
         }
-        // EEXIST: somebody took the free path. KEEP the record — destroying a
-        // lock file we could not attribute is precisely what this never does.
-        Err(_) => Detached::Displaced(quarantine),
+        Err(_) => Removal::Displaced,
     }
 }
 
@@ -738,6 +1051,13 @@ pub struct Options {
     pub wait_ms: u64,
     pub stale_ms: u64,
     pub sleep_ms: u64,
+    /// An EXPLICIT pathname for this lock, in place of `<root>/.casa/locks/<name>.lock`
+    /// (the Node twin's `opts.lockPath`). It exists for exactly one caller: the
+    /// feed's `.conversation.lock`, which predates the `.casa/locks/` table and is
+    /// spoken by every existing feed writer on both sides, so it is SUPPLIED
+    /// rather than migrated (docs/42 §1, §10). Same protocol, same
+    /// implementation, same rank — only the pathname differs.
+    pub lock_path: Option<PathBuf>,
     pub(crate) now_ms: fn() -> i64,
     pub(crate) kill: fn(i64) -> Result<(), i32>,
 }
@@ -748,6 +1068,7 @@ impl Default for Options {
             wait_ms: DEFAULT_WAIT_MS,
             stale_ms: DEFAULT_STALE_MS,
             sleep_ms: SLEEP_MS,
+            lock_path: None,
             now_ms: || chrono::Utc::now().timestamp_millis(),
             kill: real_kill,
         }
@@ -779,6 +1100,11 @@ impl std::fmt::Debug for Options {
 /// hands back what was PROVED.
 #[derive(Debug)]
 pub struct ProjectLock {
+    /// The household this lock was taken for. Kept as EVIDENCE for a report — the
+    /// lock's identity is the resolved `path`, which is what release acts on, so
+    /// a lock taken at an explicit `lock_path` is finished against that pathname
+    /// and never against the one the (root, name) table would have chosen.
+    #[allow(dead_code)]
     root: PathBuf,
     name: String,
     path: PathBuf,
@@ -799,7 +1125,7 @@ impl ProjectLock {
     }
 
     pub fn release(mut self) -> Release {
-        let out = release_locked(&self.root, &self.name, &self.token);
+        let out = release_locked(&self.path, &self.name, &self.token);
         self.released = true;
         out
     }
@@ -808,7 +1134,7 @@ impl ProjectLock {
 impl Drop for ProjectLock {
     fn drop(&mut self) {
         if !self.released {
-            let _ = release_locked(&self.root, &self.name, &self.token);
+            let _ = release_locked(&self.path, &self.name, &self.token);
         }
     }
 }
@@ -828,7 +1154,12 @@ pub fn acquire(root: &Path, name: &str, opts: &Options) -> Result<ProjectLock, L
             cure: cure_for(&path, "no-project-root"),
         });
     }
-    let path = lock_path_for(root, name);
+    // The pathname is the identity of the lock (§1). `opts.lock_path` supplies it
+    // directly for the feed, whose `.conversation.lock` predates the table.
+    let path = opts
+        .lock_path
+        .clone()
+        .unwrap_or_else(|| lock_path_for(root, name));
 
     // A PENDING RELEASE IS NOT RE-ENTERABLE (§4/§6). The frame that owned this
     // lock has already finished and tried to release; treating that as
@@ -841,7 +1172,7 @@ pub fn acquire(root: &Path, name: &str, opts: &Options) -> Result<ProjectLock, L
             .map(|x| x.token.clone())
     });
     if let Some(tok) = pending {
-        let finished = release_locked(root, name, &tok);
+        let finished = release_locked(&path, name, &tok);
         if let Release::Retained(_) = finished {
             report_unrecoverable(&path, name, "release-pending");
             return Err(LockRefusal::Unavailable {
@@ -901,7 +1232,7 @@ pub fn acquire(root: &Path, name: &str, opts: &Options) -> Result<ProjectLock, L
     let last_detail = loop {
         let token = mint_token();
         match try_publish(&path, &token, pid, &host, (opts.now_ms)()) {
-            Published::Took { dev, ino } => {
+            Published::Took { dev, ino, handle } => {
                 HELD.with(|h| {
                     h.borrow_mut().insert(
                         path.clone(),
@@ -911,6 +1242,9 @@ pub fn acquire(root: &Path, name: &str, opts: &Options) -> Result<ProjectLock, L
                             pending: false,
                             dev,
                             ino,
+                            // §4a: the authority handle travels with the ownership
+                            // record and is held for the whole critical section.
+                            handle: Some(std::sync::Arc::new(handle)),
                         },
                     )
                 });
@@ -998,9 +1332,53 @@ fn classify_held(path: &Path, host: &str, opts: &Options) -> &'static str {
     "held"
 }
 
-/// Release, per §4/§4a. Ownership is dropped only on proof.
-fn release_locked(root: &Path, name: &str, token: &str) -> Release {
-    let path = lock_path_for(root, name);
+/// What the read-only pre-check (§4a) could establish about the lock path, from
+/// ONE descriptor. A `stat` of a name plus a `read` of the same name are two
+/// lookups with a successor-sized gap between them; opening once and asking
+/// `read`/`fstat` of THAT descriptor judges one inode.
+enum SelfOwnership {
+    /// Nothing at the pathname.
+    Gone,
+    /// The record carries our token AND the kernel agrees it is our inode.
+    Ours,
+    /// Provably somebody else's — touch NOTHING.
+    Foreign,
+    /// The evidence could not be obtained (EIO on the open or the read, an
+    /// unparseable record). NOT "probably ours": the caller fails closed and keeps
+    /// the right to retry. `receipt-s1b-three` made this the contract and the
+    /// collapse landed on it (docs/42 §10).
+    Unverifiable(String),
+}
+
+fn verify_self_ownership(lock_path: &Path, token: &str, mine: Option<&Holder>) -> SelfOwnership {
+    let mut fd = match std::fs::File::open(lock_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SelfOwnership::Gone,
+        Err(e) => return SelfOwnership::Unverifiable(e.to_string()),
+    };
+    let mut raw = String::new();
+    if let Err(e) = fd.read_to_string(&mut raw) {
+        return SelfOwnership::Unverifiable(e.to_string());
+    }
+    let st = fd.metadata().ok();
+    let Some(rec) = parse_record(&raw) else {
+        return SelfOwnership::Unverifiable("unattributable".into());
+    };
+    if rec.token != token {
+        return SelfOwnership::Foreign;
+    }
+    match (mine, st) {
+        (Some(m), Some(st)) if ids_of(&st) != (m.dev, m.ino) => SelfOwnership::Foreign,
+        _ => SelfOwnership::Ours,
+    }
+}
+
+/// Release, per §4/§4a/§4b. Ownership is dropped only on proof.
+fn release_locked(lock_path: &Path, name: &str, token: &str) -> Release {
+    // The RESOLVED pathname travels with the holder: an outstanding release must be
+    // finished against the SAME pathname the holder took, not the one the
+    // (root, name) table would have chosen for it.
+    let path = lock_path.to_path_buf();
     let mine = HELD.with(|h| h.borrow().get(&path).cloned());
 
     // THE TOKEN IS CHECKED FIRST, AGAINST OUR OWN RECORD, BEFORE ANY DISK OR
@@ -1025,7 +1403,14 @@ fn release_locked(root: &Path, name: &str, token: &str) -> Release {
         return Release::Gone;
     }
 
+    // Ownership is given up HERE and only here — and the AUTHORITY HANDLE goes
+    // with it (§4a): the advisory claim is handed back explicitly and the
+    // descriptor closed. A RETAINED release keeps both, because it still owns the
+    // lock and still needs the evidence on the retry.
     let drop_held = || {
+        if let Some(h) = mine.as_ref().and_then(|m| m.handle.as_ref()) {
+            drop_authority_flock(h);
+        }
         HELD.with(|h| h.borrow_mut().remove(&path));
         STACK.with(|s| {
             let mut b = s.borrow_mut();
@@ -1046,74 +1431,101 @@ fn release_locked(root: &Path, name: &str, token: &str) -> Release {
 
     let mut last = "gone".to_string();
     for attempt in 0..RELEASE_ATTEMPTS {
-        // ── §4a: OWNERSHIP BEFORE ANY PATHNAME CHANGE ────────────────────────
-        // Going straight to `rename(lockPath, quarantine)` and judging the record
-        // afterwards moves a LIVE SUCCESSOR's authority pathname out of the way,
-        // and the pathname then sits EMPTY for the length of a read: a third
-        // process's create succeeds there, the restoring link fails EEXIST, and
-        // two processes are left each certain they hold the week. The fix is not
-        // a better judgement AFTER the move — it is refusing to move a pathname
-        // we have not proved is ours.
         if precheck_enabled() {
-            let st = std::fs::symlink_metadata(&path).ok();
-            let Some(st) = st else {
-                // Nothing at the pathname at all: nobody's authority is at risk.
-                last = "gone".into();
-                if attempt + 1 < RELEASE_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    continue;
+            // ── THE HANDLE FIRST: DOES OUR RECORD STILL HAVE A NAME AT ALL? ───
+            // One `fstat` of the descriptor we have held since acquisition,
+            // touching no pathname. `nlink == 0` is the kernel saying our lock
+            // file was removed while we held it — by a human clearing a wedge, by
+            // a fixture, by anything. Whatever is at the lock path now is somebody
+            // else's or nothing at all, and either way the correct action is to
+            // touch NOTHING. Asking this BEFORE any lookup is also what stops an
+            // inode number that has since been REISSUED to another file from being
+            // mistaken for ours below.
+            let live = mine
+                .as_ref()
+                .and_then(|m| m.handle.as_ref())
+                .and_then(|h| h.metadata().ok());
+            if let Some(st) = live {
+                if nlink_of(&st) == 0 {
+                    let occupied = std::fs::symlink_metadata(&path).is_ok();
+                    drop_held();
+                    return if occupied {
+                        Release::Stolen
+                    } else {
+                        Release::Gone
+                    };
                 }
-                drop_held();
-                return Release::Gone;
-            };
-            match &mine {
-                // `(dev, ino)` from the fstat of the inode we published is the
-                // kernel's own answer — unforgeable, and not reusable by another
-                // process while our link lives.
-                Some(m) => {
-                    if ids_of(&st) != (m.dev, m.ino) {
-                        drop_held();
-                        return Release::Stolen;
+            }
+
+            // ── A READ-ONLY PRE-CHECK, WHICH IS NOT THE DECISION ──────────────
+            // If the pathname already resolves to a DIFFERENT inode, a successor
+            // owns the lock and we can report it without even pinning. It is NOT
+            // the exclusion decision — that one cannot be made on a closed
+            // descriptor (reviewer seq 195: verify, then act on a pathname, is two
+            // decisions with a gap). The decision belongs to `pin_and_decide`,
+            // which re-establishes both halves of the evidence on an inode it has
+            // ADDED A NAME TO, and never lets the pathname go free.
+            match verify_self_ownership(&path, token, mine.as_ref()) {
+                SelfOwnership::Foreign => {
+                    drop_held();
+                    return Release::Stolen;
+                }
+                SelfOwnership::Unverifiable(reason) => {
+                    // THE EVIDENCE COULD NOT BE OBTAINED — and "I could not read
+                    // it" must never soften into "it is probably still mine".
+                    // Retrying is allowed; guessing is not.
+                    last = format!("unverifiable:{reason}");
+                    if attempt + 1 < RELEASE_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
                     }
+                    return retain(last);
                 }
-                // No kernel-grounded identity (a release driven by token alone).
-                // Fall back to the RECORD, and still refuse to move a pathname
-                // whose token is not ours — weaker evidence than an inode, but
-                // never as weak as "rename first and judge afterwards".
-                None => {
-                    let rec = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|r| parse_record(&r));
-                    if rec.map(|r| r.token != token).unwrap_or(true) {
-                        drop_held();
-                        return Release::Stolen;
+                SelfOwnership::Gone => {
+                    // Nothing at the pathname at all: nobody's authority is at risk.
+                    last = "gone".into();
+                    if attempt + 1 < RELEASE_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
                     }
+                    drop_held();
+                    return Release::Gone;
                 }
+                SelfOwnership::Ours => {}
             }
         }
 
-        match detach_and_decide(&path, token) {
-            Detached::Removed => {
+        match pin_and_decide(&path, token, mine.as_ref()) {
+            Removal::Removed => {
                 drop_held();
                 return Release::Released;
             }
-            // Provably not ours any more: a successor legitimately owns the lock.
-            Detached::Restored => {
+            // Provably not ours any more: a successor legitimately owns the lock,
+            // and nothing of theirs was moved, quarantined or briefly unreachable.
+            Removal::Restored => {
                 drop_held();
                 return Release::Stolen;
             }
-            Detached::Displaced(q) => {
+            Removal::Displaced => {
+                // §4b step 5 fired: the directory entry this release removed proved,
+                // against the kernel's link count on the inode it was holding open,
+                // not to have been its own. An outsider cleared the lock path
+                // between two adjacent syscalls and a successor's entry went with
+                // our unlink. There is no cure and no putting it back — the only
+                // honest thing to do is name it so it never reads as a clean
+                // release.
                 eprintln!(
-                    "[project-lock] {}: a foreign lock record was moved to {} and could not be \
-                     restored — it is LEFT ON DISK as evidence. A lock record is never destroyed \
-                     on a guess.",
-                    path.display(),
-                    q.display()
+                    "[project-lock] {}: displaced — this release removed a lock entry that was \
+                     NOT its own, because the lock path was cleared underneath it. Another \
+                     process may believe it still holds \"{name}\". Stop the writers of that lock \
+                     and restart them; do not clear lock files by hand while a mutation is \
+                     running.",
+                    path.display()
                 );
                 drop_held();
                 return Release::Stolen;
             }
-            Detached::Gone => {
+            Removal::Gone => {
                 last = "gone".into();
                 if attempt + 1 < RELEASE_ATTEMPTS {
                     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1122,7 +1534,7 @@ fn release_locked(root: &Path, name: &str, token: &str) -> Release {
                 drop_held();
                 return Release::Gone;
             }
-            Detached::Failed(e) => {
+            Removal::Failed(e) => {
                 last = e;
                 if attempt + 1 < RELEASE_ATTEMPTS {
                     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1585,24 +1997,99 @@ mod tests {
         clean();
     }
 
-    /// **§4a, injected at the boundary — the successor gap.** A third process
-    /// started from INSIDE the injected rename must never acquire.
+    /// **§4b, injected at the boundary — THE PIN INSTANT.** A real third OS
+    /// process, started at the exact moment removal reaches for the authority
+    /// pathname, must never acquire.
     ///
-    /// The conforming build never gets as far as the rename when a successor owns
-    /// the pathname, so the hook never fires and the third process never runs.
-    /// That would be a vacuous pass on its own, so the same scenario runs a second
-    /// time with §4a switched OFF: there the hook fires, the third process DOES
-    /// acquire on the empty pathname, and two holders exist at once — the exact
-    /// audit outcome (`cLocked: true`, `currentIsC: true`) this gate forbids.
+    /// THE ARMING IS THE POINT. This gate used to fire on `rename`, the syscall
+    /// detach-then-decide used. The fixed primitive never renames, so left there
+    /// the hook could no longer fire and the gate would be VACUOUS — green while
+    /// testing nothing. It is armed on the `link` that PINS: the conforming build
+    /// really does reach for the lock path, the third process really does run, and
+    /// it is refused because `link(2)` ADDS a name and frees nothing.
+    ///
+    /// The CONTROL restores detach-then-decide and reproduces the audit's
+    /// outcome — the same fixture, the same instant, and the third process gets in.
     #[test]
     #[serial(project_lock)]
-    fn a_third_process_started_inside_the_rename_never_acquires() {
+    fn a_third_process_racing_the_pin_never_acquires() {
+        // ── the CONFORMING build: the hook FIRES, and the path is still taken ──
+        clean();
+        let dir = scratch();
+        let path = lock_path_for(dir.path(), WEEK_MUTATION);
+        let holder = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
+        let our_record = std::fs::read_to_string(&path).unwrap();
+
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        arm_third_process_hook(dir.path(), &fired);
+        let outcome = holder.release();
+        let third = read_third_process_verdict(dir.path());
+        inject::reset();
+
+        assert_eq!(outcome, Release::Released);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the seam must be armed on the syscall the FIXED primitive calls (the pin `link`), \
+             or this gate is vacuous"
+        );
+        assert_eq!(
+            third.as_deref(),
+            Some("refused:held"),
+            "§4b: `link` adds a name and removes none, so the authority pathname is NEVER free — \
+             a third process racing the pin finds the lock still held"
+        );
+        assert!(!path.exists(), "and the release still completed");
+        assert!(debris(&path).is_empty(), "{:?}", debris(&path));
+
+        // ── the CONTROL: detach-then-decide, the REJECTED primitive ───────────
+        clean();
+        let dir2 = scratch();
+        let path2 = lock_path_for(dir2.path(), WEEK_MUTATION);
+        let holder = acquire(dir2.path(), WEEK_MUTATION, &opts(200)).unwrap();
+        let fired2 = std::sync::Arc::new(AtomicBool::new(false));
+        arm_third_process_hook(dir2.path(), &fired2);
+        inject::USE_REJECTED_DETACH.store(true, Ordering::SeqCst);
+        let _ = holder.release();
+        let third2 = read_third_process_verdict(dir2.path());
+        inject::reset();
+
+        assert!(
+            fired2.load(Ordering::SeqCst),
+            "the control must actually reach the rename, or it proves nothing"
+        );
+        assert_eq!(
+            third2.as_deref(),
+            Some("acquired"),
+            "CONTROL: `rename` frees the authority pathname, and a third process takes the week \
+             inside the gap — the failure the conforming half above must not reproduce"
+        );
+        // The control's third process is still "holding" a lock nobody will release.
+        let _ = std::fs::remove_file(&path2);
+        clean();
+        let _ = our_record;
+    }
+
+    /// **§4a, the POST-VERIFICATION successor gap — reviewer seq 195, 4/4.** The
+    /// fixture is the audit's: a holder verifies, an outsider clears the lock file,
+    /// a successor legitimately acquires, and only THEN does the predecessor's
+    /// already-approved decision fire. A pre-check cannot save a build that acts on
+    /// a pathname afterwards — the authority handle can, because `nlink == 0` on
+    /// the descriptor we never closed is a path-free proof that our record was
+    /// cleared while we held it.
+    ///
+    /// The CONTROL is the rejected build in full: §4a's evidence off and
+    /// detach-then-decide back. It reproduces the audit's two-holder state — the
+    /// third process acquires (`cLocked: true`) while the successor still believes
+    /// it holds the week.
+    #[test]
+    #[serial(project_lock)]
+    fn a_successor_is_never_displaced_by_a_predecessors_release() {
         // ── the CONFORMING build ────────────────────────────────────────────
         clean();
         let dir = scratch();
         let path = lock_path_for(dir.path(), WEEK_MUTATION);
         let predecessor = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
-        std::fs::remove_file(&path).unwrap(); // a human cleared the wedge
+        std::fs::remove_file(&path).unwrap(); // a human cleared the wedge (§5's cure)
         let successor = hold_elsewhere(dir.path(), opts(200));
         let successor_record = std::fs::read_to_string(&path).unwrap();
 
@@ -1615,28 +2102,31 @@ mod tests {
         assert_eq!(outcome, Release::Stolen);
         assert!(
             !fired.load(Ordering::SeqCst),
-            "§4a: the pathname must never be renamed once a successor owns it — no rename, no \
-             gap, no third holder"
+            "§4a: our own record has no name left on disk, so release reaches for NOTHING — not \
+             even to pin"
         );
         assert_eq!(third, None, "no third process ran, so none could acquire");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             successor_record,
-            "the successor still holds the week"
+            "the successor still holds the week, byte for byte"
         );
-        successor.release();
+        assert!(debris(&path).is_empty(), "{:?}", debris(&path));
+        assert_eq!(successor.release(), Release::Released);
 
-        // ── the CONTROL: §4a off is the REJECTED build ──────────────────────
+        // ── the CONTROL: the REJECTED build reproduces TWO HOLDERS ───────────
         clean();
         let dir2 = scratch();
         let path2 = lock_path_for(dir2.path(), WEEK_MUTATION);
         let predecessor = acquire(dir2.path(), WEEK_MUTATION, &opts(200)).unwrap();
         std::fs::remove_file(&path2).unwrap();
         let successor = hold_elsewhere(dir2.path(), opts(200));
+        let successor_record2 = std::fs::read_to_string(&path2).unwrap();
 
         let fired2 = std::sync::Arc::new(AtomicBool::new(false));
         arm_third_process_hook(dir2.path(), &fired2);
         inject::SKIP_OWNERSHIP_PRECHECK.store(true, Ordering::SeqCst);
+        inject::USE_REJECTED_DETACH.store(true, Ordering::SeqCst);
         let _ = predecessor.release();
         let third2 = read_third_process_verdict(dir2.path());
         inject::reset();
@@ -1648,11 +2138,90 @@ mod tests {
         assert_eq!(
             third2.as_deref(),
             Some("acquired"),
-            "CONTROL: without §4a a third process takes the week inside the gap — this is the \
-             failure the conforming half above must not reproduce"
+            "CONTROL: the audit's `cLocked: true` — a third process took the week out of the gap \
+             the rename opened in a LIVE successor's authority pathname"
         );
-        let _ = successor.release();
+        assert_ne!(
+            std::fs::read_to_string(&path2).unwrap(),
+            successor_record2,
+            "CONTROL: `currentIsC: true` — the record at the lock path is the third process's, \
+             not the successor's"
+        );
+        // ...and the successor only finds out when it tries to let go. That is the
+        // two-holder window: it was inside its section the whole time.
+        assert_eq!(successor.release(), Release::Stolen);
+        let _ = std::fs::remove_file(&path2);
         clean();
+    }
+
+    /// **§4a's kernel-enforced half — the one the JS twin cannot have.** docs/42
+    /// §4b states Node's residue and then requires the Rust twin to hold
+    /// `LOCK_EX` on the authority handle across the section. While a holder is
+    /// inside, the published inode is claimed by the kernel: no second holder can
+    /// be in a section on that inode by ANY route — a leftover pin name, a
+    /// hard-linked copy of the record, a `link` that put it back.
+    ///
+    /// The probe opens the lock file afresh, so it is a different open file
+    /// description and `flock` treats it as an independent contender even from
+    /// this process. Its CONTROL removes the claim and shows the same probe
+    /// succeeding, so the assertion is the kernel's answer and not the probe's.
+    #[test]
+    #[serial(project_lock)]
+    #[cfg(unix)]
+    fn the_published_inode_is_claimed_with_flock_for_the_whole_section() {
+        clean();
+        let dir = scratch();
+        let path = lock_path_for(dir.path(), WEEK_MUTATION);
+
+        let held = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
+        assert_eq!(
+            probe_flock(&path),
+            Some(false),
+            "a holder inside its section holds LOCK_EX on the inode it published"
+        );
+        assert_eq!(held.release(), Release::Released);
+
+        // Released with the lock, not merely at process exit: a fresh acquisition
+        // of a NEW inode is claimable again, and the old claim is gone with the
+        // handle.
+        let again = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
+        assert_eq!(probe_flock(&path), Some(false));
+        again.release();
+        assert_eq!(probe_flock(&path), None, "no lock file, nothing to claim");
+
+        // ── the CONTROL: without the claim the probe walks straight in ────────
+        clean();
+        let dir2 = scratch();
+        let path2 = lock_path_for(dir2.path(), WEEK_MUTATION);
+        inject::SKIP_AUTHORITY_FLOCK.store(true, Ordering::SeqCst);
+        let held = acquire(dir2.path(), WEEK_MUTATION, &opts(200)).unwrap();
+        assert_eq!(
+            probe_flock(&path2),
+            Some(true),
+            "CONTROL: with `flock` removed the published inode is unclaimed — which is exactly \
+             the JS twin's position, and the residue docs/42 §4b asks this implementation to \
+             close"
+        );
+        assert_eq!(held.release(), Release::Released);
+        inject::reset();
+        clean();
+    }
+
+    /// `Some(true)` = the exclusive claim was granted (nobody held it),
+    /// `Some(false)` = EWOULDBLOCK (somebody is inside a section on that inode),
+    /// `None` = there is no lock file. Any claim it takes is given straight back.
+    #[cfg(unix)]
+    fn probe_flock(lock_path: &Path) -> Option<bool> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::open(lock_path).ok()?;
+        // SAFETY: `fd` is owned by `file` and outlives both calls.
+        let got = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if got {
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        Some(got)
     }
 
     /// Arm the seam so that, at the instant the authority pathname is empty, a
@@ -1661,7 +2230,7 @@ mod tests {
     fn arm_third_process_hook(root: &Path, fired: &std::sync::Arc<AtomicBool>) {
         let root = root.to_path_buf();
         let fired = fired.clone();
-        *inject::AFTER_DETACH_RENAME.lock().unwrap() = Some(Box::new(move || {
+        *inject::AFTER_AUTHORITY_REACH.lock().unwrap() = Some(Box::new(move || {
             fired.store(true, Ordering::SeqCst);
             child_acquire(&root);
         }));
@@ -1899,7 +2468,9 @@ mod tests {
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().to_string())
-                    .filter(|n| n.contains(".reclaim.") || n.contains(".new."))
+                    .filter(|n| {
+                        n.contains(".reclaim.") || n.contains(".new.") || n.contains(".pin.")
+                    })
                     .collect()
             })
             .unwrap_or_default()

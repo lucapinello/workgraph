@@ -1428,7 +1428,25 @@ emoji = "①"
     #[test]
     fn a_row_that_cannot_take_the_lock_is_refused_not_written_unserialised() {
         let (_dir, feed) = scratch_feed();
-        let held = super::super::feed_lock::acquire(&feed, 1000).unwrap();
+        // A SECOND WRITER, and not a nested frame of this one. Since the feed lock
+        // became an adapter over `project_lock`, re-entrancy is real and keyed per
+        // (thread, resolved path) (docs/42 §6): a "holder" taken on THIS call stack
+        // would be recognised as the same writer re-entering — correct behaviour,
+        // and a fixture that proves nothing about contention. The contender takes
+        // its role on a fresh thread, where the only thing the two share is the file.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (ready, held) = std::sync::mpsc::channel::<()>();
+        let contender = {
+            let feed = feed.clone();
+            std::thread::spawn(move || {
+                let lock = super::super::feed_lock::acquire(&feed, 1000)
+                    .expect("the other writer must acquire");
+                ready.send(()).unwrap();
+                let _ = wait.recv();
+                lock.release()
+            })
+        };
+        held.recv().expect("the other writer must acquire");
 
         let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
             .with_turn(TURN, ReplyPhase::Final);
@@ -1441,7 +1459,8 @@ emoji = "①"
             !feed.exists() || fs::read_to_string(&feed).unwrap().is_empty(),
             "NOTHING was written"
         );
-        held.release();
+        let _ = go.send(());
+        contender.join().unwrap();
 
         // And once the lock is free the same row goes in.
         assert_eq!(append_entry_allocating(&feed, &entry).unwrap(), 1);
