@@ -97,11 +97,13 @@
 //!    a leftover `.pin.` name, a hard-linked copy of the record, a `link` that put
 //!    it back — and the claim cannot be forged by inode reuse, because it lives
 //!    with the open file description and dies with it. What it does NOT close, said
-//!    plainly: §4b step 4's link-count proof and its `unlink` are still two
-//!    adjacent syscalls, and a successor that publishes a DIFFERENT inode at the
-//!    lock path in that window is not covered by a lock on ours. That residue
-//!    needs an outsider mutating the lock path during a live hold (§5) and is
-//!    reported as `displaced`, never as a clean release.
+//!    plainly: a successor that publishes a DIFFERENT inode at the lock path is not
+//!    covered by an advisory lock on ours, so `flock` was never what made the
+//!    removal safe. §4b step 5 is: the removal is an atomic `rename` that HANDS
+//!    BACK the inode it removed, so a successor published in the window between the
+//!    link-count proof and the removal is IDENTIFIED — as a fact, not an inference
+//!    from a count delta — and PUT BACK where it was published, and this release
+//!    reports that it lost the lock rather than that it let one go.
 //!
 //!    A read-only pre-check of the pathname (`open` ONCE, `read` + `fstat` that
 //!    descriptor, compare token AND inode) still runs first, because a successor
@@ -477,21 +479,45 @@ pub(crate) mod inject {
     /// the negatives below have a build that REPRODUCES the audit's two-holder
     /// outcome. Nothing outside `cfg(test)` can reach it.
     pub static USE_REJECTED_DETACH: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        /// Put the REJECTED REMOVAL of candidate `7da0c79a` back: a blind
+        /// `unlink(lockPath)` justified only by the link count read one syscall
+        /// earlier, confirmed only by the DELTA of that count. This is what the
+        /// reviewer's boundary control drove a successor through, 4/4. It exists
+        /// so the gate above has a build in which it FAILS — a gate whose control
+        /// cannot fail is not a gate. Nothing outside `cfg(test)` can reach it.
+        ///
+        /// THREAD-LOCAL, unlike the flags above. Those must reach the helper
+        /// threads a contention fixture takes its second role on; this one only
+        /// ever has to reach `holder.release()` on the arming test's own stack,
+        /// and a process-global would put the rejected primitive under every
+        /// unrelated append running concurrently in the same test binary.
+        pub static USE_BLIND_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub fn blind_unlink_armed() -> bool {
+        USE_BLIND_UNLINK.with(|f| f.get())
+    }
 
     type Hook = Box<dyn Fn() + Send + Sync>;
     /// Fired at the exact instant removal has reached for the authority pathname:
     /// after `link(lockPath → pin)` in the conforming build (where the pathname is
     /// still TAKEN), and after `rename(lockPath → quarantine)` in the rejected one
     /// (where it is EMPTY). Arming it on the syscall the fixed primitive actually
-    /// calls is the whole point: armed on `rename`, this gate would be VACUOUS —
-    /// green while testing nothing, because the fix never renames.
+    /// calls FIRST is the whole point: the conforming build reaches for the
+    /// authority pathname with a `link` that adds a name and frees none, and a gate
+    /// armed on the rejected build's opening move would be VACUOUS — green while
+    /// testing nothing. (§4b step 5 does rename, much later and only once the lock
+    /// has been proven ours; that is a different instant and has its own seam
+    /// below.)
     pub static AFTER_AUTHORITY_REACH: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
 
-    /// Fired between the LINK-COUNT PROOF and the unlink that acts on it — the
-    /// two-adjacent-syscall residue §4b documents. A successor driven in HERE is
-    /// the reviewer's second repro: the predecessor has already proved the path
-    /// was its own, and by the time it unlinks, the entry there is somebody
-    /// else's. It must never read as a clean release.
+    /// Fired between the LINK-COUNT PROOF and the removal that acts on it. A
+    /// successor driven in HERE is the reviewer's second repro: the predecessor
+    /// has already proved the pathname was its own, and by the time it removes,
+    /// the entry there is somebody else's. Under the blind unlink this cost the
+    /// successor its lock and still read as `Released`; under §4b step 5 the
+    /// rename identifies the entry it took and puts it back.
     pub static AFTER_LINK_COUNT_PROOF: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
 
     pub fn reset() {
@@ -500,6 +526,7 @@ pub(crate) mod inject {
         SKIP_OWNERSHIP_PRECHECK.store(false, std::sync::atomic::Ordering::SeqCst);
         SKIP_AUTHORITY_FLOCK.store(false, std::sync::atomic::Ordering::SeqCst);
         USE_REJECTED_DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
+        USE_BLIND_UNLINK.with(|f| f.set(false));
         *AFTER_AUTHORITY_REACH.lock().unwrap() = None;
         *AFTER_LINK_COUNT_PROOF.lock().unwrap() = None;
     }
@@ -862,14 +889,34 @@ fn with_suffix(lock_path: &Path, suffix: &str) -> PathBuf {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// §4b — PIN THEN JUDGE. The ONLY way this module removes a lock file.
+// §4b — PIN THEN JUDGE, THEN REMOVE BY IDENTITY. The ONLY way this module
+// removes a lock file.
 //
-// It never detaches anything: the authority pathname is never freed by a decision
-// that can have gone stale, and every removal is guarded by the kernel's own link
-// count on an inode we hold open. `rename` does not appear here, and neither does
-// `.reclaim.` quarantine — there is nothing to quarantine when nothing is moved.
-// A `*.pin.<hex>` file is a dead extra NAME for a record, never a lock: nothing
-// waits on it, acquisition never reads it, and it is removed on every exit path.
+// The DECISION is never made on a pathname that can have gone stale: a lock is
+// judged through a handle on an inode this release has ADDED A NAME TO, on both
+// halves of the evidence (our token in the record AND our `(dev, ino)` from the
+// kernel), with the link count re-read adjacent to the act. A record that is NOT
+// ours is never moved, quarantined or made briefly unreachable — step (3) returns
+// without touching the pathname at all.
+//
+// The REMOVAL is `rename(lockPath → *.detach.<hex>)`, and that is not the
+// `.reclaim.` quarantine §5 rejects. The rejected one renames on the strength of
+// a stale READ, before knowing whose lock it is, and can therefore free the
+// authority pathname out from under a live holder. This one is reached only after
+// the pin, both halves and the count have all said the lock is ours, and it is
+// there for the one thing `unlink(2)` cannot do: POSIX has no compare-and-unlink
+// (`funlinkat(2)` is FreeBSD-only and is not in `libc` for any target we build),
+// so a blind unlink can only be JUSTIFIED by a count read one syscall earlier —
+// and one syscall is all the reviewer's 4/4 control needed to make a predecessor
+// delete its successor's lock and call it a clean release. A rename REMOVES the
+// entry and HANDS BACK THE INODE IT REMOVED in one atomic step, so "whose entry
+// was that" is a fact rather than an inference. When the fact says "a
+// successor's", that successor's inode is still alive under a private name and it
+// goes straight back where it was published.
+//
+// A `*.pin.<hex>` / `*.detach.<hex>` file is a dead extra NAME for a record,
+// never a lock: nothing waits on one, acquisition never reads one, and both are
+// removed on every exit path.
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum Removal {
@@ -880,8 +927,14 @@ enum Removal {
     /// Not ours. Nothing of theirs was moved, quarantined or briefly unreachable —
     /// only the extra name WE made was removed.
     Restored,
-    /// §4b step 5: the entry we removed proved not to have been ours after all.
-    /// Reported under its own name; it never passes for a clean release.
+    /// §4b step 5: the entry we detached proved not to have been ours after all,
+    /// AND IT WAS PUT BACK — the same inode, under the same name, before
+    /// anything else could be done with the pathname. The successor still holds
+    /// its lock; we do not, and we say so.
+    SuccessorPreserved,
+    /// The entry we detached was not ours and could NOT be put back: something
+    /// else had already taken the pathname. Reported under its own name; it
+    /// never passes for a clean release.
     Displaced,
     /// The `link` or the `unlink` failed (transient); nothing was removed.
     Failed(String),
@@ -988,12 +1041,69 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
         drop_pin();
         return Removal::Restored;
     }
-    // THE SEAM AGAIN, at the two-adjacent-syscall residue §4b documents: a
-    // successor that lands between the count above and the unlink below is caught
-    // by (5), because the entry that goes is then B's and OUR count does not move.
+    // THE SEAM, at the interleaving the reviewer's 4/4 control reproduces: a
+    // successor that replaces the authority entry between the count above and the
+    // removal below. Everything after this point exists so that interleaving can
+    // no longer cost the successor its lock.
     after_link_count_proof();
-    // THE RELEASE POINT — the one instant the path becomes free.
-    if let Err(e) = std::fs::remove_file(lock_path) {
+
+    // THE REJECTED REMOVAL, WRITTEN OUT. Candidate `7da0c79a` unlinked the
+    // pathname here on the strength of the count above and confirmed itself with
+    // that count's delta. Restoring it — rather than merely turning a check off —
+    // is what makes the gate's control able to fail: the same fixture, the same
+    // seam, the reviewer's exact JSON.
+    #[cfg(test)]
+    if inject::blind_unlink_armed() {
+        if let Err(e) = std::fs::remove_file(lock_path) {
+            drop_pin();
+            return if e.kind() == std::io::ErrorKind::NotFound {
+                Removal::Gone
+            } else {
+                Removal::Failed(e.to_string())
+            };
+        }
+        let after = fd.metadata().ok().map(|m| nlink_of(&m));
+        drop_pin();
+        return match after {
+            Some(a) if a < before => Removal::Removed,
+            _ => Removal::Displaced,
+        };
+    }
+
+    // ── (5) THE REMOVAL, AND IT IS IDENTITY-PROVEN ──────────────────────────
+    //
+    // `unlink(path)` names a DIRECTORY ENTRY, never an inode, and POSIX has no
+    // compare-and-unlink (`funlinkat(2)` is FreeBSD-only and is not exposed by
+    // `libc` for any target this repo builds). A blind `remove_file(lock_path)`
+    // here could therefore only be JUSTIFIED by the count read one syscall
+    // earlier — and a justification that was true one syscall ago is exactly what
+    // the reviewer drove a successor through, 4/4:
+    //
+    //     predecessor "Released", successor's authority entry gone, third writer
+    //     admitted while the successor was still inside its section.
+    //
+    // `rename(lock_path, <detach>)` is ONE atomic syscall that removes the entry
+    // AND CAPTURES THE INODE IT REMOVED. There is no gap between "which file is
+    // this" and "take that entry away": whatever appears under the private detach
+    // name IS what the lock path named at the instant it stopped naming it. So
+    // the judgment below is a fact rather than an inference — and when it says
+    // the entry was a successor's, that successor's inode is still alive under a
+    // name only we hold, so it goes straight back where it was: the SAME inode,
+    // the same bytes, not a copy.
+    //
+    // THIS IS NOT §5's REJECTED RECLAIM, AND THE DIFFERENCE IS WHAT IS KNOWN
+    // BEFORE THE RENAME. That one renames on the strength of a stale READ, before
+    // knowing whose lock it is, so it can free the authority pathname out from
+    // under a live holder it never identified. This rename is reached only after
+    // the read-only pre-check, the pin, BOTH halves of the evidence and the
+    // adjacent link count have all said the lock is ours. A record that is not
+    // ours is still never moved, quarantined or made briefly unreachable — step
+    // (3) returns above without touching the pathname. The pathname this frees is
+    // one we have just proven we are entitled to free, and the single case in
+    // which that proof turns out to have gone stale is the case this exists to
+    // REPAIR rather than to report.
+    let detach = with_suffix(lock_path, &format!("detach.{}", mint_token()));
+    if let Err(e) = std::fs::rename(lock_path, &detach) {
         drop_pin();
         return if e.kind() == std::io::ErrorKind::NotFound {
             Removal::Gone
@@ -1001,15 +1111,79 @@ fn pin_and_decide(lock_path: &Path, our_token: &str, mine: Option<&Holder>) -> R
             Removal::Failed(e.to_string())
         };
     }
-    // (5) Confirm against the SAME descriptor: our inode must have LOST a name.
-    //     An unreadable confirmation is NOT a clean release — we removed a
-    //     directory entry and cannot say whose.
+    // WHOSE ENTRY DID WE JUST TAKE? Asked of a HANDLE on the detached inode, and
+    // compared against the inode we pinned and proved at (2) — the one carrying
+    // our token, kept alive (and therefore un-reissuable) by the descriptor `fd`.
+    let taken = std::fs::File::open(&detach)
+        .and_then(|f| f.metadata())
+        .map(|m| ids_of(&m));
+    let put_back = |detail: &str| -> Removal {
+        // Same inode, same bytes, under the name it was published at, and atomic
+        // — `link` fails EEXIST rather than clobbering whatever arrived in the
+        // meantime. Only when it CANNOT go back is this a displacement.
+        let restored = std::fs::hard_link(&detach, lock_path);
+        let _ = std::fs::remove_file(&detach);
+        match restored {
+            Ok(()) => Removal::SuccessorPreserved,
+            Err(e) => Removal::Failed(format!("{detail}: {e}")),
+        }
+    };
+    let ours_removed = match taken {
+        Ok(ids) => ids == ids_of(&meta),
+        Err(e) => {
+            // THE EVIDENCE COULD NOT BE OBTAINED. Put the entry back and fail
+            // closed: an unjudgeable removal is retained and retried, never
+            // reported as a release. If it really was ours, the retry re-proves
+            // it; if it was not, we have just given it back.
+            drop_pin();
+            return match put_back(&format!("unjudgeable detach ({e})")) {
+                Removal::SuccessorPreserved => {
+                    Removal::Failed(format!("the detached entry could not be judged: {e}"))
+                }
+                other => other,
+            };
+        }
+    };
+    if !ours_removed {
+        // A SUCCESSOR'S ENTRY, and we know it as a fact rather than a suspicion.
+        // It goes back before anything else can be done with the pathname, and
+        // this release reports that it has LOST the lock — never that it let go
+        // of one.
+        drop_pin();
+        return match put_back("a successor's entry could not be put back") {
+            Removal::Failed(detail) => {
+                report_displaced(lock_path, &detail);
+                Removal::Displaced
+            }
+            other => other,
+        };
+    }
+    // Our own entry, proven. The detach name is the last one we made; dropping it
+    // is the release point completing.
+    if let Err(e) = std::fs::remove_file(&detach) {
+        drop_pin();
+        return Removal::Failed(e.to_string());
+    }
+    // Confirm against the SAME descriptor: our inode must have LOST a name. An
+    // unreadable confirmation is NOT a clean release.
     let after = fd.metadata().ok().map(|m| nlink_of(&m));
     drop_pin();
     match after {
         Some(a) if a < before => Removal::Removed,
         _ => Removal::Displaced,
     }
+}
+
+/// Printed once: a directory entry that belonged to a live holder has gone and
+/// no report can put it back.
+fn report_displaced(lock_path: &Path, detail: &str) {
+    eprintln!(
+        "[project-lock] {}: displaced — this release detached a lock entry that was NOT its own \
+         and could not put it back ({detail}). Another process may believe it still holds this \
+         lock. Stop the writers of that lock and restart them; do not clear lock files by hand \
+         while a mutation is running.",
+        lock_path.display()
+    );
 }
 
 /// **THE REJECTED PRIMITIVE, WRITTEN OUT.** Not reachable outside `cfg(test)` and
@@ -1555,22 +1729,23 @@ fn release_locked(lock_path: &Path, name: &str, token: &str) -> Release {
                 drop_held();
                 return Release::Stolen;
             }
+            // §4b step 5 fired and the REPAIR held: the entry this release
+            // detached proved — atomically, against the inode the rename handed
+            // back — not to have been its own, and it was put straight back where
+            // it was published. An outsider cleared the lock path while we held
+            // it and a successor published there; the successor still has its
+            // lock, we do not have ours, and that is what we report. NOT
+            // `Released`: this release never let go of anything.
+            Removal::SuccessorPreserved => {
+                drop_held();
+                return Release::Stolen;
+            }
             Removal::Displaced => {
-                // §4b step 5 fired: the directory entry this release removed proved,
-                // against the kernel's link count on the inode it was holding open,
-                // not to have been its own. An outsider cleared the lock path
-                // between two adjacent syscalls and a successor's entry went with
-                // our unlink. There is no cure and no putting it back — the only
-                // honest thing to do is name it so it never reads as a clean
-                // release.
-                eprintln!(
-                    "[project-lock] {}: displaced — this release removed a lock entry that was \
-                     NOT its own, because the lock path was cleared underneath it. Another \
-                     process may believe it still holds \"{name}\". Stop the writers of that lock \
-                     and restart them; do not clear lock files by hand while a mutation is \
-                     running.",
-                    path.display()
-                );
+                // The repair could not be made — something else had already taken
+                // the pathname. There is no cure and no putting it back, so the
+                // only honest thing to do is name it (`report_displaced` printed
+                // the operator's line) so it never reads as a clean release.
+                let _ = name;
                 drop_held();
                 return Release::Stolen;
             }
@@ -1647,7 +1822,7 @@ pub fn with_project_lock<T>(
 /// telling the caller its write failed would be a different lie. The honest shape
 /// is a success the caller can interrogate: use [`Completed::verified`] where the
 /// distinction matters, `.out` where it does not.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "a completed section carries a release verdict — read it or take .out explicitly"]
 pub struct Completed<T, R = Release> {
     /// What the body returned. The mutation happened.
@@ -2274,38 +2449,35 @@ mod tests {
         clean();
     }
 
-    /// **THE REVIEWER'S SECOND REPRO (bridge seq 214, 4/4), AND WHAT IS STILL
-    /// OPEN IN IT.** A successor that replaces the authority path between this
-    /// release's link-count proof and its unlink is STILL removed, and the
-    /// release still reports `Released`. This test REPRODUCES that; it does not
-    /// claim it is fixed.
+    /// **THE REVIEWER'S SECOND REPRO (bridge seq 214, 4/4) — NOW THE GATE.** A
+    /// successor that replaces the authority path between this release's
+    /// link-count proof and its removal used to be DELETED by that removal, and
+    /// the release reported `Released`. The reviewer's boundary control read, four
+    /// runs out of four:
     ///
-    /// Why it cannot be closed here. The interleaving is:
+    /// ```json
+    /// {"predecessor":"Released","successorRecordSurvived":false,
+    ///  "third":"Ok(Released)","successorRelease":"Gone"}
+    /// ```
     ///
-    ///   A pins its inode (2 names) → A proves the count → B unlinks A's entry
-    ///   (A: 1 name) and publishes ITS OWN inode at the path → A unlinks the
-    ///   path, removing B's entry → A's count went 2 → 1, which is exactly what
-    ///   a clean release looks like.
+    /// Three writers believing they held one week, arriving through the staleness
+    /// of one integer. What closed it is in `pin_and_decide` step (5): the removal
+    /// is an atomic `rename` that HANDS BACK THE INODE IT REMOVED, so "whose entry
+    /// was that" stopped being an inference from a link count read one syscall
+    /// earlier and became a fact read off the thing itself — and a fact that
+    /// arrives while the successor's inode is still alive under a private name is
+    /// a fact you can act on: it goes back where it was published.
     ///
-    /// The count delta cannot distinguish "our entry went, by our unlink" from
-    /// "our entry went, by an outsider, and our unlink took a successor's". Only
-    /// an IDENTITY-CHECKED unlink can — `funlinkat(2)`, which fails unless the
-    /// path names the same file as the fd. It is FreeBSD-only and is not exposed
-    /// by the `libc` crate for any target this builds for, so `unlink(2)` by
-    /// name is the only removal available and this residue is irreducible in the
-    /// current primitive. What `pin_and_decide` DOES do is read the count
-    /// adjacent to the unlink (so every wider interleaving refuses without
-    /// touching anything) and make step (5) an affirmative proof (so an
-    /// unreadable confirmation is `Displaced`, not `Removed`).
+    /// This asserts every field of that control, inverted:
     ///
-    /// Closing it needs a protocol change, not a patch: either an authority
-    /// object that is never removed by name (a per-holder unique entry plus a
-    /// generation counter read under the section's `flock`), or a platform
-    /// removal that checks identity. Tracked as its own task — see the
-    /// `wg` graph, "Lock: close the pre-unlink successor window".
+    /// * the predecessor does NOT report a clean release;
+    /// * the successor's authority record SURVIVES, byte for byte;
+    /// * a third writer is REFUSED, because the pathname is occupied throughout;
+    ///   and
+    /// * the successor can still release its own lock.
     #[test]
     #[serial(project_lock)]
-    fn the_pre_unlink_successor_window_is_reproduced_and_still_open() {
+    fn a_successor_published_in_the_pre_removal_window_keeps_its_lock() {
         clean();
         let dir = scratch();
         let path = lock_path_for(dir.path(), WEEK_MUTATION);
@@ -2336,19 +2508,112 @@ mod tests {
             fired.load(Ordering::SeqCst),
             "the seam must actually fire, or this reproduction proves nothing"
         );
-        // THE KNOWN GAP, pinned so it cannot be quietly widened or forgotten:
-        // the successor's authority entry is gone and the predecessor called it
-        // a clean release. When the protocol change lands, BOTH of these flip
-        // and this test becomes the gate.
+        // 1. THE PREDECESSOR NEVER LET GO, AND SAYS SO.
+        assert_eq!(
+            verdict,
+            Release::Stolen,
+            "a release that removed nothing of its own must never read as Released"
+        );
+        // 2. THE SUCCESSOR'S RECORD SURVIVED — the same bytes, put back under the
+        //    same name. `successorRecordSurvived: false` was the whole disaster.
+        assert!(
+            path.exists(),
+            "the successor's authority entry was removed by its predecessor"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            successor_record,
+            "the record that came back is byte-for-byte the successor's, not a copy \
+             of ours and not a rewrite"
+        );
+        // 3. A THIRD WRITER IS REFUSED. In the control it acquired cleanly
+        //    (`third: Ok(Released)`) because the pathname had been left free.
+        let third = acquire_elsewhere(dir.path(), opts(50));
+        let third_detail = match &third {
+            Ok(v) => panic!("a third writer acquired a lock a successor still holds: {v:?}"),
+            Err(e) => e.detail().to_string(),
+        };
+        // `foreign-host` is the classification THIS fixture's record earns — it
+        // names `host: "successor"`, which is not this machine — and it is a
+        // refusal that also never removes anything (§5). `held`/`timeout` are
+        // what a same-host successor produces. Any of the three is the flip; the
+        // control's `Ok(Released)` was the disaster.
+        assert!(
+            ["held", "timeout", "foreign-host"].contains(&third_detail.as_str()),
+            "the third writer must be refused BECAUSE somebody else's lock is in \
+             place, not for some other reason: {third_detail}"
+        );
+        // 4. AND NO DEBRIS: the detach/pin names are private and every exit path
+        //    removes them, so what is left in the directory is the lock and
+        //    nothing else.
+        assert_eq!(
+            debris(&path),
+            Vec::<String>::new(),
+            "the repair left temporary names behind"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        clean();
+    }
+
+    /// **THE GATE'S CONTROL.** With the rejected removal of candidate `7da0c79a`
+    /// put back — a blind `unlink` justified by a count read one syscall earlier
+    /// — the SAME fixture reproduces the reviewer's boundary JSON exactly:
+    ///
+    /// ```json
+    /// {"predecessor":"Released","successorRecordSurvived":false,
+    ///  "third":"Ok(Released)","successorRelease":"Gone"}
+    /// ```
+    ///
+    /// Without this, "the successor keeps its lock" would be satisfiable by a
+    /// fixture that never put a successor there, and the gate above would be
+    /// green while testing nothing.
+    #[test]
+    #[serial(project_lock)]
+    fn the_rejected_blind_unlink_still_loses_the_successors_lock() {
+        clean();
+        let dir = scratch();
+        let path = lock_path_for(dir.path(), WEEK_MUTATION);
+
+        inject::USE_BLIND_UNLINK.with(|f| f.set(true));
+        let holder = acquire(dir.path(), WEEK_MUTATION, &opts(200)).unwrap();
+
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let successor_record = "{\"token\":\"".to_string()
+            + &"b".repeat(32)
+            + "\",\"pid\":1,\"host\":\"successor\",\"name\":\"week-mutation\",\"v\":1}\n";
+        {
+            let path = path.clone();
+            let fired = fired.clone();
+            let record = successor_record.clone();
+            *inject::AFTER_LINK_COUNT_PROOF.lock().unwrap() = Some(Box::new(move || {
+                if fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let _ = std::fs::remove_file(&path);
+                std::fs::write(&path, &record).unwrap();
+            }));
+        }
+
+        let verdict = holder.release();
+        inject::reset();
+
+        assert!(fired.load(Ordering::SeqCst), "the seam must actually fire");
         assert_eq!(
             verdict,
             Release::Released,
-            "KNOWN GAP (seq 214 item 1): if this is no longer Released the window \
-             has been closed — update this test into the gate it is waiting to be"
+            "the control must reproduce the CLEAN release the reviewer recorded"
         );
         assert!(
             !path.exists(),
-            "KNOWN GAP: the successor's authority entry was removed by its predecessor"
+            "the control must reproduce the successor's entry being removed"
+        );
+        // ...and the third writer walks straight in, which is the two-holder
+        // outcome the gate above now prevents.
+        let third = acquire_elsewhere(dir.path(), opts(50));
+        assert!(
+            third.is_ok(),
+            "the control must reproduce the third writer acquiring: {third:?}"
         );
         clean();
     }
@@ -2748,7 +3013,10 @@ mod tests {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().to_string())
                     .filter(|n| {
-                        n.contains(".reclaim.") || n.contains(".new.") || n.contains(".pin.")
+                        n.contains(".reclaim.")
+                            || n.contains(".new.")
+                            || n.contains(".pin.")
+                            || n.contains(".detach.")
                     })
                     .collect()
             })

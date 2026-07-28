@@ -548,19 +548,81 @@ fn read_scope_key(path: &Path) -> Result<Option<Vec<u8>>, ReceiptError> {
 ///   are publishing, and it propagates.
 fn sync_dir(dir: Option<&Path>) -> std::io::Result<()> {
     let Some(dir) = dir else { return Ok(()) };
-    let Ok(handle) = std::fs::File::open(dir) else {
-        return Ok(());
+    // THE OPEN IS CLASSIFIED THE SAME WAY THE FSYNC IS (reviewer 7da0c79a
+    // blocker 3). `let Ok(handle) = … else { return Ok(()) }` mapped EVERY open
+    // failure — injected EIO included — to a successful durable append: the
+    // ledger line was already on disk and its directory entry was unproved, and
+    // the API said yes. The caller hands us the concrete parent it has just
+    // written the receipt into, so a refused open is not evidence that
+    // directory durability is unsupported here. Only the narrow set below is.
+    let handle = match open_dir_for_sync(dir) {
+        Ok(handle) => handle,
+        Err(e) if dir_fsync_unsupported(&e) => return Ok(()),
+        Err(e) => return Err(e),
     };
     match handle.sync_all() {
         Ok(()) => Ok(()),
-        Err(e)
-            if e.raw_os_error().is_some_and(|code| {
-                [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::EPERM].contains(&code)
-            }) =>
-        {
-            Ok(())
-        }
+        Err(e) if dir_fsync_unsupported(&e) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// "This object cannot be fsynced here", as opposed to "the device said no".
+/// The same ANNOUNCED set the gateway twin draws in `receiptLedger.mjs` and the
+/// same one [`super::casa_feed`] uses, so the two ledgers agree about what a
+/// durable append means.
+fn dir_fsync_unsupported(e: &std::io::Error) -> bool {
+    e.raw_os_error().is_some_and(|code| {
+        [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::EPERM].contains(&code)
+    })
+}
+
+/// `File::open` on the parent, carrying the reviewer's injection seam on the
+/// exact result the classification reads. `cfg(test)` only: no shipped binary
+/// contains it, and it changes no production decision.
+fn open_dir_for_sync(dir: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(test)]
+    {
+        let injected = inject::DIR_OPEN_ERRNO.with(|e| e.get());
+        if injected != 0 {
+            return Err(std::io::Error::from_raw_os_error(injected));
+        }
+    }
+    std::fs::File::open(dir)
+}
+
+/// Test-only seams. Not compiled at all in a shipped binary.
+///
+/// THREAD-LOCAL, not a process-global: `cargo test` runs this module's tests
+/// concurrently on many threads, and a global would inject an EIO into whichever
+/// unrelated test happened to be appending at the time. Keyed to the arming
+/// thread, the seam reaches exactly the call it was armed for and no `#[serial]`
+/// is needed to make that true.
+#[cfg(test)]
+pub(crate) mod inject {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Errno `open_dir_for_sync` returns instead of asking the filesystem.
+        pub static DIR_OPEN_ERRNO: Cell<i32> = const { Cell::new(0) };
+    }
+
+    /// Arm the seam for THIS thread; the guard disarms it however the test ends,
+    /// so a panicking assertion cannot leave the seam armed for the next test
+    /// that reuses the thread.
+    pub struct Armed;
+
+    impl Armed {
+        pub fn with(errno: i32) -> Armed {
+            DIR_OPEN_ERRNO.with(|e| e.set(errno));
+            Armed
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            DIR_OPEN_ERRNO.with(|e| e.set(0));
+        }
     }
 }
 
@@ -845,7 +907,14 @@ impl ClassifyDetail for serde_json::Error {
 /// ledger of concatenated JSON that no longer parsed. This entry point takes the
 /// lock; [`append_locked`] is the same body for a caller already inside the feed
 /// transaction (the lock is NOT reentrant).
-pub fn append(project_root: &Path, receipt: &Receipt) -> Result<(), ReceiptError> {
+/// **THE RELEASE VERDICT IS PART OF THE RESULT** (reviewer 7da0c79a blocker 2).
+/// This function used to read `lock.release();` as a statement and discard the
+/// typed verdict the wrapper had just been taught to return, so a receipt
+/// written inside a section whose release could not be proven was
+/// indistinguishable at the boundary from one written inside a section that
+/// proved it let go. A receipt IS the certification evidence; a certifier that
+/// cannot see an unvouched section certifies it by default.
+pub fn append(project_root: &Path, receipt: &Receipt) -> Result<Appended, ReceiptError> {
     let ledger = ledger_path_for(project_root);
     if let Some(parent) = ledger.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ReceiptError::Io(e.to_string()))?;
@@ -853,8 +922,61 @@ pub fn append(project_root: &Path, receipt: &Receipt) -> Result<(), ReceiptError
     let lock = super::feed_lock::acquire(&ledger, super::feed_lock::DEFAULT_WAIT_MS)
         .map_err(|refusal| ReceiptError::NotSerialised(refusal.to_string()))?;
     let outcome = append_locked(project_root, receipt, &lock);
-    lock.release();
-    outcome
+    let release = lock.release();
+    // The receipt half is decided FIRST: a refused receipt is a refused receipt
+    // whatever the release did, and reporting the lock instead would hide it.
+    outcome?;
+    Ok(match release {
+        super::feed_lock::Release::Retained(reason) => {
+            eprintln!(
+                "[relay-receipt] the receipt was written under the lock, but the release could \
+                 not be verified ({reason}) — this process still owns it and retries on the next \
+                 acquire."
+            );
+            Appended::ReleaseUnverified(reason)
+        }
+        _ => Appended::Certified,
+    })
+}
+
+/// A receipt that LANDED, and how the section that wrote it ended.
+///
+/// Not an `Err`: the ledger line is on disk and every contract check passed
+/// under the held lock, so failing the caller's write would be a different lie.
+/// Not a bare `()` either — see [`append`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a written receipt carries its release verdict — certify it or discard it explicitly"]
+pub enum Appended {
+    /// The receipt landed AND the release proved it let go.
+    Certified,
+    /// The receipt landed inside a section THIS frame did not release — see
+    /// [`append_locked`]. The verdict belongs to whoever holds the lock, and
+    /// that caller propagates it from its own transaction; there is nothing
+    /// unvouched for this frame to report.
+    InCallersSection,
+    /// The receipt landed, but the release could not be proven: this process
+    /// still owns the feed lock and retries on the next acquire.
+    ReleaseUnverified(String),
+}
+
+impl Appended {
+    /// Did the section that wrote this receipt prove it let the lock go?
+    pub fn is_certified(&self) -> bool {
+        !matches!(self, Appended::ReleaseUnverified(_))
+    }
+
+    /// `Ok(())` unless a release THIS frame performed could not be proven;
+    /// `Err` carries the unverified reason.
+    pub fn certified(self) -> Result<(), String> {
+        match self {
+            Appended::Certified | Appended::InCallersSection => Ok(()),
+            Appended::ReleaseUnverified(reason) => Err(reason),
+        }
+    }
+
+    /// The write happened, release verdict deliberately discarded — spelled out
+    /// so the discard is a decision in the source rather than the default.
+    pub fn regardless_of_release(self) {}
 }
 
 /// [`append`]'s body, for a caller that ALREADY HOLDS the feed lock — the
@@ -1000,15 +1122,39 @@ fn append_line_durable(path: &Path, line: &str) -> Result<(), ReceiptError> {
     let mut buffer = String::with_capacity(line.len() + 1);
     buffer.push_str(line);
     buffer.push('\n');
+    // The exact length BEFORE our bytes. We are inside the feed lock (both entry
+    // points take it, and `append_locked` cannot be reached without the witness),
+    // so nobody else can have appended and everything past this offset is ours.
+    let before = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| ReceiptError::Io(e.to_string()))?;
-    file.write_all(buffer.as_bytes())
+    let landed = file
+        .write_all(buffer.as_bytes())
         .and_then(|_| file.sync_all())
-        .map_err(|e| ReceiptError::Io(e.to_string()))?;
-    sync_dir(path.parent()).map_err(|e| ReceiptError::Io(e.to_string()))
+        .and_then(|()| sync_dir(path.parent()));
+    // A DURABILITY FAILURE IS A REFUSAL, AND A REFUSAL LEAVES THE LEDGER
+    // BYTE-IDENTICAL. Now that a refused parent-directory open propagates
+    // (blocker 3), this error can arrive with our line already written, and a
+    // ledger line whose directory entry may not survive a power loss is exactly
+    // the evidence-that-vanishes case above. Take our own bytes back out.
+    if let Err(e) = landed {
+        let detail = e.to_string();
+        return Err(match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(f) => match f.set_len(before) {
+                Ok(()) => ReceiptError::Io(detail),
+                Err(t) => ReceiptError::Io(format!(
+                    "{detail} — AND the unproven line could not be taken back out: {t}"
+                )),
+            },
+            Err(t) => ReceiptError::Io(format!(
+                "{detail} — AND the unproven line could not be taken back out: {t}"
+            )),
+        });
+    }
+    Ok(())
 }
 
 /// The EVIDENCE a prior attempt already recorded for this `(turn, attempt)`, if
@@ -1092,6 +1238,80 @@ pub fn engine_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`append`], asserting the section PROVED it let the feed lock go.
+    ///
+    /// Every receipt test writes through here, so each of them is also a
+    /// standing control on the propagated verdict (reviewer 7da0c79a blocker 2):
+    /// if the ordinary path ever degraded to an unverified release, the whole
+    /// suite would say so instead of one dedicated test.
+    fn append_certified(project_root: &Path, receipt: &Receipt) -> Result<(), ReceiptError> {
+        append(project_root, receipt)?
+            .certified()
+            .expect("an undisturbed append certifies its own release");
+        Ok(())
+    }
+
+    /// **BLOCKER 3 (reviewer 7da0c79a, 4/4) — A FAILED PARENT OPEN IS A FAILED
+    /// SYNC.** `sync_dir` mapped every `File::open(dir)` error to `Ok(())`, so an
+    /// injected EIO on the ledger's parent produced:
+    ///
+    /// ```json
+    /// {"appendReturnedOk":true,"fileExists":true,
+    ///  "injectedDirectoryOpenEio":true,"negativeControlReturnedOk":true}
+    /// ```
+    ///
+    /// The receipt was on disk, its directory entry was unproved, and the API
+    /// said yes. Every field of that control is asserted here, with the first one
+    /// INVERTED, and the ledger is checked byte-identical: a refused append is a
+    /// refused append, so the unproven line comes back out.
+    #[test]
+    fn an_injected_eio_on_the_ledgers_parent_is_a_refused_append() {
+        let dir = scratch();
+        let ledger = ledger_path_for(dir.path());
+
+        // The NEGATIVE CONTROL first, uninjected and on the same fixture: this is
+        // what "the seam is off" looks like, so a green assertion below cannot be
+        // an accident of the fixture never appending at all.
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11)))
+            .expect("the uninjected control must append");
+        let unharmed = std::fs::read_to_string(&ledger).unwrap();
+        assert_eq!(unharmed.lines().count(), 1, "the control wrote its line");
+
+        let refused = {
+            let _armed = inject::Armed::with(libc::EIO);
+            append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12)))
+        };
+        let err = refused.expect_err(
+            "a receipt whose directory durability could not be proved must NOT return Ok",
+        );
+        assert!(
+            matches!(&err, ReceiptError::Io(detail) if detail.contains("Input/output error")),
+            "the refusal must name the device error it actually got: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ledger).unwrap(),
+            unharmed,
+            "a refused append leaves the ledger byte-identical — the unproven line \
+             must not survive the refusal that named it"
+        );
+        assert_eq!(
+            read_all(dir.path()).len(),
+            1,
+            "the refused receipt must not be readable as a recorded one"
+        );
+    }
+
+    /// The seam is a TEST SEAM, not a behaviour: with it disarmed the very same
+    /// append succeeds. Without this, "EIO refuses" would be satisfiable by an
+    /// append that never worked.
+    #[test]
+    fn the_directory_open_seam_is_off_by_default() {
+        let dir = scratch();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11)))
+            .expect("no seam is armed, so the append proceeds");
+        assert_eq!(read_all(dir.path()).len(), 1);
+    }
 
     const TURN: &str = "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3301";
     const TURN2: &str = "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3302";
@@ -1301,7 +1521,7 @@ mod tests {
     fn the_scope_key_never_reaches_the_ledger() {
         let dir = scratch();
         let r = receipt(dir.path(), TURN, 1, Some(11));
-        append(dir.path(), &r).unwrap();
+        append_certified(dir.path(), &r).unwrap();
         let key = std::fs::read(scope_key_path(dir.path())).unwrap();
         let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
         assert!(
@@ -1367,7 +1587,7 @@ mod tests {
     #[test]
     fn a_second_receipt_for_one_feed_row_is_refused() {
         let dir = scratch();
-        append(dir.path(), &receipt(dir.path(), TURN, 7, Some(11))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 7, Some(11))).unwrap();
         let second = receipt(dir.path(), TURN2, 7, Some(12));
         assert!(matches!(
             append(dir.path(), &second),
@@ -1380,7 +1600,7 @@ mod tests {
     fn a_reused_receipt_id_is_refused() {
         let dir = scratch();
         let first = receipt(dir.path(), TURN, 1, Some(11));
-        append(dir.path(), &first).unwrap();
+        append_certified(dir.path(), &first).unwrap();
         let mut clone = receipt(dir.path(), TURN2, 2, Some(12));
         clone.receipt_id = first.receipt_id.clone();
         assert!(matches!(
@@ -1396,7 +1616,7 @@ mod tests {
     #[test]
     fn the_same_delivery_cannot_be_certified_twice() {
         let dir = scratch();
-        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(4242))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(4242))).unwrap();
         let replayed = receipt(dir.path(), TURN2, 2, Some(4242));
         assert!(
             matches!(
@@ -1414,10 +1634,11 @@ mod tests {
     #[test]
     fn the_same_message_id_from_another_bot_is_a_different_delivery() {
         let dir = scratch();
-        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(4242))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(4242))).unwrap();
         let mut other_bot = receipt(dir.path(), TURN2, 2, Some(4242));
         other_bot.transport_scope_id = scope_id_for_bot(dir.path(), "bot-two").unwrap();
-        append(dir.path(), &other_bot).expect("a genuine second bot's receipt was suppressed");
+        append_certified(dir.path(), &other_bot)
+            .expect("a genuine second bot's receipt was suppressed");
         assert_eq!(read_all(dir.path()).len(), 2);
     }
 
@@ -1439,11 +1660,11 @@ mod tests {
         let mut first = receipt(dir.path(), TURN, 1, None);
         first.status = RelayStatus::Failed;
         first.attempt_id = Some(ATTEMPT_ONE.into());
-        append(dir.path(), &first).unwrap();
+        append_certified(dir.path(), &first).unwrap();
 
         let mut retry = receipt(dir.path(), TURN, 2, Some(99));
         retry.attempt_id = Some(ATTEMPT_TWO.into());
-        append(dir.path(), &retry).expect("the self-heal retry's receipt was suppressed");
+        append_certified(dir.path(), &retry).expect("the self-heal retry's receipt was suppressed");
 
         let all = read_all(dir.path());
         assert_eq!(all.len(), 2);
@@ -1458,7 +1679,7 @@ mod tests {
         let dir = scratch();
         let mut first = receipt(dir.path(), TURN, 1, Some(11));
         first.attempt_id = Some(ATTEMPT_ONE.into());
-        append(dir.path(), &first).unwrap();
+        append_certified(dir.path(), &first).unwrap();
 
         let mut refire = receipt(dir.path(), TURN, 2, Some(12));
         refire.attempt_id = Some(ATTEMPT_ONE.into());
@@ -1498,12 +1719,12 @@ mod tests {
         let mut ack = receipt(dir.path(), TURN, 1, Some(11));
         ack.reply_phase = ReplyPhase::Ack;
         ack.attempt_id = Some(ATTEMPT_ONE.to_string());
-        append(dir.path(), &ack).unwrap();
+        append_certified(dir.path(), &ack).unwrap();
 
         let mut answer = receipt(dir.path(), TURN, 2, Some(12));
         answer.reply_phase = ReplyPhase::Final;
         answer.attempt_id = Some(ATTEMPT_ONE.to_string());
-        append(dir.path(), &answer).expect("the final is not a refire of its own ack");
+        append_certified(dir.path(), &answer).expect("the final is not a refire of its own ack");
 
         // …but the SAME phase twice still is one.
         let mut refire = receipt(dir.path(), TURN, 3, Some(13));
@@ -1564,7 +1785,7 @@ mod tests {
     fn the_ledger_line_carries_exactly_the_schemas_receipt_fields() {
         let dir = scratch();
         let r = receipt(dir.path(), TURN, 5, Some(11));
-        append(dir.path(), &r).unwrap();
+        append_certified(dir.path(), &r).unwrap();
         let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
         let line: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(body.trim()).expect("the ledger line parses as an object");
@@ -1584,7 +1805,7 @@ mod tests {
         }
         // …and `messageId` is PRESENT, not omitted, even when there is none.
         let unproven = receipt(dir.path(), TURN2, 6, None);
-        append(dir.path(), &unproven).unwrap();
+        append_certified(dir.path(), &unproven).unwrap();
         let whole = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
         let last = whole.lines().next_back().unwrap();
         assert_eq!(wire_keys(last), V9_1_RECEIPT_FIELDS);
@@ -1608,7 +1829,7 @@ mod tests {
         r.outcome = RelayOutcome::Fallback;
         r.reply_phase = ReplyPhase::Watchdog;
         r.attempt_id = Some(ATTEMPT_ONE.to_string());
-        append(dir.path(), &r).unwrap();
+        append_certified(dir.path(), &r).unwrap();
 
         let body = std::fs::read_to_string(index_path_for(dir.path())).unwrap();
         let entry: serde_json::Map<String, serde_json::Value> =
@@ -1649,7 +1870,7 @@ mod tests {
             ),
         ] {
             let dir = scratch();
-            append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+            append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
             let path = index_path_for(dir.path());
             let before = mutate(std::fs::read_to_string(&path).unwrap());
             std::fs::write(&path, &before).unwrap();
@@ -1683,7 +1904,7 @@ mod tests {
     #[test]
     fn a_truncated_line_is_never_read_as_a_receipt() {
         let dir = scratch();
-        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
         let path = ledger_path_for(dir.path());
         let mut body = std::fs::read_to_string(&path).unwrap();
         body.push_str("{\"receiptId\":\"rcpt_3f2504e0-4f89-41d3-9a0c-030\n");
@@ -1702,7 +1923,7 @@ mod tests {
     fn a_corrupted_proof_blocks_a_new_claim_instead_of_licensing_a_duplicate() {
         let dir = scratch();
         let first = receipt(dir.path(), TURN, 7, Some(4242));
-        append(dir.path(), &first).unwrap();
+        append_certified(dir.path(), &first).unwrap();
 
         // Corrupt the proof exactly as the reproducer did: the row is still
         // there, it just no longer parses.
@@ -1751,7 +1972,7 @@ mod tests {
     #[test]
     fn an_unknown_receipt_key_is_damage_and_authorises_nothing() {
         let dir = scratch();
-        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
         let path = ledger_path_for(dir.path());
         let body = std::fs::read_to_string(&path).unwrap();
         std::fs::write(
@@ -1792,7 +2013,7 @@ mod tests {
     #[test]
     fn a_record_interrupted_at_the_delimiter_is_refused_without_welding_a_second_onto_it() {
         let dir = scratch();
-        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
         let path = ledger_path_for(dir.path());
         let whole = std::fs::read_to_string(&path).unwrap();
         // Interrupt exactly at the delimiter: the record's bytes are all there,
@@ -1824,8 +2045,8 @@ mod tests {
     #[test]
     fn a_well_formed_terminated_ledger_still_reads_and_accepts() {
         let dir = scratch();
-        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
-        append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap();
         assert_eq!(read_strict(dir.path()).unwrap().len(), 2);
         let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
         assert!(body.ends_with('\n'), "every record carries its delimiter");
@@ -1846,7 +2067,7 @@ mod tests {
             ("a stray NUL-ish blob", "\u{1}\u{2}\u{3}"),
         ] {
             let dir = scratch();
-            append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+            append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
             let path = ledger_path_for(dir.path());
             let mut body = std::fs::read_to_string(&path).unwrap();
             body.push_str(tail);
@@ -1880,7 +2101,7 @@ mod tests {
     fn an_absent_ledger_is_empty_not_damaged() {
         let dir = scratch();
         assert_eq!(read_strict(dir.path()).unwrap().len(), 0);
-        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
         assert_eq!(read_strict(dir.path()).unwrap().len(), 1);
     }
 
@@ -1977,7 +2198,7 @@ mod tests {
         let dir = scratch();
         let mut good = receipt(dir.path(), TURN, 1, Some(11));
         good.attempt_id = Some(ATTEMPT_ONE.to_string());
-        append(dir.path(), &good).unwrap();
+        append_certified(dir.path(), &good).unwrap();
         assert_eq!(read_strict(dir.path()).unwrap().len(), 1);
     }
 
@@ -2021,7 +2242,7 @@ mod tests {
             // `(turn, attempt)`, so reusing one here would refuse the later rows
             // for the right reason and prove nothing about the wire shape.
             r.attempt_id = Some(format!("attempt-6ba7b810-9dad-41d1-80b4-00c04fd430c{i}"));
-            append(dir.path(), &r).unwrap();
+            append_certified(dir.path(), &r).unwrap();
         }
         // The tokens are stable on the wire — in the INDEX, which is where the
         // correlation lives now. The LEDGER must not contain them: `"final"` in
@@ -2061,7 +2282,7 @@ mod tests {
         // The accepted turn is delivered once, by attempt 1.
         let mut first = receipt(root, TURN, 1, Some(4242));
         first.attempt_id = Some(ATTEMPT_ONE.to_string());
-        append(root, &first).unwrap();
+        append_certified(root, &first).unwrap();
 
         // THE REFIRE. Same turn, same attempt — the dispatcher redelivering an
         // occurrence that was already answered.
@@ -2106,7 +2327,7 @@ mod tests {
         let mut dead = receipt(root, TURN, 1, None);
         dead.attempt_id = Some(ATTEMPT_ONE.to_string());
         dead.status = RelayStatus::Failed;
-        append(root, &dead).unwrap();
+        append_certified(root, &dead).unwrap();
 
         assert!(
             evidence_for_attempt(root, TURN, Some(ATTEMPT_TWO)).is_none(),
@@ -2116,7 +2337,7 @@ mod tests {
         // So it relays, and writes its own receipt for the delivery that worked.
         let mut healed = receipt(root, TURN, 2, Some(9001));
         healed.attempt_id = Some(ATTEMPT_TWO.to_string());
-        append(root, &healed).unwrap();
+        append_certified(root, &healed).unwrap();
         let now = evidence_for_attempt(root, TURN, Some(ATTEMPT_TWO)).unwrap();
         assert_eq!(now.message_id, Some(9001));
         assert_eq!(read_all(root).len(), 2);

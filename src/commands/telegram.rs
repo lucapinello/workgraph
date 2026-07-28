@@ -4424,12 +4424,23 @@ impl FamilyReplyDelivery {
             self.write_engine_receipt(
                 turn, feed_id, &agent_id, bot_id, message_id, outcome, phase, lock,
             )
+            // Written inside THIS transaction, so the receipt frame released
+            // nothing; the section's verdict arrives with the row below.
+            .map(relay_receipt::Appended::regardless_of_release)
         });
 
         match written {
-            Ok(feed_id) => MirrorOutcome::Recorded {
-                feed_id,
+            // THE SECTION'S RELEASE VERDICT TRAVELS WITH THE ROW (blocker 2).
+            // `Recorded` used to be a plain `feed_id`, so a row written inside a
+            // section whose release could not be proven read exactly like a row
+            // written inside one that proved it let go.
+            Ok(row) => MirrorOutcome::Recorded {
+                feed_id: row.feed_id(),
                 proven: turn.is_some(),
+                release_unverified: match row {
+                    casa_feed::ProvenRow::Certified(_) => None,
+                    casa_feed::ProvenRow::ReleaseUnverified { reason, .. } => Some(reason),
+                },
             },
             Err(failure) => {
                 let detail = failure.to_string();
@@ -4455,7 +4466,7 @@ impl FamilyReplyDelivery {
         outcome: relay_receipt::RelayOutcome,
         phase: relay_receipt::ReplyPhase,
         lock: &worksgood::notify::feed_lock::FeedLock,
-    ) -> Result<(), relay_receipt::ReceiptError> {
+    ) -> Result<relay_receipt::Appended, relay_receipt::ReceiptError> {
         write_engine_receipt_at(
             &self.project_root(),
             turn,
@@ -4480,8 +4491,15 @@ enum MirrorOutcome {
     /// Nothing to mirror: a DM, or the transient ack a later edit replaces.
     Skipped,
     /// The row is on disk. `proven` is false for a legacy reply with no
-    /// canonical turn, which can carry no receipt.
-    Recorded { feed_id: i64, proven: bool },
+    /// canonical turn, which can carry no receipt. `release_unverified` carries
+    /// the reason when the section that wrote the row could not PROVE it let the
+    /// feed lock go — the row is real, the exclusion around it is unvouched, and
+    /// a consumer that certifies rows must be able to tell the two apart.
+    Recorded {
+        feed_id: i64,
+        proven: bool,
+        release_unverified: Option<String>,
+    },
     /// The row is NOT on disk, and the message may already be with the family.
     Failed(String),
 }
@@ -4505,7 +4523,7 @@ fn write_engine_receipt_at(
     // transaction as the row it proves. `None` means "take the lock yourself" —
     // the scripted `feed-write` seam, which has no surrounding transaction.
     lock: Option<&worksgood::notify::feed_lock::FeedLock>,
-) -> Result<(), relay_receipt::ReceiptError> {
+) -> Result<relay_receipt::Appended, relay_receipt::ReceiptError> {
     // WHICH BOT PHYSICALLY SENT THIS — not the semantic reply role. One role can
     // be spoken by different bots across a rotation, and "whose token sent it" is
     // the question a delivery dispute turns on. Keyed digest, so a leaked ledger
@@ -4541,7 +4559,10 @@ fn write_engine_receipt_at(
         casa_feed::now_ms(),
     );
     match lock {
-        Some(held) => relay_receipt::append_locked(root, &receipt, held),
+        // Inside the caller's feed transaction: this frame releases nothing, so
+        // the release verdict is the enclosing section's to propagate.
+        Some(held) => relay_receipt::append_locked(root, &receipt, held)
+            .map(|()| relay_receipt::Appended::InCallersSection),
         None => relay_receipt::append(root, &receipt),
     }
 }
@@ -5980,7 +6001,7 @@ pub fn run_feed_write(
     // auditor counts, and `feed-write --kind agent` is precisely the shape that
     // put unattributable helper rows into a certification run.
     let mut proved = false;
-    let feed_id = casa_feed::append_entry_proving(&feed_path, &entry, |feed_id, lock| {
+    let written = casa_feed::append_entry_proving(&feed_path, &entry, |feed_id, lock| {
         let (Some(turn), Some(mid)) = (turn_id.as_deref(), message_id) else {
             return Ok(());
         };
@@ -5996,6 +6017,7 @@ pub fn run_feed_write(
             phase,
             Some(lock),
         )
+        .map(relay_receipt::Appended::regardless_of_release)
     })
     .map_err(|e| anyhow::anyhow!("{e}"))
     .with_context(|| format!("failed to append to feed {}", feed_path.display()))?;
@@ -6005,7 +6027,17 @@ pub fn run_feed_write(
     // feed id goes with it: a caller that must later prove this row needs the id
     // it was ACTUALLY allocated, never an ordinal it counted for itself.
     println!("{}", entry.to_json_line());
-    println!("feedId={feed_id}");
+    println!("feedId={}", written.feed_id());
+    // THE RELEASE VERDICT IS PART OF THE ANSWER, always stated (blocker 2). A
+    // scripted certifier that only ever saw `feedId=` could not distinguish a
+    // row written inside a proven section from one whose release nobody can
+    // vouch for; it now has to read past the id to find that out.
+    match &written {
+        casa_feed::ProvenRow::Certified(_) => println!("feedRelease=proven"),
+        casa_feed::ProvenRow::ReleaseUnverified { reason, .. } => {
+            println!("feedRelease=unverified reason={reason}");
+        }
+    }
     if proved {
         println!("receipt=written");
     }
@@ -13905,7 +13937,9 @@ domains = ["calendar"]
             "501",
             Some("attempt-3f2504e0-4f89-41d3-9a0c-0305e82c3301"),
         )
-        .unwrap();
+        .unwrap()
+        .certified()
+        .expect("an undisturbed receipt append certifies its own release");
         // A REFIRE of the same attempt is suppressed...
         let refire = write(
             2,
@@ -13925,7 +13959,9 @@ domains = ["calendar"]
             "503",
             Some("attempt-3f2504e0-4f89-41d3-9a0c-0305e82c3302"),
         )
-        .unwrap();
+        .unwrap()
+        .certified()
+        .expect("an undisturbed receipt append certifies its own release");
         unsafe { std::env::remove_var("WG_ATTEMPT_ID") };
 
         let receipts = relay_receipt::read_all(root);

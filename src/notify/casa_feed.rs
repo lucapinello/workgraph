@@ -730,7 +730,10 @@ fn count_entries(body: &str) -> usize {
 /// cannot be taken: an unserialised append can land inside a rotation and be
 /// present in neither the archive nor the live file — a message the household
 /// said that the house then denies ever hearing.
-pub fn append_entry_allocating(feed_path: &Path, entry: &FeedEntry) -> Result<i64, FeedWriteError> {
+pub fn append_entry_allocating(
+    feed_path: &Path,
+    entry: &FeedEntry,
+) -> Result<ProvenRow, FeedWriteError> {
     append_entry_proving(feed_path, entry, |_id, _lock| {
         Ok::<(), std::convert::Infallible>(())
     })
@@ -779,7 +782,7 @@ pub fn append_entry_proving<E>(
     feed_path: &Path,
     entry: &FeedEntry,
     prove: impl FnOnce(i64, &super::feed_lock::FeedLock) -> Result<(), E>,
-) -> Result<i64, ProveFailure<E>> {
+) -> Result<ProvenRow, ProveFailure<E>> {
     validate(entry).map_err(ProveFailure::Feed)?;
     if let Some(sealed) = sealed_reason(feed_path, entry) {
         return Err(ProveFailure::Feed(sealed));
@@ -805,8 +808,19 @@ pub fn append_entry_proving<E>(
                     }));
                 }
             };
-            append_entry_durable(feed_path, entry)
-                .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
+            // A DURABILITY FAILURE IS A REFUSAL, AND A REFUSAL LEAVES NO ROW.
+            // Now that `sync_dir` propagates a refused parent-directory open
+            // (blocker 3), this error can arrive with our bytes already on disk
+            // — and "no row, not a row with a caveat" is the contract the whole
+            // module is built on. We hold the lock, so the pre-append length is
+            // exact and the truncate can only be taking back our own bytes.
+            if let Err(e) = append_entry_durable(feed_path, entry) {
+                let failed = FeedWriteError::Io(e.to_string());
+                return Err(match roll_back(feed_path, before, 0) {
+                    Ok(()) => ProveFailure::Feed(failed),
+                    Err(orphan) => ProveFailure::Feed(orphan),
+                });
+            }
             // Our bytes have landed, so our row is the LAST live line at this
             // instant — no counter is needed and none can drift. A live file we
             // cannot read back is the same unknown as an unreadable archive, so it
@@ -842,12 +856,19 @@ pub fn append_entry_proving<E>(
             }
         })
         .map_err(|refusal| ProveFailure::Feed(FeedWriteError::NotSerialised(refusal)))?;
-    // THE RELEASE VERDICT IS READ, not dropped on the wrapper's floor. The row
-    // and its receipt are certification evidence, and a section whose release
-    // could not be PROVEN is a section a human has to look at — the transaction
-    // itself stands (our bytes are on disk, our id was allocated under the
-    // held lock), but the wedged lock is named rather than left on stderr as
-    // the only trace.
+    // THE RELEASE VERDICT IS READ *AND RETURNED*, not dropped on the wrapper's
+    // floor. The row and its receipt are certification evidence, and a section
+    // whose release could not be PROVEN is a section a human has to look at.
+    //
+    // THE STDERR LINE IS NOT THE PROPAGATION (reviewer 7da0c79a blocker 2).
+    // This function used to log the retention and then hand back `completed.out`
+    // — an ordinary `Ok(feed_id)`, byte-identical at the boundary to a fully
+    // proven append. The reviewer's scratch-feed control read
+    // `{"apiReturnedOk":true,"feedId":1,"feedRowExists":true,"releaseWasRetained":true}`
+    // 4/4: the caller could not tell. The verdict is now part of the SUCCESS
+    // VALUE, so a certifier calls [`ProvenRow::certified`] and refuses, while a
+    // caller whose contract really is "the row landed" says so in the source
+    // with [`ProvenRow::feed_id`].
     if let super::feed_lock::Release::Retained(reason) = &completed.release {
         eprintln!(
             "[{}] casa feed: the row was written under the lock, but the release could not be \
@@ -855,7 +876,58 @@ pub fn append_entry_proving<E>(
             chrono::Utc::now().format("%H:%M:%S"),
         );
     }
-    completed.out
+    let feed_id = completed.out?;
+    Ok(match completed.release {
+        super::feed_lock::Release::Retained(reason) => {
+            ProvenRow::ReleaseUnverified { feed_id, reason }
+        }
+        _ => ProvenRow::Certified(feed_id),
+    })
+}
+
+/// A feed row that LANDED, and how the section that wrote it ended.
+///
+/// This is deliberately not an `Err`: the bytes are on disk and the global id
+/// was allocated under the held lock, so telling the caller its write failed
+/// would be a different lie. It is also deliberately not a bare `i64` — see
+/// [`append_entry_proving`]. A caller that certifies the row must be able to
+/// refuse a section nobody can vouch for, and it cannot refuse a fact it was
+/// never told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a written row carries its release verdict — certify it or take the id explicitly"]
+pub enum ProvenRow {
+    /// The row landed AND the release proved it let go. Fully certified.
+    Certified(i64),
+    /// The row landed, but the release could not be proven: this process still
+    /// owns the feed lock and retries on the next acquire. The row is real; the
+    /// exclusion around it is unvouched.
+    ReleaseUnverified { feed_id: i64, reason: String },
+}
+
+impl ProvenRow {
+    /// The global feed id, release verdict deliberately discarded — for callers
+    /// whose contract really is "the row is on disk". Spelled out so the discard
+    /// is a decision in the source rather than the default.
+    pub fn feed_id(&self) -> i64 {
+        match self {
+            ProvenRow::Certified(id) => *id,
+            ProvenRow::ReleaseUnverified { feed_id, .. } => *feed_id,
+        }
+    }
+
+    /// The id, but only if the section's release was PROVEN. `Err` carries the
+    /// unverified reason rather than the value.
+    pub fn certified(self) -> Result<i64, String> {
+        match self {
+            ProvenRow::Certified(id) => Ok(id),
+            ProvenRow::ReleaseUnverified { reason, .. } => Err(reason),
+        }
+    }
+
+    /// Did the section that wrote this row prove it let the lock go?
+    pub fn is_certified(&self) -> bool {
+        matches!(self, ProvenRow::Certified(_))
+    }
 }
 
 /// Append one row and make it DURABLE — one write, then fsync of the file and of
@@ -888,22 +960,84 @@ fn append_entry_durable(feed_path: &Path, entry: &FeedEntry) -> std::io::Result<
 /// (`receiptLedger.mjs` §"DURABILITY IS A THREE-WAY ANSWER"), so the two
 /// implementations agree about what a durable append means:
 ///
-/// * the directory cannot be opened as a file, or the call is not implemented
-///   (`ENOTSUP`/`EOPNOTSUPP`/`EINVAL`/`EPERM`) — some network and virtual
-///   mounts. Nothing failed; there was nothing to do.
+/// * the call is not implemented for this object (`ENOTSUP`/`EOPNOTSUPP`/
+///   `EINVAL`/`EPERM`) — some network and virtual mounts, and every platform
+///   that cannot open a directory as a file at all. Nothing failed; there was
+///   nothing to do.
 /// * anything else (`EIO`, `ENOSPC`, `EBADF`) is a device error on the bytes we
 ///   are publishing. It propagates.
+///
+/// **AND THAT LINE IS DRAWN ON THE `open` TOO** (reviewer 7da0c79a blocker 3).
+/// `Err(_) => return Ok(())` used to swallow EVERY open failure, so an injected
+/// EIO on the parent directory produced `appendReturnedOk: true` with the row
+/// already on disk and directory durability unproved — the one case the
+/// three-way answer above exists to name. The caller always supplies a concrete
+/// parent it has just written into, so "I could not open it" is not evidence
+/// that directory durability was unsupported: it is an unproved claim, and an
+/// unproved durability claim FAILS CLOSED.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    let handle = match fs::File::open(dir) {
+    let handle = match open_dir_for_sync(dir) {
         Ok(handle) => handle,
-        // A directory we cannot even open for fsync never made a durability
-        // claim to break. The bytes themselves are already fsynced.
-        Err(_) => return Ok(()),
+        // The NARROW, justified exemption: the platform/filesystem cannot hand
+        // out a descriptor for a directory at all. Nothing to fsync, nothing
+        // claimed.
+        Err(e) if fsync_unsupported(&e) => return Ok(()),
+        Err(e) => return Err(e),
     };
     match handle.sync_all() {
         Ok(()) => Ok(()),
         Err(e) if fsync_unsupported(&e) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// `File::open` on the parent, with the reviewer's injection seam sitting on the
+/// exact result the classification above reads. Compiled only under `cfg(test)`
+/// so the seam cannot exist in a shipped binary, and it changes no production
+/// decision — it supplies the errno the real filesystem refused to.
+fn open_dir_for_sync(dir: &Path) -> std::io::Result<fs::File> {
+    #[cfg(test)]
+    {
+        let injected = inject::DIR_OPEN_ERRNO.with(|e| e.get());
+        if injected != 0 {
+            return Err(std::io::Error::from_raw_os_error(injected));
+        }
+    }
+    fs::File::open(dir)
+}
+
+/// Test-only seams. Not compiled at all in a shipped binary.
+///
+/// THREAD-LOCAL, not a process-global: `cargo test` runs this module's tests
+/// concurrently on many threads, and a global would inject an EIO into whichever
+/// unrelated test happened to be appending at the time. Keyed to the arming
+/// thread, the seam reaches exactly the call it was armed for and no `#[serial]`
+/// is needed to make that true.
+#[cfg(test)]
+pub(crate) mod inject {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Errno `open_dir_for_sync` returns instead of asking the filesystem.
+        pub static DIR_OPEN_ERRNO: Cell<i32> = const { Cell::new(0) };
+    }
+
+    /// Arm the seam for THIS thread; the guard disarms it however the test ends,
+    /// so a panicking assertion cannot leave the seam armed for the next test
+    /// that reuses the thread.
+    pub struct Armed;
+
+    impl Armed {
+        pub fn with(errno: i32) -> Armed {
+            DIR_OPEN_ERRNO.with(|e| e.set(errno));
+            Armed
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            DIR_OPEN_ERRNO.with(|e| e.set(0));
+        }
     }
 }
 
@@ -942,6 +1076,17 @@ fn truncate_to(feed_path: &Path, len: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The global feed id of a row whose section PROVED it let the lock go.
+    ///
+    /// Every existing test goes through here, so each of them is also a standing
+    /// control that the ordinary path reports a certified release: if the
+    /// verdict ever silently degraded, the whole suite would say so rather than
+    /// one dedicated test.
+    fn certified_id(row: ProvenRow) -> i64 {
+        row.certified()
+            .expect("an undisturbed append certifies its own release")
+    }
 
     fn catalog() -> PersonaCatalog {
         PersonaCatalog::from_personas(vec![
@@ -1305,6 +1450,162 @@ emoji = "①"
         (dir, feed)
     }
 
+    /// **BLOCKER 3 (reviewer 7da0c79a, 4/4) — A FAILED PARENT OPEN IS A FAILED
+    /// SYNC.** `sync_dir` mapped every `File::open(dir)` error to `Ok(())`, so an
+    /// injected EIO on the feed's parent produced:
+    ///
+    /// ```json
+    /// {"appendReturnedOk":true,"fileExists":true,
+    ///  "injectedDirectoryOpenEio":true,"negativeControlReturnedOk":true}
+    /// ```
+    ///
+    /// The row was on disk, its directory entry was unproved, and the API said
+    /// yes. Every field of that control is asserted here with the first one
+    /// INVERTED — and the feed is byte-identical afterwards, because "NO ROW, not
+    /// a row with a caveat" is the module's contract for every refusal.
+    #[test]
+    fn an_injected_eio_on_the_feeds_parent_is_a_refused_append() {
+        let (_dir, feed) = scratch_feed();
+
+        // The NEGATIVE CONTROL, uninjected and on the same fixture.
+        let first = certified_id(
+            append_entry_allocating(&feed, &agent_entry(&catalog(), "harbor", "one", 1))
+                .expect("the uninjected control must append"),
+        );
+        assert_eq!(first, 1);
+        let unharmed = fs::read_to_string(&feed).unwrap();
+
+        let refused = {
+            let _armed = inject::Armed::with(libc::EIO);
+            append_entry_allocating(&feed, &agent_entry(&catalog(), "harbor", "two", 2))
+        };
+        let err = refused
+            .expect_err("a row whose directory durability could not be proved must NOT return Ok");
+        assert!(
+            matches!(&err, FeedWriteError::Io(detail) if detail.contains("Input/output error")),
+            "the refusal must name the device error it actually got: {err:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&feed).unwrap(),
+            unharmed,
+            "a refused append leaves the feed byte-identical — the row the family \
+             would have seen must not survive the refusal that named it"
+        );
+    }
+
+    /// The seam is a TEST SEAM, not a behaviour: with it disarmed the very same
+    /// append succeeds.
+    #[test]
+    fn the_feeds_directory_open_seam_is_off_by_default() {
+        let (_dir, feed) = scratch_feed();
+        assert_eq!(
+            certified_id(
+                append_entry_allocating(&feed, &agent_entry(&catalog(), "harbor", "one", 1))
+                    .expect("no seam is armed, so the append proceeds")
+            ),
+            1
+        );
+    }
+
+    /// **BLOCKER 2 (reviewer 7da0c79a, 4/4) — A RETAINED RELEASE IS NOT AN
+    /// ORDINARY SUCCESS.** `append_entry_proving` logged the retention and
+    /// returned `completed.out`, so the certifying API's caller read:
+    ///
+    /// ```json
+    /// {"apiReturnedOk":true,"feedId":1,"feedRowExists":true,"releaseWasRetained":true}
+    /// ```
+    ///
+    /// — an ordinary `Ok(feed_id)`, byte-identical at the boundary to a fully
+    /// proven append. The row and the id are still real (they are, and this
+    /// asserts both), but the verdict now travels WITH them.
+    #[test]
+    fn a_retained_release_makes_the_written_row_typed_degraded_not_plain_ok() {
+        let (_dir, feed) = scratch_feed();
+
+        // Force the retention the honest way, exactly as the project-lock test
+        // does: make the lock RECORD unreadable while we hold it, so
+        // `verify_self_ownership` answers Unverifiable, the release cannot prove
+        // anything, and §4's rule applies — "I could not read it" never softens
+        // into "it is probably still mine".
+        let entry = agent_entry(&catalog(), "harbor", "the row that landed", 1);
+        let lock_path = super::super::feed_lock::lock_path_for(&feed);
+        let written = {
+            let _wedge = UnreadableOnce::arm(lock_path.clone());
+            append_entry_proving(&feed, &entry, |_id, _lock| {
+                // The row is already on disk here; the wedge fires on RELEASE.
+                UnreadableOnce::wedge(&lock_path);
+                Ok::<(), std::convert::Infallible>(())
+            })
+        };
+        let row = written.expect("the row itself landed — the write did not fail");
+        // 1. The row and its id are real...
+        assert_eq!(
+            row.feed_id(),
+            1,
+            "feedId=1, exactly as the control recorded"
+        );
+        assert_eq!(
+            count_entries(&fs::read_to_string(&feed).unwrap()),
+            1,
+            "feedRowExists — the mutation happened and is not rolled back"
+        );
+        // 2. ...and the caller can SEE that nobody vouched for the section.
+        assert!(
+            !row.is_certified(),
+            "an unverified release must not present as a certified row: {row:?}"
+        );
+        assert!(
+            matches!(&row, ProvenRow::ReleaseUnverified { feed_id: 1, reason }
+                     if reason.starts_with("unverifiable")),
+            "the reason travels with the row, not only to stderr: {row:?}"
+        );
+        assert!(
+            row.certified().is_err(),
+            "a certifier must be able to REFUSE this row"
+        );
+        let _ = fs::remove_file(&lock_path);
+    }
+
+    /// The negative half: an undisturbed proving append certifies its own
+    /// release. Without it, "not certified" would be satisfiable by never
+    /// certifying anything.
+    #[test]
+    fn an_undisturbed_proving_append_certifies_its_release() {
+        let (_dir, feed) = scratch_feed();
+        let row = append_entry_proving(
+            &feed,
+            &agent_entry(&catalog(), "harbor", "one", 1),
+            |_id, _lock| Ok::<(), std::convert::Infallible>(()),
+        )
+        .unwrap();
+        assert_eq!(row, ProvenRow::Certified(1));
+        assert!(row.is_certified());
+    }
+
+    /// Makes the lock record unreadable for the duration, and restores the
+    /// directory's mode however the test ends.
+    struct UnreadableOnce(PathBuf);
+
+    impl UnreadableOnce {
+        fn arm(lock_path: PathBuf) -> UnreadableOnce {
+            UnreadableOnce(lock_path)
+        }
+
+        /// Truncate the held lock record to nothing: it is then present but
+        /// UNATTRIBUTABLE, which is the `Unverifiable` branch of
+        /// `verify_self_ownership` — not `Foreign` (that would be a successor)
+        /// and not `Gone`.
+        fn wedge(lock_path: &Path) {
+            let _ = fs::write(lock_path, b"");
+        }
+    }
+
+    impl Drop for UnreadableOnce {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
     /// ITEM 8 — RAW vs HASHED. `web_physical_turn_key()` hashes the accepted
     /// turn into `web-turn-<64hex>` for the engine's INTERNAL delivery digest.
     /// That hash in the causal position cannot join a gateway row carrying the
@@ -1350,7 +1651,7 @@ emoji = "①"
         let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
             .with_turn(TURN, ReplyPhase::Final);
 
-        let feed_id = append_entry_allocating(&feed, &entry).unwrap();
+        let feed_id = certified_id(append_entry_allocating(&feed, &entry).unwrap());
         assert_eq!(feed_id, 1, "the first row of a fresh feed is global id 1");
 
         let row: serde_json::Value =
@@ -1398,8 +1699,8 @@ emoji = "①"
         let second = agent_entry(&catalog(), "harbor", "the SECOND answer", same_ms)
             .with_turn(TURN, ReplyPhase::Final);
 
-        let first_id = append_entry_allocating(&feed, &first).unwrap();
-        let second_id = append_entry_allocating(&feed, &second).unwrap();
+        let first_id = certified_id(append_entry_allocating(&feed, &first).unwrap());
+        let second_id = certified_id(append_entry_allocating(&feed, &second).unwrap());
 
         assert_ne!(
             first_id, second_id,
@@ -1470,7 +1771,7 @@ emoji = "①"
 
         let entry = agent_entry(&catalog(), "harbor", "after the rotation", 9)
             .with_turn(TURN, ReplyPhase::Final);
-        let id = append_entry_allocating(&feed, &entry).unwrap();
+        let id = certified_id(append_entry_allocating(&feed, &entry).unwrap());
 
         assert_eq!(
             id, 6,
@@ -1515,7 +1816,10 @@ emoji = "①"
 
         // …and once the archive is readable again the same row gets the id it
         // always had: 1 archived + live ordinal 1.
-        assert_eq!(append_entry_allocating(&feed, &entry).unwrap(), 2);
+        assert_eq!(
+            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
+            2
+        );
     }
 
     /// The same rule for an unreadable SEGMENT — the `unwrap_or_default()` per
@@ -1547,7 +1851,10 @@ emoji = "①"
             "an unreadable segment must be typed unknown, got {refused:?}"
         );
         assert!(!feed.exists() || fs::read_to_string(&feed).unwrap().is_empty());
-        assert_eq!(append_entry_allocating(&feed, &entry).unwrap(), 3);
+        assert_eq!(
+            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
+            3
+        );
     }
 
     /// A MISSING archive directory is still the fact it always was: an install
@@ -1560,7 +1867,10 @@ emoji = "①"
         assert!(!archive_dir_for(&feed).exists());
         let entry = agent_entry(&catalog(), "harbor", "the first row ever", 9)
             .with_turn(TURN, ReplyPhase::Final);
-        assert_eq!(append_entry_allocating(&feed, &entry).unwrap(), 1);
+        assert_eq!(
+            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
+            1
+        );
         drop(dir);
     }
 
@@ -1574,7 +1884,7 @@ emoji = "①"
             .with_non_relay_type(NON_RELAY_TELEGRAM_INBOUND);
         assert!(!entry.is_unbound());
 
-        append_entry_allocating(&feed, &entry).unwrap();
+        certified_id(append_entry_allocating(&feed, &entry).unwrap());
         let row: serde_json::Value =
             serde_json::from_str(fs::read_to_string(&feed).unwrap().lines().next().unwrap())
                 .unwrap();
@@ -1627,7 +1937,10 @@ emoji = "①"
         // the conversation itself.
         let bound = agent_entry(&catalog(), "harbor", "dinner is pasta", 2)
             .with_turn(TURN, ReplyPhase::Final);
-        assert_eq!(append_entry_allocating(&feed, &bound).unwrap(), 1);
+        assert_eq!(
+            certified_id(append_entry_allocating(&feed, &bound).unwrap()),
+            1
+        );
 
         // ...but an agent row that DECLARES ITSELF EXEMPT does not, whatever
         // token it picks. This is the half the exact-tree control caught: the
@@ -1703,8 +2016,10 @@ emoji = "①"
 
         let human = group_entry(&catalog(), "guest", "we're out of milk", 5, None)
             .with_non_relay_type(NON_RELAY_TELEGRAM_INBOUND);
-        let id = append_entry_allocating(&feed, &human)
-            .expect("a human's message is never refused by the seal");
+        let id = certified_id(
+            append_entry_allocating(&feed, &human)
+                .expect("a human's message is never refused by the seal"),
+        );
         assert_eq!(id, 1);
 
         let rows: Vec<serde_json::Value> = fs::read_to_string(&feed)
@@ -1782,7 +2097,10 @@ emoji = "①"
         contender.join().unwrap();
 
         // And once the lock is free the same row goes in.
-        assert_eq!(append_entry_allocating(&feed, &entry).unwrap(), 1);
+        assert_eq!(
+            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
+            1
+        );
     }
 
     /// Concurrent writers each get a DISTINCT id, and the ids are exactly
@@ -1803,7 +2121,7 @@ emoji = "①"
                             .with_turn(TURN, ReplyPhase::Final);
                         for _ in 0..50 {
                             match append_entry_allocating(&feed, &entry) {
-                                Ok(id) => return id,
+                                Ok(row) => return certified_id(row),
                                 // Refused, not written — retry, exactly as a
                                 // real writer does. The lock FAILS CLOSED
                                 // (feed_lock §3): under contention a writer is
