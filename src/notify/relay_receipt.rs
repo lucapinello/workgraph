@@ -141,7 +141,18 @@ impl ReplyPhase {
 }
 
 /// One receipt: the evidence for exactly ONE feed row.
+///
+/// THE FIELD SET IS EXHAUSTIVE IN BOTH DIRECTIONS. `deny_unknown_fields` is the
+/// reading half of that: schema v9.1's `receipt_fields` is a closed object, and
+/// a ledger line carrying a key the schema does not define is a record written
+/// by something that was not speaking this contract. Accepting it silently —
+/// which is what a plain `Deserialize` did — let the exact-tree control add
+/// `"unknownKey"` to a receipt and watch the writer append a second one on top
+/// of it, certifying against evidence it had not actually understood. The
+/// gateway twin's `validateReceipt` refuses the same shape from the other side
+/// (`receiptLedger.mjs` RECEIPT_FIELDS, "no strangers, no absentees").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Receipt {
     /// `rcpt_<uuid v4>` — unique per relay ATTEMPT, never reused.
     #[serde(rename = "receiptId")]
@@ -554,6 +565,25 @@ pub fn read_strict(project_root: &Path) -> Result<Vec<Receipt>, ReceiptError> {
             });
         }
     };
+    // A JSONL RECORD IS THE BYTES UP TO AND INCLUDING ITS NEWLINE. A last line
+    // without one is a write that was interrupted at the delimiter, and
+    // `body.lines()` cannot tell that from a finished record — it yields the
+    // same string either way. Two reasons this must be refused rather than
+    // parsed, and the exact-tree control demonstrated both at once: the bytes
+    // may be a PREFIX of a longer record, so "it parsed" proves nothing about
+    // what was meant; and our append adds no leading newline, so the next write
+    // WELDS itself to the torn line and destroys both records — the control got
+    // `receipt=written` and a ledger of one unparsable 385-column line. Turning
+    // detectable uncertainty into fresh corruption while reporting success is
+    // the worst of the available outcomes. The gateway twin refuses the same
+    // state (`parseLedgerText`, "AN UNTERMINATED FINAL LINE IS NOT A RECEIPT").
+    if !body.is_empty() && !body.ends_with('\n') {
+        return Err(ReceiptError::LedgerCorrupt {
+            line: body.lines().count(),
+            detail: "the final record has no terminating newline — the write was interrupted"
+                .into(),
+        });
+    }
     let mut receipts = Vec::new();
     for (index, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
@@ -1277,6 +1307,99 @@ mod tests {
             1,
             "the refusal left the ledger byte-identical"
         );
+    }
+
+    /// THE EXACT-TREE CONTROL, as a permanent gate: a receipt line carrying a
+    /// key the schema does not define is DAMAGE, not a receipt with a bonus.
+    ///
+    /// The control added `"unknownKey":"must-reject"` to a written receipt and
+    /// asked the same binary for a second one; it got
+    /// `writerAcceptedAndAppendedSecondReceipt: true`. That is a writer
+    /// certifying against evidence it did not understand — the unknown key can
+    /// be a claim of a different contract, a partial record from another
+    /// implementation, or a forgery, and "ignore it" chooses one of those
+    /// readings silently.
+    #[test]
+    fn an_unknown_receipt_key_is_damage_and_authorises_nothing() {
+        let dir = scratch();
+        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        let path = ledger_path_for(dir.path());
+        let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            body.replace("}\n", ",\"unknownKey\":\"must-reject\"}\n"),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            matches!(
+                read_strict(dir.path()),
+                Err(ReceiptError::LedgerCorrupt { line: 1, .. })
+            ),
+            "an unknown key was read as a valid receipt"
+        );
+        let err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap_err();
+        assert!(
+            matches!(err, ReceiptError::LedgerCorrupt { .. }),
+            "an unknown key still authorised a new receipt: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the refusal left the ledger byte-identical"
+        );
+    }
+
+    /// …and the same for a record interrupted AT THE DELIMITER: valid JSON, no
+    /// terminating newline.
+    ///
+    /// This is the sharpest of the damaged shapes because the old reader could
+    /// not see it at all — `lines()` yields the same string for a finished
+    /// record and a torn one — and because appending onto it WELDS two records
+    /// into one unparsable line. The exact-tree control got `receipt=written`,
+    /// `physicalLines: 1`, `ledgerParses: false`: detectable uncertainty turned
+    /// into fresh corruption, reported as success.
+    #[test]
+    fn a_record_interrupted_at_the_delimiter_is_refused_without_welding_a_second_onto_it() {
+        let dir = scratch();
+        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        let path = ledger_path_for(dir.path());
+        let whole = std::fs::read_to_string(&path).unwrap();
+        // Interrupt exactly at the delimiter: the record's bytes are all there,
+        // its newline never became durable.
+        let torn = whole.trim_end_matches('\n').to_string();
+        std::fs::write(&path, &torn).unwrap();
+
+        assert!(
+            matches!(
+                read_strict(dir.path()),
+                Err(ReceiptError::LedgerCorrupt { .. })
+            ),
+            "a record with no terminating newline was read as committed"
+        );
+        let err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap_err();
+        assert!(
+            matches!(err, ReceiptError::LedgerCorrupt { .. }),
+            "an interrupted delimiter still authorised a new receipt: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            torn,
+            "the refusal left the ledger byte-identical — no second record welded on"
+        );
+    }
+
+    /// The negative half of the two rules above: a ledger the writer itself
+    /// produced still reads clean. Fail-closed must not mean fail-always.
+    #[test]
+    fn a_well_formed_terminated_ledger_still_reads_and_accepts() {
+        let dir = scratch();
+        append(dir.path(), &receipt(dir.path(), TURN, 1, Some(11))).unwrap();
+        append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap();
+        assert_eq!(read_strict(dir.path()).unwrap().len(), 2);
+        let body = std::fs::read_to_string(ledger_path_for(dir.path())).unwrap();
+        assert!(body.ends_with('\n'), "every record carries its delimiter");
     }
 
     /// Every damaged shape fails closed, and each names WHERE — an unreadable

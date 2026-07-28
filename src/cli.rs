@@ -7206,10 +7206,13 @@ pub enum TelegramCommands {
         #[arg(long)]
         reply_phase: Option<String>,
 
-        /// Why this row legitimately has NO delivery receipt:
-        /// `telegram-inbound`, `engine-lifecycle` or `diagnostic`. A row with
-        /// neither a turn id nor one of these is UNBOUND, and a sealed run
-        /// (`.casa/feed-seal.json`) refuses to write an unbound agent row at all.
+        /// Why this row legitimately has NO delivery receipt. The schema's
+        /// closed set: `telegram-inbound`, `system-notice-pane-only`,
+        /// `legacy-preboundary`. A row with neither a turn id nor one of these
+        /// is UNBOUND, and a sealed run (`.casa/feed-seal.json`) refuses to
+        /// write an unbound agent row at all. An `--kind agent` row may not
+        /// claim ANY of them: a helper line that reached the family has a
+        /// delivery, and a delivery is proven by a receipt.
         #[arg(long)]
         non_relay_type: Option<String>,
 

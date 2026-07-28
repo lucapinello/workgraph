@@ -167,21 +167,33 @@ pub struct FeedEntry {
 /// row saying so in machine-readable form instead of just lacking a receipt.
 pub const NON_RELAY_TELEGRAM_INBOUND: &str = "telegram-inbound";
 
-/// `nonRelayType` for a lifecycle/report-back row the engine writes on its own
-/// initiative — no family turn asked for it, so it has no causal turn and no
-/// relay receipt, and it says which of those it is.
-pub const NON_RELAY_ENGINE_LIFECYCLE: &str = "engine-lifecycle";
+/// `nonRelayType` for a notice the pane shows but nothing relayed — a failure
+/// notice written for the family's own screen, which has no transport answer to
+/// prove because no transport was asked to carry it.
+pub const NON_RELAY_SYSTEM_NOTICE_PANE_ONLY: &str = "system-notice-pane-only";
 
-/// `nonRelayType` for a diagnostic row written by `wg telegram feed-write`.
-pub const NON_RELAY_DIAGNOSTIC: &str = "diagnostic";
+/// `nonRelayType` for a row that predates the sealed cutover cursor. It is
+/// preserved verbatim and NEVER certifies anything; the token exists so a
+/// historical row says what it is rather than reading as an unproven claim.
+pub const NON_RELAY_LEGACY_PREBOUNDARY: &str = "legacy-preboundary";
 
 /// The `nonRelayType` tokens this writer may stamp. A CLOSED set: a free-text
 /// reason would let any writer excuse itself from the receipt contract by
 /// inventing a category, which is the whole gate defeated by a string literal.
+///
+/// THE SET IS THE SCHEMA'S, NOT OURS. `receipt-observe-schema-v9.1.json`
+/// `non_relay_type_allowlist` is exhaustive and immutable, and this writer's
+/// former `engine-lifecycle` / `diagnostic` tokens were not in it. That is not a
+/// naming quibble: a token the schema does not know is an exemption from the
+/// receipt contract that the auditor cannot evaluate, so an engine row could
+/// opt out of being provable by inventing a category — the exact defeat the
+/// closed set exists to prevent. A lifecycle or diagnostic row the engine wants
+/// in the family's feed now carries its turn and its receipt like every other
+/// agent row, or it is not written.
 pub const NON_RELAY_TYPES: &[&str] = &[
     NON_RELAY_TELEGRAM_INBOUND,
-    NON_RELAY_ENGINE_LIFECYCLE,
-    NON_RELAY_DIAGNOSTIC,
+    NON_RELAY_SYSTEM_NOTICE_PANE_ONLY,
+    NON_RELAY_LEGACY_PREBOUNDARY,
 ];
 
 /// Longest a mirrored message may be. Well beyond any real family message; caps
@@ -479,6 +491,28 @@ pub enum FeedWriteError {
     BadNonRelayType(String),
     /// A row bound to a turn must say which phase of it it is.
     TurnWithoutPhase,
+    /// An `agent` row claimed a `nonRelayType` exemption. Every allowlisted
+    /// token belongs to some OTHER row: `telegram-inbound` to an inbound human
+    /// row, `system-notice-pane-only` to a notice nothing relayed,
+    /// `legacy-preboundary` to history. A post-cutover agent row is a helper
+    /// speaking to the family through a transport, so it has a delivery, and a
+    /// delivery is proven by a receipt — never excused by a token.
+    AgentClaimedExemption(String),
+    /// A read this write depends on did not answer — an unreadable archive
+    /// segment, an unreadable live feed. TYPED UNKNOWN, which is a different
+    /// fact from "there was nothing there", and the difference is a permanent
+    /// duplicate global id. See [`archived_count_from_bytes`].
+    ReadUnknown {
+        what: &'static str,
+        detail: String,
+    },
+    /// The row could not be proven AND could not be taken back out. The feed now
+    /// holds a row nothing proves, and that is reported as the hard failure it
+    /// is rather than printed past.
+    OrphanRow {
+        feed_id: i64,
+        detail: String,
+    },
     /// The certifying feed is SEALED and this writer is not bound to a causal
     /// turn. See [`sealed_reason`].
     Sealed {
@@ -505,6 +539,21 @@ impl std::fmt::Display for FeedWriteError {
             FeedWriteError::TurnWithoutPhase => write!(
                 f,
                 "refusing to write a turn-bound feed row that does not say which phase of the turn it is"
+            ),
+            FeedWriteError::AgentClaimedExemption(v) => write!(
+                f,
+                "refusing an agent row claiming the nonRelayType exemption {v:?}: a helper row that \
+                 reached the family has a delivery, and a delivery is proven by a receipt"
+            ),
+            FeedWriteError::ReadUnknown { what, detail } => write!(
+                f,
+                "the {what} could not be read ({detail}) — refusing to allocate a global feed id \
+                 against evidence we cannot see in full"
+            ),
+            FeedWriteError::OrphanRow { feed_id, detail } => write!(
+                f,
+                "feed row {feed_id} could not be proven AND could not be rolled back ({detail}) — \
+                 it is on disk with nothing proving it"
             ),
             FeedWriteError::Sealed { kind } => write!(
                 f,
@@ -583,6 +632,13 @@ fn validate(entry: &FeedEntry) -> Result<(), FeedWriteError> {
         if !NON_RELAY_TYPES.contains(&kind) {
             return Err(FeedWriteError::BadNonRelayType(kind.to_string()));
         }
+        // …and the token has to belong to a row of THIS kind. Checking only
+        // membership let an agent row pick any allowlisted string and become
+        // exempt; the schema's negatives list "agent row claiming nonRelayType
+        // exemption" precisely because membership alone is not the rule.
+        if entry.kind == FeedKind::Agent {
+            return Err(FeedWriteError::AgentClaimedExemption(kind.to_string()));
+        }
     }
     Ok(())
 }
@@ -603,27 +659,54 @@ fn archive_dir_for(feed_path: &Path) -> PathBuf {
 /// per-segment COUNT is invisible to a name-set check, and an id is permanent.
 /// That is exactly how the gateway slice reproduced the duplicate id `[1, 2, 2]`.
 /// The allocator pays for the recount.
-fn archived_count_from_bytes(feed_path: &Path) -> usize {
+///
+/// AND IT FAILS CLOSED. A missing archive directory is a FACT — an install that
+/// has never rotated has zero archived rows — but an archive we cannot READ is
+/// not that fact, it is the absence of an answer. Returning `0` for the two
+/// cases alike is how the exact-tree control got `feedId=1` for a row whose
+/// global id was 2: one unreadable directory, and a permanent id was reissued to
+/// a second row. Every unreadable segment, and the unreadable directory itself,
+/// is [`FeedWriteError::ReadUnknown`], and the write does not happen.
+fn archived_count_from_bytes(feed_path: &Path) -> Result<usize, FeedWriteError> {
     let dir = archive_dir_for(feed_path);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return 0;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // Nothing has rotated yet. That IS zero archived rows.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(FeedWriteError::ReadUnknown {
+                what: "feed archive directory",
+                detail: e.to_string(),
+            });
+        }
     };
-    let mut names: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|e| e == "jsonl")
-                && p.file_name()
-                    .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
-        })
-        .collect();
+    let mut names: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| FeedWriteError::ReadUnknown {
+            what: "feed archive directory",
+            detail: e.to_string(),
+        })?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "jsonl")
+            && path
+                .file_name()
+                .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
+        {
+            names.push(path);
+        }
+    }
     // File order: the segments are named so that lexical order IS rotation
     // order, matching the gateway's `feedSegments`.
     names.sort();
-    names
-        .iter()
-        .map(|p| count_entries(&fs::read_to_string(p).unwrap_or_default()))
-        .sum()
+    let mut total = 0usize;
+    for path in &names {
+        let body = fs::read_to_string(path).map_err(|e| FeedWriteError::ReadUnknown {
+            what: "feed archive segment",
+            detail: e.to_string(),
+        })?;
+        total += count_entries(&body);
+    }
+    Ok(total)
 }
 
 /// Non-blank lines — one entry per line, matching the reader's parse.
@@ -706,27 +789,54 @@ pub fn append_entry_proving<E>(
             .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
     }
     super::feed_lock::with_feed_lock(feed_path, super::feed_lock::DEFAULT_WAIT_MS, |lock| {
-        let before = fs::metadata(feed_path).map(|m| m.len()).unwrap_or(0);
+        // THE ARCHIVE IS COUNTED BEFORE OUR BYTES LAND. It cannot change while
+        // we hold the lock, and asking first means an unreadable archive costs
+        // nothing: no row is written, no id is issued, and the refusal is a
+        // typed unknown rather than a silent zero.
+        let archived = archived_count_from_bytes(feed_path).map_err(ProveFailure::Feed)? as i64;
+        let before = match fs::metadata(feed_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(ProveFailure::Feed(FeedWriteError::ReadUnknown {
+                    what: "live feed",
+                    detail: e.to_string(),
+                }));
+            }
+        };
         append_entry_durable(feed_path, entry)
             .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
         // Our bytes have landed, so our row is the LAST live line at this
-        // instant — no counter is needed and none can drift.
-        let live = count_entries(&fs::read_to_string(feed_path).unwrap_or_default());
-        let feed_id = archived_count_from_bytes(feed_path) as i64 + live as i64;
+        // instant — no counter is needed and none can drift. A live file we
+        // cannot read back is the same unknown as an unreadable archive, so it
+        // rolls our row back out instead of counting as an empty feed.
+        let live = match fs::read_to_string(feed_path) {
+            Ok(body) => count_entries(&body),
+            Err(e) => {
+                let unknown = FeedWriteError::ReadUnknown {
+                    what: "live feed",
+                    detail: e.to_string(),
+                };
+                return Err(match roll_back(feed_path, before, 0) {
+                    Ok(()) => ProveFailure::Feed(unknown),
+                    Err(orphan) => ProveFailure::Feed(orphan),
+                });
+            }
+        };
+        let feed_id = archived + live as i64;
 
         match prove(feed_id, lock) {
             Ok(()) => Ok(feed_id),
             Err(proof_error) => {
                 // ROLL BACK. An unprovable row must not survive the attempt to
-                // prove it.
-                if let Err(e) = truncate_to(feed_path, before) {
-                    eprintln!(
-                        "[{}] casa feed: a row could not be proven AND could not be rolled back ({e}) \
-                         — feed row {feed_id} is on disk with nothing proving it",
-                        chrono::Utc::now().format("%H:%M:%S"),
-                    );
+                // prove it — and a rollback that did not happen is REPORTED,
+                // not printed past: the caller learns "there is an orphan row on
+                // disk", which is a different instruction to an operator than
+                // "your receipt was refused".
+                match roll_back(feed_path, before, feed_id) {
+                    Ok(()) => Err(ProveFailure::Proof(proof_error)),
+                    Err(orphan) => Err(ProveFailure::Feed(orphan)),
                 }
-                Err(ProveFailure::Proof(proof_error))
             }
         }
     })
@@ -747,12 +857,63 @@ fn append_entry_durable(feed_path: &Path, entry: &FeedEntry) -> std::io::Result<
         .open(feed_path)?;
     file.write_all(line.as_bytes())?;
     file.sync_all()?;
-    if let Some(parent) = feed_path.parent()
-        && let Ok(handle) = fs::File::open(parent)
-    {
-        let _ = handle.sync_all();
+    if let Some(parent) = feed_path.parent() {
+        sync_dir(parent)?;
     }
     Ok(())
+}
+
+/// fsync a directory, distinguishing "this filesystem does not implement it"
+/// from "the device said no".
+///
+/// The `let _ = handle.sync_all()` this replaced made the durability comment
+/// above it false in exactly the case it was written for: an EIO on the
+/// directory entry means the row may not survive a power loss, and we returned
+/// success anyway. The gateway twin draws the same three-way line
+/// (`receiptLedger.mjs` §"DURABILITY IS A THREE-WAY ANSWER"), so the two
+/// implementations agree about what a durable append means:
+///
+/// * the directory cannot be opened as a file, or the call is not implemented
+///   (`ENOTSUP`/`EOPNOTSUPP`/`EINVAL`/`EPERM`) — some network and virtual
+///   mounts. Nothing failed; there was nothing to do.
+/// * anything else (`EIO`, `ENOSPC`, `EBADF`) is a device error on the bytes we
+///   are publishing. It propagates.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    let handle = match fs::File::open(dir) {
+        Ok(handle) => handle,
+        // A directory we cannot even open for fsync never made a durability
+        // claim to break. The bytes themselves are already fsynced.
+        Err(_) => return Ok(()),
+    };
+    match handle.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if fsync_unsupported(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Is this fsync error the filesystem saying "not implemented" rather than
+/// "the write failed"? Matches the gateway twin's ANNOUNCED set.
+fn fsync_unsupported(e: &std::io::Error) -> bool {
+    // Compared as VALUES, not matched as patterns: `ENOTSUP` and `EOPNOTSUPP`
+    // are the same number on this platform, and a duplicate const pattern is a
+    // compile warning rather than the union it reads as.
+    e.raw_os_error().is_some_and(|code| {
+        [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::EPERM].contains(&code)
+    })
+}
+
+/// Take our row back out, or say we could not.
+///
+/// The diagnostic print this replaced was the whole recovery story for the one
+/// state the transaction exists to make impossible — a row on disk with nothing
+/// proving it. A message on stderr is not a return value: the caller went on
+/// believing only its receipt had failed.
+fn roll_back(feed_path: &Path, before: u64, feed_id: i64) -> Result<(), FeedWriteError> {
+    truncate_to(feed_path, before).map_err(|e| FeedWriteError::OrphanRow {
+        feed_id,
+        detail: e.to_string(),
+    })
 }
 
 /// Cut the file back to `len` and make the cut durable.
@@ -1302,6 +1463,92 @@ emoji = "①"
         );
     }
 
+    /// AN UNREADABLE ARCHIVE IS NOT AN EMPTY ONE. The exact-tree control:
+    /// archive one row, make `.casa/archive` unreadable, append a live row —
+    /// and the writer reported `feedId=1` for a row whose global id was 2,
+    /// reissuing a permanent id to a second row. That is the very duplicate the
+    /// recount-from-bytes exists to prevent, arriving through the `unwrap_or`
+    /// underneath it.
+    #[test]
+    fn an_unreadable_archive_refuses_the_write_instead_of_counting_zero() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, feed) = scratch_feed();
+        let archive = dir.path().join(".casa").join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("group-feed-0001.jsonl"), "{\"ts\":1}\n").unwrap();
+
+        let entry =
+            agent_entry(&catalog(), "harbor", "the live row", 9).with_turn(TURN, ReplyPhase::Final);
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = append_entry_allocating(&feed, &entry);
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            matches!(
+                refused,
+                Err(FeedWriteError::ReadUnknown {
+                    what: "feed archive directory",
+                    ..
+                })
+            ),
+            "an unreadable archive must be typed unknown, got {refused:?}"
+        );
+        assert!(
+            !feed.exists() || fs::read_to_string(&feed).unwrap().is_empty(),
+            "the refusal writes NO ROW: the id it would have carried is unknowable"
+        );
+
+        // …and once the archive is readable again the same row gets the id it
+        // always had: 1 archived + live ordinal 1.
+        assert_eq!(append_entry_allocating(&feed, &entry).unwrap(), 2);
+    }
+
+    /// The same rule for an unreadable SEGMENT — the `unwrap_or_default()` per
+    /// file, which loses a whole segment's worth of ids rather than the whole
+    /// directory's.
+    #[test]
+    fn an_unreadable_archive_segment_refuses_the_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, feed) = scratch_feed();
+        let archive = dir.path().join(".casa").join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let segment = archive.join("group-feed-0001.jsonl");
+        fs::write(&segment, "{\"ts\":1}\n{\"ts\":2}\n").unwrap();
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let entry =
+            agent_entry(&catalog(), "harbor", "the live row", 9).with_turn(TURN, ReplyPhase::Final);
+        let refused = append_entry_allocating(&feed, &entry);
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            matches!(
+                refused,
+                Err(FeedWriteError::ReadUnknown {
+                    what: "feed archive segment",
+                    ..
+                })
+            ),
+            "an unreadable segment must be typed unknown, got {refused:?}"
+        );
+        assert!(!feed.exists() || fs::read_to_string(&feed).unwrap().is_empty());
+        assert_eq!(append_entry_allocating(&feed, &entry).unwrap(), 3);
+    }
+
+    /// A MISSING archive directory is still the fact it always was: an install
+    /// that has never rotated has zero archived rows. Fail-closed must not mean
+    /// fail-always — this is the control that stops the fix above from being a
+    /// blanket refusal.
+    #[test]
+    fn a_never_rotated_install_still_allocates_from_zero() {
+        let (dir, feed) = scratch_feed();
+        assert!(!archive_dir_for(&feed).exists());
+        let entry = agent_entry(&catalog(), "harbor", "the first row ever", 9)
+            .with_turn(TURN, ReplyPhase::Final);
+        assert_eq!(append_entry_allocating(&feed, &entry).unwrap(), 1);
+        drop(dir);
+    }
+
     /// ITEM 6 — an inbound Telegram row is writer-stamped `kind:group` +
     /// `nonRelayType:telegram-inbound`, and is therefore BOUND: it says why no
     /// receipt could ever prove it, instead of merely lacking one.
@@ -1367,10 +1614,67 @@ emoji = "①"
             .with_turn(TURN, ReplyPhase::Final);
         assert_eq!(append_entry_allocating(&feed, &bound).unwrap(), 1);
 
-        // ...as does one that declares why it needs no receipt.
+        // ...but an agent row that DECLARES ITSELF EXEMPT does not, whatever
+        // token it picks. This is the half the exact-tree control caught: the
+        // seal's own gate reads "bound EITHER by a turn OR by a nonRelayType",
+        // so an agent row only had to name an exemption to walk through a sealed
+        // run unprovable. Every allowlisted token belongs to some other row's
+        // situation; a helper that spoke to the family has a delivery.
         let declared = agent_entry(&catalog(), "harbor", "listener restarted", 3)
-            .with_non_relay_type(NON_RELAY_ENGINE_LIFECYCLE);
-        assert_eq!(append_entry_allocating(&feed, &declared).unwrap(), 2);
+            .with_non_relay_type(NON_RELAY_TELEGRAM_INBOUND);
+        assert_eq!(
+            append_entry_allocating(&feed, &declared).unwrap_err(),
+            FeedWriteError::AgentClaimedExemption(NON_RELAY_TELEGRAM_INBOUND.to_string())
+        );
+        assert_eq!(
+            fs::read_to_string(&feed).unwrap().lines().count(),
+            1,
+            "the exemption refusal leaves the one bound row and nothing else"
+        );
+    }
+
+    /// The same refusal with the SEAL ABSENT. A sealed run is when an auditor is
+    /// watching; the contract is not "be provable while observed".
+    #[test]
+    fn an_agent_row_may_not_claim_a_non_relay_exemption_sealed_or_not() {
+        let (dir, feed) = scratch_feed();
+        assert!(!is_sealed(&feed));
+        for token in NON_RELAY_TYPES {
+            let entry = agent_entry(&catalog(), "harbor", "an unprovable helper line", 1)
+                .with_non_relay_type(token);
+            assert_eq!(
+                append_entry_allocating(&feed, &entry).unwrap_err(),
+                FeedWriteError::AgentClaimedExemption((*token).to_string()),
+                "{token} let an agent row out of the receipt contract"
+            );
+        }
+        assert!(!feed.exists() || fs::read_to_string(&feed).unwrap().is_empty());
+        drop(dir);
+    }
+
+    /// The allowlist IS the schema's. `engine-lifecycle` and `diagnostic` were
+    /// this writer's own inventions and are not in v9.1's
+    /// `non_relay_type_allowlist`; a token the auditor's schema does not define
+    /// is an exemption nobody can evaluate.
+    #[test]
+    fn the_non_relay_allowlist_is_exactly_the_schema_set() {
+        assert_eq!(
+            NON_RELAY_TYPES,
+            &[
+                "telegram-inbound",
+                "system-notice-pane-only",
+                "legacy-preboundary"
+            ]
+        );
+        let (_dir, feed) = scratch_feed();
+        for retired in ["engine-lifecycle", "diagnostic"] {
+            let entry =
+                group_entry(&catalog(), "someone", "text", 1, None).with_non_relay_type(retired);
+            assert_eq!(
+                append_entry_allocating(&feed, &entry).unwrap_err(),
+                FeedWriteError::BadNonRelayType(retired.to_string())
+            );
+        }
     }
 
     /// ITEM 7, the half that matters more. A NORMAL HOUSEHOLD GROUP MESSAGE
@@ -1481,7 +1785,7 @@ emoji = "①"
                 (0..10)
                     .map(|i| {
                         let entry = agent_entry(&cat, "harbor", &format!("w{worker} m{i}"), 1)
-                            .with_non_relay_type(NON_RELAY_ENGINE_LIFECYCLE);
+                            .with_turn(TURN, ReplyPhase::Final);
                         for _ in 0..50 {
                             match append_entry_allocating(&feed, &entry) {
                                 Ok(id) => return id,
