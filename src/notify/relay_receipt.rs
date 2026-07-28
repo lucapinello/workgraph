@@ -1654,7 +1654,18 @@ mod tests {
             let before = mutate(std::fs::read_to_string(&path).unwrap());
             std::fs::write(&path, &before).unwrap();
 
-            let err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap_err();
+            // Retry a LOCK refusal, exactly as a real writer does. Under a
+            // loaded suite the shared feed lock's wait budget is sometimes
+            // starved, and `NotSerialised` is a correct fail-closed answer that
+            // simply has not reached the index read yet — accepting it as the
+            // damage verdict would make this gate pass for the wrong reason.
+            let mut err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap_err();
+            for _ in 0..50 {
+                if !matches!(err, ReceiptError::NotSerialised(_)) {
+                    break;
+                }
+                err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12))).unwrap_err();
+            }
             assert!(
                 matches!(err, ReceiptError::LedgerCorrupt { .. }),
                 "{label} in the index still authorised a receipt: {err:?}"
