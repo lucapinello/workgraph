@@ -207,6 +207,27 @@ impl ReplyPhase {
             ReplyPhase::Failure => "failure",
         }
     }
+
+    /// How far through the turn this phase is — the ONLY ordering the replay
+    /// guard's edit-succession exemption reads. See [`is_edit_succession`].
+    ///
+    /// The designed successions are `ack → final`, `ack → watchdog → final`,
+    /// `ack → failure` and `ack → watchdog → failure`: the heavy lane posts an
+    /// ack and then EDITS that same physical message forward.
+    ///
+    /// `Final` and `Failure` share rank 2 deliberately. They are both TERMINAL,
+    /// so neither succeeds the other, and equal ranks fail the strict `<` below
+    /// — a second terminal claim over a message that already carries one is the
+    /// replay it looks like, and v9.1's "exactly one replyPhase:'final' per
+    /// accepted turn" stays enforced by this guard as well as by the attempt
+    /// guard.
+    fn succession_rank(self) -> u8 {
+        match self {
+            ReplyPhase::Ack => 0,
+            ReplyPhase::Watchdog => 1,
+            ReplyPhase::Final | ReplyPhase::Failure => 2,
+        }
+    }
 }
 
 /// One receipt: the evidence for exactly ONE feed row.
@@ -298,7 +319,9 @@ pub enum ReceiptError {
         by: String,
     },
     /// This exact (transport scope, message id) delivery is already recorded —
-    /// a replayed claim of an old delivery.
+    /// a replayed claim of an old delivery. NOT raised for the designed edit
+    /// succession, where one physical message is edited forward through a
+    /// turn's phases: see [`is_edit_succession`].
     Replay {
         replay_key: String,
         by: String,
@@ -693,11 +716,67 @@ pub fn is_valid_attempt_id(s: &str) -> bool {
 /// delivered helper ack/watchdog/final". Two deliveries of one attempt are two
 /// receipts; a refire is the same phase of the same attempt arriving twice.
 pub fn attempt_key(turn_id: &str, attempt_id: Option<&str>, phase: ReplyPhase) -> String {
-    let attempt = attempt_id
+    format!(
+        "{turn_id}\u{1f}{}\u{1f}{}",
+        attempt_slot(attempt_id),
+        phase.as_str()
+    )
+}
+
+/// The attempt an id names, with the "caller supplied none" case normalised to
+/// `1` exactly once. Extracted so [`attempt_key`] and [`is_edit_succession`]
+/// cannot drift into two different answers to "is this the same attempt" — a
+/// drift that would show up as one guard exempting what the other suppresses.
+fn attempt_slot(attempt_id: Option<&str>) -> &str {
+    attempt_id
         .map(str::trim)
         .filter(|a| !a.is_empty())
-        .unwrap_or("1");
-    format!("{turn_id}\u{1f}{attempt}\u{1f}{}", phase.as_str())
+        .unwrap_or("1")
+}
+
+/// Is `incoming` the DESIGNED EDIT SUCCESSION of `prior` — the same physical
+/// Telegram message advancing phase within one turn/attempt — rather than a
+/// replayed claim of `prior`'s delivery?
+///
+/// THIS IS THE LIVE DEFECT THE REPLAY GUARD HAD. The heavy web-inbound flow
+/// posts an ack and then edits THAT SAME MESSAGE into the final answer
+/// (`commands/telegram.rs` `edit_phase` → [`RelayOutcome::Edit`]), so the final
+/// shares the ack's `(transportScopeId, messageId)` by construction — and the
+/// guard refused the final's row+receipt as a replay of its own ack. The
+/// delivery had already SUCCEEDED; only the evidence write was refused, which
+/// left the turn's reservation held and the turn finalless while the family was
+/// looking at the answer on their screen. Reproduced three times in the live
+/// certification run (segment 5: ack `rcpt_3a74cecb`, feed 585, replay key
+/// `de8d3197…`; gateway.log "the reply was sent but NOT recorded").
+///
+/// The fix narrows the guard's PREDICATE and leaves the key alone. Putting the
+/// phase into [`replay_key`] would have been the smaller diff, but that key is a
+/// wire field: `replayKey` is `sha256(transportScopeId + NUL + messageId)` in
+/// schema v9.1 and in the gateway twin's `receiptLedger.mjs`, which appends to
+/// the same index. Rekeying it here would leave the two writers computing
+/// different keys for one delivery, and a replay guard that no longer matches
+/// the twin's rows is not a replay guard at all.
+///
+/// So the exemption is deliberately narrow — all four must hold:
+///
+///   1. the incoming receipt is an EDIT. A `send` (or the `fallback` send after
+///      a refused edit) mints a NEW message id, so a send presenting an id that
+///      is already recorded is exactly the replay this guard exists to refuse;
+///   2. the SAME turn — a different turn reusing a message id is refused as now;
+///   3. the SAME attempt — a self-heal retry re-presenting an earlier attempt's
+///      id is refused as now;
+///   4. the prior is at a STRICTLY EARLIER phase ([`ReplyPhase::succession_rank`]).
+///      A refire — the same phase of the same attempt arriving twice — fails
+///      this, and is refused exactly as before.
+///
+/// It fails CLOSED on unjoinable evidence: a prior with no index line keeps
+/// [`ReplyPhase::default`] (`Final`, the top rank) and `attempt_id: None`, so it
+/// can never be read as an earlier phase of this attempt.
+pub fn is_edit_succession(prior: &Receipt, incoming: &Receipt) -> bool {
+    incoming.outcome == RelayOutcome::Edit
+        && incoming.turn_id == prior.turn_id
+        && attempt_slot(incoming.attempt_id.as_deref()) == attempt_slot(prior.attempt_id.as_deref())
+        && prior.reply_phase.succession_rank() < incoming.reply_phase.succession_rank()
 }
 
 // ---------------------------------------------------------------------------
@@ -896,7 +975,9 @@ impl ClassifyDetail for serde_json::Error {
 ///   4. receipt id not reused;
 ///   5. this row is not already proven — one row, one receipt;
 ///   6. this (scope, message id) delivery is not already recorded — the replay
-///      guard, so a re-read of an old response cannot re-certify it;
+///      guard, so a re-read of an old response cannot re-certify it, EXCEPT for
+///      the designed edit succession in which one physical message is edited
+///      forward through a turn's phases ([`is_edit_succession`]);
 ///   7. this (turn, attempt) has not already written — a refire is suppressed,
 ///      a genuine retry is NOT.
 ///
@@ -1040,11 +1121,20 @@ pub fn append_locked(
     }
     if let Some(mid) = receipt.message_id.filter(|id| *id > 0) {
         let key = replay_key(&receipt.transport_scope_id, mid);
-        if let Some(prior) = existing.iter().find(|r| {
-            r.message_id
-                .filter(|id| *id > 0)
-                .is_some_and(|prior_mid| replay_key(&r.transport_scope_id, prior_mid) == key)
-        }) {
+        // EVERY prior holder of this key is checked, not just the first found:
+        // `ack → watchdog → final` leaves the final facing two of them, and an
+        // exemption that stopped at the first would let a genuine replay hide
+        // behind a legitimate predecessor. The refusal names the prior that
+        // actually failed the succession test.
+        if let Some(prior) = existing
+            .iter()
+            .filter(|r| {
+                r.message_id
+                    .filter(|id| *id > 0)
+                    .is_some_and(|prior_mid| replay_key(&r.transport_scope_id, prior_mid) == key)
+            })
+            .find(|prior| !is_edit_succession(prior, receipt))
+        {
             return Err(ReceiptError::Replay {
                 replay_key: key,
                 by: prior.receipt_id.clone(),
@@ -1640,6 +1730,210 @@ mod tests {
         append_certified(dir.path(), &other_bot)
             .expect("a genuine second bot's receipt was suppressed");
         assert_eq!(read_all(dir.path()).len(), 2);
+    }
+
+    // ── the edit succession: one message, several phases ────────────────────
+
+    /// One ack receipt, ready to be edited forward.
+    fn ack_at(root: &Path, feed_id: i64, mid: i64, attempt: &str) -> Receipt {
+        let mut r = receipt(root, TURN, feed_id, Some(mid));
+        r.reply_phase = ReplyPhase::Ack;
+        r.outcome = RelayOutcome::Send;
+        r.attempt_id = Some(attempt.to_string());
+        r
+    }
+
+    /// A later phase of the SAME physical message — the edit.
+    fn edited_to(
+        root: &Path,
+        turn: &str,
+        feed_id: i64,
+        mid: i64,
+        phase: ReplyPhase,
+        attempt: &str,
+    ) -> Receipt {
+        let mut r = receipt(root, turn, feed_id, Some(mid));
+        r.reply_phase = phase;
+        r.outcome = RelayOutcome::Edit;
+        r.attempt_id = Some(attempt.to_string());
+        r
+    }
+
+    /// **THE LIVE DEFECT** (certification run 3, segment 5, reproduced 3×): the
+    /// heavy lane posts an ack and EDITS that same message into the final, so
+    /// the final carries the ack's `(scope, message id)` — and the replay guard
+    /// refused the final's receipt as a replay of its own ack. The delivery had
+    /// already reached the family; only the evidence was refused, leaving the
+    /// turn's reservation held and the turn finalless.
+    #[test]
+    fn edit_succession_lets_the_final_land_over_its_own_ack() {
+        let dir = scratch();
+        let ack = ack_at(dir.path(), 1, 4242, ATTEMPT_ONE);
+        append_certified(dir.path(), &ack).unwrap();
+
+        let final_ = edited_to(dir.path(), TURN, 2, 4242, ReplyPhase::Final, ATTEMPT_ONE);
+        append_certified(dir.path(), &final_)
+            .expect("the final was refused as a replay of the ack it edited");
+
+        let all = read_all(dir.path());
+        assert_eq!(all.len(), 2, "both phases of the one message are recorded");
+        assert_eq!(
+            all.iter()
+                .filter(|r| r.reply_phase == ReplyPhase::Final)
+                .count(),
+            1,
+            "exactly one final per accepted turn",
+        );
+        // …and the succession is still ONE physical delivery: both rows carry
+        // the same message id, which is precisely why the guard tripped.
+        assert!(all.iter().all(|r| r.message_id == Some(4242)));
+        // A refire asking "what did the family end up with" gets the answer.
+        let evidence = evidence_for_attempt(dir.path(), TURN, Some(ATTEMPT_ONE)).unwrap();
+        assert_eq!(evidence.receipt_id, final_.receipt_id);
+        assert_eq!(evidence.reply_phase, ReplyPhase::Final);
+    }
+
+    /// The three-phase shape: `ack → watchdog → final`, all on one message. The
+    /// final faces TWO prior holders of the key, and both must be recognised.
+    #[test]
+    fn edit_succession_survives_a_watchdog_between_the_ack_and_the_final() {
+        let dir = scratch();
+        append_certified(dir.path(), &ack_at(dir.path(), 1, 77, ATTEMPT_ONE)).unwrap();
+        append_certified(
+            dir.path(),
+            &edited_to(dir.path(), TURN, 2, 77, ReplyPhase::Watchdog, ATTEMPT_ONE),
+        )
+        .expect("the watchdog line edited over the ack was refused");
+        append_certified(
+            dir.path(),
+            &edited_to(dir.path(), TURN, 3, 77, ReplyPhase::Final, ATTEMPT_ONE),
+        )
+        .expect("the final was refused behind two legitimate predecessors");
+        assert_eq!(read_all(dir.path()).len(), 3);
+    }
+
+    /// …AND THE GUARD STILL HAS TEETH. The same final arriving twice is a
+    /// refire, not a succession: equal phases are not strictly earlier.
+    #[test]
+    fn edit_succession_still_refuses_the_same_final_arriving_twice() {
+        let dir = scratch();
+        append_certified(dir.path(), &ack_at(dir.path(), 1, 4242, ATTEMPT_ONE)).unwrap();
+        let final_ = edited_to(dir.path(), TURN, 2, 4242, ReplyPhase::Final, ATTEMPT_ONE);
+        append_certified(dir.path(), &final_).unwrap();
+
+        // A fresh receipt id and a fresh feed id, so nothing but the replay
+        // guard can be what refuses this.
+        let again = edited_to(dir.path(), TURN, 3, 4242, ReplyPhase::Final, ATTEMPT_ONE);
+        assert!(
+            matches!(append(dir.path(), &again), Err(ReceiptError::Replay { .. })),
+            "a refire of the final was admitted as an edit succession",
+        );
+        assert_eq!(read_all(dir.path()).len(), 2);
+    }
+
+    /// A DIFFERENT TURN presenting the same `(scope, message id)` is refused
+    /// exactly as before — the exemption is scoped to one turn's own message.
+    #[test]
+    fn edit_succession_refuses_a_different_turn_reusing_the_message_id() {
+        let dir = scratch();
+        append_certified(dir.path(), &ack_at(dir.path(), 1, 4242, ATTEMPT_ONE)).unwrap();
+        let stranger = edited_to(dir.path(), TURN2, 2, 4242, ReplyPhase::Final, ATTEMPT_ONE);
+        assert!(
+            matches!(
+                append(dir.path(), &stranger),
+                Err(ReceiptError::Replay { .. })
+            ),
+            "another turn re-certified this turn's delivery",
+        );
+        assert_eq!(read_all(dir.path()).len(), 1);
+    }
+
+    /// A different ATTEMPT of the same turn is refused too: a self-heal retry
+    /// re-presenting the first attempt's message id is claiming a delivery it
+    /// did not make.
+    #[test]
+    fn edit_succession_refuses_another_attempt_of_the_same_turn() {
+        let dir = scratch();
+        append_certified(dir.path(), &ack_at(dir.path(), 1, 4242, ATTEMPT_ONE)).unwrap();
+        let retry = edited_to(dir.path(), TURN, 2, 4242, ReplyPhase::Final, ATTEMPT_TWO);
+        assert!(
+            matches!(append(dir.path(), &retry), Err(ReceiptError::Replay { .. })),
+            "a second attempt re-certified the first attempt's delivery",
+        );
+        assert_eq!(read_all(dir.path()).len(), 1);
+    }
+
+    /// And a SEND is never a succession. A send mints a new message id, so a
+    /// send presenting a recorded one is the replay this guard exists for —
+    /// including the `fallback` send after an edit that could not be applied,
+    /// whose whole point is that it carries a DIFFERENT id.
+    #[test]
+    fn edit_succession_is_only_for_edits_never_for_a_send_or_fallback() {
+        for outcome in [RelayOutcome::Send, RelayOutcome::Fallback] {
+            let dir = scratch();
+            append_certified(dir.path(), &ack_at(dir.path(), 1, 4242, ATTEMPT_ONE)).unwrap();
+            let mut claim = edited_to(dir.path(), TURN, 2, 4242, ReplyPhase::Final, ATTEMPT_ONE);
+            claim.outcome = outcome;
+            assert!(
+                matches!(append(dir.path(), &claim), Err(ReceiptError::Replay { .. })),
+                "a {} claiming a recorded message id was admitted",
+                outcome.as_str(),
+            );
+            assert_eq!(read_all(dir.path()).len(), 1);
+        }
+    }
+
+    /// The phase order the exemption reads, asserted directly: the two TERMINAL
+    /// phases share a rank, so neither can succeed the other and a second
+    /// terminal claim over one message stays refused.
+    #[test]
+    fn edit_succession_orders_the_phases_and_ranks_both_terminals_equal() {
+        use ReplyPhase::*;
+        assert!(Ack.succession_rank() < Watchdog.succession_rank());
+        assert!(Watchdog.succession_rank() < Final.succession_rank());
+        assert!(Ack.succession_rank() < Failure.succession_rank());
+        assert_eq!(Final.succession_rank(), Failure.succession_rank());
+
+        // A failure notice edited over a recorded FINAL is refused: the answer
+        // is already the family's, and overwriting its evidence is not a phase
+        // advance.
+        let dir = scratch();
+        append_certified(dir.path(), &ack_at(dir.path(), 1, 9, ATTEMPT_ONE)).unwrap();
+        append_certified(
+            dir.path(),
+            &edited_to(dir.path(), TURN, 2, 9, ReplyPhase::Final, ATTEMPT_ONE),
+        )
+        .unwrap();
+        assert!(matches!(
+            append(
+                dir.path(),
+                &edited_to(dir.path(), TURN, 3, 9, ReplyPhase::Failure, ATTEMPT_ONE)
+            ),
+            Err(ReceiptError::Replay { .. })
+        ));
+        assert_eq!(read_all(dir.path()).len(), 2);
+    }
+
+    /// FAIL CLOSED on evidence we cannot join. A prior receipt with no index
+    /// line — what a GATEWAY-written row looks like from here — keeps the
+    /// placeholder phase and no attempt, so it can never be mistaken for an
+    /// earlier phase of this attempt and its message id stays protected.
+    #[test]
+    fn edit_succession_cannot_be_claimed_over_an_unjoinable_prior() {
+        let dir = scratch();
+        append_certified(dir.path(), &ack_at(dir.path(), 1, 4242, ATTEMPT_ONE)).unwrap();
+        // Drop the index — the ack's phase/attempt are no longer knowable.
+        std::fs::write(index_path_for(dir.path()), "").unwrap();
+
+        let final_ = edited_to(dir.path(), TURN, 2, 4242, ReplyPhase::Final, ATTEMPT_ONE);
+        assert!(
+            matches!(
+                append(dir.path(), &final_),
+                Err(ReceiptError::Replay { .. })
+            ),
+            "an unjoinable prior was read as an earlier phase of this attempt",
+        );
+        assert_eq!(read_all(dir.path()).len(), 1);
     }
 
     #[test]
