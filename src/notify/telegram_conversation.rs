@@ -2119,6 +2119,40 @@ pub async fn run_conversation_turn(
     composer: Option<&dyn ReplyComposer>,
     sink: &dyn ReplySink,
 ) -> Result<TurnOutcome> {
+    // Capture the gateway-forwarded week block and local civil date once at turn
+    // entry. The prompt builder reads the same process-local env, while finalization
+    // receives these immutable snapshots so delivery cannot reclassify the request
+    // after a midnight crossing or observe later grounding bytes.
+    let week_context = std::env::var("WG_WEEK_CONTEXT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let local_date = chrono::Local::now().date_naive();
+    run_conversation_turn_with_week_context(
+        workgraph_dir,
+        plan,
+        human_message,
+        request_id,
+        timing,
+        composer,
+        sink,
+        week_context.as_deref(),
+        local_date,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_conversation_turn_with_week_context(
+    workgraph_dir: &Path,
+    plan: &ConversationPlan,
+    human_message: &str,
+    request_id: &str,
+    timing: AckTiming,
+    composer: Option<&dyn ReplyComposer>,
+    sink: &dyn ReplySink,
+    week_context: Option<&str>,
+    local_date: chrono::NaiveDate,
+) -> Result<TurnOutcome> {
     let route = plan.route();
     let durable_sink = TurnDeliverySink::new(
         workgraph_dir,
@@ -2266,6 +2300,8 @@ pub async fn run_conversation_turn(
                     &origin,
                     retry_ack_message_id.as_deref(),
                     retry_persisted_reply,
+                    week_context,
+                    local_date,
                 )
                 .await
             }
@@ -2553,6 +2589,8 @@ async fn run_composed_turn(
     origin: &crate::graph::TaskOrigin,
     retry_ack_message_id: Option<&str>,
     retrying_delivery: bool,
+    week_context: Option<&str>,
+    local_date: chrono::NaiveDate,
 ) -> Result<TurnOutcome> {
     // Load the authoritative project-local roster once for every dynamic send
     // this turn. The delivery choke point reuses it for graph answers, compose
@@ -2654,6 +2692,8 @@ async fn run_composed_turn(
                             acked,
                             text,
                             &family_roster,
+                            week_context,
+                            local_date,
                         )
                         .await;
                     }
@@ -2751,8 +2791,32 @@ async fn finalize_composed_reply(
     acked: bool,
     first_text: String,
     family_roster: &grounding::FamilyVoiceRoster,
+    week_context: Option<&str>,
+    local_date: chrono::NaiveDate,
 ) -> Result<TurnOutcome> {
-    let directive = lifecycle::extract_task_directive(first_text.trim());
+    // A whole historical dinner week remains a real composed turn: election,
+    // model execution, latency acknowledgement, edit-in-place delivery, turn/
+    // attempt receipts, and the elected persona all stay unchanged. Once the
+    // composer returns, however, the exact seven-row gateway block is stronger
+    // evidence than a lossy model paraphrase. Format the final from those rows
+    // BEFORE promise auditing, so discarded model prose cannot create a phantom
+    // TASK_CREATE or promise side effect. The helper fails closed on every
+    // incomplete/misaligned block and then this is the ordinary compose path.
+    let deterministic_historical = week_context.and_then(|context| {
+        grounding::historical_week_dinner_reply(human_message, context, local_date)
+    });
+    let directive = if let Some(reply) = deterministic_historical.as_ref() {
+        eprintln!(
+            "[{}] historical-week guard: replaced {agent_id}'s draft with seven row-fed clauses",
+            chrono::Utc::now().format("%H:%M:%S"),
+        );
+        lifecycle::TaskDirective {
+            reply: reply.clone(),
+            title: None,
+        }
+    } else {
+        lifecycle::extract_task_directive(first_text.trim())
+    };
     let mut reply_text = directive.reply.clone();
     // Audit the human-facing reply (with the machine tail already stripped) IN THE
     // CONTEXT OF THE TURN. Conditional capability copy on a turn that asked for
@@ -3005,7 +3069,7 @@ async fn finalize_composed_reply(
     // and only when the env carries a table — unset → no-op. MUST live here in the
     // ENGINE process: engine-composed replies write through the scoped family-reply sink
     // here, so the gateway's own never-claim-empty guard never sees them.
-    if let Ok(raw) = std::env::var("WG_WEEK_CONTEXT") {
+    if let Some(raw) = week_context {
         let wc = grounding::parse_week_context(&raw);
         let false_empty = grounding::false_empty_week_claims(&reply_text, &wc);
         if !false_empty.is_empty() {
@@ -3058,7 +3122,9 @@ async fn finalize_composed_reply(
     // actually go read the source. Delivered verbatim (style is not re-applied).
     // With turn-one grounding in place this is a backstop; the transcript shows
     // exactly why the backstop must exist.
-    if let Some(prev) = prior_replies.last() {
+    if deterministic_historical.is_none()
+        && let Some(prev) = prior_replies.last()
+    {
         if grounding::is_repetitive(&reply_text, prev) {
             eprintln!(
                 "[{}] repetition guard: {agent_id}'s draft repeats its previous reply — answering honestly",
@@ -6720,6 +6786,101 @@ domains = ["calendar", "coordination", "shopping"]
         assert_eq!(edits.len(), 1, "the answer edits the ack in place");
         assert_eq!(edits[0].2, ack_mid, "edit targets the ack's message id");
         assert_eq!(edits[0].3, "Here at last — all sorted!");
+    }
+
+    /// A historical whole-week read remains a real composed turn: the elected cook's
+    /// composer still runs long enough to produce the normal acknowledgement/edit
+    /// lifecycle, but the final bytes come deterministically from the exact seven
+    /// forwarded plan rows rather than from the model's lossy paraphrase.
+    #[tokio::test]
+    async fn historical_week_dinner_final_is_row_fed_after_real_ack_lifecycle() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("bruno", Some("bruno"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "bruno", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "bruno");
+        let plan = plan_conversation(&wg, &cfg, "telegram:bruno", "555", "luca-1", Entry::Direct);
+        assert!(matches!(plan, ConversationPlan::Converse { .. }));
+
+        let context = "Requested historical dinner plan (2026-07-20 through 2026-07-26),\n\
+                       selected from the one exact indexed plan for that civil-date range. Answer the\n\
+                       dated request FROM these seven rows, in the order shown. Do not substitute the\n\
+                       current week, another week, or another day's row:\n\
+                       - Monday (Jul 20): Mushroom risotto, finished with spinach & lemon\n\
+                       - Tuesday (Jul 21): Pan-seared duck breast, roast potatoes & a quick salad\n\
+                       - Wednesday (Jul 22): No cooking \u{2014} Luca's out this evening\n\
+                       - Thursday (Jul 23): Pasta al pomodoro\n\
+                       - Friday (Jul 24): Pan seared pork\n\
+                       - Saturday (Jul 25): Pizza margherita, homemade dough\n\
+                       - Sunday (Jul 26): Clear-the-fridge frittata, greens folded through";
+        let expected = "Monday was Mushroom risotto, finished with spinach and lemon. \
+                        Tuesday was Pan-seared duck breast, roast potatoes and a quick salad. \
+                        Wednesday, July 22 was out, no cooking \u{2014} Luca was out that evening. \
+                        Thursday was Pasta al pomodoro. \
+                        Friday was Pan seared pork. \
+                        Saturday was Pizza margherita, homemade dough. \
+                        Sunday was Clear-the-fridge frittata, greens folded through.";
+        let sink = RecSink::default();
+        // Deliberately reproduce the lossy live draft and delay past ack_after. The
+        // deterministic final must replace these model bytes without bypassing compose.
+        // The bogus directive proves replacement happens before promise auditing and
+        // task creation, not merely as a late presentation rewrite.
+        let composer = FakeComposer::ok_after(
+            "Monday through Sunday: Monday risotto - Tuesday duck - Wednesday out - \
+             Thursday pasta - Friday pork - Saturday pizza - Sunday frittata.\n\
+             TASK_CREATE: rewrite the whole dinner plan",
+            Duration::from_millis(200),
+        );
+
+        let outcome = run_conversation_turn_with_week_context(
+            &wg,
+            &plan,
+            "Give me the July 20\u{2013}26 dinners in order.",
+            "req-c034",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+            Some(context),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Replied { acked: true });
+        let calls = sink.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the only fresh send must be the ack: {calls:?}"
+        );
+        assert_eq!(calls[0].0, "bruno");
+        assert!(calls[0].2.contains("On it"), "first send is not an ack");
+        let edits = sink.edits();
+        assert_eq!(
+            edits.len(),
+            1,
+            "the final must edit the ack once: {edits:?}"
+        );
+        assert_eq!(edits[0].0, "bruno");
+        assert_eq!(edits[0].2, "1");
+        assert_eq!(edits[0].3, expected);
+
+        if let ConversationPlan::Converse { session_ref, .. } = &plan {
+            let out = chat::read_outbox_since_ref(&wg, session_ref, 0).unwrap();
+            assert_eq!(
+                out.last().map(|message| message.content.as_str()),
+                Some(expected),
+                "outbox and Telegram final diverged",
+            );
+        }
+        let task_count = crate::parser::load_graph(wg.join("graph.jsonl"))
+            .map(|graph| graph.tasks().count())
+            .unwrap_or(0);
+        assert_eq!(
+            task_count, 0,
+            "the discarded model directive created a phantom task",
+        );
     }
 
     /// A slow compose that then FAILS: the ack is edited into the glitch line

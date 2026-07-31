@@ -2160,6 +2160,303 @@ pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
 // the scoped family-reply sink in the ENGINE process, so the guard MUST live here.
 // ---------------------------------------------------------------------------
 
+static HISTORICAL_WEEK_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^Requested historical dinner plan \((\d{4}-\d{2}-\d{2}) through (\d{4}-\d{2}-\d{2})\),$",
+    )
+    .expect("valid historical-week header regex")
+});
+
+static HISTORICAL_WEEK_ROW_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^- (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \(([^()\n]+)\): (.+)$",
+    )
+    .expect("valid historical-week row regex")
+});
+
+static HISTORICAL_MONTH_DAY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?$",
+    )
+    .expect("valid historical month-day regex")
+});
+
+static HISTORICAL_WEEK_REQUEST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:(?:give|show)\s+me(?:\s+all)?(?:\s+the)?|list(?:\s+all)?(?:\s+the)?)\s+(january|february|march|april|may|june|july|august|september|sept|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*(?:-|–|—|through|to)\s*(?:(january|february|march|april|may|june|july|august|september|sept|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\.?\s+)?(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?\s+(?:plan(?:['’]s)?\s+)?dinners?\s+in\s+(?:(?:date|chronological)\s+)?order\s*[.!?]*$",
+    )
+    .expect("valid historical-week request regex")
+});
+
+static STANDALONE_AMPERSAND_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s+&\s+").expect("valid standalone ampersand regex"));
+
+static HISTORICAL_NO_COOK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bno\s+cooking\b").expect("valid no-cook regex"));
+
+static HISTORICAL_OUT_CONTRACTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?P<subject>\p{L}[\p{L}-]*)['’]s\s+out\b")
+        .expect("valid historical out-contraction regex")
+});
+
+static HISTORICAL_THIS_PERIOD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bthis\s+(morning|afternoon|evening|night)\b")
+        .expect("valid historical period regex")
+});
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoricalDinnerRow {
+    day: String,
+    date: NaiveDate,
+    dish: String,
+}
+
+fn historical_month_number(value: &str) -> Option<u32> {
+    match value
+        .chars()
+        .take(3)
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn historical_month_name(month: u32) -> Option<&'static str> {
+    match month {
+        1 => Some("January"),
+        2 => Some("February"),
+        3 => Some("March"),
+        4 => Some("April"),
+        5 => Some("May"),
+        6 => Some("June"),
+        7 => Some("July"),
+        8 => Some("August"),
+        9 => Some("September"),
+        10 => Some("October"),
+        11 => Some("November"),
+        12 => Some("December"),
+        _ => None,
+    }
+}
+
+fn historical_request_matches_range(human_message: &str, start: NaiveDate, end: NaiveDate) -> bool {
+    let compact = human_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let Some(captures) = HISTORICAL_WEEK_REQUEST_RE.captures(&compact) else {
+        return false;
+    };
+    let Some(start_month) = captures
+        .get(1)
+        .and_then(|value| historical_month_number(value.as_str()))
+    else {
+        return false;
+    };
+    let Some(start_day) = captures
+        .get(2)
+        .and_then(|value| value.as_str().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    let end_month = captures
+        .get(3)
+        .and_then(|value| historical_month_number(value.as_str()))
+        .unwrap_or(start_month);
+    let Some(end_day) = captures
+        .get(4)
+        .and_then(|value| value.as_str().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if let Some(year) = captures
+        .get(5)
+        .and_then(|value| value.as_str().parse::<i32>().ok())
+        && (start.year() != year || end.year() != year)
+    {
+        return false;
+    }
+    start.month() == start_month
+        && start.day() == start_day
+        && end.month() == end_month
+        && end.day() == end_day
+}
+
+fn historical_row_date(label: &str, year: i32) -> Option<NaiveDate> {
+    let captures = HISTORICAL_MONTH_DAY_RE.captures(label.trim())?;
+    let month = historical_month_number(captures.get(1)?.as_str())?;
+    let day = captures.get(2)?.as_str().parse::<u32>().ok()?;
+    NaiveDate::from_ymd_opt(year, month, day)
+}
+
+fn exact_historical_dinner_rows(
+    human_message: &str,
+    week_context: &str,
+    local_date: NaiveDate,
+) -> Option<Vec<HistoricalDinnerRow>> {
+    let lines: Vec<&str> = week_context
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let headers: Vec<_> = lines
+        .iter()
+        .filter_map(|line| HISTORICAL_WEEK_HEADER_RE.captures(line))
+        .collect();
+    if headers.len() != 1
+        || lines
+            .iter()
+            .any(|line| line.starts_with("Today is ") || line.starts_with("Tomorrow is "))
+        || lines.iter().any(|line| line.starts_with("\u{2022} "))
+    {
+        return None;
+    }
+    let header = &headers[0];
+    let start = NaiveDate::parse_from_str(header.get(1)?.as_str(), "%Y-%m-%d").ok()?;
+    let end = NaiveDate::parse_from_str(header.get(2)?.as_str(), "%Y-%m-%d").ok()?;
+    let current_week_monday = local_date.checked_sub_days(chrono::Days::new(
+        local_date.weekday().num_days_from_monday().into(),
+    ))?;
+    if start.weekday() != Weekday::Mon
+        || end.weekday() != Weekday::Sun
+        || end.signed_duration_since(start).num_days() != 6
+        || end >= current_week_monday
+        || !historical_request_matches_range(human_message, start, end)
+    {
+        return None;
+    }
+
+    let row_lines: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("- "))
+        .collect();
+    if row_lines.len() != 7 {
+        return None;
+    }
+    const ORDER: [&str; 7] = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ];
+    let mut seen_days = HashSet::new();
+    let mut seen_dates = HashSet::new();
+    let mut rows = Vec::with_capacity(7);
+    for (index, line) in row_lines.into_iter().enumerate() {
+        let captures = HISTORICAL_WEEK_ROW_RE.captures(line)?;
+        let day = captures.get(1)?.as_str().to_ascii_lowercase();
+        let expected = start.checked_add_days(chrono::Days::new(index as u64))?;
+        let date = historical_row_date(captures.get(2)?.as_str(), expected.year())?;
+        let dish = captures.get(3)?.as_str().trim();
+        if day != ORDER[index]
+            || date != expected
+            || !seen_days.insert(day.clone())
+            || !seen_dates.insert(date)
+            || dish.is_empty()
+            || dish.eq_ignore_ascii_case("not planned yet")
+        {
+            return None;
+        }
+        rows.push(HistoricalDinnerRow {
+            day,
+            date,
+            dish: dish.to_string(),
+        });
+    }
+    Some(rows)
+}
+
+fn historical_no_cook_detail(dish: &str) -> Option<String> {
+    let without_status = HISTORICAL_NO_COOK_RE.replace_all(dish, "");
+    let detail = without_status
+        .trim_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '—' | '–' | '-' | ',' | ';' | ':' | '/' | '|' | '.' | '!' | '?'
+                )
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if detail.is_empty() || detail.eq_ignore_ascii_case("out") {
+        return None;
+    }
+    let detail = HISTORICAL_OUT_CONTRACTION_RE.replace_all(&detail, "${subject} was out");
+    let detail = HISTORICAL_THIS_PERIOD_RE.replace_all(&detail, "that $1");
+    let detail = detail
+        .trim_end_matches(&['.', '!', '?'][..])
+        .trim()
+        .to_string();
+    (!detail.is_empty()).then_some(detail)
+}
+
+/// Deterministically format a composed historical whole-week dinner read from the
+/// gateway's exact, already-selected seven-row block. This is intentionally NOT an
+/// instant read: the caller still runs the real composer and acknowledgement/edit
+/// lifecycle, then uses these data-fed clauses as the final family-visible bytes.
+///
+/// The capability is the conjunction of the narrow dated request and the validated
+/// historical block. Any missing, duplicate, reordered, misdated, current-or-future
+/// week, or mismatched-range input returns `None`; the ordinary composed reply path
+/// remains in force and no partial rows are exposed as an authoritative answer.
+pub(crate) fn historical_week_dinner_reply(
+    human_message: &str,
+    week_context: &str,
+    local_date: NaiveDate,
+) -> Option<String> {
+    let rows = exact_historical_dinner_rows(human_message, week_context, local_date)?;
+    let clauses = rows
+        .into_iter()
+        .map(|row| {
+            let dish = STANDALONE_AMPERSAND_RE
+                .replace_all(&row.dish, " and ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_end_matches(&['.', '!', '?'][..])
+                .to_string();
+            let low = dish.to_lowercase();
+            let is_out = low
+                .split(|character: char| !character.is_alphanumeric())
+                .any(|word| word == "out");
+            if HISTORICAL_NO_COOK_RE.is_match(&low) && is_out {
+                let month = historical_month_name(row.date.month())?;
+                let prefix = format!(
+                    "{}, {month} {} was out, no cooking",
+                    capitalize_weekday(&row.day),
+                    row.date.day(),
+                );
+                match historical_no_cook_detail(&dish) {
+                    Some(detail) => Some(format!("{prefix} — {detail}.")),
+                    None => Some(format!("{prefix}.")),
+                }
+            } else {
+                Some(format!("{} was {dish}.", capitalize_weekday(&row.day)))
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(clauses.join(" "))
+}
+
 /// The parsed `WG_WEEK_CONTEXT`: which weekdays have a planned dinner (keyed by
 /// lowercase full weekday name → dish text), plus which weekday "today" and
 /// "tomorrow" resolve to (so a relative-day empty-claim — "nothing for tomorrow"
@@ -4254,6 +4551,206 @@ label = "Fallback Member"
          Today is Friday — dinner: Chicken tray bake.\n\
          Tomorrow is Saturday — dinner: Baked white fish with tomato, olives & capers."
             .to_string()
+    }
+
+    fn historical_w30_dinner_context() -> String {
+        "Requested historical dinner plan (2026-07-20 through 2026-07-26),\n\
+         selected from the one exact indexed plan for that civil-date range. Answer the\n\
+         dated request FROM these seven rows, in the order shown. Do not substitute the\n\
+         current week, another week, or another day's row:\n\
+         - Monday (Jul 20): Mushroom risotto, finished with spinach & lemon\n\
+         - Tuesday (Jul 21): Pan-seared duck breast, roast potatoes & a quick salad\n\
+         - Wednesday (Jul 22): No cooking \u{2014} Luca's out this evening\n\
+         - Thursday (Jul 23): Pasta al pomodoro\n\
+         - Friday (Jul 24): Pan seared pork\n\
+         - Saturday (Jul 25): Pizza margherita, homemade dough\n\
+         - Sunday (Jul 26): Clear-the-fridge frittata, greens folded through"
+            .to_string()
+    }
+
+    #[test]
+    fn historical_week_dinner_reply_is_exact_ordered_and_row_fed() {
+        let prompt = "Give me the July 20\u{2013}26 dinners in order.";
+        let context = historical_w30_dinner_context();
+        let local_date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let expected = "Monday was Mushroom risotto, finished with spinach and lemon. \
+                        Tuesday was Pan-seared duck breast, roast potatoes and a quick salad. \
+                        Wednesday, July 22 was out, no cooking \u{2014} Luca was out that evening. \
+                        Thursday was Pasta al pomodoro. \
+                        Friday was Pan seared pork. \
+                        Saturday was Pizza margherita, homemade dough. \
+                        Sunday was Clear-the-fridge frittata, greens folded through.";
+
+        assert_eq!(
+            historical_week_dinner_reply(prompt, &context, local_date).as_deref(),
+            Some(expected),
+        );
+
+        let mutations = [
+            (
+                "Mushroom risotto, finished with spinach & lemon",
+                "Porcini barley with parsley",
+                "Mushroom risotto",
+                "Porcini barley",
+            ),
+            (
+                "Pan-seared duck breast, roast potatoes & a quick salad",
+                "Roast aubergine with couscous",
+                "Pan-seared duck breast",
+                "Roast aubergine",
+            ),
+            (
+                "No cooking \u{2014} Luca's out this evening",
+                "No cooking \u{2014} Renata's out this afternoon",
+                "Luca was out that evening",
+                "Renata was out that afternoon",
+            ),
+            (
+                "Pasta al pomodoro",
+                "Pumpkin ravioli",
+                "Pasta al pomodoro",
+                "Pumpkin ravioli",
+            ),
+            (
+                "Pan seared pork",
+                "Grilled halloumi",
+                "Pan seared pork",
+                "Grilled halloumi",
+            ),
+            (
+                "Pizza margherita, homemade dough",
+                "Focaccia sandwiches",
+                "Pizza margherita",
+                "Focaccia sandwiches",
+            ),
+            (
+                "Clear-the-fridge frittata, greens folded through",
+                "Lentil soup with herbs",
+                "Clear-the-fridge frittata",
+                "Lentil soup",
+            ),
+        ];
+        for (source, replacement, old_words, new_words) in mutations {
+            let changed = context.replace(source, replacement);
+            let changed_reply = historical_week_dinner_reply(prompt, &changed, local_date)
+                .expect("changed row stays valid");
+            assert_ne!(
+                changed_reply, expected,
+                "mutating `{source}` did not change the final",
+            );
+            assert!(
+                !changed_reply.contains(old_words),
+                "old row words `{old_words}` survived: {changed_reply}",
+            );
+            assert!(
+                changed_reply.contains(new_words),
+                "new row words `{new_words}` are absent: {changed_reply}",
+            );
+        }
+    }
+
+    #[test]
+    fn historical_week_dinner_reply_rejects_current_iso_week_exact_block() {
+        let prompt = "Give me the July 27\u{2013}August 2 dinners in order.";
+        let context = "Requested historical dinner plan (2026-07-27 through 2026-08-02),\n\
+                       selected from the one exact indexed plan for that civil-date range. Answer the\n\
+                       dated request FROM these seven rows, in the order shown. Do not substitute the\n\
+                       current week, another week, or another day's row:\n\
+                       - Monday (Jul 27): Lentil soup\n\
+                       - Tuesday (Jul 28): Roast aubergine\n\
+                       - Wednesday (Jul 29): Pasta primavera\n\
+                       - Thursday (Jul 30): Chicken thighs\n\
+                       - Friday (Jul 31): Baked fish\n\
+                       - Saturday (Aug 1): Homemade pizza\n\
+                       - Sunday (Aug 2): Vegetable frittata";
+
+        assert_eq!(
+            historical_week_dinner_reply(
+                prompt,
+                context,
+                NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            ),
+            None,
+            "a current-week block was accepted as historical",
+        );
+        assert!(
+            historical_week_dinner_reply(
+                prompt,
+                context,
+                NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            )
+            .is_some(),
+            "the exact same block should become historical after that ISO week",
+        );
+    }
+
+    #[test]
+    fn historical_week_dinner_reply_fails_closed_on_any_incomplete_or_misaligned_block() {
+        let prompt = "Give me the July 20\u{2013}26 dinners in order.";
+        let context = historical_w30_dinner_context();
+        let local_date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let sunday = "- Sunday (Jul 26): Clear-the-fridge frittata, greens folded through";
+        let tuesday = "- Tuesday (Jul 21): Pan-seared duck breast, roast potatoes & a quick salad";
+        let wednesday = "- Wednesday (Jul 22): No cooking \u{2014} Luca's out this evening";
+
+        let cases = [
+            (
+                "wrong request range",
+                "Give me the July 27\u{2013}August 2 dinners in order.".to_string(),
+                context.clone(),
+            ),
+            (
+                "non-historical context",
+                prompt.to_string(),
+                context.replacen(
+                    "Requested historical dinner plan",
+                    "This week's dinner plan",
+                    1,
+                ),
+            ),
+            (
+                "missing row",
+                prompt.to_string(),
+                context.replace(&format!("\n{sunday}"), ""),
+            ),
+            (
+                "duplicate weekday/date",
+                prompt.to_string(),
+                context.replace(
+                    tuesday,
+                    "- Monday (Jul 20): Pan-seared duck breast, roast potatoes & a quick salad",
+                ),
+            ),
+            (
+                "rows out of order",
+                prompt.to_string(),
+                context
+                    .replace(tuesday, "__TUESDAY__")
+                    .replace(wednesday, tuesday)
+                    .replace("__TUESDAY__", wednesday),
+            ),
+            (
+                "wrong row date",
+                prompt.to_string(),
+                context.replace(
+                    wednesday,
+                    "- Wednesday (Jul 23): No cooking \u{2014} Luca's out this evening",
+                ),
+            ),
+            (
+                "eighth row",
+                prompt.to_string(),
+                format!("{context}\n- Monday (Jul 20): Duplicate"),
+            ),
+        ];
+
+        for (label, request, block) in cases {
+            assert_eq!(
+                historical_week_dinner_reply(&request, &block, local_date),
+                None,
+                "{label} was accepted",
+            );
+        }
     }
 
     #[test]
