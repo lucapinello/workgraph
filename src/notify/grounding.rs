@@ -2188,6 +2188,30 @@ static HISTORICAL_WEEK_REQUEST_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid historical-week request regex")
 });
 
+// RUN-3 C075 (2026-07-31): a dated whole-week training SUMMARY is still a
+// composed lane, but it is a READ, not a request to create a background task.
+// Keep the grammar in lock-step with claw3d-bridge's typed detector. The exact
+// request recognition is deliberately independent of the context parser so a
+// recognized request with missing/malformed context can fail closed instead of
+// falling back to composer prose (the live failure created a real TASK_CREATE).
+static HISTORICAL_WORKOUT_REQUEST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^summarize\s+(?:the\s+)?(january|february|march|april|may|june|july|august|september|sept|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*(?:-|–|—|through|to)\s*(?:(january|february|march|april|may|june|july|august|september|sept|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\.?\s+)?(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?\s+(?:training|workouts?)\s*[.!?]*$",
+    )
+    .expect("valid historical-workout request regex")
+});
+
+static HISTORICAL_WORKOUT_WEEK_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^week_key=(\d{4})-W(\d{2})$").expect("valid historical-workout week-key regex")
+});
+
+static HISTORICAL_WORKOUT_ROW_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^row=(\d{4}-\d{2}-\d{2})\|(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\|([01]\d|2[0-3]):([0-5]\d)\|([^|\r\n]{1,160})$",
+    )
+    .expect("valid historical-workout row regex")
+});
+
 static STANDALONE_AMPERSAND_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s+&\s+").expect("valid standalone ampersand regex"));
 
@@ -2210,6 +2234,27 @@ struct HistoricalDinnerRow {
     date: NaiveDate,
     dish: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoricalWorkoutRow {
+    day: String,
+    time: NaiveTime,
+    title: String,
+}
+
+/// Tri-state result for the C075 guard. `NotApplicable` preserves every other
+/// composed turn. `InvalidContext` is intentionally distinct from it: once the
+/// exact dated training-summary grammar is recognized, missing or malformed
+/// gateway evidence must never fall back to model prose or task creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoricalWorkoutReply {
+    NotApplicable,
+    Grounded(String),
+    InvalidContext,
+}
+
+pub(crate) const HISTORICAL_WORKOUT_REFUSAL: &str =
+    "I couldn't verify that historical training week safely.";
 
 fn historical_month_number(value: &str) -> Option<u32> {
     match value
@@ -2294,6 +2339,270 @@ fn historical_request_matches_range(human_message: &str, start: NaiveDate, end: 
         && start.day() == start_day
         && end.month() == end_month
         && end.day() == end_day
+}
+
+fn historical_workout_request_matches_range(
+    human_message: &str,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> bool {
+    let compact = human_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let Some(captures) = HISTORICAL_WORKOUT_REQUEST_RE.captures(&compact) else {
+        return false;
+    };
+    let Some(start_month) = captures
+        .get(1)
+        .and_then(|value| historical_month_number(value.as_str()))
+    else {
+        return false;
+    };
+    let Some(start_day) = captures
+        .get(2)
+        .and_then(|value| value.as_str().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    let end_month = captures
+        .get(3)
+        .and_then(|value| historical_month_number(value.as_str()))
+        .unwrap_or(start_month);
+    let Some(end_day) = captures
+        .get(4)
+        .and_then(|value| value.as_str().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if let Some(year) = captures
+        .get(5)
+        .and_then(|value| value.as_str().parse::<i32>().ok())
+        && (start.year() != year || end.year() != year)
+    {
+        return false;
+    }
+    start.month() == start_month
+        && start.day() == start_day
+        && end.month() == end_month
+        && end.day() == end_day
+}
+
+fn exact_historical_workout_rows(
+    human_message: &str,
+    week_context: &str,
+    local_date: NaiveDate,
+) -> Option<(NaiveDate, NaiveDate, Vec<HistoricalWorkoutRow>)> {
+    let lines: Vec<&str> = week_context
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() != 9
+        || lines.first().copied() != Some("WG_HISTORICAL_WORKOUT_CONTEXT_V1")
+        || lines.last().copied() != Some("END_WG_HISTORICAL_WORKOUT_CONTEXT_V1")
+    {
+        return None;
+    }
+
+    let week_key = HISTORICAL_WORKOUT_WEEK_KEY_RE.captures(lines[1])?;
+    let week_year = week_key.get(1)?.as_str().parse::<i32>().ok()?;
+    let week_number = week_key.get(2)?.as_str().parse::<u32>().ok()?;
+    let start = lines[2]
+        .strip_prefix("range_start=")
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())?;
+    let end = lines[3]
+        .strip_prefix("range_end=")
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())?;
+    let current_week_monday = local_date.checked_sub_days(chrono::Days::new(
+        local_date.weekday().num_days_from_monday().into(),
+    ))?;
+    let start_iso = start.iso_week();
+    let end_iso = end.iso_week();
+    if start.weekday() != Weekday::Mon
+        || end.weekday() != Weekday::Sun
+        || end.signed_duration_since(start).num_days() != 6
+        || end >= current_week_monday
+        || start_iso.year() != week_year
+        || start_iso.week() != week_number
+        || end_iso.year() != week_year
+        || end_iso.week() != week_number
+        || !historical_workout_request_matches_range(human_message, start, end)
+    {
+        return None;
+    }
+
+    let mut seen_dates = HashSet::new();
+    let mut rows = Vec::with_capacity(4);
+    let mut prior_date = None;
+    for line in &lines[4..8] {
+        let captures = HISTORICAL_WORKOUT_ROW_RE.captures(line)?;
+        let date = NaiveDate::parse_from_str(captures.get(1)?.as_str(), "%Y-%m-%d").ok()?;
+        let day = captures.get(2)?.as_str().to_string();
+        let hour = captures.get(3)?.as_str().parse::<u32>().ok()?;
+        let minute = captures.get(4)?.as_str().parse::<u32>().ok()?;
+        let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+        let title = captures
+            .get(5)?
+            .as_str()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if date < start
+            || date > end
+            || family_plan::long_weekday(date).to_ascii_lowercase() != day
+            || !seen_dates.insert(date)
+            || prior_date.is_some_and(|prior| date <= prior)
+            || title.is_empty()
+        {
+            return None;
+        }
+        prior_date = Some(date);
+        rows.push(HistoricalWorkoutRow { day, time, title });
+    }
+    (rows.len() == 4).then_some((start, end, rows))
+}
+
+fn historical_count_word(count: usize) -> Option<&'static str> {
+    match count {
+        0 => Some("zero"),
+        1 => Some("one"),
+        2 => Some("two"),
+        3 => Some("three"),
+        4 => Some("four"),
+        _ => None,
+    }
+}
+
+fn historical_workout_range_label(start: NaiveDate, end: NaiveDate) -> Option<String> {
+    let start_month = historical_month_name(start.month())?;
+    if start.month() == end.month() && start.year() == end.year() {
+        Some(format!("{start_month} {}-{}", start.day(), end.day()))
+    } else {
+        Some(format!(
+            "{start_month} {}-{} {}",
+            start.day(),
+            historical_month_name(end.month())?,
+            end.day(),
+        ))
+    }
+}
+
+fn historical_workout_title(title: &str) -> Option<String> {
+    let folded = title
+        .trim_matches(&['.', '!', '?'][..])
+        .replace(['(', ')'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if folded.is_empty() {
+        return None;
+    }
+    // "Lower (strength)" uses strength as a redundant category qualifier;
+    // the week-shape clause already calls these lifting sessions. Other
+    // qualifiers remain visible, so mutating the source changes the final.
+    Some(if folded == "lower strength" {
+        "lower".to_string()
+    } else {
+        folded
+    })
+}
+
+fn historical_workout_time(time: NaiveTime) -> String {
+    let hour = time.hour();
+    let display_hour = hour % 12;
+    let display_hour = if display_hour == 0 { 12 } else { display_hour };
+    let period = if hour < 12 { "a.m." } else { "p.m." };
+    if time.minute() == 0 {
+        format!("{display_hour} {period}")
+    } else {
+        format!("{display_hour}:{:02} {period}", time.minute())
+    }
+}
+
+/// Deterministically format a composed historical whole-week workout summary
+/// from the gateway's exact, validated row protocol. The composer still runs
+/// (and may emit the normal engine acknowledgement), but its prose and any
+/// hidden `TASK_CREATE` are discarded before promise/action auditing.
+///
+/// Unlike the older dinner helper's `Option`, this is tri-state. Once the exact
+/// dated-summary request is recognized, absent/malformed/current-week context is
+/// `InvalidContext`, never ordinary model fallback: the live C075 miss otherwise
+/// turned the word "Summarize" into a real background task and household writes.
+pub(crate) fn historical_week_workout_reply(
+    human_message: &str,
+    week_context: &str,
+    local_date: NaiveDate,
+) -> HistoricalWorkoutReply {
+    let compact = human_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !HISTORICAL_WORKOUT_REQUEST_RE.is_match(&compact) {
+        return HistoricalWorkoutReply::NotApplicable;
+    }
+    let Some((start, end, rows)) =
+        exact_historical_workout_rows(human_message, week_context, local_date)
+    else {
+        return HistoricalWorkoutReply::InvalidContext;
+    };
+
+    let recovery_count = rows
+        .iter()
+        .filter(|row| {
+            row.title
+                .split(|character: char| !character.is_alphanumeric())
+                .any(|word| word.eq_ignore_ascii_case("recovery"))
+        })
+        .count();
+    let lifting_count = rows.len().saturating_sub(recovery_count);
+    let Some(lifting_word) = historical_count_word(lifting_count) else {
+        return HistoricalWorkoutReply::InvalidContext;
+    };
+    let Some(recovery_word) = historical_count_word(recovery_count) else {
+        return HistoricalWorkoutReply::InvalidContext;
+    };
+    let Some(range) = historical_workout_range_label(start, end) else {
+        return HistoricalWorkoutReply::InvalidContext;
+    };
+    let lifting_noun = if lifting_count == 1 {
+        "lifting session"
+    } else {
+        "lifting sessions"
+    };
+    let recovery_noun = if recovery_count == 1 {
+        "active recovery"
+    } else {
+        "active recovery sessions"
+    };
+    let shape = format!(
+        "The {range} training had {lifting_word} {lifting_noun} and {recovery_word} {recovery_noun}."
+    );
+
+    let mut sessions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(title) = historical_workout_title(&row.title) else {
+            return HistoricalWorkoutReply::InvalidContext;
+        };
+        sessions.push(format!(
+            "{} {title} at {}",
+            capitalize_weekday(&row.day),
+            historical_workout_time(row.time),
+        ));
+    }
+    let days = match sessions.as_slice() {
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let (last, initial) = sessions.split_last().expect("four validated rows");
+            format!("{}, and {last}", initial.join(", "))
+        }
+    };
+    // Every formatted clock ends in the a.m./p.m. abbreviation's period, so
+    // the day clause is already sentence-terminal. Appending another period
+    // would produce the live-visible `a.m..` typo.
+    HistoricalWorkoutReply::Grounded(format!("{shape} {days}"))
 }
 
 fn historical_row_date(label: &str, year: i32) -> Option<NaiveDate> {
@@ -4566,6 +4875,154 @@ label = "Fallback Member"
          - Saturday (Jul 25): Pizza margherita, homemade dough\n\
          - Sunday (Jul 26): Clear-the-fridge frittata, greens folded through"
             .to_string()
+    }
+
+    fn historical_w30_workout_context() -> String {
+        "WG_HISTORICAL_WORKOUT_CONTEXT_V1\n\
+         week_key=2026-W30\n\
+         range_start=2026-07-20\n\
+         range_end=2026-07-26\n\
+         row=2026-07-20|monday|07:00|Lower (strength)\n\
+         row=2026-07-22|wednesday|07:00|Upper (push)\n\
+         row=2026-07-24|friday|07:00|Upper (pull)\n\
+         row=2026-07-26|sunday|10:00|Active recovery\n\
+         END_WG_HISTORICAL_WORKOUT_CONTEXT_V1"
+            .to_string()
+    }
+
+    #[test]
+    fn historical_week_workout_reply_is_exact_and_row_fed() {
+        let prompt = "Summarize the July 20\u{2013}26 training.";
+        let context = historical_w30_workout_context();
+        let local_date = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let expected = "The July 20-26 training had three lifting sessions and one active recovery. \
+                        Monday lower at 7 a.m., Wednesday upper push at 7 a.m., \
+                        Friday upper pull at 7 a.m., and Sunday active recovery at 10 a.m.";
+        assert_eq!(
+            historical_week_workout_reply(prompt, &context, local_date),
+            HistoricalWorkoutReply::Grounded(expected.to_string()),
+        );
+
+        let mutations = [
+            ("Upper (push)", "Upper (power)", "upper push", "upper power"),
+            (
+                "07:00|Upper (pull)",
+                "08:30|Upper (pull)",
+                "7 a.m.",
+                "8:30 a.m.",
+            ),
+            (
+                "10:00|Active recovery",
+                "10:00|Tempo run",
+                "three lifting sessions and one active recovery",
+                "four lifting sessions and zero active recovery sessions",
+            ),
+        ];
+        for (source, replacement, old_words, new_words) in mutations {
+            let changed = context.replacen(source, replacement, 1);
+            let HistoricalWorkoutReply::Grounded(changed_reply) =
+                historical_week_workout_reply(prompt, &changed, local_date)
+            else {
+                panic!("mutated row should remain structurally valid: {source}");
+            };
+            assert_ne!(changed_reply, expected, "mutation did not change reply");
+            assert!(
+                changed_reply.contains(new_words),
+                "new row words absent from {changed_reply}",
+            );
+            if source != "07:00|Upper (pull)" {
+                assert!(
+                    !changed_reply.contains(old_words),
+                    "old row words survived in {changed_reply}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn historical_week_workout_reply_is_tri_state_and_fails_closed() {
+        let prompt = "Summarize the July 20-26 workouts?";
+        let context = historical_w30_workout_context();
+        let local_date = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        assert_eq!(
+            historical_week_workout_reply("How was training?", &context, local_date),
+            HistoricalWorkoutReply::NotApplicable,
+        );
+        assert_eq!(
+            historical_week_workout_reply(prompt, "", local_date),
+            HistoricalWorkoutReply::InvalidContext,
+            "recognized request with absent evidence fell through",
+        );
+
+        let cases = [
+            (
+                "wrong request range",
+                "Summarize the July 13-19 workouts?".to_string(),
+                context.clone(),
+            ),
+            (
+                "wrong week key",
+                prompt.to_string(),
+                context.replace("week_key=2026-W30", "week_key=2026-W31"),
+            ),
+            (
+                "missing row",
+                prompt.to_string(),
+                context.replace("row=2026-07-24|friday|07:00|Upper (pull)\n", ""),
+            ),
+            (
+                "duplicate or misdated row",
+                prompt.to_string(),
+                context.replace("2026-07-22|wednesday", "2026-07-20|wednesday"),
+            ),
+            (
+                "rows out of order",
+                prompt.to_string(),
+                context
+                    .replace("row=2026-07-20|monday|07:00|Lower (strength)", "__MONDAY__")
+                    .replace(
+                        "row=2026-07-22|wednesday|07:00|Upper (push)",
+                        "row=2026-07-20|monday|07:00|Lower (strength)",
+                    )
+                    .replace("__MONDAY__", "row=2026-07-22|wednesday|07:00|Upper (push)"),
+            ),
+            (
+                "extra line",
+                prompt.to_string(),
+                context.replace(
+                    "END_WG_HISTORICAL_WORKOUT_CONTEXT_V1",
+                    "note=untrusted\nEND_WG_HISTORICAL_WORKOUT_CONTEXT_V1",
+                ),
+            ),
+            (
+                "delimiter injection",
+                prompt.to_string(),
+                context.replace("Upper (push)", "Upper|push"),
+            ),
+        ];
+        for (label, request, block) in cases {
+            assert_eq!(
+                historical_week_workout_reply(&request, &block, local_date),
+                HistoricalWorkoutReply::InvalidContext,
+                "{label} was accepted or fell through",
+            );
+        }
+
+        let current_context = context
+            .replace("week_key=2026-W30", "week_key=2026-W31")
+            .replace("2026-07-20", "2026-07-27")
+            .replace("2026-07-22", "2026-07-29")
+            .replace("2026-07-24", "2026-07-31")
+            .replace("2026-07-26", "2026-08-02");
+        assert_eq!(
+            historical_week_workout_reply(
+                "Summarize the July 27-August 2 training.",
+                &current_context,
+                NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+            ),
+            HistoricalWorkoutReply::InvalidContext,
+            "current-week context was accepted as historical",
+        );
     }
 
     #[test]

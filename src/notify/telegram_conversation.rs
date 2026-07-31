@@ -2794,28 +2794,60 @@ async fn finalize_composed_reply(
     week_context: Option<&str>,
     local_date: chrono::NaiveDate,
 ) -> Result<TurnOutcome> {
-    // A whole historical dinner week remains a real composed turn: election,
-    // model execution, latency acknowledgement, edit-in-place delivery, turn/
-    // attempt receipts, and the elected persona all stay unchanged. Once the
-    // composer returns, however, the exact seven-row gateway block is stronger
-    // evidence than a lossy model paraphrase. Format the final from those rows
-    // BEFORE promise auditing, so discarded model prose cannot create a phantom
-    // TASK_CREATE or promise side effect. The helper fails closed on every
-    // incomplete/misaligned block and then this is the ordinary compose path.
+    // Whole historical dinner/training weeks remain real composed turns:
+    // election, model execution, latency acknowledgement, edit-in-place
+    // delivery, turn/attempt receipts, and the elected persona all stay
+    // unchanged. Once the composer returns, however, the gateway's exact typed
+    // rows are stronger evidence than a lossy model paraphrase. Format the final
+    // from those rows BEFORE promise auditing, so discarded model prose cannot
+    // create a phantom TASK_CREATE or promise side effect.
+    //
+    // RUN-3 C075: workout summary recognition is deliberately tri-state. A
+    // recognized dated workout request with absent/malformed/current-week
+    // context gets a neutral terminal refusal and NO model/task fallback. The
+    // live failure did fall back, interpreting "Summarize" as background work
+    // and mutating the real household. Dinner behavior remains unchanged: an
+    // invalid dinner block simply stays on its existing ordinary compose path.
+    let workout_guard = grounding::historical_week_workout_reply(
+        human_message,
+        week_context.unwrap_or_default(),
+        local_date,
+    );
     let deterministic_historical = week_context.and_then(|context| {
         grounding::historical_week_dinner_reply(human_message, context, local_date)
     });
-    let directive = if let Some(reply) = deterministic_historical.as_ref() {
-        eprintln!(
-            "[{}] historical-week guard: replaced {agent_id}'s draft with seven row-fed clauses",
-            chrono::Utc::now().format("%H:%M:%S"),
-        );
-        lifecycle::TaskDirective {
-            reply: reply.clone(),
-            title: None,
+    let directive = match workout_guard {
+        grounding::HistoricalWorkoutReply::Grounded(reply) => {
+            eprintln!(
+                "[{}] historical-workout guard: replaced {agent_id}'s draft with row-fed clauses",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+            lifecycle::TaskDirective { reply, title: None }
         }
-    } else {
-        lifecycle::extract_task_directive(first_text.trim())
+        grounding::HistoricalWorkoutReply::InvalidContext => {
+            eprintln!(
+                "[{}] historical-workout guard: refused invalid typed context for {agent_id}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            );
+            lifecycle::TaskDirective {
+                reply: grounding::HISTORICAL_WORKOUT_REFUSAL.to_string(),
+                title: None,
+            }
+        }
+        grounding::HistoricalWorkoutReply::NotApplicable => {
+            if let Some(reply) = deterministic_historical.as_ref() {
+                eprintln!(
+                    "[{}] historical-week guard: replaced {agent_id}'s draft with seven row-fed clauses",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                );
+                lifecycle::TaskDirective {
+                    reply: reply.clone(),
+                    title: None,
+                }
+            } else {
+                lifecycle::extract_task_directive(first_text.trim())
+            }
+        }
     };
     let mut reply_text = directive.reply.clone();
     // Audit the human-facing reply (with the machine tail already stripped) IN THE
@@ -6881,6 +6913,114 @@ domains = ["calendar", "coordination", "shopping"]
             task_count, 0,
             "the discarded model directive created a phantom task",
         );
+    }
+
+    /// RUN-3 C075: the exact historical workout rows win after the real compose
+    /// and engine ack lifecycle, before a model promise/TASK_CREATE can mutate
+    /// the graph or intent ledger. Every delivered word below is derived by the
+    /// grounding helper from the forwarded dates, titles, and times.
+    #[tokio::test]
+    async fn historical_week_workout_final_suppresses_model_task_creation() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("mira", Some("mira"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "mira", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "mira");
+        let plan = plan_conversation(&wg, &cfg, "telegram:mira", "555", "luca-1", Entry::Direct);
+        assert!(matches!(plan, ConversationPlan::Converse { .. }));
+
+        let context = "WG_HISTORICAL_WORKOUT_CONTEXT_V1\n\
+                       week_key=2026-W30\n\
+                       range_start=2026-07-20\n\
+                       range_end=2026-07-26\n\
+                       row=2026-07-20|monday|07:00|Lower (strength)\n\
+                       row=2026-07-22|wednesday|07:00|Upper (push)\n\
+                       row=2026-07-24|friday|07:00|Upper (pull)\n\
+                       row=2026-07-26|sunday|10:00|Active recovery\n\
+                       END_WG_HISTORICAL_WORKOUT_CONTEXT_V1";
+        let expected = "The July 20-26 training had three lifting sessions and one active recovery. \
+                        Monday lower at 7 a.m., Wednesday upper push at 7 a.m., \
+                        Friday upper pull at 7 a.m., and Sunday active recovery at 10 a.m.";
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok_after(
+            "Got it — pulling the full week's training right now and I'll get you that summary!\n\
+             TASK_CREATE: Summarize Luca's July 20-26 training week",
+            Duration::from_millis(200),
+        );
+
+        let outcome = run_conversation_turn_with_week_context(
+            &wg,
+            &plan,
+            "Summarize the July 20\u{2013}26 training.",
+            "req-c075",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+            Some(context),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Replied { acked: true });
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 1, "only the engine ack is a fresh send");
+        assert_eq!(calls[0].0, "mira");
+        assert!(calls[0].2.contains("On it"));
+        let edits = sink.edits();
+        assert_eq!(edits.len(), 1, "the row-fed answer edits the ack");
+        assert_eq!(edits[0].0, "mira");
+        assert_eq!(edits[0].3, expected);
+
+        let task_count = crate::parser::load_graph(wg.join("graph.jsonl"))
+            .map(|graph| graph.tasks().count())
+            .unwrap_or(0);
+        assert_eq!(task_count, 0, "discarded TASK_CREATE reached the graph");
+        assert!(
+            !wg.join(".casa/intents.jsonl").exists(),
+            "discarded TASK_CREATE reached the intent ledger",
+        );
+    }
+
+    /// Recognition, not successful parsing, is the no-task boundary. A typed
+    /// C075 request with malformed context receives one neutral final and never
+    /// falls back to the model directive that caused the live side effects.
+    #[tokio::test]
+    async fn malformed_historical_workout_context_refuses_without_task() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().to_path_buf();
+        let cfg = cfg_with_bots(&[("mira", Some("mira"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "mira", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "mira");
+        let plan = plan_conversation(&wg, &cfg, "telegram:mira", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer =
+            FakeComposer::ok("I'll pull that together.\nTASK_CREATE: Summarize Luca's training");
+
+        let outcome = run_conversation_turn_with_week_context(
+            &wg,
+            &plan,
+            "Summarize the July 20-26 training.",
+            "req-c075-malformed",
+            fast_timing(),
+            Some(&composer),
+            &sink,
+            Some("WG_HISTORICAL_WORKOUT_CONTEXT_V1\nweek_key=2026-W30"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Replied { acked: false });
+        assert_eq!(sink.calls().len(), 1);
+        assert_eq!(sink.calls()[0].2, grounding::HISTORICAL_WORKOUT_REFUSAL);
+        let task_count = crate::parser::load_graph(wg.join("graph.jsonl"))
+            .map(|graph| graph.tasks().count())
+            .unwrap_or(0);
+        assert_eq!(task_count, 0, "malformed context created a task");
+        assert!(!wg.join(".casa/intents.jsonl").exists());
     }
 
     /// A slow compose that then FAILS: the ack is edited into the glitch line
