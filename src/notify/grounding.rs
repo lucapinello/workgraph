@@ -2509,6 +2509,47 @@ fn historical_workout_title(title: &str) -> Option<String> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoricalWorkoutKind {
+    Lifting,
+    ActiveRecovery,
+    Other,
+}
+
+/// Classify only workout titles with positive evidence. The C075 source uses
+/// conventional lifting split labels (`Lower (strength)`, `Upper (push)`, and
+/// `Upper (pull)`), while recovery names itself. Everything else remains
+/// faithfully visible in the row enumeration but must not be relabelled as
+/// lifting merely because it is not recovery (for example a tempo run or
+/// putting practice).
+fn historical_workout_kind(title: &str) -> HistoricalWorkoutKind {
+    let words: Vec<String> = title
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if words.iter().any(|word| word == "recovery") {
+        return HistoricalWorkoutKind::ActiveRecovery;
+    }
+    let explicit_lifting = words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "strength" | "lifting" | "weightlifting" | "weights" | "resistance"
+        )
+    });
+    let split_lifting = matches!(
+        words.first().map(String::as_str),
+        Some("upper") | Some("lower")
+    ) && words
+        .iter()
+        .any(|word| matches!(word.as_str(), "push" | "pull"));
+    if explicit_lifting || split_lifting {
+        HistoricalWorkoutKind::Lifting
+    } else {
+        HistoricalWorkoutKind::Other
+    }
+}
+
 fn historical_workout_time(time: NaiveTime) -> String {
     let hour = time.hour();
     let display_hour = hour % 12;
@@ -2548,37 +2589,55 @@ pub(crate) fn historical_week_workout_reply(
         return HistoricalWorkoutReply::InvalidContext;
     };
 
-    let recovery_count = rows
+    let kinds: Vec<HistoricalWorkoutKind> = rows
         .iter()
-        .filter(|row| {
-            row.title
-                .split(|character: char| !character.is_alphanumeric())
-                .any(|word| word.eq_ignore_ascii_case("recovery"))
-        })
+        .map(|row| historical_workout_kind(&row.title))
+        .collect();
+    let lifting_count = kinds
+        .iter()
+        .filter(|kind| **kind == HistoricalWorkoutKind::Lifting)
         .count();
-    let lifting_count = rows.len().saturating_sub(recovery_count);
-    let Some(lifting_word) = historical_count_word(lifting_count) else {
-        return HistoricalWorkoutReply::InvalidContext;
-    };
-    let Some(recovery_word) = historical_count_word(recovery_count) else {
-        return HistoricalWorkoutReply::InvalidContext;
-    };
+    let recovery_count = kinds
+        .iter()
+        .filter(|kind| **kind == HistoricalWorkoutKind::ActiveRecovery)
+        .count();
     let Some(range) = historical_workout_range_label(start, end) else {
         return HistoricalWorkoutReply::InvalidContext;
     };
-    let lifting_noun = if lifting_count == 1 {
-        "lifting session"
+    let shape = if kinds
+        .iter()
+        .all(|kind| *kind != HistoricalWorkoutKind::Other)
+    {
+        let Some(lifting_word) = historical_count_word(lifting_count) else {
+            return HistoricalWorkoutReply::InvalidContext;
+        };
+        let Some(recovery_word) = historical_count_word(recovery_count) else {
+            return HistoricalWorkoutReply::InvalidContext;
+        };
+        let lifting_noun = if lifting_count == 1 {
+            "lifting session"
+        } else {
+            "lifting sessions"
+        };
+        let recovery_noun = if recovery_count == 1 {
+            "active recovery"
+        } else {
+            "active recovery sessions"
+        };
+        format!(
+            "The {range} training had {lifting_word} {lifting_noun} and {recovery_word} {recovery_noun}."
+        )
     } else {
-        "lifting sessions"
+        let Some(session_word) = historical_count_word(rows.len()) else {
+            return HistoricalWorkoutReply::InvalidContext;
+        };
+        let session_noun = if rows.len() == 1 {
+            "session"
+        } else {
+            "sessions"
+        };
+        format!("The {range} training had {session_word} {session_noun}.")
     };
-    let recovery_noun = if recovery_count == 1 {
-        "active recovery"
-    } else {
-        "active recovery sessions"
-    };
-    let shape = format!(
-        "The {range} training had {lifting_word} {lifting_noun} and {recovery_word} {recovery_noun}."
-    );
 
     let mut sessions = Vec::with_capacity(rows.len());
     for row in rows {
@@ -4903,39 +4962,76 @@ label = "Fallback Member"
             HistoricalWorkoutReply::Grounded(expected.to_string()),
         );
 
-        let mutations = [
-            ("Upper (push)", "Upper (power)", "upper push", "upper power"),
+        let changed_time = context.replacen("07:00|Upper (pull)", "08:30|Upper (pull)", 1);
+        let HistoricalWorkoutReply::Grounded(changed_time_reply) =
+            historical_week_workout_reply(prompt, &changed_time, local_date)
+        else {
+            panic!("mutated clock should remain structurally valid");
+        };
+        assert_ne!(changed_time_reply, expected);
+        assert!(changed_time_reply.contains("8:30 a.m."));
+
+        // An unclassified session keeps its exact row-derived label, while the
+        // overview becomes a neutral count instead of treating every
+        // non-recovery workout as lifting.
+        for (source, replacement, expected_title) in [
+            ("Upper (push)", "Upper (power)", "Wednesday upper power"),
             (
-                "07:00|Upper (pull)",
-                "08:30|Upper (pull)",
-                "7 a.m.",
-                "8:30 a.m.",
+                "Active recovery",
+                "Tempo run",
+                "Sunday tempo run at 10 a.m.",
             ),
             (
-                "10:00|Active recovery",
-                "10:00|Tempo run",
-                "three lifting sessions and one active recovery",
-                "four lifting sessions and zero active recovery sessions",
+                "Upper (push)",
+                "Putting practice",
+                "Wednesday putting practice at 7 a.m.",
             ),
-        ];
-        for (source, replacement, old_words, new_words) in mutations {
+        ] {
             let changed = context.replacen(source, replacement, 1);
             let HistoricalWorkoutReply::Grounded(changed_reply) =
                 historical_week_workout_reply(prompt, &changed, local_date)
             else {
                 panic!("mutated row should remain structurally valid: {source}");
             };
-            assert_ne!(changed_reply, expected, "mutation did not change reply");
             assert!(
-                changed_reply.contains(new_words),
-                "new row words absent from {changed_reply}",
+                changed_reply.starts_with("The July 20-26 training had four sessions."),
+                "unknown workout was assigned a made-up category: {changed_reply}",
             );
-            if source != "07:00|Upper (pull)" {
-                assert!(
-                    !changed_reply.contains(old_words),
-                    "old row words survived in {changed_reply}",
-                );
-            }
+            assert!(
+                changed_reply.contains(expected_title),
+                "new row title absent from {changed_reply}",
+            );
+            assert!(
+                !changed_reply.contains("lifting session"),
+                "an unknown workout was counted as lifting: {changed_reply}",
+            );
+        }
+    }
+
+    #[test]
+    fn historical_workout_categories_require_positive_row_evidence() {
+        assert_eq!(
+            historical_workout_kind("Lower (strength)"),
+            HistoricalWorkoutKind::Lifting,
+        );
+        assert_eq!(
+            historical_workout_kind("Upper (push)"),
+            HistoricalWorkoutKind::Lifting,
+        );
+        assert_eq!(
+            historical_workout_kind("Upper (pull)"),
+            HistoricalWorkoutKind::Lifting,
+        );
+        assert_eq!(
+            historical_workout_kind("Active recovery"),
+            HistoricalWorkoutKind::ActiveRecovery,
+        );
+        for title in ["Tempo run", "Putting practice", "Yoga", "Swim intervals"] {
+            assert_eq!(
+                historical_workout_kind(title),
+                HistoricalWorkoutKind::Other,
+                "{title:?} was relabelled as lifting",
+            );
         }
     }
 
