@@ -73,7 +73,8 @@
 //! (`claw3d-bridge/src/feedLock.mjs` §9) there is NO persisted counter anywhere —
 //! the id is DERIVED:
 //!
-//!     id = <entries in every archive segment, counted from the bytes> + <live ordinal>
+//!     id = <entries in canonical group-feed-YYYY-MM.jsonl archive segments,
+//!           counted from the bytes> + <live ordinal>
 //!
 //! one-based, in file order, live file last, allocated INSIDE the critical
 //! section immediately after our own bytes land (so our row is the last live line
@@ -84,6 +85,7 @@
 //! how the feed minted the duplicate id `[1, 2, 2]` the gateway slice reproduced.
 
 use std::collections::hash_map::DefaultHasher;
+use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
@@ -652,7 +654,8 @@ fn archive_dir_for(feed_path: &Path) -> PathBuf {
         .join("archive")
 }
 
-/// Count the entries in every archive segment FROM THE BYTES, in file order.
+/// Count entries in every canonical `group-feed-YYYY-MM.jsonl` archive segment
+/// FROM THE BYTES, in file order.
 ///
 /// Deliberately NOT from `manifest.json`. The manifest is a read accelerator
 /// that is believed whenever its name set matches the files on disk — a wrong
@@ -667,6 +670,24 @@ fn archive_dir_for(feed_path: &Path) -> PathBuf {
 /// global id was 2: one unreadable directory, and a permanent id was reissued to
 /// a second row. Every unreadable segment, and the unreadable directory itself,
 /// is [`FeedWriteError::ReadUnknown`], and the write does not happen.
+///
+/// The exact-name predicate is also load-bearing. `.casa/archive` co-locates
+/// other JSONL ledgers, including `relay-receipts-YYYY-MM.jsonl`; counting those
+/// rows poisons every later feed id. Keep this predicate in lockstep with the
+/// gateway's `ARCHIVE_RE` in `conversation.mjs` and `conversationObserve.mjs`.
+fn is_canonical_feed_archive_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    bytes.len() == 24
+        && bytes.starts_with(b"group-feed-")
+        && bytes[11..15].iter().all(u8::is_ascii_digit)
+        && bytes[15] == b'-'
+        && bytes[16..18].iter().all(u8::is_ascii_digit)
+        && &bytes[18..] == b".jsonl"
+}
+
 fn archived_count_from_bytes(feed_path: &Path) -> Result<usize, FeedWriteError> {
     let dir = archive_dir_for(feed_path);
     let entries = match fs::read_dir(&dir) {
@@ -687,11 +708,7 @@ fn archived_count_from_bytes(feed_path: &Path) -> Result<usize, FeedWriteError> 
             detail: e.to_string(),
         })?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "jsonl")
-            && path
-                .file_name()
-                .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
-        {
+        if path.file_name().is_some_and(is_canonical_feed_archive_name) {
             names.push(path);
         }
     }
@@ -1744,12 +1761,12 @@ emoji = "①"
         fs::create_dir_all(&archive).unwrap();
         // Two rotated segments holding 3 and 2 entries.
         fs::write(
-            archive.join("group-feed-0001.jsonl"),
+            archive.join("group-feed-2026-06.jsonl"),
             "{\"ts\":1}\n{\"ts\":2}\n{\"ts\":3}\n",
         )
         .unwrap();
         fs::write(
-            archive.join("group-feed-0002.jsonl"),
+            archive.join("group-feed-2026-07.jsonl"),
             "{\"ts\":4}\n{\"ts\":5}\n",
         )
         .unwrap();
@@ -1761,8 +1778,8 @@ emoji = "①"
             serde_json::json!({
                 "version": 1,
                 "segments": [
-                    {"name": "group-feed-0001.jsonl", "count": 1},
-                    {"name": "group-feed-0002.jsonl", "count": 1}
+                    {"name": "group-feed-2026-06.jsonl", "count": 1},
+                    {"name": "group-feed-2026-07.jsonl", "count": 1}
                 ]
             })
             .to_string(),
@@ -1779,6 +1796,89 @@ emoji = "①"
         );
     }
 
+    /// This table is the Rust spelling of the gateway's exact
+    /// `/^group-feed-(\d{4})-(\d{2})\.jsonl$/` selector. In particular, `\d`
+    /// there is ASCII-only in JavaScript without the Unicode flag and the regex
+    /// intentionally checks SHAPE, not whether the month is in 01..=12.
+    #[test]
+    fn canonical_feed_archive_name_matches_the_gateway_archive_regex() {
+        for accepted in [
+            "group-feed-2026-07.jsonl",
+            "group-feed-0000-00.jsonl",
+            "group-feed-9999-99.jsonl",
+        ] {
+            assert!(
+                is_canonical_feed_archive_name(OsStr::new(accepted)),
+                "gateway accepts {accepted:?}, so the engine must accept it"
+            );
+        }
+
+        for rejected in [
+            "relay-receipts-2026-07.jsonl",
+            "arbitrary.jsonl",
+            "group-feed-2026-7.jsonl",
+            "group-feed-2026-007.jsonl",
+            "group-feed-20260-07.jsonl",
+            "group-feed-2026-0a.jsonl",
+            "group-feed-2026-07.jsonl.bak",
+            ".group-feed-2026-07.jsonl",
+            "group-feed-２０２６-０７.jsonl",
+        ] {
+            assert!(
+                !is_canonical_feed_archive_name(OsStr::new(rejected)),
+                "gateway rejects {rejected:?}, so the engine must reject it"
+            );
+        }
+    }
+
+    /// C034's exact failure shape: feed and receipt archives are deliberately
+    /// co-located. Only the canonical feed segment contributes to the global
+    /// id; counting the receipt rows shifts the receipt join onto a row that
+    /// does not exist in the gateway's view.
+    #[test]
+    fn co_located_receipt_archive_does_not_shift_the_global_feed_id() {
+        let (dir, feed) = scratch_feed();
+        let archive = dir.path().join(".casa").join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(
+            archive.join("group-feed-2026-07.jsonl"),
+            "{\"ts\":1}\n{\"ts\":2}\n{\"ts\":3}\n",
+        )
+        .unwrap();
+        fs::write(
+            archive.join("relay-receipts-2026-07.jsonl"),
+            "{\"receiptId\":1}\n{\"receiptId\":2}\n",
+        )
+        .unwrap();
+        fs::write(&feed, "{\"ts\":4}\n").unwrap();
+
+        let entry = agent_entry(&catalog(), "harbor", "the C034 reply", 5)
+            .with_turn(TURN, ReplyPhase::Final);
+        assert_eq!(
+            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
+            5,
+            "3 archived feed rows + live ordinal 2; the 2 receipt rows are not feed history"
+        );
+    }
+
+    /// Non-feed JSONL entries are outside the selector and therefore must not
+    /// even be opened. A directory with a receipt-archive filename is an
+    /// unreadable-as-a-file control: the old broad `*.jsonl` selector refused
+    /// this write, while the gateway-compatible selector ignores it.
+    #[test]
+    fn an_unreadable_non_feed_jsonl_entry_is_ignored() {
+        let (dir, feed) = scratch_feed();
+        let archive = dir.path().join(".casa").join("archive");
+        fs::create_dir_all(archive.join("relay-receipts-2026-07.jsonl")).unwrap();
+
+        let entry = agent_entry(&catalog(), "harbor", "the first feed row", 9)
+            .with_turn(TURN, ReplyPhase::Final);
+        assert_eq!(
+            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
+            1
+        );
+    }
+
     /// AN UNREADABLE ARCHIVE IS NOT AN EMPTY ONE. The exact-tree control:
     /// archive one row, make `.casa/archive` unreadable, append a live row —
     /// and the writer reported `feedId=1` for a row whose global id was 2,
@@ -1791,7 +1891,7 @@ emoji = "①"
         let (dir, feed) = scratch_feed();
         let archive = dir.path().join(".casa").join("archive");
         fs::create_dir_all(&archive).unwrap();
-        fs::write(archive.join("group-feed-0001.jsonl"), "{\"ts\":1}\n").unwrap();
+        fs::write(archive.join("group-feed-2026-07.jsonl"), "{\"ts\":1}\n").unwrap();
 
         let entry =
             agent_entry(&catalog(), "harbor", "the live row", 9).with_turn(TURN, ReplyPhase::Final);
@@ -1831,7 +1931,7 @@ emoji = "①"
         let (dir, feed) = scratch_feed();
         let archive = dir.path().join(".casa").join("archive");
         fs::create_dir_all(&archive).unwrap();
-        let segment = archive.join("group-feed-0001.jsonl");
+        let segment = archive.join("group-feed-2026-07.jsonl");
         fs::write(&segment, "{\"ts\":1}\n{\"ts\":2}\n").unwrap();
         fs::set_permissions(&segment, fs::Permissions::from_mode(0o000)).unwrap();
 
