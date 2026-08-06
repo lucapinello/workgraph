@@ -2310,6 +2310,53 @@ exec 9>&-
 kill $HEARTBEAT_PID 2>/dev/null; wait $HEARTBEAT_PID 2>/dev/null
 {stream_result}
 
+# --- Reaped-WIP preservation (task preserve-a-reaped) -------------------------
+# The reap arms below mark the task failed and then touch .wg-cleanup-pending,
+# which invites the worktree sweep. Nothing here used to look at the worktree
+# first, so a worker hard-killed at coordinator.agent_timeout with finished but
+# uncommitted work simply lost it (2026-08-05: 1036 staged lines survived only
+# because a human hand-saved a patch before the sweep ran, and the successor then
+# re-derived byte-identical code from the same worktree). Preserve BEFORE failing:
+# a named WIP commit on the task branch, an out-of-tree patch that outlives
+# `git worktree remove --force`, and a sidecar + task log so a successor is TOLD
+# the work exists and whose it was. Subshell body: nothing leaks to the wrapper.
+wg_preserve_reaped_wip() (
+    REAP_REASON="$1"
+    PRESERVE_WT="$WG_WORKTREE_PATH"
+    if [ -z "$PRESERVE_WT" ]; then PRESERVE_WT="$PWD"; fi
+    git -C "$PRESERVE_WT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    PRESERVE_DIRTY=$(git -C "$PRESERVE_WT" status --porcelain 2>/dev/null)
+    if [ -z "$PRESERVE_DIRTY" ]; then return 0; fi
+    PRESERVE_DIR=$(dirname "$OUTPUT_FILE")
+    mkdir -p "$PRESERVE_DIR" 2>/dev/null || return 1
+    PRESERVE_STAMP=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unstamped)
+    PRESERVE_PATCH="$PRESERVE_DIR/reaped-wip-$PRESERVE_STAMP.patch"
+    PRESERVE_BRANCH=$(git -C "$PRESERVE_WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+    git -C "$PRESERVE_WT" add -A -- . 2>/dev/null || return 1
+    PRESERVE_BASE=HEAD
+    if ! git -C "$PRESERVE_WT" rev-parse --verify HEAD >/dev/null 2>&1; then
+        PRESERVE_BASE=$(git -C "$PRESERVE_WT" hash-object -t tree /dev/null)
+    fi
+    git -C "$PRESERVE_WT" diff --cached --binary "$PRESERVE_BASE" > "$PRESERVE_PATCH" 2>/dev/null || return 1
+    PRESERVE_FILES=$(git -C "$PRESERVE_WT" diff --cached --name-only "$PRESERVE_BASE" 2>/dev/null | grep -c .)
+    if [ -z "$(git -C "$PRESERVE_WT" config user.email 2>/dev/null)" ]; then
+        GIT_AUTHOR_NAME="wg reap preserver"
+        GIT_AUTHOR_EMAIL="wg-reap@localhost"
+        GIT_COMMITTER_NAME="wg reap preserver"
+        GIT_COMMITTER_EMAIL="wg-reap@localhost"
+        export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+    fi
+    PRESERVE_SUBJECT="wip($TASK_ID): preserved work of reaped $WG_AGENT_ID ($REAP_REASON) [wg-reap-preserved]"
+    git -C "$PRESERVE_WT" commit --no-verify -q -m "$PRESERVE_SUBJECT" -m "Made by the wg reap path, not by the agent: a rescue, not a reviewed change. A successor MUST start from this commit instead of re-deriving the work. Patch: $PRESERVE_PATCH" || return 1
+    PRESERVE_SHA=$(git -C "$PRESERVE_WT" rev-parse HEAD 2>/dev/null)
+    printf '{{"schema":"wg-reap-preserved-wip/1","agent":"%s","task":"%s","reason":"%s","branch":"%s","commit":"%s","patch":"%s","file_count":%s}}\n' "$WG_AGENT_ID" "$TASK_ID" "$REAP_REASON" "$PRESERVE_BRANCH" "$PRESERVE_SHA" "$PRESERVE_PATCH" "$PRESERVE_FILES" > "$PRESERVE_WT/.wg-reaped-wip.json" 2>/dev/null
+    cp "$PRESERVE_WT/.wg-reaped-wip.json" "$PRESERVE_DIR/reaped-wip-$PRESERVE_STAMP.json" 2>/dev/null || true
+    echo "[wrapper] PRESERVED $PRESERVE_FILES uncommitted file(s) from reaped $WG_AGENT_ID as $PRESERVE_SHA on $PRESERVE_BRANCH (patch: $PRESERVE_PATCH)" >> "$OUTPUT_FILE"
+    wg log "$TASK_ID" "PRESERVED WIP: $WG_AGENT_ID was reaped ($REAP_REASON) with $PRESERVE_FILES uncommitted file(s). Saved as commit $PRESERVE_SHA on $PRESERVE_BRANCH [wg-reap-preserved]. Patch: $PRESERVE_PATCH. A successor must START FROM this commit, not re-derive the work." >/dev/null 2>&1 || true
+    wg artifact "$TASK_ID" "$PRESERVE_PATCH" >/dev/null 2>&1 || true
+    return 0
+)
+
 # Check if task is still in progress (agent didn't mark it done/failed)
 TASK_STATUS=$(wg show "$TASK_ID" --json 2>/dev/null | grep -o '"status": *"[^"]*"' | head -1 | sed 's/.*"status": *"//;s/"//' || echo "unknown")
 
@@ -2317,6 +2364,7 @@ if [ "$TASK_STATUS" = "in-progress" ]; then
     if [ $EXIT_CODE -eq 124 ]; then
         echo "" >> "$OUTPUT_FILE"
         echo "[wrapper] Agent killed by hard timeout, marking task failed" >> "$OUTPUT_FILE"
+        wg_preserve_reaped_wip "hard-timeout" || echo "[wrapper] WARNING: could not preserve the reaped agent's uncommitted work" >> "$OUTPUT_FILE"
         FAIL_CLASS=$(wg classify-failure --exit-code $EXIT_CODE 2>/dev/null || echo "agent-hard-timeout")
         wg fail "$TASK_ID" --class "$FAIL_CLASS" --reason "Agent exceeded hard timeout" 2>> "$OUTPUT_FILE" || echo "[wrapper] WARNING: 'wg fail' failed with exit code $?" >> "$OUTPUT_FILE"
     elif [ $EXIT_CODE -eq 0 ]; then
@@ -2365,6 +2413,7 @@ if [ "$TASK_STATUS" = "in-progress" ]; then
     else
         echo "" >> "$OUTPUT_FILE"
         echo "[wrapper] Agent exited with code $EXIT_CODE, marking task failed" >> "$OUTPUT_FILE"
+        wg_preserve_reaped_wip "exit-$EXIT_CODE" || echo "[wrapper] WARNING: could not preserve the reaped agent's uncommitted work" >> "$OUTPUT_FILE"
         FAIL_CLASS=$(wg classify-failure --raw-stream "$RAW_STREAM" --exit-code $EXIT_CODE 2>/dev/null || echo "agent-exit-nonzero")
         wg fail "$TASK_ID" --class "$FAIL_CLASS" --reason "Agent exited with code $EXIT_CODE" 2>> "$OUTPUT_FILE" || echo "[wrapper] WARNING: 'wg fail' failed with exit code $?" >> "$OUTPUT_FILE"
     fi
@@ -5017,6 +5066,71 @@ mod tests {
         assert!(
             fallback.is_none(),
             "Fresh spawn should not have a fallback command"
+        );
+    }
+
+    /// A reaped worker's uncommitted work must be preserved BEFORE the task is
+    /// failed and the worktree is marked for the cleanup sweep.
+    ///
+    /// 2026-08-05: a worker was hard-killed at `coordinator.agent_timeout` with
+    /// 1036 lines of finished but uncommitted work. This arm marked the task
+    /// failed, touched `.wg-cleanup-pending`, and never looked at the worktree —
+    /// the work survived only because a human opened the tree before the sweep
+    /// and hand-saved a patch. Ordering is the whole point: preserving after
+    /// `wg fail` would race the retry/cleanup that `wg fail` itself invites.
+    #[test]
+    fn test_wrapper_script_preserves_reaped_wip_before_failing() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wrapper_path = write_wrapper_script(
+            temp_dir.path(),
+            "test-task",
+            "/tmp/output.log",
+            "claude --print",
+            None,
+            "claude",
+            None,
+        )
+        .unwrap();
+        let script = std::fs::read_to_string(&wrapper_path).unwrap();
+
+        assert!(
+            script.contains("wg_preserve_reaped_wip() ("),
+            "wrapper must define the reaped-WIP preservation helper"
+        );
+        assert!(
+            script.contains("[wg-reap-preserved]"),
+            "the WIP commit subject must carry the machine-readable rescue marker"
+        );
+
+        for (call, fail_line) in [
+            (
+                "wg_preserve_reaped_wip \"hard-timeout\"",
+                "--reason \"Agent exceeded hard timeout\"",
+            ),
+            (
+                "wg_preserve_reaped_wip \"exit-$EXIT_CODE\"",
+                "--reason \"Agent exited with code $EXIT_CODE\"",
+            ),
+        ] {
+            let call_at = script
+                .find(call)
+                .unwrap_or_else(|| panic!("reap arm must call preservation: {call}"));
+            let fail_at = script
+                .find(fail_line)
+                .unwrap_or_else(|| panic!("reap arm must still fail the task: {fail_line}"));
+            assert!(
+                call_at < fail_at,
+                "preservation must run BEFORE `wg fail` ({call})"
+            );
+        }
+
+        let cleanup_at = script
+            .find("touch \"$WG_WORKTREE_PATH/.wg-cleanup-pending\"")
+            .expect("wrapper still marks the worktree for cleanup");
+        let first_call = script.find("wg_preserve_reaped_wip \"hard-timeout\"").unwrap();
+        assert!(
+            first_call < cleanup_at,
+            "preservation must run before the worktree is marked for the sweep"
         );
     }
 
