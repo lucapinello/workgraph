@@ -7199,18 +7199,34 @@ pub enum TelegramCommands {
         #[arg(long)]
         turn_id: Option<String>,
 
+        // ONE PARAGRAPH ON PURPOSE. clap renders only a doc comment's FIRST
+        // paragraph into `--help`; a blank `///` line pushes everything after it
+        // into a long help this subcommand does not print. The marker sentence
+        // below has to REACH `--help`, so the rationale stays out here in
+        // ordinary comments rather than being silently dropped from the text a
+        // twin reads.
+        //
+        // LOAD-BEARING TEXT: the gateway's cross-impl twin
+        // (`claw3d-bridge/test/replyPhaseEngineTwin.test.mjs`) reads "REQUIRED
+        // whenever the row is turn-bound" out of `telegram feed-write --help` to
+        // tell a binary that carries this contract from one that predates it. It
+        // cannot probe the BEHAVIOUR instead, because the behaviour — the refusal
+        // — is the thing it asserts, so a stale binary would exempt itself.
+        // Change the wording and that twin skips loudly rather than lying; change
+        // it in both places.
+        //
+        // WHY THERE IS NO DEFAULT: this used to default to `final`, the strongest
+        // of the four and the one the turn's one-final reservation is keyed on,
+        // so a caller that named a turn and declared nothing silently claimed to
+        // be that turn's single answer — and the writer's own default walked past
+        // the validator that refuses an unstamped turn-bound row.
         /// Which phase of the turn this row is: `ack`, `final`, `watchdog` or
         /// `failure`. Stamped by the writer, which knows; deriving it from the
         /// text later is how a watchdog line gets counted as the turn's final
-        /// answer.
-        ///
-        /// REQUIRED whenever the row is turn-bound (`--turn-id` or
-        /// `WG_TURN_ID`), and there is NO default. It used to default to
-        /// `final` — the strongest of the four, and the one the turn's one-final
-        /// reservation is keyed on — so a caller that declared nothing claimed
-        /// to be the turn's single answer, and the writer's own default walked
-        /// past the validator that refuses an unstamped turn-bound row. A row
-        /// with no turn needs no phase: there is no turn for it to be a phase of.
+        /// answer. REQUIRED whenever the row is turn-bound (`--turn-id` or
+        /// `WG_TURN_ID`), with no default — an unstamped turn-bound agent row is
+        /// a receipt/observe v9.1 required negative. A row with no turn needs no
+        /// phase: there is no turn for it to be a phase of.
         #[arg(long)]
         reply_phase: Option<String>,
 
