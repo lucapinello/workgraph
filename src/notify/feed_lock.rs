@@ -506,6 +506,132 @@ mod tests {
         watcher.join().unwrap();
     }
 
+    /// Debris of a publication that did not complete: the staging file, a pin, a
+    /// detach name, a quarantine. A refused acquisition leaves the directory
+    /// exactly as it found it.
+    fn debris(lock_path: &Path) -> Vec<String> {
+        let Some(dir) = lock_path.parent() else {
+            return Vec::new();
+        };
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| {
+                        n.contains(".reclaim.")
+                            || n.contains(".new.")
+                            || n.contains(".pin.")
+                            || n.contains(".detach.")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// **§2 STEP 5, THROUGH THE FEED'S PUBLIC SURFACE** (task `rust-feed-lock`).
+    ///
+    /// The Node side has exactly this gate, and it is named for the DEFECT rather
+    /// than for the implementation precisely so a refactor cannot quietly drop it:
+    /// `test_feedlock_fsync_failure_fails_closed`, `EIO` injected on the record
+    /// `fsync` and, separately, on the directory `fsync` only, plus a healthy
+    /// control. docs/42 §10 requires it to "keep passing through the Rust one —
+    /// whatever is behind `acquireFeedLock` at the time", and until now the engine
+    /// had no answer to it: `project_lock`'s own boundary negative
+    /// (`injected_fsync_eio_publishes_nothing_and_runs_nothing`) drives the WEEK
+    /// pathname through `with_project_lock`, so a feed adapter that stopped
+    /// inheriting the barrier — by re-copying the protocol, as this module used to
+    /// carry it, or by routing somewhere else — would not redden a single engine
+    /// test. "Inherited by construction" is a claim about the code; this is the
+    /// assertion.
+    ///
+    /// A link whose directory entry never reached the platter is a lock the next
+    /// boot cannot see and one the holder believes it has, so a refused `fsync` —
+    /// the record's or the directory's — is a REFUSED LOCK: the feed writer's body
+    /// does not run, nothing is published at the lock path, and no debris is left.
+    ///
+    /// Its teeth are `the_pre_fix_twin_without_step_5_publishes_the_lock_anyway`
+    /// below, which restores the build this task was filed against.
+    #[test]
+    #[serial(project_lock)]
+    fn an_injected_fsync_eio_publishes_no_feed_lock_and_runs_no_body() {
+        for (flag, label) in [
+            (&project_lock::inject::FAIL_RECORD_FSYNC, "record fsync"),
+            (&project_lock::inject::FAIL_DIR_FSYNC, "directory fsync"),
+        ] {
+            project_lock::inject::reset();
+            let dir = scratch();
+            let feed = feed(&dir);
+            let lock_path = lock_path_for(&feed);
+            project_lock::inject::arm(flag);
+
+            let mut ran = false;
+            let refused = with_feed_lock(&feed, 30, |_| ran = true).unwrap_err();
+
+            assert!(
+                !ran,
+                "{label} EIO must not run the feed write — an unserialised append tears the feed"
+            );
+            assert!(
+                matches!(refused, LockRefusal::RecordWriteFailed(_)),
+                "{label}: a durability failure is a refusal the caller can SEE, not a timeout \
+                 and not a success: {refused:?}"
+            );
+            assert!(
+                !lock_path.exists(),
+                "{label}: NOTHING is published — a lock whose directory entry is not on the \
+                 device is a lock the next boot cannot see and one the holder believes it has"
+            );
+            assert!(
+                debris(&lock_path).is_empty(),
+                "{label}: {:?}",
+                debris(&lock_path)
+            );
+
+            // THE HEALTHY CONTROL, on the same fixture: the refusal above is the
+            // injected EIO and not a fixture that cannot take the lock at all.
+            project_lock::inject::reset();
+            let mut healthy = false;
+            let ok = with_feed_lock(&feed, DEFAULT_WAIT_MS, |_| healthy = true).unwrap();
+            assert!(healthy, "{label}: the control body must run");
+            assert_eq!(ok.release, Release::Released, "{label}");
+            assert!(!lock_path.exists(), "{label}");
+        }
+        project_lock::inject::reset();
+    }
+
+    /// **THE CONTROL — a gate whose control cannot fail is not a gate.**
+    ///
+    /// `SKIP_DIR_FSYNC` restores the build task `rust-feed-lock` was filed
+    /// against: step 5 is not attempted at all, which is what this module did
+    /// before the collapse (`stage_record` synced the RECORD and `try_publish`
+    /// linked it into place with no `File::open(parent)` + `sync_all()` after).
+    /// On that build the directory `fsync` cannot refuse, so the same fixture that
+    /// fails CLOSED above ACQUIRES — the assertion is not vacuous, and it is not
+    /// passing because of the record `fsync` doing both halves' work.
+    #[test]
+    #[serial(project_lock)]
+    fn the_pre_fix_twin_without_step_5_publishes_the_lock_anyway() {
+        project_lock::inject::reset();
+        let dir = scratch();
+        let feed = feed(&dir);
+        let lock_path = lock_path_for(&feed);
+
+        project_lock::inject::arm(&project_lock::inject::SKIP_DIR_FSYNC);
+        project_lock::inject::arm(&project_lock::inject::FAIL_DIR_FSYNC);
+
+        let mut ran = false;
+        let published = with_feed_lock(&feed, DEFAULT_WAIT_MS, |_| ran = true);
+        project_lock::inject::reset();
+
+        assert!(
+            published.is_ok() && ran,
+            "the pre-fix twin has no barrier to refuse, so it publishes and runs — if this \
+             starts failing, the negative above has stopped being a test of step 5"
+        );
+        assert_eq!(published.unwrap().release, Release::Released);
+        assert!(!lock_path.exists(), "released, so nothing is left behind");
+    }
+
     #[test]
     #[serial(project_lock)]
     fn with_feed_lock_runs_the_body_and_releases() {

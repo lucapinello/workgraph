@@ -512,6 +512,15 @@ pub(crate) mod inject {
         pub static FAIL_RECORD_FSYNC: Cell<bool> = const { Cell::new(false) };
         /// Make the CONTAINING DIRECTORY `fsync` fail with EIO (§2).
         pub static FAIL_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
+        /// REMOVE §2 step 5: the containing-directory `fsync` is not attempted at
+        /// all. This is the build task `rust-feed-lock` was filed against — the
+        /// pre-collapse `feed_lock.rs`, which synced the RECORD and then linked it
+        /// into place with no `File::open(parent)` + `sync_all()` after, so a lock
+        /// could be held whose directory entry never reached the platter. It is
+        /// the CONTROL for the fsync negatives: on this build `FAIL_DIR_FSYNC`
+        /// cannot fire, so a fixture that fails closed on the conforming build
+        /// acquires here. A gate whose control cannot fail is not a gate.
+        pub static SKIP_DIR_FSYNC: Cell<bool> = const { Cell::new(false) };
         /// Skip ALL of §4a's read-only evidence — the `nlink == 0` question put to
         /// the authority handle AND the pathname pre-check. Kept only so the
         /// two-holder negative has a control that proves it has teeth.
@@ -621,6 +630,7 @@ pub(crate) mod inject {
         for flag in [
             &FAIL_RECORD_FSYNC,
             &FAIL_DIR_FSYNC,
+            &SKIP_DIR_FSYNC,
             &SKIP_OWNERSHIP_PRECHECK,
             &SKIP_AUTHORITY_FLOCK,
             &USE_REJECTED_DETACH,
@@ -657,8 +667,16 @@ fn record_fsync(file: &std::fs::File) -> std::io::Result<()> {
 /// CLOSED on it.
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(test)]
-    if inject::armed(&inject::FAIL_DIR_FSYNC) {
-        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    {
+        // THE PRE-`rust-feed-lock` BUILD, and it is checked FIRST: on a twin that
+        // never attempts step 5 there is no `fsync` for `FAIL_DIR_FSYNC` to
+        // refuse, which is exactly what makes it the control.
+        if inject::armed(&inject::SKIP_DIR_FSYNC) {
+            return Ok(());
+        }
+        if inject::armed(&inject::FAIL_DIR_FSYNC) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
     }
     let fd = std::fs::File::open(dir)?;
     fd.sync_all()
