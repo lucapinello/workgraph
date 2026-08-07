@@ -7199,10 +7199,18 @@ pub enum TelegramCommands {
         #[arg(long)]
         turn_id: Option<String>,
 
-        /// Which phase of the turn this row is: `ack`, `final` (default),
-        /// `watchdog` or `failure`. Stamped by the writer, which knows; deriving
-        /// it from the text later is how a watchdog line gets counted as the
-        /// turn's final answer.
+        /// Which phase of the turn this row is: `ack`, `final`, `watchdog` or
+        /// `failure`. Stamped by the writer, which knows; deriving it from the
+        /// text later is how a watchdog line gets counted as the turn's final
+        /// answer.
+        ///
+        /// REQUIRED whenever the row is turn-bound (`--turn-id` or
+        /// `WG_TURN_ID`), and there is NO default. It used to default to
+        /// `final` — the strongest of the four, and the one the turn's one-final
+        /// reservation is keyed on — so a caller that declared nothing claimed
+        /// to be the turn's single answer, and the writer's own default walked
+        /// past the validator that refuses an unstamped turn-bound row. A row
+        /// with no turn needs no phase: there is no turn for it to be a phase of.
         #[arg(long)]
         reply_phase: Option<String>,
 

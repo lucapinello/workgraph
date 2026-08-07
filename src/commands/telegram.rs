@@ -6002,21 +6002,44 @@ pub fn run_feed_write(
         .or_else(|| std::env::var("WG_TURN_ID").ok())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
+    // THE PHASE IS PARSED ONCE, AND IT IS NEVER GUESSED (task
+    // receipt-engine-reply). Row and receipt take it from the SAME value, so the
+    // two can never disagree about what this line was — it used to be parsed
+    // twice from the same flag, which is one edit away from disagreeing.
+    //
+    // AND THERE IS NO DEFAULT. This used to read `.unwrap_or("final")`, so a
+    // caller that named a turn and declared no phase had `final` stamped for it:
+    // the STRONGEST of the four claims, the one the turn's one-final reservation
+    // is keyed on, asserted by a writer that never said it. It also walked
+    // straight past `casa_feed::validate`'s `TurnWithoutPhase` — v9.1's required
+    // negative, unreachable from this seam because the default filled the exact
+    // hole the validator exists to catch. The writer KNOWS which of the four it
+    // is emitting; if it did not say, it is asked, not guessed for.
+    let phase = match reply_phase.map(str::trim) {
+        Some("ack") => Some(relay_receipt::ReplyPhase::Ack),
+        Some("final") => Some(relay_receipt::ReplyPhase::Final),
+        Some("watchdog") => Some(relay_receipt::ReplyPhase::Watchdog),
+        Some("failure") => Some(relay_receipt::ReplyPhase::Failure),
+        Some(other) => {
+            anyhow::bail!("--reply-phase must be one of ack|final|watchdog|failure, got '{other}'")
+        }
+        None => None,
+    };
     let entry = match turn_id.as_deref() {
         Some(turn) => {
-            let phase = match reply_phase.map(str::trim).unwrap_or("final") {
-                "ack" => casa_feed::ReplyPhase::Ack,
-                "final" => casa_feed::ReplyPhase::Final,
-                "watchdog" => casa_feed::ReplyPhase::Watchdog,
-                "failure" => casa_feed::ReplyPhase::Failure,
-                other => anyhow::bail!(
-                    "--reply-phase must be one of ack|final|watchdog|failure, got '{other}'"
-                ),
+            // A turn-bound row must say WHICH reply of that turn it is. Refused
+            // BEFORE the append, so a refusal leaves no row.
+            let Some(phase) = phase else {
+                anyhow::bail!(
+                    "a row bound to a turn must declare --reply-phase (ack|final|watchdog|failure) \
+                     — the writer knows which it is emitting, and an unstamped turn-bound agent \
+                     row is a receipt/observe v9.1 required negative"
+                );
             };
-            // Row and receipt take the phase from the SAME flag, so the two can
-            // never disagree about what this line was.
             entry.with_turn(turn, phase)
         }
+        // No causal turn: its own single-row occurrence, with no turn to be a
+        // phase of. An inbound human mirror lands here.
         None => entry,
     };
     let entry = match non_relay_type {
@@ -6025,15 +6048,6 @@ pub fn run_feed_write(
     };
 
     let feed_path = casa_feed::feed_path_for(root);
-    let phase = match reply_phase.map(str::trim).unwrap_or("final") {
-        "ack" => relay_receipt::ReplyPhase::Ack,
-        "final" => relay_receipt::ReplyPhase::Final,
-        "watchdog" => relay_receipt::ReplyPhase::Watchdog,
-        "failure" => relay_receipt::ReplyPhase::Failure,
-        other => {
-            anyhow::bail!("--reply-phase must be one of ack|final|watchdog|failure, got '{other}'")
-        }
-    };
     let role = agent_id.unwrap_or("unknown");
 
     // ONE TRANSACTION, through the very same writer the listener's delivery seam
@@ -6049,7 +6063,11 @@ pub fn run_feed_write(
     // put unattributable helper rows into a certification run.
     let mut proved = false;
     let written = casa_feed::append_entry_proving(&feed_path, &entry, |feed_id, lock| {
-        let (Some(turn), Some(mid)) = (turn_id.as_deref(), message_id) else {
+        // The phase is destructured HERE rather than defaulted above: a row with a
+        // turn always carries one (the bail above), so pattern-matching it costs
+        // nothing and leaves no `unwrap_or_default()` that could quietly stand in
+        // for a declaration on some future path.
+        let (Some(turn), Some(mid), Some(phase)) = (turn_id.as_deref(), message_id, phase) else {
             return Ok(());
         };
         proved = true;
@@ -14218,6 +14236,115 @@ domains = ["calendar"]
             .filter(|l| !l.trim().is_empty())
             .map(|l| l.to_string())
             .collect()
+    }
+
+    /// THE CLI SEAM MAY NOT GUESS THE PHASE (task receipt-engine-reply).
+    ///
+    /// `casa_feed::validate` refuses a turn-bound row carrying no `reply_phase`
+    /// — v9.1's required negative — and `feed-write` walked straight past it by
+    /// defaulting the missing flag to `"final"`. That default is not a
+    /// convenience: `final` is the STRONGEST of the four claims, the one the
+    /// turn's one-final reservation is keyed on, so a caller who never declared
+    /// anything silently claimed to be the turn's single answer. It also made
+    /// the gate unreachable from this seam — the writer's own default filled the
+    /// exact hole the validator exists to catch, which is a gate defeated by a
+    /// literal.
+    ///
+    /// The writer KNOWS which phase it is emitting. If it did not say, it must
+    /// be asked, not guessed for.
+    #[test]
+    fn feed_write_refuses_a_turn_bound_row_whose_phase_was_never_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+
+        let err = run_feed_write(
+            dir.path(),
+            "agent",
+            None,
+            Some("harbor"),
+            "Dinner is pasta.",
+            None,
+            Some(ENGINE_TURN),
+            None, // …and no --reply-phase
+            None,
+            None,
+            None,
+        )
+        .expect_err("a turn-bound agent row was written with a phase nobody declared");
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains("--reply-phase"),
+            "the refusal must name the flag the caller has to supply: {detail}"
+        );
+
+        // A REFUSAL LEAVES NO ROW. Refusing after the append would put exactly
+        // the unstamped row into the family's conversation that the refusal
+        // exists to keep out.
+        assert!(
+            !feed.exists() || feed_lines(&feed).is_empty(),
+            "the refused row reached the feed anyway: {:?}",
+            feed_lines(&feed)
+        );
+
+        // THE CONTROL. The same call, with the phase declared, writes the row —
+        // so the refusal above is about the missing declaration and not about
+        // some other thing wrong with this shape.
+        run_feed_write(
+            dir.path(),
+            "agent",
+            None,
+            Some("harbor"),
+            "Dinner is pasta.",
+            None,
+            Some(ENGINE_TURN),
+            Some("final"),
+            None,
+            None,
+            None,
+        )
+        .expect("a fully declared turn-bound row must still be writable");
+        let lines = feed_lines(&feed);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(row["turnId"], ENGINE_TURN);
+        assert_eq!(row["replyPhase"], "final");
+    }
+
+    /// …and the requirement is CONDITIONAL on being turn-bound. A row with no
+    /// causal turn is its own single-row occurrence: there is no turn for it to
+    /// be a phase of, and demanding one would make the listener's inbound human
+    /// mirrors unwritable.
+    #[test]
+    fn feed_write_still_writes_a_turn_less_row_with_no_phase() {
+        // `WG_TURN_ID` is process-global and this call falls back to it, so a
+        // leaked value would make the row turn-BOUND and this control vacuous.
+        // Say so rather than pass quietly.
+        assert!(
+            std::env::var("WG_TURN_ID").is_err(),
+            "WG_TURN_ID is set in this test process — the turn-less control cannot be trusted"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+
+        run_feed_write(
+            dir.path(),
+            "group",
+            Some("Wren"),
+            None,
+            "what are we doing this weekend?",
+            None,
+            None,
+            None, // no phase, and none is owed
+            Some(casa_feed::NON_RELAY_TELEGRAM_INBOUND),
+            None,
+            None,
+        )
+        .expect("an inbound human mirror needs no phase");
+        let lines = feed_lines(&feed);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert!(row["turnId"].is_null(), "{row:?}");
+        assert!(row["replyPhase"].is_null(), "{row:?}");
     }
 
     #[test]

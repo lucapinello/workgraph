@@ -1695,6 +1695,49 @@ emoji = "①"
             FeedWriteError::TurnWithoutPhase
         );
         assert!(!feed.exists() || fs::read_to_string(&feed).unwrap().is_empty());
+
+        // …AND THROUGH THE PROVING SEAM, WHICH IS THE ONE PRODUCTION USES (task
+        // receipt-engine-reply). Both engine reply writers — the listener's
+        // `ReplySink::mirror` and `feed-write --kind agent` — call
+        // `append_entry_proving`, not the allocating wrapper. It delegates today,
+        // so asserting only the wrapper is asserting an implementation detail: a
+        // future proving path that validated separately would leave the writers
+        // this contract is actually about uncovered.
+        //
+        // The PROOF HALF MUST NOT RUN EITHER. A receipt written for a row that was
+        // never appended names a feed id nothing occupies — an orphan claim, which
+        // is worse than the unstamped row it came from.
+        let mut proof_ran = false;
+        let failure = append_entry_proving(&feed, &entry, |_id, _lock| {
+            proof_ran = true;
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                failure,
+                ProveFailure::Feed(FeedWriteError::TurnWithoutPhase)
+            ),
+            "{failure:?}"
+        );
+        assert!(
+            !proof_ran,
+            "a receipt was minted for a row the validator refused to write"
+        );
+        assert!(!feed.exists() || fs::read_to_string(&feed).unwrap().is_empty());
+
+        // THE CONTROL: the same row, stamped, lands. So the refusal above is about
+        // the missing phase and not about anything else in this entry.
+        let stamped = agent_entry(&catalog(), "harbor", "still working on it", 1)
+            .with_turn(TURN, ReplyPhase::Watchdog);
+        assert_eq!(
+            certified_id(append_entry_allocating(&feed, &stamped).unwrap()),
+            1
+        );
+        let row: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&feed).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert_eq!(row["replyPhase"], "watchdog");
     }
 
     /// ITEM 3 — THE EXACT-ROW JOIN. Two rows written in the SAME MILLISECOND get
