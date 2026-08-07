@@ -5,6 +5,7 @@
 //! channels based on event type and supports escalation chains.
 
 pub mod capability;
+pub mod casa_audience;
 pub mod casa_feed;
 pub mod config;
 pub mod daily_digest;

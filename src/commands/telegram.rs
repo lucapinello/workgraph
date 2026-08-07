@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use worksgood::notify::NotificationChannel;
+use worksgood::notify::casa_audience;
 use worksgood::notify::casa_feed;
 use worksgood::notify::config::NotifyConfig;
 use worksgood::notify::family_plan;
@@ -4429,6 +4430,22 @@ impl FamilyReplyDelivery {
             .map(relay_receipt::Appended::regardless_of_release)
         });
 
+        // WHO SAW IT (`casa_audience`, task audit-does-any). The reply has
+        // already physically reached the family group by the time we mirror it,
+        // so the audience is a FACT whichever way the row above went — a feed
+        // write that failed does not un-send it, which is why this is recorded
+        // outside the row's transaction and on both outcomes. It is a separate
+        // critical section on purpose: the row and its receipt are one fact and
+        // roll back together, while an audience record must survive a row that
+        // could not be proven, since the family saw the reply either way.
+        //
+        // Before this call the gateway instrumented every reply seam it owned
+        // and THIS process — the listener, which the gateway is not in the loop
+        // for at all — appended agent rows carrying a turnId with no audience
+        // record anywhere. An auditor reading the ledger for such a turn got
+        // "no reply recorded", which is indistinguishable from "no reply".
+        self.record_reply_audience(turn.as_deref(), &agent_id);
+
         match written {
             // THE SECTION'S RELEASE VERDICT TRAVELS WITH THE ROW (blocker 2).
             // `Recorded` used to be a plain `feed_id`, so a row written inside a
@@ -4450,6 +4467,36 @@ impl FamilyReplyDelivery {
                 );
                 MirrorOutcome::Failed(detail)
             }
+        }
+    }
+
+    /// Record WHO SAW this reply, in the same ledger and the same six fields the
+    /// gateway's `audienceLedger.mjs` writes (see [`casa_audience`]).
+    ///
+    /// Only reached for a GROUP reply (its one caller returns early for every
+    /// other scope), so the audience is `group` reached `via` the family chat.
+    ///
+    /// TWO OUTCOMES ARE NOT ERRORS AND ONE IS. A reply with no canonical turn
+    /// answers no turn and has nothing to join a record to — skipped, silently,
+    /// because it is the correct answer rather than a failure. A second write
+    /// for a turn that already reached this chat (the ack, then the answer) is a
+    /// no-op, because the question is "who saw it", not "how many sends". But a
+    /// REFUSAL means this reply went out with NO durable audience record — the
+    /// exact hole the ledger closes — so it is printed where the operator reads
+    /// the listener's log, never swallowed.
+    fn record_reply_audience(&self, turn: Option<&str>, agent_id: &str) {
+        let Some(turn) = turn else { return };
+        match casa_audience::record_group_reply(
+            &self.feed_path,
+            turn,
+            agent_id,
+            casa_feed::now_ms(),
+        ) {
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "[{}] casa audience: the reply was sent but its audience was NOT recorded: {e}",
+                chrono::Utc::now().format("%H:%M:%S"),
+            ),
         }
     }
 
@@ -6037,6 +6084,37 @@ pub fn run_feed_write(
         casa_feed::ProvenRow::ReleaseUnverified { reason, .. } => {
             println!("feedRelease=unverified reason={reason}");
         }
+    }
+    // WHO SAW IT — the same ledger, the same six fields, through the same
+    // `casa_audience` writer the listener's delivery seam now calls (task
+    // audit-does-any). Stated on EVERY run, in one machine-readable word, for
+    // the reason `feedRelease=` is: a certifier that only ever saw the row could
+    // not tell a reply whose audience is on the record from one whose audience
+    // nothing anywhere can name.
+    //
+    //   recorded / duplicate  the audience IS on the record (a duplicate is the
+    //                         ack and the answer of one turn — one audience)
+    //   skipped   no-turn     nothing to join a record to; the honest answer
+    //             inbound     a human's own line is not a reply (see the module
+    //                         header) — recording it would read as a helper
+    //                         answering privately
+    //   refused   <reason>    the row exists and its audience does NOT. The hole
+    //                         this ledger closes, reported rather than swallowed.
+    match (kind, turn_id.as_deref()) {
+        ("agent", Some(turn)) => {
+            match casa_audience::record_group_reply(&feed_path, turn, role, casa_feed::now_ms()) {
+                Ok(outcome) => println!("audience={}", outcome.as_str()),
+                Err(e) => {
+                    eprintln!("casa audience: the row was written but its audience was NOT: {e}");
+                    println!("audience=refused reason={e}");
+                }
+            }
+        }
+        ("agent", None) => println!(
+            "audience=skipped reason={}",
+            casa_audience::AudienceSkipped::NoTurn.as_str()
+        ),
+        _ => println!("audience=skipped reason=inbound"),
     }
     if proved {
         println!("receipt=written");
