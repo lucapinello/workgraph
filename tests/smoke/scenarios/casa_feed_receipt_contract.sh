@@ -46,6 +46,18 @@ command -v python3 >/dev/null 2>&1 \
 scratch="$(make_scratch)"
 feed="$scratch/.casa/group-feed.jsonl"
 ledger="$scratch/.casa/relay-receipts.jsonl"
+# THE SECOND FILE, AND WHY IT IS NOT A NAMING QUIBBLE. Schema v9.1's
+# `receipt_fields` is an EXHAUSTIVE object. This writer used to put three keys of
+# its own in the LEDGER — `replyPhase`, `outcome`, `attemptId` — and the gateway
+# twin validates every ledger line against the exact field set, so an engine
+# receipt read as `malformed` from the other side AND `archiveReceiptsThrough`
+# threw ("refusing to rotate"), which meant a house whose engine writes receipts
+# could never rotate `.casa/group-feed.jsonl` again. The correlation those keys
+# carried is still needed (the refire guard keys on `(turn, attempt)`), so it
+# lives in the never-rotated INDEX — out of the evidence, in the accelerator.
+# Legs 6 and 8 therefore read PHASE and ATTEMPT from here, and leg 6 asserts the
+# ledger does NOT carry them.
+index="$scratch/.casa/relay-receipt-index.jsonl"
 
 cat >"$scratch/household.toml" <<'TOML'
 [[agent]]
@@ -101,10 +113,20 @@ for bad in \
     "web-turn-1e4d3c2b1a09f8e7d6c5b4a3928170695e4d3c2b1a09f8e7d6c5b4a392817069" \
     "web-turn-00000000-0000-0000-0000-000000000000" \
     "web-turn-3f2504e0-4f89-11d3-9a0c-0305e82c3301" ; do
-    if feed_write --kind agent --agent-id otto --bot-id otto \
-        --text "should never land" --turn-id "$bad" --message-id 999 >/dev/null 2>&1; then
-        loud_fail "an unjoinable turn id was ACCEPTED: $bad"
-    fi
+    # `--reply-phase` IS SUPPLIED, and that is load-bearing. A turn-bound row
+    # must declare its phase (the writer may not GUESS it), and that guard fires
+    # BEFORE the turn-id validation this leg exists to prove — so without the
+    # flag all three of these were refused for the wrong reason and the leg
+    # passed against a build with the turn-id check removed entirely.
+    err=$(feed_write --kind agent --agent-id otto --bot-id otto \
+        --text "should never land" --turn-id "$bad" --reply-phase final \
+        --message-id 999 2>&1) \
+        && loud_fail "an unjoinable turn id was ACCEPTED: $bad"
+    # …and refused BY THE TURN-ID RULE, named in the refusal.
+    case "$err" in
+        *"causal turn id is not a raw web-turn-"*) ;;
+        *) loud_fail "turn id $bad was refused for the WRONG reason: $err" ;;
+    esac
 done
 rows_after=$(grep -c . "$feed")
 receipts_after=$(grep -c . "$ledger")
@@ -117,12 +139,20 @@ echo "   → all three refused; feed and ledger byte-count unchanged"
 echo "3. the REPLAY guard: a second claim of the same (scope, message id) is refused at write,"
 echo "   and the REFUSED RECEIPT TAKES ITS ROW WITH IT (one transaction):"
 rows_before=$(grep -c . "$feed")
-if feed_write --kind agent --agent-id otto --bot-id otto \
+# `--reply-phase` supplied for the same reason as leg 2: the phase guard fires
+# first, so without it this leg was refused before the replay guard was ever
+# consulted and would have passed with the replay guard deleted.
+err=$(feed_write --kind agent --agent-id otto --bot-id otto \
     --text "A replayed claim." \
     --turn-id "web-turn-3f2504e0-4f89-41d3-9a0c-0305e82c3309" \
-    --message-id 501 >/dev/null 2>&1; then
-    loud_fail "a replayed claim of message 501 was accepted"
-fi
+    --reply-phase final --message-id 501 2>&1) \
+    && loud_fail "a replayed claim of message 501 was accepted"
+# Refused BY THE REPLAY GUARD: the refusal names the delivery already on record
+# and the receipt that holds it.
+case "$err" in
+    *"is already recorded by rcpt_"*) ;;
+    *) loud_fail "the replayed claim was refused for the WRONG reason: $err" ;;
+esac
 # The row and the receipt are ONE transaction. Written in two, the refused
 # receipt would leave "A replayed claim." in the family's conversation with
 # nothing able to prove it — the exact unprovable row the contract removes.
@@ -154,21 +184,24 @@ rm -f "$scratch/.casa/feed-seal.json"
 echo "   → unbound agent row refused; the household message landed"
 
 echo "6. shapes + privacy over the whole feed and ledger:"
-python3 - "$feed" "$ledger" "$TURN_A" "$TURN_B" "$SECRET_TOKEN" "$SECRET_CHATID" "$SECRET_USERID" <<'PY'
+python3 - "$feed" "$ledger" "$index" "$TURN_A" "$TURN_B" "$SECRET_TOKEN" "$SECRET_CHATID" "$SECRET_USERID" <<'PY'
 import hashlib, json, sys
 
-feed_path, ledger_path, turn_a, turn_b, *secrets = sys.argv[1:]
+feed_path, ledger_path, index_path, turn_a, turn_b, *secrets = sys.argv[1:]
 feed_raw = open(feed_path).read()
 ledger_raw = open(ledger_path).read()
+index_raw = open(index_path).read()
 
-# PRIVACY: neither file may carry a secret substring, nor the field names a leak
-# would ride in on.
-for blob, what in ((feed_raw, "feed"), (ledger_raw, "ledger")):
+# PRIVACY: none of the three files may carry a secret substring, nor the field
+# names a leak would ride in on.
+for blob, what in ((feed_raw, "feed"), (ledger_raw, "ledger"), (index_raw, "index")):
     for secret in secrets + ["bot_token", "chat_id", "user_id"]:
         assert secret not in blob, f"{what} leaked secret substring: {secret!r}"
 
 rows = [json.loads(l) for l in feed_raw.splitlines() if l.strip()]
 receipts = [json.loads(l) for l in ledger_raw.splitlines() if l.strip()]
+index = [json.loads(l) for l in index_raw.splitlines() if l.strip()]
+by_receipt_id = {e["receiptId"]: e for e in index}
 
 # Rows are one-based and dense: the receipt's feedId indexes them directly.
 assert len(receipts) == 2, f"expected exactly 2 receipts, got {len(receipts)}"
@@ -188,7 +221,30 @@ for r in receipts:
     assert r["status"] == "delivered", r["status"]
     assert isinstance(r["messageId"], int) and r["messageId"] > 0, r["messageId"]
     assert r["receiptId"].startswith("rcpt_"), r["receiptId"]
-    assert r["replyPhase"] == "final", r["replyPhase"]
+
+    # EXHAUSTIVE v9.1 `receipt_fields`, and NOT ONE KEY MORE. This is the
+    # assertion whose absence let the unreadable-receipt wedge ship: the gateway
+    # twin rejects unknown keys, so a fourth key here is a ledger line the other
+    # half reads as `malformed` — and one malformed line makes its
+    # `archiveReceiptsThrough` throw, so the feed stops rotating forever.
+    assert set(r) == {
+        "receiptId", "turnId", "feedId", "feedKind", "roleId",
+        "transportScopeId", "messageId", "acceptedAtMs", "status", "provenance",
+    }, f"ledger receipt drifted from v9.1 receipt_fields: {sorted(set(r))}"
+    # The three keys this writer used to smuggle into the evidence live in the
+    # INDEX now. Named individually so a regression says WHICH one came back.
+    for moved in ("replyPhase", "outcome", "attemptId"):
+        assert moved not in r, \
+            f"{moved!r} is back in the LEDGER — v9.1 forbids it and the twin will refuse to rotate"
+
+    # …and the correlation is still recorded, in the accelerator, joined by
+    # receiptId. Dropping it from the ledger must not mean losing it.
+    entry = by_receipt_id.get(r["receiptId"])
+    assert entry is not None, f"no index entry for receipt {r['receiptId']}"
+    assert entry["replyPhase"] == "final", entry["replyPhase"]
+    assert entry["feedId"] == r["feedId"], "the index names a different row than the receipt"
+    assert entry["turnId"] == r["turnId"], "the index names a different turn than the receipt"
+
     # The transport scope id names the ACTUAL SENDING BOT through a KEYED digest.
     scope = r["transportScopeId"]
     assert scope.startswith("ts_") and len(scope) == 67, scope
@@ -223,11 +279,18 @@ rows_before=$(grep -c . "$feed")
 # `1`/`2` collide across unrelated processes by construction: one turn's real
 # second attempt then keys the same as another's first, and the receipt for the
 # send that actually reached the family is suppressed as a refire.
-if (cd "$scratch" && WG_DIR= WG_ATTEMPT_ID=1 wg telegram feed-write --root "$scratch" \
+# `--reply-phase` supplied for the same reason as legs 2 and 3 — otherwise the
+# phase guard refuses this before WG_ATTEMPT_ID is ever parsed, and the leg
+# passes against a build that accepts counted attempt ids happily.
+err=$(cd "$scratch" && WG_DIR= WG_ATTEMPT_ID=1 wg telegram feed-write --root "$scratch" \
         --kind agent --agent-id otto --bot-id otto --text "counted attempt" \
-        --turn-id "$TURN_C" --message-id 601 >/dev/null 2>&1); then
-    loud_fail "a COUNTED attempt id was accepted"
-fi
+        --turn-id "$TURN_C" --reply-phase final --message-id 601 2>&1) \
+    && loud_fail "a COUNTED attempt id was accepted"
+# Refused BY THE TYPED-ID RULE, naming attemptId.
+case "$err" in
+    *"attemptId is not a valid typed id"*) ;;
+    *) loud_fail "the counted attempt id was refused for the WRONG reason: $err" ;;
+esac
 [ "$(grep -c . "$feed")" -eq "$rows_before" ] \
     || loud_fail "a refused attempt id still left a row behind"
 echo "   → refused; feed unchanged"
@@ -237,7 +300,7 @@ attempt_write() {
     local attempt="$1" mid="$2" text="$3"
     (cd "$scratch" && WG_DIR= WG_ATTEMPT_ID="$attempt" wg telegram feed-write --root "$scratch" \
         --kind agent --agent-id otto --bot-id otto --text "$text" \
-        --turn-id "$TURN_C" --message-id "$mid")
+        --turn-id "$TURN_C" --reply-phase final --message-id "$mid")
 }
 receipts_before=$(grep -c . "$ledger")
 attempt_write "$ATTEMPT_ONE" 601 "attempt one" >/dev/null \
@@ -251,8 +314,16 @@ attempt_write "$ATTEMPT_TWO" 603 "attempt two" >/dev/null \
     || loud_fail "a self-heal retry was suppressed as a refire"
 [ "$(grep -c . "$ledger")" -eq "$((receipts_before + 2))" ] \
     || loud_fail "expected exactly two more receipts (attempt one and attempt two)"
-grep -q '"attemptId":"'"$ATTEMPT_TWO"'"' "$ledger" \
+# WHICH ATTEMPT reached the family is recorded in the INDEX, not the ledger:
+# `attemptId` is not one of v9.1's `receipt_fields` (see the note beside
+# $index above). Asserted here rather than merely dropped — the correlation is
+# the point of the leg, and the file it lives in is an implementation detail
+# the gate must follow, not a reason to stop checking.
+grep -q '"attemptId":"'"$ATTEMPT_TWO"'"' "$index" \
     || loud_fail "the retry's receipt does not record WHICH attempt reached the family"
+if grep -q '"attemptId":"'"$ATTEMPT_TWO"'"' "$ledger"; then
+    loud_fail "attemptId is back in the v9.1 LEDGER — the twin will read it as malformed and refuse to rotate"
+fi
 echo "   → attempt 1 recorded, its refire refused, attempt 2 recorded"
 
 echo "PASS: engine receipt contract — exact-row join by global feed id, raw turn ids only, inbound stamped, seal holds, replay refused, one transaction, minted attempts"
