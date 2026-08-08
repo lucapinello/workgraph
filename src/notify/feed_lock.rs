@@ -21,7 +21,8 @@
 //! on the Rust side (docs/42 §10, "what is still outstanding — on the RUST side
 //! only"). A protocol change is made in `project_lock.rs`, once.
 //!
-//! What is left here is the feed's four facts:
+//! What is left here is the feed's five facts — four of the protocol's, and one
+//! (5) that is the caller's alone:
 //!
 //! 1. THE PATHNAME — `<dirname(feed)>/.conversation.lock`. It predates the
 //!    `.casa/locks/<name>.lock` table and every existing feed writer on both sides
@@ -38,6 +39,10 @@
 //! 3. THE DEFAULTS — a 1000 ms fail-closed wait and a 30 s report horizon.
 //! 4. THE RESULT SHAPE its callers branch on — [`FeedLock`], [`Release`] and
 //!    [`LockRefusal`], rather than the project lock's typed refusal.
+//! 5. THE CALLER'S PATIENCE — [`DEFAULT_ATTEMPTS`]. How many whole budgets a
+//!    production feed writer spends before it tells the family "not recorded".
+//!    This is the ONE fact here that is NOT part of the protocol and has no Node
+//!    twin: see [`acquire_retrying`].
 //!
 //! Everything else — staging + `link(2)` publication, the `fsync` of the record
 //! AND of the containing directory (a refused `fsync` is a refused lock), the
@@ -60,6 +65,32 @@ pub const LOCK_NAME: &str = ".conversation.lock";
 /// `DEFAULT_WAIT_MS`. Every honest critical section is a handful of synchronous
 /// fs calls, so a full second is many times the worst honest hold.
 pub const DEFAULT_WAIT_MS: u64 = 1000;
+
+/// How many whole [`DEFAULT_WAIT_MS`] budgets a production feed writer spends
+/// before it fails closed — the CALLER's patience, not the protocol's.
+///
+/// **THIS IS NOT A PROTOCOL CONSTANT AND MUST NOT BECOME ONE.** `DEFAULT_WAIT_MS`
+/// is asserted equal on both sides of the cross-implementation gate
+/// (`protocol_constants_match_the_node_twin` here, leg 4 of
+/// `claw3d-bridge/test/feedLockRustTwin.test.mjs` there); raising it on the Rust
+/// side alone is drift dressed up as a fix, which is exactly what `rust-feed-lock`
+/// refused to do. How long ONE acquisition waits is a contract between the two
+/// implementations. How many acquisitions a caller is willing to attempt before
+/// giving the family a refusal is a product decision each caller makes for itself,
+/// and neither side has to agree about it for the two to serialise correctly.
+///
+/// WHY THREE, MEASURED (`feed-lock-retry`, docs/42 §9). The engine's real
+/// `wg telegram feed-write` takes this lock three times in sequence — the row
+/// ([`super::casa_feed::append_entry_proving`]), the delivery receipt
+/// ([`super::relay_receipt::append`]) and the audience record
+/// ([`super::casa_audience::record_audience`]) — and each held section reads the
+/// whole live feed plus every archive segment. Six concurrent writers of that
+/// shape were measured at **986 ms of the 1000 ms budget**: zero refusals in one
+/// run and 73 % refusals in another, at the SAME offered load. Three attempts
+/// buys ~3 s of patience, which covers roughly eighteen concurrent writers —
+/// far past anything a household produces — while still ENDING. Past that,
+/// "busy" has stopped being the true answer and a refusal is the honest one.
+pub const DEFAULT_ATTEMPTS: u32 = 3;
 
 /// How old an attributable lock whose owner is provably dead must be before the
 /// REPORT calls it stale rather than held — the Node adapter's 30 s horizon.
@@ -226,6 +257,68 @@ pub fn acquire(feed_path: &Path, wait_ms: u64) -> Result<FeedLock, LockRefusal> 
     }
 }
 
+/// Acquire, spending up to `attempts` whole `wait_ms` budgets on a lock that is
+/// merely BUSY — the production feed writers' entry point (docs/42 §9).
+///
+/// WHAT MAKES THIS SAFE, AND WHY IT IS NOT A WEAKENING OF ANYTHING.
+///
+/// 1. **Only [`LockRefusal::Timeout`] is retried.** docs/42 §3 defines that
+///    variant as "the lock was held for the whole wait": our body never ran and
+///    the feed was not touched. There is nothing on disk for a second attempt to
+///    duplicate. Every other refusal returns on the FIRST attempt, unchanged and
+///    without spending another millisecond of the family's time —
+///    [`LockRefusal::Unavailable`] is the "a human must remove this file" answer
+///    (§5) and retrying it is a wedge, [`LockRefusal::RecordWriteFailed`] and
+///    [`LockRefusal::Io`] are local failures where retrying cannot help.
+/// 2. **The section still cannot run twice.** The retry is around the
+///    ACQUISITION only; [`with_feed_lock_retrying`] still takes its body as
+///    `FnOnce`, so "the row was written twice" is a compile error rather than a
+///    discipline. This is deliberately not a loop around the whole write.
+/// 3. **A refusal is still a refusal.** When the budget is spent the caller gets
+///    back the same `Timeout` it would have got before, and writes nothing. The
+///    fail-closed rule is untouched; only the number of times we ask is new.
+/// 4. **It adds no contention.** The inner acquire already polls every 4 ms for
+///    its whole budget, so a further attempt does not knock harder — it only
+///    keeps knocking for longer. There is deliberately no back-off sleep between
+///    attempts: the previous attempt was one unbroken second of polling, and
+///    sleeping on top of it would be dead time in which a freed lock goes untaken.
+///
+/// A retry that SUCCEEDS is reported on stderr. A system that only stays up
+/// because it retries must not look identical to one that never had to.
+pub fn acquire_retrying(
+    feed_path: &Path,
+    wait_ms: u64,
+    attempts: u32,
+) -> Result<FeedLock, LockRefusal> {
+    let attempts = attempts.max(1);
+    let mut spent = 0u32;
+    loop {
+        spent += 1;
+        match acquire(feed_path, wait_ms) {
+            Ok(lock) => {
+                if spent > 1 {
+                    eprintln!(
+                        "[{}] casa feed: the conversation lock was busy for {} of {} attempts \
+                         ({} ms each) — the write landed on attempt {spent}, nothing was lost.",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        spent - 1,
+                        attempts,
+                        wait_ms,
+                    );
+                }
+                return Ok(lock);
+            }
+            // BUSY, and we can still afford to ask again. Nothing was written:
+            // §3 guarantees the body did not run.
+            Err(LockRefusal::Timeout) if spent < attempts => continue,
+            // Either the patience is spent — and the family is told the same
+            // typed refusal as before — or this is not a "try again in a moment"
+            // at all and never was.
+            Err(refusal) => return Err(refusal),
+        }
+    }
+}
+
 /// Run `f` while holding the lock (docs/42 §7: nothing is finished up
 /// afterwards). The lock is released before the result is handed back.
 ///
@@ -244,6 +337,24 @@ pub fn with_feed_lock<T>(
     f: impl FnOnce(&FeedLock) -> T,
 ) -> Result<super::project_lock::Completed<T, Release>, LockRefusal> {
     let lock = acquire(feed_path, wait_ms)?;
+    let out = f(&lock);
+    let release = lock.release();
+    Ok(super::project_lock::Completed { out, release })
+}
+
+/// [`with_feed_lock`], but spending up to `attempts` budgets on a merely BUSY
+/// lock — see [`acquire_retrying`] for why that is safe and what it is not.
+///
+/// `f` is still `FnOnce`. The retry is around the acquisition, never around the
+/// section, so this wrapper CANNOT run the caller's write twice: the compiler
+/// enforces it, and the family's row cannot be duplicated by a lock policy.
+pub fn with_feed_lock_retrying<T>(
+    feed_path: &Path,
+    wait_ms: u64,
+    attempts: u32,
+    f: impl FnOnce(&FeedLock) -> T,
+) -> Result<super::project_lock::Completed<T, Release>, LockRefusal> {
+    let lock = acquire_retrying(feed_path, wait_ms, attempts)?;
     let out = f(&lock);
     let release = lock.release();
     Ok(super::project_lock::Completed { out, release })
@@ -303,6 +414,128 @@ mod tests {
         });
         let token = tok_rx.recv().expect("the other writer must acquire");
         (token, go, join)
+    }
+
+    /// A holder that lets go partway through the caller's patience. The taker
+    /// with the PRE-CHANGE shape — `attempts = 1`, which is byte-for-byte what
+    /// `acquire` alone did — is refused; the production shape lands.
+    ///
+    /// THIS IS THE PERMANENT MUTATION CONTROL for `feed-lock-retry`. It is not a
+    /// mutation switch that turns a check off: `attempts = 1` is a real, callable,
+    /// supported configuration that reproduces the exact build this task changed,
+    /// so the gate has a build in which it fails permanently rather than only on
+    /// the afternoon it was written. Short budgets, because what is being proved
+    /// is the SHAPE of the loop, not the wall clock.
+    #[test]
+    #[serial(project_lock)]
+    fn one_attempt_is_the_pre_change_build_and_it_loses_the_write_that_three_lands() {
+        let wait = 120u64;
+        let hold = 200u64; // longer than ONE budget, shorter than three.
+
+        for (attempts, expected_landed) in [(1u32, false), (3u32, true)] {
+            let dir = scratch();
+            let feed = feed(&dir);
+            let (ready, held) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let feed = feed.clone();
+                std::thread::spawn(move || {
+                    let lock = acquire(&feed, 1000).expect("the other writer must acquire");
+                    ready.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(hold));
+                    lock.release()
+                })
+            };
+            held.recv().expect("the other writer must acquire");
+
+            let landed = match acquire_retrying(&feed, wait, attempts) {
+                Ok(lock) => {
+                    lock.release();
+                    true
+                }
+                Err(LockRefusal::Timeout) => false,
+                Err(other) => panic!("expected a busy lock, got {other:?}"),
+            };
+            holder.join().unwrap();
+            assert_eq!(
+                landed, expected_landed,
+                "attempts={attempts} against a {hold}ms hold on a {wait}ms budget"
+            );
+        }
+    }
+
+    /// A REFUSAL A HUMAN HAS TO CLEAR IS NOT RETRIED, AND COSTS NO TIME.
+    ///
+    /// docs/42 §5: an ownerless lock file is never removed by anyone but a person,
+    /// so asking again is a wedge, not patience — it would multiply the family's
+    /// wait by the attempt count and then give the same answer. The refusal must
+    /// come back on the FIRST attempt, unchanged.
+    #[test]
+    #[serial(project_lock)]
+    fn only_a_timeout_is_retried_an_unavailable_lock_refuses_on_the_first_attempt() {
+        let dir = scratch();
+        let feed = feed(&dir);
+        // Ownerless: present, but carrying no parseable owner record. The
+        // classifier calls this "unattributable", which maps to `Unavailable`.
+        std::fs::write(lock_path_for(&feed), "not a lock record\n").unwrap();
+
+        let wait = 300u64;
+        let attempts = 4u32;
+        let started = std::time::Instant::now();
+        let refusal = acquire_retrying(&feed, wait, attempts).unwrap_err();
+        let spent = started.elapsed();
+
+        assert!(
+            matches!(refusal, LockRefusal::Unavailable(_)),
+            "an ownerless lock is a human's job, not a retry: got {refusal:?}"
+        );
+        assert!(
+            spent < std::time::Duration::from_millis(wait * 2),
+            "the caller spent {spent:?} on a refusal that retrying cannot help — it retried \
+             something it must never retry"
+        );
+        // And the file was NOT touched: §5 removes nothing, at any attempt count.
+        assert_eq!(
+            std::fs::read_to_string(lock_path_for(&feed)).unwrap(),
+            "not a lock record\n"
+        );
+    }
+
+    /// The caller's patience is the CALLER's, and the wait is the PROTOCOL's.
+    ///
+    /// If `DEFAULT_ATTEMPTS` ever migrates into the block above this one, it has
+    /// become something the Node twin must agree about — and it is not, because
+    /// how many times a writer asks changes nothing about how two processes
+    /// serialise. This test exists to make that boundary a thing someone has to
+    /// delete on purpose.
+    #[test]
+    #[serial(project_lock)]
+    fn the_retry_budget_is_a_caller_policy_and_the_wait_is_the_protocol() {
+        assert_eq!(
+            DEFAULT_WAIT_MS, 1000,
+            "the PROTOCOL constant, asserted equal by the Node twin — a retry budget is not a \
+             licence to raise it"
+        );
+        assert!(
+            DEFAULT_ATTEMPTS >= 2,
+            "a single attempt is the pre-change build: see \
+             one_attempt_is_the_pre_change_build_and_it_loses_the_write_that_three_lands"
+        );
+        assert!(
+            DEFAULT_ATTEMPTS <= 5,
+            "patience that is not bounded is a wedge with a nicer name"
+        );
+    }
+
+    /// `attempts = 0` is a caller bug, and it is read as "ask once" rather than
+    /// "do not take the lock and carry on anyway". Fail-closed has no zero.
+    #[test]
+    #[serial(project_lock)]
+    fn zero_attempts_still_asks_once_it_never_skips_the_lock() {
+        let dir = scratch();
+        let feed = feed(&dir);
+        let lock = acquire_retrying(&feed, 200, 0).expect("a free lock is taken");
+        assert!(lock_path_for(&feed).exists(), "the lock was actually taken");
+        assert_eq!(lock.release(), Release::Released);
     }
 
     /// The two processes can only serialise through ONE protocol. If either of

@@ -1000,8 +1000,21 @@ pub fn append(project_root: &Path, receipt: &Receipt) -> Result<Appended, Receip
     if let Some(parent) = ledger.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ReceiptError::Io(e.to_string()))?;
     }
-    let lock = super::feed_lock::acquire(&ledger, super::feed_lock::DEFAULT_WAIT_MS)
-        .map_err(|refusal| ReceiptError::NotSerialised(refusal.to_string()))?;
+    // THE RETRY IS TAKEN ON THE TYPED REFUSAL, BEFORE IT BECOMES A STRING.
+    // `ReceiptError::NotSerialised` carries prose, so by the time a caller sees
+    // it the difference between "busy for a second" and "a human must delete
+    // this file" is gone. That distinction is exactly what may and may not be
+    // retried, so the budget is spent HERE, against
+    // `feed_lock::LockRefusal::Timeout` (docs/42 §9, `feed-lock-retry`) — a
+    // receipt is written on the same lock as the row it proves, and losing it to
+    // a coin flip leaves a row in the family's conversation that nothing can
+    // prove. When the patience is spent the error is byte-identical to before.
+    let lock = super::feed_lock::acquire_retrying(
+        &ledger,
+        super::feed_lock::DEFAULT_WAIT_MS,
+        super::feed_lock::DEFAULT_ATTEMPTS,
+    )
+    .map_err(|refusal| ReceiptError::NotSerialised(refusal.to_string()))?;
     let outcome = append_locked(project_root, receipt, &lock);
     let release = lock.release();
     // The receipt half is decided FIRST: a refused receipt is a refused receipt
@@ -1432,6 +1445,111 @@ mod tests {
             None,
             1_785_000_000_000,
         )
+    }
+
+    /// A RECEIPT LOST TO A COIN FLIP LEAVES AN UNPROVABLE ROW.
+    ///
+    /// The receipt is written on the SAME lock as the row it proves, and `wg
+    /// telegram feed-write` takes that lock three times in one process (row,
+    /// receipt, audience), so the receipt is the acquisition most likely to arrive
+    /// after the budget has already been eaten. Losing it does not merely delay
+    /// something: it leaves a line in the family's conversation that nothing can
+    /// ever prove — the exact shape the ledger exists to eliminate.
+    ///
+    /// A holder that lets go inside the caller's patience must therefore cost the
+    /// receipt nothing, and must not cost it TWO ledger lines: the retry is around
+    /// the acquisition, so the contract checks in `append_locked` — including the
+    /// one-row-one-receipt rule — run exactly once (docs/42 §9, `feed-lock-retry`).
+    #[test]
+    fn a_receipt_refused_by_a_momentary_holder_is_retried_and_lands_exactly_once() {
+        let dir = scratch();
+        let ledger = ledger_path_for(dir.path());
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+
+        // A SECOND WRITER on a fresh thread — re-entrancy is keyed per (thread,
+        // resolved path) (docs/42 §6), so a holder on this call stack would be
+        // this same writer re-entering and would prove nothing about contention.
+        let hold_ms = super::super::feed_lock::DEFAULT_WAIT_MS + 300;
+        let (ready, held) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let ledger = ledger.clone();
+            std::thread::spawn(move || {
+                let lock = super::super::feed_lock::acquire(&ledger, 1000)
+                    .expect("the other writer must acquire");
+                ready.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+                lock.release()
+            })
+        };
+        held.recv().expect("the other writer must acquire");
+
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11)))
+            .expect("a momentary contention loss must not leave the row unprovable");
+
+        assert_eq!(
+            std::fs::read_to_string(&ledger).unwrap().lines().count(),
+            1,
+            "exactly one ledger line: a retry may not write the receipt twice"
+        );
+        assert_eq!(read_all(dir.path()).len(), 1);
+        holder.join().unwrap();
+    }
+
+    /// Held for the WHOLE patience, the receipt still fails CLOSED with the same
+    /// refusal and a byte-identical ledger. A retry budget may not launder a
+    /// refusal into a success, and it may not become an unbounded wait.
+    #[test]
+    fn a_receipt_refused_for_the_whole_patience_fails_closed_with_an_untouched_ledger() {
+        let dir = scratch();
+        let ledger = ledger_path_for(dir.path());
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        // A NEGATIVE CONTROL on the same fixture: uncontended, this receipt lands.
+        append_certified(dir.path(), &receipt(dir.path(), TURN, 1, Some(11)))
+            .expect("the uncontended control must append");
+        let unharmed = std::fs::read_to_string(&ledger).unwrap();
+
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (ready, held) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let ledger = ledger.clone();
+            std::thread::spawn(move || {
+                let lock = super::super::feed_lock::acquire(&ledger, 1000)
+                    .expect("the other writer must acquire");
+                ready.send(()).unwrap();
+                let _ = wait.recv();
+                lock.release()
+            })
+        };
+        held.recv().expect("the other writer must acquire");
+
+        let started = std::time::Instant::now();
+        let err = append(dir.path(), &receipt(dir.path(), TURN2, 2, Some(12)))
+            .expect_err("a receipt that could not be serialised must NOT return Ok");
+        let spent = started.elapsed();
+
+        assert!(
+            matches!(err, ReceiptError::NotSerialised(_)),
+            "the refusal is unchanged by the retry budget: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ledger).unwrap(),
+            unharmed,
+            "a refused append leaves the ledger byte-identical"
+        );
+        // LITERAL bounds, not `DEFAULT_WAIT_MS * DEFAULT_ATTEMPTS` — a floor
+        // derived from the attempt count collapses to zero at `attempts = 1`,
+        // the very build this asserts against. See the twin of this test in
+        // `casa_feed`.
+        assert!(
+            spent >= std::time::Duration::from_millis(2000),
+            "gave up after {spent:?} — less than two protocol budgets, so it did not retry"
+        );
+        assert!(
+            spent < std::time::Duration::from_millis(5000),
+            "waited {spent:?} — a bounded budget must be spendable, not endless"
+        );
+        let _ = go.send(());
+        holder.join().unwrap();
     }
 
     // ── typed id shapes ─────────────────────────────────────────────────────

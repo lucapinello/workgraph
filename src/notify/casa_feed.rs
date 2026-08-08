@@ -808,8 +808,20 @@ pub fn append_entry_proving<E>(
         fs::create_dir_all(parent)
             .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
     }
-    let completed =
-        super::feed_lock::with_feed_lock(feed_path, super::feed_lock::DEFAULT_WAIT_MS, |lock| {
+    // A MOMENTARY CONTENTION LOSS IS NOT A LOST MESSAGE (docs/42 §9,
+    // `feed-lock-retry`). Six concurrent writers of the shape `wg telegram
+    // feed-write` actually performs were measured at 986 ms of the 1000 ms
+    // budget, so which of "recorded" and "the house never heard you" the family
+    // gets was decided by scheduler noise. The retry is around the ACQUISITION
+    // only — the closure below is `FnOnce`, so it cannot run twice and this row
+    // cannot be duplicated — and only a typed `Timeout`, which docs/42 §3 defines
+    // as "the body never ran and the feed was not touched", is ever retried. When
+    // the patience is spent the refusal is the SAME `NotSerialised` as before.
+    let completed = super::feed_lock::with_feed_lock_retrying(
+        feed_path,
+        super::feed_lock::DEFAULT_WAIT_MS,
+        super::feed_lock::DEFAULT_ATTEMPTS,
+        |lock| {
             // THE ARCHIVE IS COUNTED BEFORE OUR BYTES LAND. It cannot change while
             // we hold the lock, and asking first means an unreadable archive costs
             // nothing: no row is written, no id is issued, and the refusal is a
@@ -871,8 +883,9 @@ pub fn append_entry_proving<E>(
                     }
                 }
             }
-        })
-        .map_err(|refusal| ProveFailure::Feed(FeedWriteError::NotSerialised(refusal)))?;
+        },
+    )
+    .map_err(|refusal| ProveFailure::Feed(FeedWriteError::NotSerialised(refusal)))?;
     // THE RELEASE VERDICT IS READ *AND RETURNED*, not dropped on the wrapper's
     // floor. The row and its receipt are certification evidence, and a section
     // whose release could not be PROVEN is a section a human has to look at.
@@ -2290,5 +2303,127 @@ emoji = "①"
             (1..=40).collect::<Vec<i64>>(),
             "40 concurrent rows, ids 1..=40, no duplicate and no gap"
         );
+    }
+    /// A MOMENTARY CONTENTION LOSS IS NOT A LOST MESSAGE.
+    ///
+    /// The lock's `Timeout` means, by docs/42 §3, that our body NEVER RAN and the
+    /// feed was not touched — so a second acquisition cannot double-write. The
+    /// holder here keeps the lock for LONGER than one protocol budget and SHORTER
+    /// than the caller's patience: attempt 1 must lose, attempt 2 must land, and
+    /// the family must end up with exactly ONE row and exactly ONE proof.
+    ///
+    /// The retry re-acquires; it never re-runs the section. `prove` is `FnOnce`,
+    /// so "the row was written twice" is a type error rather than a discipline.
+    #[test]
+    fn a_row_refused_by_a_momentary_holder_is_retried_and_lands_exactly_once() {
+        let (_dir, feed) = scratch_feed();
+        // A SECOND WRITER, on a fresh thread: re-entrancy is keyed per (thread,
+        // resolved path) (docs/42 §6), so a holder taken on THIS call stack is the
+        // same writer re-entering and proves nothing about contention.
+        let hold_ms = super::super::feed_lock::DEFAULT_WAIT_MS + 300;
+        let (ready, held) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let feed = feed.clone();
+            std::thread::spawn(move || {
+                let lock = super::super::feed_lock::acquire(&feed, 1000)
+                    .expect("the other writer must acquire");
+                ready.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+                lock.release()
+            })
+        };
+        held.recv().expect("the other writer must acquire");
+
+        let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
+            .with_turn(TURN, ReplyPhase::Final);
+        let proofs = std::sync::atomic::AtomicUsize::new(0);
+        let row = append_entry_proving(&feed, &entry, |_id, _lock| {
+            proofs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .expect("a momentary contention loss must not cost the family the message");
+        assert_eq!(certified_id(row), 1);
+        assert_eq!(
+            proofs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the proof half ran ONCE — a retry re-acquires, it never re-runs the section"
+        );
+        assert_eq!(
+            count_entries(&fs::read_to_string(&feed).unwrap()),
+            1,
+            "exactly one row: a retry may not duplicate the family's message"
+        );
+        holder.join().unwrap();
+    }
+
+    /// THE PATIENCE IS BOUNDED, AND A REFUSAL IS STILL A REFUSAL.
+    ///
+    /// Held for the WHOLE window, the write fails CLOSED with nothing on disk and
+    /// the refusal the family is told is still the typed `Timeout` — a retry
+    /// budget may not launder a refusal into a success, and it may not become an
+    /// unbounded wait that wedges the caller instead of answering it.
+    #[test]
+    fn a_row_refused_for_the_whole_patience_budget_fails_closed_with_nothing_written() {
+        let (_dir, feed) = scratch_feed();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (ready, held) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let feed = feed.clone();
+            std::thread::spawn(move || {
+                let lock = super::super::feed_lock::acquire(&feed, 1000)
+                    .expect("the other writer must acquire");
+                ready.send(()).unwrap();
+                let _ = wait.recv();
+                lock.release()
+            })
+        };
+        held.recv().expect("the other writer must acquire");
+
+        let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
+            .with_turn(TURN, ReplyPhase::Final);
+        let started = std::time::Instant::now();
+        let err = append_entry_allocating(&feed, &entry).unwrap_err();
+        let spent = started.elapsed();
+
+        assert!(
+            matches!(
+                err,
+                FeedWriteError::NotSerialised(super::super::feed_lock::LockRefusal::Timeout)
+            ),
+            "a Timeout is never converted to a success, and never re-typed: got {err:?}"
+        );
+        assert!(
+            !feed.exists() || fs::read_to_string(&feed).unwrap().is_empty(),
+            "NOTHING was written"
+        );
+        // MORE THAN ONE BUDGET WAS SPENT — the caller retried rather than giving
+        // the family up on the first contention loss. A non-retrying caller
+        // returns at ~one `DEFAULT_WAIT_MS`, which is what this assertion caught
+        // on the pre-change build ("gave up after 1.006s").
+        //
+        // THE BOUNDS ARE LITERAL ON PURPOSE. Written as `DEFAULT_WAIT_MS *
+        // (DEFAULT_ATTEMPTS - 1)` they read better and prove less: setting
+        // `DEFAULT_ATTEMPTS = 1` — which IS the pre-change build — moves the
+        // floor to zero and this test passes a caller that never retried. A
+        // guard whose threshold is derived from the value it is guarding is
+        // hollowed by the same edit it exists to catch. 2 s is two protocol
+        // budgets, so any retrying caller clears it whatever the attempt count;
+        // 5 s is the ceiling on how long a feed writer may make the family wait
+        // before answering, whatever the attempt count.
+        assert!(
+            spent >= std::time::Duration::from_millis(2000),
+            "the caller gave up after {spent:?} — less than two protocol budgets, so it did not \
+             retry (DEFAULT_WAIT_MS={}, DEFAULT_ATTEMPTS={})",
+            super::super::feed_lock::DEFAULT_WAIT_MS,
+            super::super::feed_lock::DEFAULT_ATTEMPTS,
+        );
+        // AND THE PATIENCE ENDED. An unbounded retry never returns at all, and a
+        // budget that quietly grew past five attempts overruns this too.
+        assert!(
+            spent < std::time::Duration::from_millis(5000),
+            "the caller waited {spent:?} — a bounded budget must be spendable, not endless"
+        );
+        let _ = go.send(());
+        holder.join().unwrap();
     }
 }

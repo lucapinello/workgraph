@@ -382,11 +382,20 @@ pub fn record_audience(
     raw: &AudienceRecord,
 ) -> Result<AudienceOutcome, AudienceError> {
     let record = sanitize(raw).map_err(AudienceError::Malformed)?;
-    let completed =
-        super::feed_lock::with_feed_lock(feed_path, super::feed_lock::DEFAULT_WAIT_MS, |_lock| {
-            write_locked(feed_path, &record, MAX_RECORDS, KEEP_RECORDS)
-        })
-        .map_err(|refusal| AudienceError::Locked(refusal.to_string()))?;
+    // THE THIRD ACQUISITION OF THE SAME LOCK IN ONE `feed-write` (the row, the
+    // receipt, then this), and so the one most likely to arrive after the budget
+    // has already been eaten. It retries on the same terms as the other two
+    // (docs/42 §9, `feed-lock-retry`): only a typed `Timeout`, around the
+    // acquisition only, and a spent budget still refuses. `write_locked` is
+    // idempotent on the (turn, audience) key anyway, but it is never given the
+    // chance to prove it — the section runs at most once.
+    let completed = super::feed_lock::with_feed_lock_retrying(
+        feed_path,
+        super::feed_lock::DEFAULT_WAIT_MS,
+        super::feed_lock::DEFAULT_ATTEMPTS,
+        |_lock| write_locked(feed_path, &record, MAX_RECORDS, KEEP_RECORDS),
+    )
+    .map_err(|refusal| AudienceError::Locked(refusal.to_string()))?;
     completed.regardless_of_release()
 }
 
