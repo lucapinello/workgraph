@@ -5127,7 +5127,9 @@ mod tests {
         let cleanup_at = script
             .find("touch \"$WG_WORKTREE_PATH/.wg-cleanup-pending\"")
             .expect("wrapper still marks the worktree for cleanup");
-        let first_call = script.find("wg_preserve_reaped_wip \"hard-timeout\"").unwrap();
+        let first_call = script
+            .find("wg_preserve_reaped_wip \"hard-timeout\"")
+            .unwrap();
         assert!(
             first_call < cleanup_at,
             "preservation must run before the worktree is marked for the sweep"
