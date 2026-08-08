@@ -737,6 +737,11 @@ mod tests {
         let reply_builder = qualified("agent_entry");
         // The two transactional appenders. Every production row goes through one
         // of them (`casa_feed::append_entry` itself is private for that reason).
+        // They are no longer interchangeable: `append_entry_allocating` is the
+        // receipt-free form and now takes a `casa_feed::NonRelayRow`, so an
+        // outbound row can only reach `append_entry_proving`. The inventory
+        // still counts BOTH — a writer is a writer, and which door it used is
+        // the compiler's business, not this guard's.
         let appenders = [
             qualified("append_entry_allocating"),
             qualified("append_entry_proving"),
@@ -752,6 +757,23 @@ mod tests {
                 .to_string_lossy()
                 .to_string();
             for (i, line) in body.lines().enumerate() {
+                // A LINE OF PROSE IS NOT A WRITER. `///` examples and `//`
+                // commentary name these functions to explain them; counting
+                // those makes the inventory a function of how the module is
+                // DOCUMENTED, and the guard then fires at whoever wrote the
+                // sentence rather than at whoever added a writer.
+                //
+                // Found by guard-an-outbound: documenting the receipt-free
+                // append with a `compile_fail` example — the very example that
+                // proves an outbound row cannot reach it — registered
+                // `casa_feed.rs` as a third reply builder. The teeth are
+                // unchanged, because a doc comment compiles to no call: rustdoc
+                // runs those examples as their own crates, and neither a
+                // documented nor a commented-out line can put a row in the
+                // family's feed.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
                 let at = format!("{rel}:{}", i + 1);
                 if line.contains(&reply_builder) {
                     reply_sites.push(at.clone());
