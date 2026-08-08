@@ -73,13 +73,18 @@
 //! (`claw3d-bridge/src/feedLock.mjs` §9) there is NO persisted counter anywhere —
 //! the id is DERIVED:
 //!
-//!     id = <entries in canonical group-feed-YYYY-MM.jsonl archive segments,
-//!           counted from the bytes> + <live ordinal>
+//! ```text
+//! id = <entries in canonical group-feed-YYYY-MM.jsonl archive segments,
+//!       counted from the bytes> + <live ordinal>
+//! ```
 //!
 //! one-based, in file order, live file last, allocated INSIDE the critical
 //! section immediately after our own bytes land (so our row is the last live line
-//! at that instant and no counter can drift). [`append_entry_allocating`] is that
-//! transaction. The archive count is recounted FROM THE BYTES and never read from
+//! at that instant and no counter can drift). [`append_entry_proving`] is that
+//! transaction, and [`append_entry_allocating`] is the same transaction with
+//! nothing to prove — reachable ONLY with a [`NonRelayRow`], the type-level
+//! declaration that no receipt could ever name this row. An outbound row cannot
+//! be handed to it. The archive count is recounted FROM THE BYTES and never read from
 //! `manifest.json`: the manifest is a READ accelerator whose per-segment counts
 //! are believed on a name-set match even when they are wrong, and a wrong count is
 //! how the feed minted the duplicate id `[1, 2, 2]` the gateway slice reproduced.
@@ -238,7 +243,8 @@ impl FeedEntry {
     /// the same way — the writers that must carry a turn all go through here.
     ///
     /// The id is stored EXACTLY as handed over. It is validated (not repaired,
-    /// not re-minted) at write time by [`append_entry_allocating`]: a bad id must
+    /// not re-minted) at write time by [`append_entry_proving`] and
+    /// [`append_entry_allocating`] alike: a bad id must
     /// produce NO ROW, and quietly normalising one here would produce a row
     /// carrying an id the gateway never issued.
     pub fn with_turn(mut self, turn_id: &str, phase: ReplyPhase) -> Self {
@@ -248,9 +254,25 @@ impl FeedEntry {
     }
 
     /// Declare why this row legitimately has no delivery receipt.
+    ///
+    /// Returns a plain [`FeedEntry`], so the row can still go through the
+    /// PROVING form (`wg telegram feed-write` builds one entry and takes one
+    /// path whatever the caller asked for). To reach the receipt-free append,
+    /// use [`FeedEntry::declaring_non_relay`], which returns the witness that
+    /// seam demands.
     pub fn with_non_relay_type(mut self, non_relay_type: &str) -> Self {
         self.non_relay_type = Some(non_relay_type.to_string());
         self
+    }
+
+    /// Declare why this row legitimately has no delivery receipt AND carry that
+    /// declaration in the type — the only way to obtain a [`NonRelayRow`], and
+    /// therefore the only way to reach [`append_entry_allocating`].
+    ///
+    /// Consuming, like the other builders: a caller cannot keep a `&FeedEntry`
+    /// alias and quietly append the undeclared version instead.
+    pub fn declaring_non_relay(self, non_relay_type: &str) -> NonRelayRow {
+        NonRelayRow(self.with_non_relay_type(non_relay_type))
     }
 
     /// Is this row UNBOUND — neither bound to a causal turn (so a receipt could
@@ -454,9 +476,12 @@ pub fn feed_path_for(project_root: &Path) -> PathBuf {
 /// global id, no receipt. A production caller reaching it would be an
 /// unserialised append that a concurrent rotation can destroy, and an unbound row
 /// nothing can ever prove — the two failures this module's transaction exists to
-/// remove. Every writer goes through [`append_entry_allocating`] or
-/// [`append_entry_proving`]; keeping this one private is the structural version
-/// of that rule, which a source-sweep guard could only approximate.
+/// remove. Every writer goes through [`append_entry_proving`], or through
+/// [`append_entry_allocating`] with a [`NonRelayRow`]; keeping this one private
+/// is the structural version of that rule, which a source-sweep guard could only
+/// approximate — and it is the same move [`NonRelayRow`] makes for the second
+/// half of the rule, so that "which append form" is decided by the type of the
+/// row rather than by whoever writes the next caller.
 fn append_entry(feed_path: &Path, entry: &FeedEntry) -> std::io::Result<()> {
     if let Some(parent) = feed_path.parent() {
         fs::create_dir_all(parent)?;
@@ -731,7 +756,57 @@ fn count_entries(body: &str) -> usize {
     body.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
-/// Append one entry and return the GLOBAL FEED ID it was allocated.
+/// A row that has DECLARED, in the type system, why no delivery receipt can
+/// ever prove it — the ONLY thing [`append_entry_allocating`] accepts.
+///
+/// WHY THIS IS A TYPE AND NOT A CONVENTION. `casa_feed` exposes two append
+/// forms, and they are not interchangeable:
+///
+/// * [`append_entry_proving`] — the OUTBOUND form. The receipt is built and
+///   appended inside the same critical section as the row, so "row" and "proof
+///   of delivery" are one transaction with only two visible outcomes.
+/// * [`append_entry_allocating`] — the RECEIPT-FREE form. There is no proof
+///   callback at all, because the row is one nothing relayed: a human's own
+///   inbound line, a pane-only notice, a pre-cutover historical row.
+///
+/// Until this witness existed, which form a caller reached was a matter of
+/// discipline. Both receipt-free callers happened to be inbound mirrors stamped
+/// [`NON_RELAY_TELEGRAM_INBOUND`], which is correct — but NOTHING stopped a
+/// future outbound caller from reaching the receipt-free form, and the result
+/// would have been precisely the defect the receipt contract exists to remove:
+/// a row in the family's conversation that reads as a delivered helper reply
+/// with no evidence anywhere behind it. Every existing test drives the correct
+/// form, so that caller would have shipped green.
+///
+/// Now it cannot be written. A `&FeedEntry` — the shape every outbound builder
+/// produces — does not typecheck at the receipt-free seam, and the only way to
+/// obtain a `NonRelayRow` is [`FeedEntry::declaring_non_relay`], which stamps
+/// the declaration it is named for. This is the same structural move that keeps
+/// the raw [`append_entry`] private and makes
+/// [`relay_receipt::append_locked`](super::relay_receipt::append_locked) demand
+/// a `&FeedLock` witness: a rule the compiler enforces instead of a rule a
+/// reviewer has to notice.
+///
+/// The declaration is still CHECKED, not merely claimed. The token must be in
+/// the closed [`NON_RELAY_TYPES`] set, and an `agent` row may not claim any of
+/// them ([`FeedWriteError::AgentClaimedExemption`]) — so minting this witness on
+/// a reply is not an escape hatch, it is a refusal with a different error. The
+/// type closes the hole that had no check; `validate` keeps the checks that a
+/// type cannot express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonRelayRow(FeedEntry);
+
+impl NonRelayRow {
+    /// The row underneath, for a caller that must echo or inspect it. Read-only
+    /// on purpose: handing back a `&mut` would let the declaration be removed
+    /// after the witness was minted.
+    pub fn entry(&self) -> &FeedEntry {
+        &self.0
+    }
+}
+
+/// Append one entry and return the GLOBAL FEED ID it was allocated — the
+/// RECEIPT-FREE form, reachable only with a [`NonRelayRow`].
 ///
 /// The whole thing is ONE critical section under the cross-process feed lock
 /// (`feed_lock`, the twin of the gateway's): validate, append our bytes, then
@@ -741,17 +816,54 @@ fn count_entries(body: &str) -> usize {
 /// The id is DERIVED, never counted from a persisted number and never guessed
 /// from an ordinal within one file:
 ///
-///     id = archived entries (from the bytes) + our one-based live ordinal
+/// ```text
+/// id = archived entries (from the bytes) + our one-based live ordinal
+/// ```
 ///
 /// Returns [`FeedWriteError::NotSerialised`] and writes NOTHING if the lock
 /// cannot be taken: an unserialised append can land inside a rotation and be
 /// present in neither the archive nor the live file — a message the household
 /// said that the house then denies ever hearing.
+///
+/// AN OUTBOUND ROW CANNOT REACH THIS FUNCTION. A `kind: agent` row bound to a
+/// turn is what [`append_entry_proving`] is for; handed here, it is a type
+/// error, not a row written unproven:
+///
+/// ```compile_fail,E0308
+/// use worksgood::notify::casa_feed::{self, PersonaCatalog, ReplyPhase};
+/// let personas = PersonaCatalog::default();
+/// let outbound = casa_feed::agent_entry(&personas, "harbor", "dinner is pasta", 1)
+///     .with_turn("2a2f8f1e-6a2a-4a7e-9f0e-1c9f0b6d4a11", ReplyPhase::Final);
+/// // NO receipt could ever name this row, and it does not say it is exempt.
+/// let _ = casa_feed::append_entry_allocating(std::path::Path::new("/tmp/f"), &outbound);
+/// ```
+///
+/// Nor can an undeclared INBOUND row — it is the missing declaration that is
+/// refused, not the kind:
+///
+/// ```compile_fail,E0308
+/// use worksgood::notify::casa_feed::{self, PersonaCatalog};
+/// let personas = PersonaCatalog::default();
+/// let undeclared = casa_feed::group_entry(&personas, "ari", "we are out of oats", 1, None);
+/// let _ = casa_feed::append_entry_allocating(std::path::Path::new("/tmp/f"), &undeclared);
+/// ```
+///
+/// THE CONTROL — the same call, differing by exactly the one declaration,
+/// compiles. Without this, the two refusals above would pass on any typo and
+/// prove nothing:
+///
+/// ```no_run
+/// use worksgood::notify::casa_feed::{self, PersonaCatalog};
+/// let personas = PersonaCatalog::default();
+/// let inbound = casa_feed::group_entry(&personas, "ari", "we are out of oats", 1, None)
+///     .declaring_non_relay(casa_feed::NON_RELAY_TELEGRAM_INBOUND);
+/// let _ = casa_feed::append_entry_allocating(std::path::Path::new("/tmp/f"), &inbound);
+/// ```
 pub fn append_entry_allocating(
     feed_path: &Path,
-    entry: &FeedEntry,
+    row: &NonRelayRow,
 ) -> Result<ProvenRow, FeedWriteError> {
-    append_entry_proving(feed_path, entry, |_id, _lock| {
+    append_entry_proving(feed_path, &row.0, |_id, _lock| {
         Ok::<(), std::convert::Infallible>(())
     })
     .map_err(|failure| match failure {
@@ -1116,6 +1228,31 @@ mod tests {
     fn certified_id(row: ProvenRow) -> i64 {
         row.certified()
             .expect("an undisturbed append certifies its own release")
+    }
+
+    /// Write a row through the production PROVING transaction with a proof that
+    /// always succeeds.
+    ///
+    /// WHY THE TESTS BELOW DO NOT USE [`append_entry_allocating`]. That form is
+    /// the RECEIPT-FREE seam and now takes a [`NonRelayRow`] — a row that has
+    /// declared, in the type system, that nothing relayed it (see the type's
+    /// docs). Most of these tests are about ids, validation and rotation and
+    /// use ordinary agent rows, which is exactly the shape that seam must
+    /// refuse; reaching it from here would mean minting the witness on rows
+    /// that have no business holding one, and a test helper that manufactures
+    /// the very exemption the guard exists to withhold hollows the guard.
+    ///
+    /// This body is byte-for-byte what `append_entry_allocating` used to be, so
+    /// those tests exercise the same transaction they always did — the only
+    /// thing that changed is which door they knock on.
+    fn write_row(feed_path: &Path, entry: &FeedEntry) -> Result<ProvenRow, FeedWriteError> {
+        append_entry_proving(feed_path, entry, |_id, _lock| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map_err(|failure| match failure {
+            ProveFailure::Feed(e) => e,
+            ProveFailure::Proof(never) => match never {},
+        })
     }
 
     fn catalog() -> PersonaCatalog {
@@ -1499,7 +1636,7 @@ emoji = "①"
 
         // The NEGATIVE CONTROL, uninjected and on the same fixture.
         let first = certified_id(
-            append_entry_allocating(&feed, &agent_entry(&catalog(), "harbor", "one", 1))
+            write_row(&feed, &agent_entry(&catalog(), "harbor", "one", 1))
                 .expect("the uninjected control must append"),
         );
         assert_eq!(first, 1);
@@ -1507,7 +1644,7 @@ emoji = "①"
 
         let refused = {
             let _armed = inject::Armed::with(libc::EIO);
-            append_entry_allocating(&feed, &agent_entry(&catalog(), "harbor", "two", 2))
+            write_row(&feed, &agent_entry(&catalog(), "harbor", "two", 2))
         };
         let err = refused
             .expect_err("a row whose directory durability could not be proved must NOT return Ok");
@@ -1530,7 +1667,7 @@ emoji = "①"
         let (_dir, feed) = scratch_feed();
         assert_eq!(
             certified_id(
-                append_entry_allocating(&feed, &agent_entry(&catalog(), "harbor", "one", 1))
+                write_row(&feed, &agent_entry(&catalog(), "harbor", "one", 1))
                     .expect("no seam is armed, so the append proceeds")
             ),
             1
@@ -1660,7 +1797,7 @@ emoji = "①"
             let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
                 .with_turn(bad, ReplyPhase::Final);
 
-            let err = append_entry_allocating(&feed, &entry).unwrap_err();
+            let err = write_row(&feed, &entry).unwrap_err();
             assert_eq!(
                 err,
                 FeedWriteError::BadTurnId(bad.to_string()),
@@ -1681,7 +1818,7 @@ emoji = "①"
         let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
             .with_turn(TURN, ReplyPhase::Final);
 
-        let feed_id = certified_id(append_entry_allocating(&feed, &entry).unwrap());
+        let feed_id = certified_id(write_row(&feed, &entry).unwrap());
         assert_eq!(feed_id, 1, "the first row of a fresh feed is global id 1");
 
         let row: serde_json::Value =
@@ -1704,7 +1841,7 @@ emoji = "①"
         entry.turn_id = Some(TURN.to_string());
 
         assert_eq!(
-            append_entry_allocating(&feed, &entry).unwrap_err(),
+            write_row(&feed, &entry).unwrap_err(),
             FeedWriteError::TurnWithoutPhase
         );
         assert!(!feed.exists() || fs::read_to_string(&feed).unwrap().is_empty());
@@ -1743,10 +1880,7 @@ emoji = "①"
         // the missing phase and not about anything else in this entry.
         let stamped = agent_entry(&catalog(), "harbor", "still working on it", 1)
             .with_turn(TURN, ReplyPhase::Watchdog);
-        assert_eq!(
-            certified_id(append_entry_allocating(&feed, &stamped).unwrap()),
-            1
-        );
+        assert_eq!(certified_id(write_row(&feed, &stamped).unwrap()), 1);
         let row: serde_json::Value =
             serde_json::from_str(fs::read_to_string(&feed).unwrap().lines().next().unwrap())
                 .unwrap();
@@ -1772,8 +1906,8 @@ emoji = "①"
         let second = agent_entry(&catalog(), "harbor", "the SECOND answer", same_ms)
             .with_turn(TURN, ReplyPhase::Final);
 
-        let first_id = certified_id(append_entry_allocating(&feed, &first).unwrap());
-        let second_id = certified_id(append_entry_allocating(&feed, &second).unwrap());
+        let first_id = certified_id(write_row(&feed, &first).unwrap());
+        let second_id = certified_id(write_row(&feed, &second).unwrap());
 
         assert_ne!(
             first_id, second_id,
@@ -1844,7 +1978,7 @@ emoji = "①"
 
         let entry = agent_entry(&catalog(), "harbor", "after the rotation", 9)
             .with_turn(TURN, ReplyPhase::Final);
-        let id = certified_id(append_entry_allocating(&feed, &entry).unwrap());
+        let id = certified_id(write_row(&feed, &entry).unwrap());
 
         assert_eq!(
             id, 6,
@@ -1911,7 +2045,7 @@ emoji = "①"
         let entry = agent_entry(&catalog(), "harbor", "the C034 reply", 5)
             .with_turn(TURN, ReplyPhase::Final);
         assert_eq!(
-            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
+            certified_id(write_row(&feed, &entry).unwrap()),
             5,
             "3 archived feed rows + live ordinal 2; the 2 receipt rows are not feed history"
         );
@@ -1929,10 +2063,7 @@ emoji = "①"
 
         let entry = agent_entry(&catalog(), "harbor", "the first feed row", 9)
             .with_turn(TURN, ReplyPhase::Final);
-        assert_eq!(
-            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
-            1
-        );
+        assert_eq!(certified_id(write_row(&feed, &entry).unwrap()), 1);
     }
 
     /// AN UNREADABLE ARCHIVE IS NOT AN EMPTY ONE. The exact-tree control:
@@ -1952,7 +2083,7 @@ emoji = "①"
         let entry =
             agent_entry(&catalog(), "harbor", "the live row", 9).with_turn(TURN, ReplyPhase::Final);
         fs::set_permissions(&archive, fs::Permissions::from_mode(0o000)).unwrap();
-        let refused = append_entry_allocating(&feed, &entry);
+        let refused = write_row(&feed, &entry);
         fs::set_permissions(&archive, fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(
@@ -1972,10 +2103,7 @@ emoji = "①"
 
         // …and once the archive is readable again the same row gets the id it
         // always had: 1 archived + live ordinal 1.
-        assert_eq!(
-            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
-            2
-        );
+        assert_eq!(certified_id(write_row(&feed, &entry).unwrap()), 2);
     }
 
     /// The same rule for an unreadable SEGMENT — the `unwrap_or_default()` per
@@ -1993,7 +2121,7 @@ emoji = "①"
 
         let entry =
             agent_entry(&catalog(), "harbor", "the live row", 9).with_turn(TURN, ReplyPhase::Final);
-        let refused = append_entry_allocating(&feed, &entry);
+        let refused = write_row(&feed, &entry);
         fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).unwrap();
 
         assert!(
@@ -2007,10 +2135,7 @@ emoji = "①"
             "an unreadable segment must be typed unknown, got {refused:?}"
         );
         assert!(!feed.exists() || fs::read_to_string(&feed).unwrap().is_empty());
-        assert_eq!(
-            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
-            3
-        );
+        assert_eq!(certified_id(write_row(&feed, &entry).unwrap()), 3);
     }
 
     /// A MISSING archive directory is still the fact it always was: an install
@@ -2023,22 +2148,25 @@ emoji = "①"
         assert!(!archive_dir_for(&feed).exists());
         let entry = agent_entry(&catalog(), "harbor", "the first row ever", 9)
             .with_turn(TURN, ReplyPhase::Final);
-        assert_eq!(
-            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
-            1
-        );
+        assert_eq!(certified_id(write_row(&feed, &entry).unwrap()), 1);
         drop(dir);
     }
 
     /// ITEM 6 — an inbound Telegram row is writer-stamped `kind:group` +
     /// `nonRelayType:telegram-inbound`, and is therefore BOUND: it says why no
     /// receipt could ever prove it, instead of merely lacking one.
+    ///
+    /// AND IT STILL LANDS THROUGH THE RECEIPT-FREE SEAM ITSELF. This is the
+    /// control on [`NonRelayRow`]: the guard that stops an outbound row from
+    /// reaching [`append_entry_allocating`] must not be a blanket refusal, so
+    /// the row the listener actually writes goes through that exact call here —
+    /// not through the test helper — and lands.
     #[test]
     fn an_inbound_group_row_is_stamped_non_relay_and_is_not_unbound() {
         let (_dir, feed) = scratch_feed();
         let entry = group_entry(&catalog(), "guest", "what's for dinner?", 7, None)
-            .with_non_relay_type(NON_RELAY_TELEGRAM_INBOUND);
-        assert!(!entry.is_unbound());
+            .declaring_non_relay(NON_RELAY_TELEGRAM_INBOUND);
+        assert!(!entry.entry().is_unbound());
 
         certified_id(append_entry_allocating(&feed, &entry).unwrap());
         let row: serde_json::Value =
@@ -2058,8 +2186,11 @@ emoji = "①"
     #[test]
     fn an_invented_non_relay_type_writes_no_row() {
         let (_dir, feed) = scratch_feed();
+        // Through the RECEIPT-FREE SEAM ITSELF: minting the witness is what a
+        // writer inventing a category would do, and the seam must refuse it
+        // rather than treat a declaration as proof that one was owed.
         let entry = agent_entry(&catalog(), "harbor", "trust me", 1)
-            .with_non_relay_type("no-receipt-needed-honest");
+            .declaring_non_relay("no-receipt-needed-honest");
         assert_eq!(
             append_entry_allocating(&feed, &entry).unwrap_err(),
             FeedWriteError::BadNonRelayType("no-receipt-needed-honest".to_string())
@@ -2081,7 +2212,7 @@ emoji = "①"
         let unbound = agent_entry(&catalog(), "harbor", "background report-back", 1);
         assert!(unbound.is_unbound());
         assert_eq!(
-            append_entry_allocating(&feed, &unbound).unwrap_err(),
+            write_row(&feed, &unbound).unwrap_err(),
             FeedWriteError::Sealed { kind: "agent" }
         );
         assert!(
@@ -2093,10 +2224,7 @@ emoji = "①"
         // the conversation itself.
         let bound = agent_entry(&catalog(), "harbor", "dinner is pasta", 2)
             .with_turn(TURN, ReplyPhase::Final);
-        assert_eq!(
-            certified_id(append_entry_allocating(&feed, &bound).unwrap()),
-            1
-        );
+        assert_eq!(certified_id(write_row(&feed, &bound).unwrap()), 1);
 
         // ...but an agent row that DECLARES ITSELF EXEMPT does not, whatever
         // token it picks. This is the half the exact-tree control caught: the
@@ -2104,8 +2232,14 @@ emoji = "①"
         // so an agent row only had to name an exemption to walk through a sealed
         // run unprovable. Every allowlisted token belongs to some other row's
         // situation; a helper that spoke to the family has a delivery.
+        //
+        // Driven through [`append_entry_allocating`] itself, because that IS the
+        // remaining way an agent row can reach the receipt-free seam now that a
+        // bare `&FeedEntry` does not typecheck there: the witness is mintable on
+        // any row, and this is the assertion that minting it buys an agent row
+        // nothing.
         let declared = agent_entry(&catalog(), "harbor", "listener restarted", 3)
-            .with_non_relay_type(NON_RELAY_TELEGRAM_INBOUND);
+            .declaring_non_relay(NON_RELAY_TELEGRAM_INBOUND);
         assert_eq!(
             append_entry_allocating(&feed, &declared).unwrap_err(),
             FeedWriteError::AgentClaimedExemption(NON_RELAY_TELEGRAM_INBOUND.to_string())
@@ -2125,7 +2259,7 @@ emoji = "①"
         assert!(!is_sealed(&feed));
         for token in NON_RELAY_TYPES {
             let entry = agent_entry(&catalog(), "harbor", "an unprovable helper line", 1)
-                .with_non_relay_type(token);
+                .declaring_non_relay(token);
             assert_eq!(
                 append_entry_allocating(&feed, &entry).unwrap_err(),
                 FeedWriteError::AgentClaimedExemption((*token).to_string()),
@@ -2134,6 +2268,58 @@ emoji = "①"
         }
         assert!(!feed.exists() || fs::read_to_string(&feed).unwrap().is_empty());
         drop(dir);
+    }
+
+    /// THE WITNESS HAS EXACTLY ONE MINT, AND THIS IS THE ONLY FILE THAT COULD
+    /// ADD A SECOND.
+    ///
+    /// [`NonRelayRow`]'s field is private, so the compiler already stops every
+    /// other module from building one out of an arbitrary row — an outbound
+    /// caller cannot reach [`append_entry_allocating`] at all. What the compiler
+    /// cannot stop is THIS module growing a second, kinder constructor: one
+    /// `pub fn as_non_relay(entry: FeedEntry) -> NonRelayRow` added for
+    /// convenience and the type gate is a formality again, with every existing
+    /// test still green because they all drive the correct form.
+    ///
+    /// So the construction sites are counted, here, beside the type. Two: the
+    /// declaration itself, and [`FeedEntry::declaring_non_relay`], which stamps
+    /// the declaration the witness is named for.
+    ///
+    /// The needle is assembled from parts on purpose — spelled out verbatim,
+    /// this test's own source would be one of the hits it counts.
+    #[test]
+    fn the_only_way_to_mint_the_receipt_free_witness_is_the_declaration() {
+        let me = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("notify")
+            .join("casa_feed.rs");
+        let body = fs::read_to_string(&me).expect("this module reads its own source");
+        // A broken path or a renamed file would otherwise pass this guard with
+        // zero hits and zero complaints.
+        assert!(
+            body.contains("pub fn append_entry_allocating("),
+            "the sweep did not read this module ({}): a guard that reads the wrong file counts \
+             nothing and passes",
+            me.display(),
+        );
+        let mint = format!("{}{}(", "NonRelay", "Row");
+        let sites: Vec<String> = body
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(&mint) && !l.trim_start().starts_with("//"))
+            .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "the receipt-free witness gained a construction site: {sites:#?}\n\
+             Exactly two are expected — the `struct` declaration and \
+             `FeedEntry::declaring_non_relay`. A third means some row can now be \
+             called non-relay WITHOUT declaring it, which is the receipt-free \
+             append reopened. If the new one really does stamp a declaration, \
+             say so here and raise the count; otherwise it belongs on \
+             `append_entry_proving`.",
+        );
     }
 
     /// The allowlist IS the schema's. `engine-lifecycle` and `diagnostic` were
@@ -2153,7 +2339,7 @@ emoji = "①"
         let (_dir, feed) = scratch_feed();
         for retired in ["engine-lifecycle", "diagnostic"] {
             let entry =
-                group_entry(&catalog(), "someone", "text", 1, None).with_non_relay_type(retired);
+                group_entry(&catalog(), "someone", "text", 1, None).declaring_non_relay(retired);
             assert_eq!(
                 append_entry_allocating(&feed, &entry).unwrap_err(),
                 FeedWriteError::BadNonRelayType(retired.to_string())
@@ -2171,7 +2357,7 @@ emoji = "①"
         fs::write(seal_path_for(dir.path()), "{\"sealed\":true}").unwrap();
 
         let human = group_entry(&catalog(), "guest", "we're out of milk", 5, None)
-            .with_non_relay_type(NON_RELAY_TELEGRAM_INBOUND);
+            .declaring_non_relay(NON_RELAY_TELEGRAM_INBOUND);
         let id = certified_id(
             append_entry_allocating(&feed, &human)
                 .expect("a human's message is never refused by the seal"),
@@ -2240,7 +2426,7 @@ emoji = "①"
 
         let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
             .with_turn(TURN, ReplyPhase::Final);
-        let err = append_entry_allocating(&feed, &entry).unwrap_err();
+        let err = write_row(&feed, &entry).unwrap_err();
         assert!(
             matches!(err, FeedWriteError::NotSerialised(_)),
             "expected a serialisation refusal, got {err:?}"
@@ -2253,10 +2439,7 @@ emoji = "①"
         contender.join().unwrap();
 
         // And once the lock is free the same row goes in.
-        assert_eq!(
-            certified_id(append_entry_allocating(&feed, &entry).unwrap()),
-            1
-        );
+        assert_eq!(certified_id(write_row(&feed, &entry).unwrap()), 1);
     }
 
     /// Concurrent writers each get a DISTINCT id, and the ids are exactly
@@ -2276,7 +2459,7 @@ emoji = "①"
                         let entry = agent_entry(&cat, "harbor", &format!("w{worker} m{i}"), 1)
                             .with_turn(TURN, ReplyPhase::Final);
                         for _ in 0..50 {
-                            match append_entry_allocating(&feed, &entry) {
+                            match write_row(&feed, &entry) {
                                 Ok(row) => return certified_id(row),
                                 // Refused, not written — retry, exactly as a
                                 // real writer does. The lock FAILS CLOSED
@@ -2382,7 +2565,12 @@ emoji = "①"
         let entry = agent_entry(&catalog(), "harbor", "dinner is pasta", 1)
             .with_turn(TURN, ReplyPhase::Final);
         let started = std::time::Instant::now();
-        let err = append_entry_allocating(&feed, &entry).unwrap_err();
+        // Through `write_row` — the same transaction, spelled the way an agent
+        // row must now spell it. This test's subject is the RETRY BUDGET, and
+        // its row is an outbound reply, which no longer typechecks at the
+        // receipt-free seam (see [`NonRelayRow`]); `write_row` is that seam's
+        // former body verbatim, so the budget being measured is unchanged.
+        let err = write_row(&feed, &entry).unwrap_err();
         let spent = started.elapsed();
 
         assert!(

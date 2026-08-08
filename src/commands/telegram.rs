@@ -790,6 +790,12 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // anywhere, so no delivery receipt could ever prove it. Saying so
                 // in machine-readable form is what keeps a human's own message
                 // from reading as an unbound row that nothing certifies.
+                //
+                // `declaring_non_relay` (not `with_non_relay_type`) because the
+                // stamp is also what makes this append TYPECHECK: the
+                // receipt-free form takes a `casa_feed::NonRelayRow`, so a
+                // future outbound reply copied from this block cannot land here
+                // unproven — it would not compile.
                 let entry = casa_feed::group_entry(
                     &family_delivery.personas,
                     &feed_sender,
@@ -797,7 +803,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                     casa_feed::now_ms(),
                     src_id,
                 )
-                .with_non_relay_type(casa_feed::NON_RELAY_TELEGRAM_INBOUND);
+                .declaring_non_relay(casa_feed::NON_RELAY_TELEGRAM_INBOUND);
                 if let Err(e) = casa_feed::append_entry_allocating(&feed_path, &entry) {
                     eprintln!(
                         "[{}] casa feed: failed to mirror inbound group message: {e}",
@@ -974,7 +980,9 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                             let feed_sender = resolve_feed_sender(&workgraph_dir, &msg);
                             // Same inbound stamp as the text mirror: a spoken
                             // message is still a human speaking into the group,
-                            // and it was still never relayed anywhere.
+                            // and it was still never relayed anywhere — and the
+                            // same `declaring_non_relay` witness, without which
+                            // the receipt-free append below does not typecheck.
                             let entry = casa_feed::group_entry(
                                 &family_delivery.personas,
                                 &feed_sender,
@@ -982,7 +990,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                                 casa_feed::now_ms(),
                                 src_id,
                             )
-                            .with_non_relay_type(casa_feed::NON_RELAY_TELEGRAM_INBOUND);
+                            .declaring_non_relay(casa_feed::NON_RELAY_TELEGRAM_INBOUND);
                             if let Err(e) = casa_feed::append_entry_allocating(&feed_path, &entry) {
                                 eprintln!(
                                     "[{}] casa feed: failed to mirror spoken message: {e}",
