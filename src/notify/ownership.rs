@@ -1415,6 +1415,95 @@ impl ClarifyLedger {
 /// window, return it so the caller can route the confirmation back to the voice
 /// that asked — reusing the original ask, WITHOUT a new election. Otherwise
 /// `None`, and the caller runs the normal election.
+/// The short follow-ups that CONTINUE the exchange the last voice just answered,
+/// carrying NEW content rather than confirming the old ask ("another one", "one more",
+/// "again", "another one about blueberry").
+///
+/// Distinct from [`CONFIRMATION_PHRASES`] on purpose: a confirmation replays the ORIGINAL
+/// ask to the same voice, while a follow-up hands that voice a NEW body. Conflating them
+/// would answer "another one about blueberry" by re-telling the first joke.
+///
+/// Deliberately narrow. Each pattern is a request for MORE OF THE SAME with no subject of
+/// its own, so it is meaningless without the previous turn — which is exactly why it must
+/// inherit that turn's voice. Anything carrying its own subject ("another one — what's for
+/// dinner?") is excluded by the domain guard in [`followup_continuation`], not here.
+const FOLLOWUP_STEMS: &[&str] = &[
+    "another",
+    "another one",
+    "one more",
+    "more",
+    "again",
+    "keep going",
+    "next",
+    "encore",
+    "un altro",
+    "ancora",
+];
+
+/// True when `text` is a bare request for more of whatever just happened.
+///
+/// A trailing qualifier is allowed and is the common case — "another one ABOUT BLUEBERRY"
+/// is still a follow-up, and the qualifier is the whole point of the new turn. A LEADING
+/// qualifier is not: "dinner, another one" is a dinner ask.
+pub fn is_bare_followup(text: &str) -> bool {
+    let t = text
+        .to_lowercase()
+        .trim()
+        .trim_end_matches(|c: char| c == '?' || c == '!' || c == '.' || c == ',')
+        .to_string();
+    if t.is_empty() || t.split_whitespace().count() > 8 {
+        return false; // a long sentence carries its own ask
+    }
+    FOLLOWUP_STEMS.iter().any(|stem| {
+        t == *stem
+            // "another one about blueberry" — the stem must START the message, so a
+            // domain word ahead of it keeps its own election.
+            || t.strip_prefix(stem)
+                .is_some_and(|rest| {
+                    let rest = rest.trim_start();
+                    rest.is_empty()
+                        || rest.starts_with("one ")
+                        || rest == "one"
+                        || rest.starts_with("about ")
+                        || rest.starts_with("on ")
+                        || rest.starts_with("with ")
+                        || rest.starts_with("please")
+                })
+    })
+}
+
+/// The voice that should answer a bare FOLLOW-UP, if one is still in the window.
+///
+/// Why this exists: the declared-tag election is lexical (docs/47) — it can only route an
+/// ask that NAMES a domain. "tell me a joke" reaches the household's jokes helper;
+/// "another one" names nothing and fell to the concierge, so a two-turn joke exchange
+/// changed voice halfway through. Observed live: The Chiller told the first joke and the
+/// calendar helper told the second.
+///
+/// Returns the pending exchange so the caller can bind its voice while passing the NEW
+/// text as the body. Two guards keep it from stealing a real ask:
+///   * the text must be a bare follow-up ([`is_bare_followup`]);
+///   * it must name no compiled domain and no declared tag — if it does, it is a fresh
+///     ask that happens to start with "another", and re-electing is correct.
+pub fn followup_continuation(
+    root: &Path,
+    chat_id: &str,
+    human: &str,
+    text: &str,
+    now_epoch: i64,
+    window_secs: i64,
+    owner_map: &OwnerMap,
+) -> Option<ClarifyExchange> {
+    if !is_bare_followup(text) {
+        return None;
+    }
+    // A follow-up that names its own domain is not a follow-up.
+    if classify_domain(text) != Domain::Coordination || owner_map.owner_for_declared_tag(text).is_some() {
+        return None;
+    }
+    ClarifyLedger::pending(root, chat_id, human, now_epoch, window_secs)
+}
+
 pub fn clarify_continuation(
     root: &Path,
     chat_id: &str,
@@ -1626,6 +1715,67 @@ mod tests {
         // A raw "meals"-only tie falls to author order (bruno first here).
         let m2 = OwnerMap::from_pairs(vec![("bruno", vec!["meals"]), ("nora", vec!["meals"])]);
         assert_eq!(m2.owner_for_domain(Domain::MealPlanning), Some("bruno"));
+    }
+
+    // ---- follow-up continuity -------------------------------------------
+
+    /// The declared-tag election is LEXICAL: it routes an ask that names a domain.
+    /// "another one" names nothing, so it fell to the concierge and a two-turn joke
+    /// exchange changed voice halfway through — The Chiller told the first joke and the
+    /// calendar helper told the second, live, in the family group.
+    #[test]
+    fn a_bare_follow_up_is_recognised_but_a_fresh_ask_is_not() {
+        // Recognised: requests for more of the same, with no subject of their own.
+        for t in [
+            "another one",
+            "another",
+            "another one about blueberry",
+            "one more",
+            "one more please",
+            "again",
+            "more",
+            "next",
+            "un altro",
+            "ancora",
+            "Another one!",
+            "another one?",
+        ] {
+            assert!(is_bare_followup(t), "should continue the exchange: {t:?}");
+        }
+
+        // NOT recognised: anything carrying its own ask. These must re-elect.
+        for t in [
+            "what's for dinner tonight?",
+            "dinner, another one",              // leading subject — a dinner ask
+            "add another one to the shopping list",
+            "another workout please",           // names a compiled domain
+            "tell me a joke",                   // names a domain: the normal path
+            "",
+            "can you draft another one of those weekly plans for next week please",  // too long
+        ] {
+            assert!(!is_bare_followup(t), "should start a fresh election: {t:?}");
+        }
+    }
+
+    /// The domain guard: a follow-up that names a domain is not a follow-up. Without it,
+    /// "another workout" would inherit the joke voice instead of reaching the coach.
+    #[test]
+    fn a_follow_up_naming_a_domain_re_elects_instead_of_inheriting() {
+        let m = OwnerMap::from_pairs(vec![
+            ("mira", vec!["workouts"]),
+            ("otto", vec!["calendar", "coordination"]),
+            ("chiller", vec!["calm", "games", "fun", "jokes"]),
+        ]);
+        // These two are the guard's whole purpose — each names a domain, so even though
+        // they open with a follow-up stem they must resolve by DOMAIN, not by whoever
+        // spoke last.
+        assert_eq!(classify_domain("another workout please"), Domain::Workouts);
+        assert_eq!(m.owner_for_declared_tag("another joke"), Some("chiller"));
+
+        // NON-VACUITY: the bare form really does name nothing, which is why it needs the
+        // ledger at all. If this were false the continuity path would be unreachable.
+        assert_eq!(classify_domain("another one about blueberry"), Domain::Coordination);
+        assert_eq!(m.owner_for_declared_tag("another one about blueberry"), None);
     }
 
     // ---- declared (non-compiled) domains ---------------------------------

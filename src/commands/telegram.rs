@@ -5597,6 +5597,61 @@ pub fn run_web_inbound(
             (election, Some(ex.original_ask))
         }
         None => {
+            // FOLLOW-UP CONTINUITY, before a fresh election. "another one about
+            // blueberry" names no domain, so the lexical election (docs/47) cannot
+            // route it and it fell to the concierge — a two-turn joke exchange changed
+            // voice halfway through. Observed live: The Chiller told the first joke and
+            // the calendar helper told the second.
+            //
+            // Unlike a clarify-continuation this carries the NEW text, not the original
+            // ask: the follow-up's whole content is the new qualifier ("about
+            // blueberry"). And `clarify_continued_body` stays None so the window REOPENS
+            // below, which is what lets "another one" work twice in a row.
+            if let Some(ex) = ownership::followup_continuation(
+                &clarify_root,
+                &clarify_chat,
+                &auth_sender,
+                message,
+                clarify_now,
+                clarify_window,
+                &owner_map,
+            ) {
+                if let Ok(election) = bind_clarify_exchange(&ex, &config, &target) {
+                    println!(
+                        "[{}] web-inbound follow-up continuation from {} -> {} (new body, same voice)",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        sender,
+                        ex.voice,
+                    );
+                    // Re-body the bound election with THIS turn's text. A stale voice is
+                    // the one thing bind_clarify_exchange refuses, and on that refusal we
+                    // deliberately fall through to a fresh election rather than guessing.
+                    let election = match election {
+                        Election::One { bot, reply_chat, addressed_by, .. } => Election::One {
+                            bot,
+                            reply_chat,
+                            body: message.trim().to_string(),
+                            addressed_by,
+                        },
+                        other => other,
+                    };
+                    (election, None)
+                } else {
+                    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
+                    let human_count = human_agent_id_set(workgraph_dir).len();
+                    (
+                        elect_group_inbound_with_owner_map(
+                            &target,
+                            message,
+                            &mention_usernames,
+                            human_count,
+                            &config,
+                            &owner_map,
+                        ),
+                        None,
+                    )
+                }
+            } else {
             // A genuinely fresh web-origin message is first-class GROUP inbound:
             // run the exact listener election seam (supergroup, no reply-chain,
             // never bot-sent). Continuations never enter this branch.
@@ -5613,6 +5668,7 @@ pub fn run_web_inbound(
                 ),
                 None,
             )
+            }
         }
     };
 
