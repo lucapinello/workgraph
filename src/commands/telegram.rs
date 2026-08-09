@@ -5607,6 +5607,9 @@ pub fn run_web_inbound(
             // ask: the follow-up's whole content is the new qualifier ("about
             // blueberry"). And `clarify_continued_body` stays None so the window REOPENS
             // below, which is what lets "another one" work twice in a row.
+            // Mentions are parsed here rather than inside, so the continuity check and
+            // the fresh election below agree on what "addressed to somebody" means.
+            let followup_mentions: Vec<String> = parse_at_mention_tokens(message);
             if let Some(ex) = ownership::followup_continuation(
                 &clarify_root,
                 &clarify_chat,
@@ -5615,6 +5618,7 @@ pub fn run_web_inbound(
                 clarify_now,
                 clarify_window,
                 &owner_map,
+                &followup_mentions,
             ) {
                 if let Ok(election) = bind_clarify_exchange(&ex, &config, &target) {
                     println!(

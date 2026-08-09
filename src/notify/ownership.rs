@@ -1415,76 +1415,33 @@ impl ClarifyLedger {
 /// window, return it so the caller can route the confirmation back to the voice
 /// that asked — reusing the original ask, WITHOUT a new election. Otherwise
 /// `None`, and the caller runs the normal election.
-/// The short follow-ups that CONTINUE the exchange the last voice just answered,
-/// carrying NEW content rather than confirming the old ask ("another one", "one more",
-/// "again", "another one about blueberry").
+/// The voice that should answer a turn that names nobody and nothing, while an exchange
+/// is still open.
 ///
-/// Distinct from [`CONFIRMATION_PHRASES`] on purpose: a confirmation replays the ORIGINAL
-/// ask to the same voice, while a follow-up hands that voice a NEW body. Conflating them
-/// would answer "another one about blueberry" by re-telling the first joke.
+/// WHY THIS IS NOT A PHRASE LIST. The first version matched a vocabulary of follow-up
+/// stems — "another one", "one more", "again". It fixed the shapes already observed and
+/// missed the next one: "tell me one about pineapple" starts with "tell me", matched no
+/// stem, named no domain, and went to the concierge. The family had just been told a joke
+/// by the jokes helper. Enumerating phrasings loses to a language; the rule underneath is
+/// what generalises.
 ///
-/// Deliberately narrow. Each pattern is a request for MORE OF THE SAME with no subject of
-/// its own, so it is meaningless without the previous turn — which is exactly why it must
-/// inherit that turn's voice. Anything carrying its own subject ("another one — what's for
-/// dinner?") is excluded by the domain guard in [`followup_continuation`], not here.
-const FOLLOWUP_STEMS: &[&str] = &[
-    "another",
-    "another one",
-    "one more",
-    "more",
-    "again",
-    "keep going",
-    "next",
-    "encore",
-    "un altro",
-    "ancora",
-];
-
-/// True when `text` is a bare request for more of whatever just happened.
+/// THE RULE: inside the open window, a turn that addresses nobody and claims no domain
+/// CONTINUES the conversation already in progress. That is how people talk — you keep
+/// answering the person you are talking to until someone else is addressed or the subject
+/// moves to their business. Falling back to the point of contact instead is what produced
+/// the same bug twice.
 ///
-/// A trailing qualifier is allowed and is the common case — "another one ABOUT BLUEBERRY"
-/// is still a follow-up, and the qualifier is the whole point of the new turn. A LEADING
-/// qualifier is not: "dinner, another one" is a dinner ask.
-pub fn is_bare_followup(text: &str) -> bool {
-    let t = text
-        .to_lowercase()
-        .trim()
-        .trim_end_matches(|c: char| c == '?' || c == '!' || c == '.' || c == ',')
-        .to_string();
-    if t.is_empty() || t.split_whitespace().count() > 8 {
-        return false; // a long sentence carries its own ask
-    }
-    FOLLOWUP_STEMS.iter().any(|stem| {
-        t == *stem
-            // "another one about blueberry" — the stem must START the message, so a
-            // domain word ahead of it keeps its own election.
-            || t.strip_prefix(stem)
-                .is_some_and(|rest| {
-                    let rest = rest.trim_start();
-                    rest.is_empty()
-                        || rest.starts_with("one ")
-                        || rest == "one"
-                        || rest.starts_with("about ")
-                        || rest.starts_with("on ")
-                        || rest.starts_with("with ")
-                        || rest.starts_with("please")
-                })
-    })
-}
-
-/// The voice that should answer a bare FOLLOW-UP, if one is still in the window.
+/// Four things end the continuation, checked here in order, each one a way of saying "this
+/// turn is not for you":
+///   * it @-mentions somebody;
+///   * it names a configured persona;
+///   * its content falls in a compiled [`Domain`] other than the coordination catch-all;
+///   * it names a domain some helper DECLARED (docs/47).
+/// Anything left is a turn with no addressee and no subject of its own — meaningless
+/// except as a continuation, which is exactly why it inherits the open voice.
 ///
-/// Why this exists: the declared-tag election is lexical (docs/47) — it can only route an
-/// ask that NAMES a domain. "tell me a joke" reaches the household's jokes helper;
-/// "another one" names nothing and fell to the concierge, so a two-turn joke exchange
-/// changed voice halfway through. Observed live: The Chiller told the first joke and the
-/// calendar helper told the second.
-///
-/// Returns the pending exchange so the caller can bind its voice while passing the NEW
-/// text as the body. Two guards keep it from stealing a real ask:
-///   * the text must be a bare follow-up ([`is_bare_followup`]);
-///   * it must name no compiled domain and no declared tag — if it does, it is a fresh
-///     ask that happens to start with "another", and re-electing is correct.
+/// The window ([`DEFAULT_CLARIFY_WINDOW_SECS`], 3 min) is the other guard: a fresh
+/// question an hour later re-elects normally.
 pub fn followup_continuation(
     root: &Path,
     chat_id: &str,
@@ -1493,13 +1450,28 @@ pub fn followup_continuation(
     now_epoch: i64,
     window_secs: i64,
     owner_map: &OwnerMap,
+    mentions: &[String],
 ) -> Option<ClarifyExchange> {
-    if !is_bare_followup(text) {
-        return None;
+    if !mentions.is_empty() {
+        return None; // addressed to someone by handle
     }
-    // A follow-up that names its own domain is not a follow-up.
-    if classify_domain(text) != Domain::Coordination || owner_map.owner_for_declared_tag(text).is_some() {
-        return None;
+    let lowered = text.to_lowercase();
+    // Addressed by NAME. Word-boundary matched so "otto" in "risotto" is not an address.
+    for (id, _) in &owner_map.entries {
+        let needle = id.to_lowercase();
+        if needle.len() >= 3
+            && lowered
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w == needle)
+        {
+            return None;
+        }
+    }
+    if classify_domain(text) != Domain::Coordination {
+        return None; // its content belongs to a compiled domain
+    }
+    if owner_map.owner_for_declared_tag(text).is_some() {
+        return None; // …or to one a helper declared
     }
     ClarifyLedger::pending(root, chat_id, human, now_epoch, window_secs)
 }
@@ -1719,63 +1691,57 @@ mod tests {
 
     // ---- follow-up continuity -------------------------------------------
 
-    /// The declared-tag election is LEXICAL: it routes an ask that names a domain.
-    /// "another one" names nothing, so it fell to the concierge and a two-turn joke
-    /// exchange changed voice halfway through — The Chiller told the first joke and the
-    /// calendar helper told the second, live, in the family group.
+    /// THE RULE, not a phrase list. The first version matched follow-up stems
+    /// ("another one", "one more") and missed the very next real phrasing: "tell me one
+    /// about pineapple" starts with "tell me", named no domain, and went to the
+    /// concierge — right after the jokes helper had told a joke. Enumerating phrasings
+    /// loses to a language.
+    ///
+    /// These assert the four things that END a continuation. Everything else — a turn
+    /// addressing nobody and claiming nothing — inherits the open voice.
     #[test]
-    fn a_bare_follow_up_is_recognised_but_a_fresh_ask_is_not() {
-        // Recognised: requests for more of the same, with no subject of their own.
-        for t in [
-            "another one",
-            "another",
-            "another one about blueberry",
-            "one more",
-            "one more please",
-            "again",
-            "more",
-            "next",
-            "un altro",
-            "ancora",
-            "Another one!",
-            "another one?",
-        ] {
-            assert!(is_bare_followup(t), "should continue the exchange: {t:?}");
-        }
-
-        // NOT recognised: anything carrying its own ask. These must re-elect.
-        for t in [
-            "what's for dinner tonight?",
-            "dinner, another one",              // leading subject — a dinner ask
-            "add another one to the shopping list",
-            "another workout please",           // names a compiled domain
-            "tell me a joke",                   // names a domain: the normal path
-            "",
-            "can you draft another one of those weekly plans for next week please",  // too long
-        ] {
-            assert!(!is_bare_followup(t), "should start a fresh election: {t:?}");
-        }
-    }
-
-    /// The domain guard: a follow-up that names a domain is not a follow-up. Without it,
-    /// "another workout" would inherit the joke voice instead of reaching the coach.
-    #[test]
-    fn a_follow_up_naming_a_domain_re_elects_instead_of_inheriting() {
+    fn only_an_address_or_a_domain_ends_a_continuation() {
         let m = OwnerMap::from_pairs(vec![
+            ("nora", vec!["meals", "nutrition"]),
             ("mira", vec!["workouts"]),
             ("otto", vec!["calendar", "coordination"]),
             ("chiller", vec!["calm", "games", "fun", "jokes"]),
         ]);
-        // These two are the guard's whole purpose — each names a domain, so even though
-        // they open with a follow-up stem they must resolve by DOMAIN, not by whoever
-        // spoke last.
-        assert_eq!(classify_domain("another workout please"), Domain::Workouts);
+
+        // (a) NAMES A COMPILED DOMAIN → re-elect. Its content is somebody's business.
+        assert_ne!(classify_domain("what's for dinner tonight?"), Domain::Coordination);
+        assert_ne!(classify_domain("another workout please"), Domain::Coordination);
+
+        // (b) NAMES A DECLARED DOMAIN → re-elect (docs/47).
         assert_eq!(m.owner_for_declared_tag("another joke"), Some("chiller"));
 
-        // NON-VACUITY: the bare form really does name nothing, which is why it needs the
-        // ledger at all. If this were false the continuity path would be unreachable.
-        assert_eq!(classify_domain("another one about blueberry"), Domain::Coordination);
-        assert_eq!(m.owner_for_declared_tag("another one about blueberry"), None);
+        // (c) NAMES A PERSONA → that persona, never the open voice. Word-boundary
+        // matched, so a name inside another word is NOT an address — "risotto" must not
+        // read as "otto", which is the whole reason this is not a substring test.
+        let addresses = |t: &str| {
+            let low = t.to_lowercase();
+            m.entries.iter().any(|(id, _)| {
+                let n = id.to_lowercase();
+                n.len() >= 3 && low.split(|c: char| !c.is_alphanumeric()).any(|w| w == n)
+            })
+        };
+        assert!(addresses("otto can you check"), "an explicit name must end continuity");
+        assert!(!addresses("can we have risotto"), "'risotto' must not read as an address to otto");
+        assert!(!addresses("tell me one about pineapple"));
+
+        // (d) CONTINUES: the shapes that carry no addressee and no subject. The middle
+        // one is the phrasing the stem list missed and the family actually used.
+        for t in ["another one", "tell me one about pineapple", "one more", "again", "keep going"] {
+            assert_eq!(classify_domain(t), Domain::Coordination, "{t:?} should name no compiled domain");
+            assert_eq!(m.owner_for_declared_tag(t), None, "{t:?} should name no declared domain");
+            assert!(!addresses(t), "{t:?} should address nobody");
+        }
+
+        // NON-VACUITY: the discriminator must genuinely separate the two groups. If
+        // classify_domain returned Coordination for everything, (a) above would be
+        // vacuous and every ask would inherit.
+        assert_eq!(classify_domain("tell me one about pineapple"), Domain::Coordination);
+        assert_ne!(classify_domain("what's for dinner tonight?"), Domain::Coordination);
     }
 
     // ---- declared (non-compiled) domains ---------------------------------
