@@ -334,6 +334,17 @@ pub enum AddressedBy {
     /// show the reasoning. Calendar/shopping/coordination and genuinely ambiguous
     /// asks stay [`Concierge`](AddressedBy::Concierge).
     Domain(crate::notify::ownership::Domain),
+    /// Nobody was named and NO compiled [`Domain`] matched — but a helper's own
+    /// DECLARED roster tag did (`chiller` declaring `jokes`, a clinic declaring
+    /// `triage`). Distinct from [`Domain`](AddressedBy::Domain) so the reasoning stays
+    /// honest: the ask classified as the coordination catch-all and was rescued by the
+    /// household's own vocabulary, which is a different fact from "the content fell in a
+    /// compiled domain".
+    ///
+    /// A unit variant rather than one carrying the tag: `AddressedBy` is `Copy`, and a
+    /// `String` payload would force that off and ripple through every call site for a
+    /// debugging nicety. The label still tells an operator the true reason. docs/47.
+    DeclaredTag,
 }
 
 impl std::fmt::Display for AddressedBy {
@@ -343,6 +354,7 @@ impl std::fmt::Display for AddressedBy {
             AddressedBy::Name => f.write_str("name"),
             AddressedBy::ReplyChain => f.write_str("reply-chain"),
             AddressedBy::Concierge => f.write_str("concierge"),
+            AddressedBy::DeclaredTag => f.write_str("declared"),
             AddressedBy::Domain(d) => write!(f, "domain:{}", d.slug()),
         }
     }
@@ -1138,6 +1150,7 @@ pub fn election_decision_summary(
                 AddressedBy::Name => "name".to_string(),
                 AddressedBy::ReplyChain => "reply".to_string(),
                 AddressedBy::Concierge => "concierge".to_string(),
+                AddressedBy::DeclaredTag => "declared".to_string(),
                 // Show WHY a non-concierge voice was elected for an unaddressed
                 // ask: the domain the classifier read the content into.
                 AddressedBy::Domain(d) => format!("domain-{}", d.slug()),
@@ -1873,10 +1886,17 @@ fn domain_voice(
     text: &str,
     config: &TelegramConfig,
     owner_map: &crate::notify::ownership::OwnerMap,
-) -> Option<(ResolvedBot, crate::notify::ownership::Domain)> {
+) -> Option<(ResolvedBot, AddressedBy)> {
     use crate::notify::ownership::classify_domain;
     let domain = classify_domain(text);
-    let owner = owner_map.owner_for_domain(domain)?;
+    // `owner_for_ask`, not `owner_for_domain`: ONE precedence, defined once. The compiled
+    // domains still answer first; only once every one has declined does a helper's own
+    // DECLARED tag get a turn (docs/47). Resolving it through the shared function rather
+    // than re-deriving here is the whole point — this is the LIVE group path, and the
+    // same fix applied only to `owner_for_ask` passed its unit test while the built
+    // binary still answered `rule=concierge target=otto` for "tell me a joke", because
+    // nothing on this route called it.
+    let owner = owner_map.owner_for_ask(text)?;
     // A concierge-owned domain keeps the concierge rule — only a more-specific
     // in-domain voice refines it.
     if owner_map
@@ -1886,7 +1906,17 @@ fn domain_voice(
         return None;
     }
     let bot = resolve_mentioned_bot(owner, config)?;
-    Some((bot, domain))
+    // HONEST REASON, not just an honest destination. When the compiled classifier said
+    // Coordination (its catch-all) and the helper was found by their own declared tag,
+    // reporting `domain-coordination` would name a domain that did not decide anything.
+    // `wg telegram elect` and the dry-run print this string, and an operator debugging a
+    // misroute needs to know WHICH mechanism chose.
+    let why = if domain == crate::notify::ownership::Domain::Coordination {
+        AddressedBy::DeclaredTag
+    } else {
+        AddressedBy::Domain(domain)
+    };
+    Some((bot, why))
 }
 
 /// The SOCIAL BACKSTOP (task social-closers-single-voice): a purely social line
@@ -2053,12 +2083,12 @@ pub fn elect_responders_with_owner_map(
         // whose owner is not the concierge (food → Bruno/Nora, workouts → Mira),
         // that owner ANSWERS as the voice. Otherwise the unaddressed ask is the
         // concierge's (Otto), exactly as before.
-        if let Some((bot, domain)) = domain_voice(text, config, owner_map) {
+        if let Some((bot, why)) = domain_voice(text, config, owner_map) {
             return Election::One {
                 bot,
                 reply_chat,
                 body: text.to_string(),
-                addressed_by: AddressedBy::Domain(domain),
+                addressed_by: why,
             };
         }
         return match concierge_bot(config, owner_map) {
@@ -2111,12 +2141,12 @@ pub fn elect_responders_with_owner_map(
             // booked" — plus the genuine broadcast ASKS that rules d-plural and
             // d-discussion already claimed above this.
             if has_social_marker(text) {
-                if let Some((bot, domain)) = domain_voice(text, config, owner_map) {
+                if let Some((bot, why)) = domain_voice(text, config, owner_map) {
                     return Election::One {
                         bot,
                         reply_chat,
                         body: text.to_string(),
-                        addressed_by: AddressedBy::Domain(domain),
+                        addressed_by: why,
                     };
                 }
                 return match concierge_bot(config, owner_map) {
@@ -2172,12 +2202,12 @@ pub fn elect_responders_with_owner_map(
         // Round-2 refinement (same as the team-ask branch): a content-classifiable
         // ask goes to its DOMAIN owner's voice; anything ambiguous stays with the
         // concierge (Otto).
-        if let Some((bot, domain)) = domain {
+        if let Some((bot, why)) = domain {
             return Election::One {
                 bot,
                 reply_chat,
                 body: text.to_string(),
-                addressed_by: AddressedBy::Domain(domain),
+                addressed_by: why,
             };
         }
         return match concierge_bot(config, owner_map) {
