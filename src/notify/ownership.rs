@@ -764,9 +764,67 @@ impl OwnerMap {
         }
     }
 
+    /// The persona whose own DECLARED domain tag the ask names.
+    ///
+    /// [`Domain`] is a closed, compiled set and [`Domain::household_tags`] a fixed
+    /// bijection onto 11 blessed roster tags. A household that declares anything else —
+    /// `calm`, `games`, `fun`, `jokes` for a wind-down helper, `triage` for a clinic —
+    /// gets a persona this election cannot represent, so every such ask fell to the
+    /// concierge. Not rarely: never. The declaration parsed, validated, rendered in the
+    /// UI, and routed nothing. That is the bug behind "I asked for a joke and the
+    /// calendar helper answered" (docs/47).
+    ///
+    /// The tags are already loaded here verbatim from `household.toml`; only
+    /// `owner_for_domain` narrows them through the compiled table. So this asks the
+    /// simpler question the compiled path cannot: does the ask NAME a domain somebody
+    /// declared? Author order breaks ties, exactly as `owner_for_domain` does.
+    ///
+    /// Deliberately conservative — whole words with an `s`-stem tolerance, no fuzzy
+    /// matching. It runs only after every built-in vocabulary has declined, so a miss
+    /// costs a concierge answer (today's behaviour) while a false positive would hand a
+    /// real domain ask to the wrong helper.
+    pub fn owner_for_declared_tag(&self, ask: &str) -> Option<&str> {
+        let words: Vec<String> = ask
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3)
+            .map(|w| w.to_string())
+            .collect();
+        if words.is_empty() {
+            return None;
+        }
+        let stem = |w: &str| w.strip_suffix('s').unwrap_or(w).to_string();
+        for (id, tags) in &self.entries {
+            for tag in tags {
+                let t = tag.trim().to_lowercase();
+                if t.len() < 3 {
+                    continue;
+                }
+                let ts = stem(&t);
+                if words.iter().any(|w| *w == t || stem(w) == ts) {
+                    return Some(id.as_str());
+                }
+            }
+        }
+        None
+    }
+
     /// The persona id that owns the ask (classify + resolve).
+    ///
+    /// The compiled domains answer first — they carry ~179 words of measured vocabulary
+    /// plus the swap-shape rule, a real fast path worth keeping. Only once every one of
+    /// them has declined does the household's OWN declared vocabulary get a turn, so the
+    /// concierge is now reached by exhausting the declared set rather than by the set
+    /// being too small to try.
     pub fn owner_for_ask(&self, ask: &str) -> Option<&str> {
-        self.owner_for_domain(classify_domain(ask))
+        let domain = classify_domain(ask);
+        if domain != Domain::Coordination {
+            return self.owner_for_domain(domain);
+        }
+        // Coordination is the catch-all, not a match. Before handing the turn to the
+        // point of contact, ask whether some helper declared this domain themselves.
+        self.owner_for_declared_tag(ask)
+            .or_else(|| self.owner_for_domain(domain))
     }
 
     /// The single-owner decision for `persona` creating a task from `ask`.
@@ -1568,6 +1626,65 @@ mod tests {
         // A raw "meals"-only tie falls to author order (bruno first here).
         let m2 = OwnerMap::from_pairs(vec![("bruno", vec!["meals"]), ("nora", vec!["meals"])]);
         assert_eq!(m2.owner_for_domain(Domain::MealPlanning), Some("bruno"));
+    }
+
+    // ---- declared (non-compiled) domains ---------------------------------
+
+    /// The household's roster is the extension point; `Domain` is a closed enum. A
+    /// household that declares a helper outside the six compiled domains used to get a
+    /// persona the election could not represent, so EVERY such ask fell to the
+    /// concierge — the measured bug behind "I asked for a joke and the calendar helper
+    /// answered". See docs/47.
+    #[test]
+    fn a_declared_domain_outside_the_compiled_set_still_elects_its_helper() {
+        // This household exactly: four compiled-domain helpers plus a wind-down helper
+        // whose four declared tags are in none of Domain::household_tags().
+        let m = OwnerMap::from_pairs(vec![
+            ("nora", vec!["meals", "nutrition"]),
+            ("bruno", vec!["meals", "cooking", "recipes"]),
+            ("mira", vec!["workouts"]),
+            ("otto", vec!["calendar", "coordination", "shopping"]),
+            ("chiller", vec!["calm", "games", "fun", "jokes"]),
+        ]);
+
+        // THE REPORTED BUG. Both of these returned the concierge (otto) before.
+        assert_eq!(m.owner_for_ask("tell me a joke about a banana"), Some("chiller"));
+        assert_eq!(m.owner_for_ask("tell me a joke"), Some("chiller"));
+        // Plural/singular tolerance: the tag is "jokes", the ask says "joke".
+        assert_eq!(m.owner_for_ask("any good jokes?"), Some("chiller"));
+        // Another declared tag on the same helper.
+        assert_eq!(m.owner_for_ask("can we play a game tonight"), Some("chiller"));
+
+        // NON-REGRESSION — the compiled fast path still answers first and unchanged.
+        assert_eq!(m.owner_for_ask("what's for dinner tonight?"), Some("nora"));
+        assert_eq!(m.owner_for_ask("how do I make the sauce?"), Some("bruno"));
+        assert_eq!(m.owner_for_ask("when is my workout?"), Some("mira"));
+        assert_eq!(m.owner_for_ask("add milk to the list"), Some("otto"));
+
+        // THE CONCIERGE STILL EXISTS. An ask naming no domain at all — compiled or
+        // declared — must still reach the point of contact. Reached by exhausting the
+        // declared set now, rather than by the set being too small to try.
+        assert_eq!(m.owner_for_ask("are you there?"), Some("otto"));
+
+        // NON-VACUITY. The compiled path really does classify these as the catch-all,
+        // so the four assertions above are exercising the new fallback and not some
+        // pre-existing match. Without it they would every one return the concierge.
+        assert_eq!(classify_domain("tell me a joke about a banana"), Domain::Coordination);
+        assert_eq!(classify_domain("can we play a game tonight"), Domain::Coordination);
+        assert_eq!(m.owner_for_domain(Domain::Coordination), Some("otto"));
+    }
+
+    /// A household with NO helper for a declared domain must not invent one.
+    #[test]
+    fn an_undeclared_domain_still_falls_to_the_concierge() {
+        let m = OwnerMap::from_pairs(vec![
+            ("nora", vec!["meals", "nutrition"]),
+            ("otto", vec!["calendar", "coordination"]),
+        ]);
+        // Nobody declared jokes here, so the concierge answers — the control for the
+        // test above, and the reason a false positive would be worse than a miss.
+        assert_eq!(m.owner_for_ask("tell me a joke"), Some("otto"));
+        assert_eq!(m.owner_for_declared_tag("tell me a joke"), None);
     }
 
     // ---- intent ledger ---------------------------------------------------
