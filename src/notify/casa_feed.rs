@@ -55,10 +55,12 @@
 //!     join silently finds nothing and every row reads as unproven. A row whose
 //!     `turnId` is not a raw `web-turn-<uuid v4>` is REFUSED — no row, no receipt
 //!     — rather than written with an id that certifies nothing.
-//!   * `replyPhase` — ack / final / watchdog / failure, stamped at emit time
-//!     because the writer KNOWS which it is. Deriving it later from the text is
-//!     text analysis, and text analysis is how a watchdog line gets counted as
-//!     the turn's final answer.
+//!   * `replyPhase` — ack / final / addendum / watchdog / failure, stamped at
+//!     emit time because the writer KNOWS which it is. Deriving it later from
+//!     the text is text analysis, and text analysis is how a watchdog line gets
+//!     counted as the turn's final answer. `addendum` is the v9.2 member: a
+//!     second voice's part of ONE answer, turn-bound and receipted, never the
+//!     turn's final.
 //!   * `nonRelayType` — why this row legitimately has NO delivery receipt. An
 //!     inbound group message was never relayed anywhere, so demanding a receipt
 //!     for it would be nonsense; saying so EXPLICITLY is what keeps it from

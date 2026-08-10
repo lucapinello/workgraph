@@ -6081,15 +6081,26 @@ pub fn run_feed_write(
     // is keyed on, asserted by a writer that never said it. It also walked
     // straight past `casa_feed::validate`'s `TurnWithoutPhase` — v9.1's required
     // negative, unreachable from this seam because the default filled the exact
-    // hole the validator exists to catch. The writer KNOWS which of the four it
+    // hole the validator exists to catch. The writer KNOWS which of the five it
     // is emitting; if it did not say, it is asked, not guessed for.
+    //
+    // THE VOCABULARY IS THE SCHEMA'S, AND IT IS A JOIN BETWEEN TWO REPOS. This
+    // arm-per-word list IS the engine's half of the closed enum, and the gateway
+    // asserts every member of ITS list is stamped verbatim by this binary
+    // (`claw3d-bridge/test/replyPhaseEngineTwin.test.mjs`). `addendum` was in the
+    // gateway's `REPLY_PHASES` from v9.2 and missing here, so the twin red-lined
+    // on the exact message below: a word one implementation writes and the other
+    // refuses is a row the gateway can produce and the engine cannot.
     let phase = match reply_phase.map(str::trim) {
         Some("ack") => Some(relay_receipt::ReplyPhase::Ack),
         Some("final") => Some(relay_receipt::ReplyPhase::Final),
+        Some("addendum") => Some(relay_receipt::ReplyPhase::Addendum),
         Some("watchdog") => Some(relay_receipt::ReplyPhase::Watchdog),
         Some("failure") => Some(relay_receipt::ReplyPhase::Failure),
         Some(other) => {
-            anyhow::bail!("--reply-phase must be one of ack|final|watchdog|failure, got '{other}'")
+            anyhow::bail!(
+                "--reply-phase must be one of ack|final|addendum|watchdog|failure, got '{other}'"
+            )
         }
         None => None,
     };
@@ -6099,9 +6110,10 @@ pub fn run_feed_write(
             // BEFORE the append, so a refusal leaves no row.
             let Some(phase) = phase else {
                 anyhow::bail!(
-                    "a row bound to a turn must declare --reply-phase (ack|final|watchdog|failure) \
-                     — the writer knows which it is emitting, and an unstamped turn-bound agent \
-                     row is a receipt/observe v9.1 required negative"
+                    "a row bound to a turn must declare --reply-phase \
+                     (ack|final|addendum|watchdog|failure) — the writer knows which it is \
+                     emitting, and an unstamped turn-bound agent row is a receipt/observe v9.1 \
+                     required negative"
                 );
             };
             entry.with_turn(turn, phase)
@@ -13889,6 +13901,126 @@ domains = ["calendar"]
         );
     }
 
+    /// THE TWO-VOICE ANSWER — an `addendum` is a real delivery that is NOT the
+    /// turn's final (schema v9.2, `multi_voice_answer`).
+    ///
+    /// The shipped case is the meal-swap fast lane: the meal owner reports the
+    /// swap and the nutrition owner adds a one-line companion take. Before the
+    /// fifth phase existed there was no shape for the second row — `final` twice
+    /// is fatal by cardinality, and it is plainly not an ack, a watchdog or a
+    /// failure — so the companion was emitted with NO causal turn. It stayed
+    /// stamped and provable and LOST THE JOIN BACK TO THE ASK: nothing on disk
+    /// said Nora's line belonged to the turn Bruno answered.
+    ///
+    /// Driven through `send_reply_once_phase`, the same seam the ack test above
+    /// uses and the same one production takes, because the thing under test is
+    /// the RESERVATION's reading of the phase and that lives in the sink.
+    #[test]
+    fn an_addendum_is_bound_receipted_and_never_the_turns_final() {
+        use worksgood::notify::relay_receipt::ReplyPhase;
+        use worksgood::notify::telegram_conversation::{self as convo};
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let answer = opaque_delivery(&feed).with_turn_override(ENGINE_TURN).wrap(
+            NumberedReplySink::default(),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        rt.block_on(convo::send_reply_once_phase(
+            dir.path(),
+            ENGINE_TURN,
+            "harbor",
+            "group-chat",
+            "Swapped Thursday to the carbonara.",
+            &answer,
+            ReplyPhase::Final,
+        ))
+        .unwrap();
+
+        // The SECOND VOICE, on the SAME accepted turn. A fresh sink with its own
+        // message-id run is the honest shape: an addendum is its own Telegram
+        // message, not an edit of the final.
+        let companion = opaque_delivery(&feed).with_turn_override(ENGINE_TURN).wrap(
+            NumberedReplySink::starting_at(70),
+            ReplyScope::Group,
+            GuardPolicy::AlreadyGuarded,
+        );
+        rt.block_on(convo::send_reply_once_phase(
+            dir.path(),
+            ENGINE_TURN,
+            "nutrition",
+            "group-chat",
+            "Heavier night — worth a walk after.",
+            &companion,
+            ReplyPhase::Addendum,
+        ))
+        .unwrap();
+
+        let rows: Vec<serde_json::Value> = feed_lines(&feed)
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // NON-VACUITY, FIRST. If the companion never reached the feed at all,
+        // every "…and it is not a final" assertion below would pass trivially
+        // against a writer that had simply dropped the line — which is exactly
+        // the outcome the v9.2 decision rejected as worse than the bug.
+        let addenda: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["replyPhase"] == "addendum")
+            .collect();
+        assert_eq!(
+            addenda.len(),
+            1,
+            "the companion line is in the feed: {rows:?}"
+        );
+        assert_eq!(addenda[0]["text"], "Heavier night — worth a walk after.");
+
+        // THE JOIN THE PHASE EXISTS FOR: same turn as the answer it accompanies,
+        // not a single-row occurrence of its own.
+        assert_eq!(
+            addenda[0]["turnId"], ENGINE_TURN,
+            "the addendum lost the durable join back to the ask: {rows:?}"
+        );
+
+        // …and exactly ONE final, which is the answer and not the companion.
+        let finals: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["replyPhase"] == "final").collect();
+        assert_eq!(
+            finals.len(),
+            1,
+            "exactly one final per accepted turn: {rows:?}"
+        );
+        assert_eq!(finals[0]["text"], "Swapped Thursday to the carbonara.");
+
+        // One row, one receipt — the addendum is certified like any other
+        // delivery, and its receipt names its own row.
+        let receipts = relay_receipt::read_all(dir.path());
+        let addendum_receipt = receipts
+            .iter()
+            .find(|r| r.reply_phase == ReplyPhase::Addendum)
+            .expect("the addendum carries its own receipt");
+        assert_eq!(addendum_receipt.turn_id, ENGINE_TURN);
+        let final_receipt = receipts
+            .iter()
+            .find(|r| r.reply_phase == ReplyPhase::Final)
+            .expect("the answer carries its own receipt");
+        assert!(
+            addendum_receipt.feed_id > 0 && addendum_receipt.feed_id != final_receipt.feed_id,
+            "one row, one receipt — the addendum's receipt names the answer's row: {receipts:?}"
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|r| r.reply_phase == ReplyPhase::Final)
+                .count(),
+            1,
+            "the addendum was counted as a final in the ledger: {receipts:?}"
+        );
+    }
+
     /// ITEM 7 — AMBIGUOUS IS NOT FAILED, at the sink stack the production path
     /// actually uses.
     ///
@@ -14376,6 +14508,97 @@ domains = ["calendar"]
         let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(row["turnId"], ENGINE_TURN);
         assert_eq!(row["replyPhase"], "final");
+    }
+
+    /// EVERY MEMBER OF THE CLOSED ENUM IS STAMPED VERBATIM BY THIS SEAM.
+    ///
+    /// `feed-write --reply-phase` is the flag the gateway's cross-impl twin
+    /// (`claw3d-bridge/test/replyPhaseEngineTwin.test.mjs`) drives against the
+    /// REAL binary, once per member of ITS `REPLY_PHASES`. That twin was red for
+    /// exactly one word: `addendum` joined the gateway's enum with schema v9.2
+    /// and this parser had four arms, so the engine refused a phase its twin
+    /// writes. A vocabulary that differs between two writers of one file is not
+    /// a naming quibble — it is a row one of them can produce and the other
+    /// cannot read.
+    ///
+    /// Kept as a LITERAL list rather than iterating over the Rust enum on
+    /// purpose: iterating would only prove the parser agrees with itself, and
+    /// the thing at risk is agreement with the OTHER repo's list.
+    #[test]
+    fn feed_write_stamps_every_phase_of_the_closed_enum_verbatim() {
+        for phase in ["ack", "final", "addendum", "watchdog", "failure"] {
+            let dir = tempfile::tempdir().unwrap();
+            let feed = casa_feed::feed_path_for(dir.path());
+            run_feed_write(
+                dir.path(),
+                "agent",
+                None,
+                Some("harbor"),
+                &format!("a {phase} line"),
+                None,
+                Some(ENGINE_TURN),
+                Some(phase),
+                None,
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("the engine refused a declared '{phase}' row: {e:#}"));
+            let lines = feed_lines(&feed);
+            assert_eq!(lines.len(), 1, "'{phase}': {lines:?}");
+            let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+            assert_eq!(
+                row["turnId"], ENGINE_TURN,
+                "'{phase}': the turn was dropped"
+            );
+            assert_eq!(
+                row["replyPhase"], phase,
+                "the engine stamped something else for '{phase}': {row}"
+            );
+        }
+
+        // THE CONTROL. The enum is still CLOSED — the loop above would pass just
+        // as well against a parser that accepted any string it was handed and
+        // echoed it onto the row, which is the normalise-anything failure the
+        // twin's third case exists to catch.
+        for invented in ["FINAL", "companion", "addendum "] {
+            let dir = tempfile::tempdir().unwrap();
+            let feed = casa_feed::feed_path_for(dir.path());
+            let outcome = run_feed_write(
+                dir.path(),
+                "agent",
+                None,
+                Some("harbor"),
+                "Dinner is the soup.",
+                None,
+                Some(ENGINE_TURN),
+                Some(invented),
+                None,
+                None,
+                None,
+            );
+            // `"addendum "` is the deliberate near-miss: it is REFUSED for its
+            // whitespace only if the parser trims before matching, and accepted
+            // as `addendum` if it does. Either way it must not become a row
+            // stamped with the untrimmed string.
+            if invented.trim() == "addendum" {
+                outcome.expect("a trimmed-but-valid phase is the word itself");
+                let row: serde_json::Value = serde_json::from_str(&feed_lines(&feed)[0]).unwrap();
+                assert_eq!(row["replyPhase"], "addendum", "the padding reached the row");
+            } else {
+                let err = outcome.expect_err(&format!(
+                    "the engine accepted the off-enum phase '{invented}'"
+                ));
+                assert!(
+                    format!("{err:#}").contains("--reply-phase"),
+                    "the refusal must name the flag: {err:#}"
+                );
+                assert!(
+                    !feed.exists() || feed_lines(&feed).is_empty(),
+                    "the off-enum row reached the feed anyway: {:?}",
+                    feed_lines(&feed)
+                );
+            }
+        }
     }
 
     /// …and the requirement is CONDITIONAL on being turn-bound. A row with no

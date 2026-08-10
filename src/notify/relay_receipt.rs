@@ -181,11 +181,30 @@ impl RelayOutcome {
 /// time because the writer KNOWS which it is — deriving it later from the text
 /// is text analysis, and text analysis is how a watchdog line gets counted as
 /// the turn's final answer.
+///
+/// FIVE MEMBERS SINCE v9.2, and the fifth is the reason this enum moved at all.
+/// `Addendum` is a SECOND VOICE's part of ONE answer — the shipped case is the
+/// meal-swap fast lane, where the meal owner reports the swap and the nutrition
+/// owner adds a one-line companion take. It is turn-bound, receipted and
+/// certified like any other row, and it is NEVER the turn's final: it is not
+/// counted as final and it does not consume the finality reservation. Before it
+/// existed the companion was written with NO causal turn, which kept it stamped
+/// and provable but destroyed the durable join back to the ask
+/// (`docs/schemas/receipt-observe-schema-v9.2.json` `multi_voice_answer`, in the
+/// gateway tree).
+///
+/// THE ORDER OF THE MEMBERS IS THE SCHEMA'S — `ack|final|addendum|watchdog|
+/// failure`. Nothing derives an ordinal from it (serde writes the lowercase
+/// name, and the only ordering anyone reads is [`succession_rank`]), but the two
+/// implementations are diffed by eye far more often than by machine and the
+/// gateway's `REPLY_PHASES` is in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplyPhase {
     Ack,
     Final,
+    /// A second voice's part of one answer. Turn-bound, never the final.
+    Addendum,
     Watchdog,
     Failure,
 }
@@ -203,6 +222,7 @@ impl ReplyPhase {
         match self {
             ReplyPhase::Ack => "ack",
             ReplyPhase::Final => "final",
+            ReplyPhase::Addendum => "addendum",
             ReplyPhase::Watchdog => "watchdog",
             ReplyPhase::Failure => "failure",
         }
@@ -221,11 +241,25 @@ impl ReplyPhase {
     /// replay it looks like, and v9.1's "exactly one replyPhase:'final' per
     /// accepted turn" stays enforced by this guard as well as by the attempt
     /// guard.
+    ///
+    /// `Addendum` JOINS THEM AT 2, AND THAT NUMBER IS A CROSS-IMPLEMENTATION
+    /// CONSTRAINT, not a taste call. The receipt index is appended to by BOTH
+    /// writers, and the gateway's port of this function
+    /// (`receiptLedger.successionRank`) is written as `ack`=0, `watchdog`=1,
+    /// ANYTHING ELSE = 2 — so a reader that does not know the word `addendum`
+    /// already ranks it 2 by falling through. Giving it any other rank here
+    /// would make the two implementations disagree about one line in a shared
+    /// file, which is the one thing the v9.2 decision's `cross_impl_note`
+    /// forbids: a rank below 2 would let a later edit be read as SUCCEEDING an
+    /// addendum in the gateway's ledger and as a replay in ours. 2 is also the
+    /// fail-closed reading on its own terms — an addendum is a distinct Telegram
+    /// message with its own message id, so it never joins another row's edit
+    /// succession anyway.
     fn succession_rank(self) -> u8 {
         match self {
             ReplyPhase::Ack => 0,
             ReplyPhase::Watchdog => 1,
-            ReplyPhase::Final | ReplyPhase::Failure => 2,
+            ReplyPhase::Final | ReplyPhase::Failure | ReplyPhase::Addendum => 2,
         }
     }
 }
@@ -2032,6 +2066,76 @@ mod tests {
         assert_eq!(read_all(dir.path()).len(), 2);
     }
 
+    /// THE FIFTH PHASE'S RANK IS A CROSS-REPO CONSTRAINT, NOT A PREFERENCE.
+    ///
+    /// The receipt index is appended to by both writers, and the gateway's port
+    /// of `succession_rank` (`receiptLedger.successionRank`) is spelled `ack`=0,
+    /// `watchdog`=1, EVERYTHING ELSE = 2 — so a reader that has never heard the
+    /// word `addendum` ranks it 2 by falling through. Knowing the word must not
+    /// change the number. If it did, one line in one shared file would be a
+    /// succession to one implementation and a replay to the other, and only one
+    /// of them would refuse the row.
+    #[test]
+    fn addendum_ranks_terminal_so_both_implementations_agree_on_one_shared_line() {
+        use ReplyPhase::*;
+        assert_eq!(
+            Addendum.succession_rank(),
+            Final.succession_rank(),
+            "the gateway's unknown-phase fall-through ranks `addendum` 2; so must we"
+        );
+        // NON-VACUITY: the equality above would also hold if every phase ranked
+        // the same. It does not — the ordering the exemption reads is real.
+        assert!(Ack.succession_rank() < Addendum.succession_rank());
+        assert!(Watchdog.succession_rank() < Addendum.succession_rank());
+
+        // …and therefore an addendum can never be the earlier phase a later edit
+        // succeeds. An addendum is its own Telegram message, so it should never
+        // face this test at all; if it somehow does, terminal is the fail-closed
+        // answer and the row is refused as the replay it looks like.
+        let dir = scratch();
+        append_certified(dir.path(), &ack_at(dir.path(), 1, 9, ATTEMPT_ONE)).unwrap();
+        append_certified(
+            dir.path(),
+            &edited_to(dir.path(), TURN, 2, 9, ReplyPhase::Addendum, ATTEMPT_ONE),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                append(
+                    dir.path(),
+                    &edited_to(dir.path(), TURN, 3, 9, ReplyPhase::Final, ATTEMPT_ONE)
+                ),
+                Err(ReceiptError::Replay { .. })
+            ),
+            "a final edited over a recorded addendum's message id was accepted"
+        );
+        assert_eq!(read_all(dir.path()).len(), 2);
+    }
+
+    /// THE WORD ON THE WIRE IS `addendum`, in both directions.
+    ///
+    /// `replyPhase` is an index field two implementations parse. A variant that
+    /// serialised as `Addendum` (serde's default) would be written by us and
+    /// read as malformed by the gateway's `optEnum(obj.replyPhase, REPLY_PHASES)`
+    /// — a whole index line dropped, and the refire guard is a search over that
+    /// list.
+    #[test]
+    fn addendum_round_trips_as_the_lowercase_schema_word() {
+        assert_eq!(ReplyPhase::Addendum.as_str(), "addendum");
+        assert_eq!(
+            serde_json::to_string(&ReplyPhase::Addendum).unwrap(),
+            "\"addendum\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ReplyPhase>("\"addendum\"").unwrap(),
+            ReplyPhase::Addendum
+        );
+        // NON-VACUITY: the parser is genuinely closed — it did not simply accept
+        // whatever it was handed and hand back a default.
+        assert!(serde_json::from_str::<ReplyPhase>("\"Addendum\"").is_err());
+        assert!(serde_json::from_str::<ReplyPhase>("\"companion\"").is_err());
+    }
+
     /// FAIL CLOSED on evidence we cannot join. A prior receipt with no index
     /// line — what a GATEWAY-written row looks like from here — keeps the
     /// placeholder phase and no attempt, so it can never be mistaken for an
@@ -2121,6 +2225,10 @@ mod tests {
             (ReplyPhase::Ack, ReplyPhase::Final),
             (ReplyPhase::Final, ReplyPhase::Watchdog),
             (ReplyPhase::Watchdog, ReplyPhase::Failure),
+            // A two-voice answer is TWO physical messages on one attempt. If the
+            // companion shared the answer's key it would be refused as a refire
+            // of the very row it accompanies — the second voice silently gone.
+            (ReplyPhase::Final, ReplyPhase::Addendum),
         ] {
             assert_ne!(
                 attempt_key(TURN, Some(ATTEMPT_ONE), a),
@@ -2643,6 +2751,10 @@ mod tests {
             (RelayOutcome::Edit, ReplyPhase::Final),
             (RelayOutcome::Fallback, ReplyPhase::Watchdog),
             (RelayOutcome::Send, ReplyPhase::Failure),
+            // The v9.2 member. A phase the index cannot spell is a correlation
+            // line the OTHER writer drops as malformed, and the refire guard is
+            // a search over that list.
+            (RelayOutcome::Send, ReplyPhase::Addendum),
         ]
         .iter()
         .enumerate()
@@ -2666,6 +2778,7 @@ mod tests {
             "\"fallback\"",
             "\"ack\"",
             "\"final\"",
+            "\"addendum\"",
             "\"watchdog\"",
             "\"failure\"",
         ] {
@@ -2677,10 +2790,11 @@ mod tests {
         }
         // …and the round trip still knows every phase and outcome it wrote.
         let back = read_all(dir.path());
-        assert_eq!(back.len(), 4);
+        assert_eq!(back.len(), 5);
         assert_eq!(back[0].reply_phase, ReplyPhase::Ack);
         assert_eq!(back[3].outcome, RelayOutcome::Send);
         assert_eq!(back[3].reply_phase, ReplyPhase::Failure);
+        assert_eq!(back[4].reply_phase, ReplyPhase::Addendum);
     }
 
     /// ITEM 9 — THE DURABLE REFIRE BYPASS. A dispatcher refire of an ALREADY

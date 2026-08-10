@@ -1093,10 +1093,11 @@ impl ReplySink for TurnDeliverySink<'_> {
 
     /// PHASE-AWARE. Only a physical `final` consumes the turn's one reservation.
     ///
-    /// The ack, the watchdog line and the failure notice all go straight to the
-    /// transport: they are real sends, but none of them is the turn's answer, and
-    /// a reservation consumed by one of them means the answer that follows is
-    /// suppressed as a duplicate of a message the family never received.
+    /// The ack, the watchdog line, the failure notice and a second voice's
+    /// addendum all go straight to the transport: they are real sends, but none
+    /// of them is the turn's answer, and a reservation consumed by one of them
+    /// means the answer that follows is suppressed as a duplicate of a message
+    /// the family never received.
     async fn send_phase(
         &self,
         bot_id: &str,
@@ -1107,13 +1108,25 @@ impl ReplySink for TurnDeliverySink<'_> {
         use crate::notify::relay_receipt::ReplyPhase;
         match phase {
             ReplyPhase::Final => self.send(bot_id, chat_id, text).await,
-            ReplyPhase::Ack | ReplyPhase::Watchdog | ReplyPhase::Failure => {
+            ReplyPhase::Ack | ReplyPhase::Watchdog | ReplyPhase::Failure | ReplyPhase::Addendum => {
                 match self.inner.send_phase(bot_id, chat_id, text, phase).await {
                     Ok(message_id) => {
-                        if let Some(id) = message_id
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|id| !id.is_empty() && *id != "0")
+                        // AN ADDENDUM'S ID IS NOT THE RESUME POINTER, and this
+                        // is the one place adding the fifth phase could have
+                        // done real damage. `ack_message_id` means "the message
+                        // a resumed turn EDITS FORWARD into the final answer"
+                        // (`rearm_incomplete_ack`, TurnDeliveryState::Fresh). An
+                        // addendum is a distinct message carrying a second
+                        // voice's own sentence — nothing edits it forward. Let
+                        // it overwrite this and a turn that dies after the
+                        // companion resumes by editing the COMPANION into the
+                        // answer: the family loses the line they were sent, and
+                        // the answer lands in a message that was never the ack.
+                        if phase != ReplyPhase::Addendum
+                            && let Some(id) = message_id
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|id| !id.is_empty() && *id != "0")
                         {
                             *self.ack_message_id.lock().unwrap() = Some(id.to_string());
                         }
@@ -1133,6 +1146,8 @@ impl ReplySink for TurnDeliverySink<'_> {
 
     /// The same rule for an edit: a failure notice that REPLACES the ack in
     /// place is still not the turn's answer, and must not consume finality.
+    /// Nor is an addendum — a second voice editing its own companion line is
+    /// still not the row that settles the ask.
     async fn edit_phase(
         &self,
         bot_id: &str,
@@ -1144,7 +1159,7 @@ impl ReplySink for TurnDeliverySink<'_> {
         use crate::notify::relay_receipt::ReplyPhase;
         match phase {
             ReplyPhase::Final => self.edit(bot_id, chat_id, message_id, text).await,
-            ReplyPhase::Ack | ReplyPhase::Watchdog | ReplyPhase::Failure => {
+            ReplyPhase::Ack | ReplyPhase::Watchdog | ReplyPhase::Failure | ReplyPhase::Addendum => {
                 self.inner
                     .edit_phase(bot_id, chat_id, message_id, text, phase)
                     .await
@@ -1231,8 +1246,9 @@ pub async fn send_reply_once(
 
 /// [`send_reply_once`], saying which PHASE of the turn these bytes are.
 ///
-/// Only a `final` is sent at most once: the ack, the watchdog and the failure
-/// notice are not the turn's answer and must not consume its one reservation.
+/// Only a `final` is sent at most once: the ack, the watchdog, the failure
+/// notice and a second voice's addendum are not the turn's answer and must not
+/// consume its one reservation.
 pub async fn send_reply_once_phase(
     workgraph_dir: &Path,
     delivery_id: &str,
@@ -3845,6 +3861,62 @@ mod tests {
             *transport.calls.lock().unwrap(),
             1,
             "an unproven delivery was re-sent — the family may have it twice",
+        );
+    }
+
+    /// AN ADDENDUM IS NOT THE MESSAGE A RESUMED TURN EDITS FORWARD.
+    ///
+    /// `ack_message_id` has exactly one meaning: the message a turn that died
+    /// before its final resumes by EDITING into the answer
+    /// ([`TurnDeliverySink::rearm_incomplete_ack`], state `Fresh`). Every
+    /// non-final send used to stash its id there, which was harmless while the
+    /// non-finals were the ack, the watchdog and the failure notice — all of
+    /// them the same "placeholder awaiting the answer" shape. A v9.2 `addendum`
+    /// is NOT that shape: it is a second voice's own sentence, complete, with
+    /// nothing owed on it. Let it overwrite the pointer and a crash after the
+    /// companion resumes by editing the COMPANION into the answer — the family
+    /// loses the line they were actually sent, and the answer arrives in a
+    /// message that was never the ack.
+    #[tokio::test]
+    async fn an_addendum_never_becomes_the_message_a_resumed_turn_edits_forward() {
+        use crate::notify::relay_receipt::ReplyPhase;
+        let dir = tempdir().unwrap();
+        let transport = RecSink::default();
+        let sink = TurnDeliverySink::new(dir.path(), CANON_TURN, "bot", "-100", &transport);
+
+        let ack = sink
+            .send_phase("bot", "-100", &ack_line(), ReplyPhase::Ack)
+            .await
+            .unwrap();
+        let companion = sink
+            .send_phase(
+                "bot",
+                "-100",
+                "Heavier night — worth a walk after.",
+                ReplyPhase::Addendum,
+            )
+            .await
+            .unwrap();
+
+        // NON-VACUITY. The assertion below is only worth anything if the
+        // companion really was a SECOND, DISTINCT physical message: if the
+        // addendum had never reached the transport, or had come back with the
+        // ack's own id, "the pointer still names the ack" would pass against a
+        // sink that overwrites the pointer with everything it sends.
+        assert_eq!(ack.as_deref(), Some("1"));
+        assert_eq!(
+            companion.as_deref(),
+            Some("2"),
+            "the addendum was not delivered as its own message: {companion:?}"
+        );
+        assert_eq!(transport.calls().len(), 2, "{:?}", transport.calls());
+
+        // The turn dies before the final. It must resume on the ACK.
+        sink.rearm_incomplete_ack();
+        assert_eq!(
+            sink.failed_edit_message_id().as_deref(),
+            Some("1"),
+            "the resumed turn would edit the second voice's line into the answer",
         );
     }
 
