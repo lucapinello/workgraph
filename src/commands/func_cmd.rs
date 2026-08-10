@@ -514,6 +514,13 @@ fn print_template_detail(template: &TaskTemplate) {
     if let Some(ref role) = template.role_hint {
         println!("    Role hint: {}", role);
     }
+    // Printed right beside the hint precisely because the two look alike and are not:
+    // the hint becomes a decorative `role:` tag, this becomes the task's owner. An
+    // operator reading `wg func show` to answer "who will this land on?" should not
+    // have to know which of the two is the real one.
+    if let Some(ref assign) = template.assign {
+        println!("    Assign: {}", assign);
+    }
     if !template.deliverables.is_empty() {
         println!("    Deliverables: {}", template.deliverables.join(", "));
     }
@@ -596,6 +603,7 @@ mod tests {
                     after: vec![],
                     loops_to: vec![],
                     role_hint: Some("analyst".to_string()),
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -608,6 +616,7 @@ mod tests {
                     after: vec!["plan".to_string()],
                     loops_to: vec![],
                     role_hint: Some("programmer".to_string()),
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -620,6 +629,7 @@ mod tests {
                     after: vec!["implement".to_string()],
                     loops_to: vec![],
                     role_hint: None,
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -1007,6 +1017,7 @@ mod tests {
                 after: vec![],
                 loops_to: vec![],
                 role_hint: Some("architect".to_string()),
+                assign: None,
                 deliverables: vec![],
                 verify: None,
                 tags: vec![],

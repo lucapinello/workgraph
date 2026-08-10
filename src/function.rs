@@ -121,6 +121,20 @@ pub struct TaskTemplate {
     pub loops_to: Vec<LoopEdgeTemplate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_hint: Option<String>,
+    /// The identity this task BELONGS to, as a content-addressed Agent id (or an
+    /// unambiguous prefix of one). Unlike `role_hint` — which only ever became a
+    /// decorative `role:<Name>` tag that nothing in the codebase reads back — this
+    /// is a real binding: `func apply` resolves it through the same agency lookup
+    /// `wg assign` uses and pins `task.agent`, so a minted task is dispatched to the
+    /// helper its own body addresses instead of landing unassigned.
+    ///
+    /// A tracked household template carries a PLACEHOLDER here (e.g.
+    /// `%%COORDINATOR_ID%%`) and the installer substitutes the roster-derived id at
+    /// render time, so no identity is ever written into a tracked file. An `assign:`
+    /// that resolves to no agent is FATAL — quietly creating the unassigned task is
+    /// exactly the defect this field closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assign: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliverables: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -626,6 +640,14 @@ pub fn substitute_task_template(
         after: template.after.clone(),
         loops_to: template.loops_to.clone(),
         role_hint: template.role_hint.clone(),
+        // Substituted like every other rendered string: a function may pass the
+        // owning identity in as an input (`assign: "{{input.owner}}"`) rather than
+        // baking it into the definition.
+        assign: template
+            .assign
+            .as_ref()
+            .map(|a| substitute(a, inputs))
+            .filter(|a| !a.trim().is_empty()),
         deliverables: template
             .deliverables
             .iter()
@@ -887,6 +909,7 @@ mod tests {
                     after: vec![],
                     loops_to: vec![],
                     role_hint: Some("analyst".to_string()),
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -899,6 +922,7 @@ mod tests {
                     after: vec!["plan".to_string()],
                     loops_to: vec![],
                     role_hint: Some("programmer".to_string()),
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -911,6 +935,7 @@ mod tests {
                     after: vec!["implement".to_string()],
                     loops_to: vec![],
                     role_hint: None,
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -928,6 +953,7 @@ mod tests {
                         delay: None,
                     }],
                     role_hint: None,
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -1290,6 +1316,7 @@ mod tests {
             after: vec![],
             loops_to: vec![],
             role_hint: Some("analyst".to_string()),
+            assign: None,
             deliverables: vec!["docs/{{input.feature_name}}.md".to_string()],
             verify: Some("{{input.test_command}}".to_string()),
             tags: vec![],
@@ -1637,6 +1664,7 @@ tasks:
                 after: vec![],
                 loops_to: vec![],
                 role_hint: Some("architect".to_string()),
+                assign: None,
                 deliverables: vec![],
                 verify: None,
                 tags: vec![],

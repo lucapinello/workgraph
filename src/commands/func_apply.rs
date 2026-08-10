@@ -171,12 +171,32 @@ pub fn run(
         func.tasks.clone()
     };
 
-    // 7. Build ID map and create tasks
+    // 7. Render every template ONCE, then build the ID map and create tasks.
+    //
+    // Everything below reads `rendered`, never the raw template. That is not tidiness:
+    // an earlier shape rendered inside the create loop while the `assign:` resolution
+    // read `template.assign` and re-ran `substitute` on it by hand. Two substitution
+    // sites, and the one in `substitute_task_template` was reachable by nothing —
+    // you could replace it with `None` and every test stayed green. One render, one
+    // reader, so a mutation anywhere on this path is visible downstream.
+    let rendered_templates: Vec<TaskTemplate> = task_templates
+        .iter()
+        .map(|template| {
+            let mut rendered = function::substitute_task_template(template, &final_inputs);
+            if !memory_text.is_empty() {
+                rendered.description = rendered
+                    .description
+                    .replace("{{memory.run_summaries}}", &memory_text);
+            }
+            rendered
+        })
+        .collect();
+
     let mut id_map: HashMap<String, String> = HashMap::new(); // template_id -> real task_id
     let mut created_ids: Vec<String> = Vec::new();
 
     // Pre-compute all task IDs so loops_to can reference forward
-    for template in &task_templates {
+    for template in &rendered_templates {
         let task_id = format!("{}-{}", prefix, template.template_id);
         if !dry_run && graph.get_node(&task_id).is_some() {
             anyhow::bail!(
@@ -187,30 +207,80 @@ pub fn run(
         id_map.insert(template.template_id.clone(), task_id);
     }
 
-    for template in &task_templates {
-        let mut rendered = function::substitute_task_template(template, &final_inputs);
-        if !memory_text.is_empty() {
-            rendered.description = rendered
-                .description
-                .replace("{{memory.run_summaries}}", &memory_text);
+    // 7a. Resolve every rendered `assign:` to a real Agent BEFORE a single task is
+    //     written.
+    //
+    // WHY THIS EXISTS. `func apply` is the SECOND HOP of a two-hop dispatch: hop 1 is
+    // a cron task assigned to the household's point of contact whose whole body is
+    // "run `wg func apply <fn>`", and hop 2 is the task this command mints — the one
+    // that actually fans out. Hop 2 used to be born with `assigned: None` and no
+    // agent, while its description opened "You are <the coordinator>, bound session
+    // <id>…". So the graph said "anyone" and the prompt said "you specifically", and
+    // whichever generic worker picked it up wore the name in the text. That is the
+    // "one generic agent wearing four name tags" shape the template it renders warns
+    // against, one level above where the template can see it.
+    //
+    // `role_hint` could not close this: it becomes a decorative `role:<Name>` tag
+    // that no reader in this codebase consults. An identity has to be an id.
+    //
+    // Resolution is deliberately the SAME lookup `wg assign` performs
+    // (`find_agent_by_prefix` over `.wg/agency/cache/agents`) — one resolver, and the
+    // installer that renders the template has already turned the household's roster
+    // alias into that content-addressed id. Failure is FATAL and happens here, before
+    // `modify_graph`, so a household with a stale/renamed identity gets a loud error
+    // instead of a half-applied function whose lead task is orphaned.
+    let mut assign_map: HashMap<String, String> = HashMap::new(); // template_id -> full agent id
+    {
+        let agents_dir = dir.join("agency").join("cache/agents");
+        for template in &rendered_templates {
+            // `template.assign` here is the RENDERED field produced above, so a
+            // function may take its owner as an input (`assign: "{{input.owner}}"`)
+            // and there is no second copy of the substitution rule living here.
+            let Some(want) = template
+                .assign
+                .as_deref()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+            else {
+                continue;
+            };
+            let agent = worksgood::agency::find_agent_by_prefix(&agents_dir, &want).map_err(|e| {
+                anyhow::anyhow!(
+                    "Function '{}': task template '{}' is assigned to '{}', which matches no agent \
+                     definition in {} ({}).\n\
+                     A template's `assign:` names the identity the task's own body addresses; \
+                     creating it unassigned would send the work to a generic worker impersonating \
+                     that helper. Re-render the function against this household's roster (the \
+                     installer substitutes the placeholder with a live agent id) and re-apply.",
+                    func.id,
+                    template.template_id,
+                    want,
+                    agents_dir.display(),
+                    e
+                )
+            })?;
+            assign_map.insert(template.template_id.clone(), agent.id);
         }
-        let task_id = id_map[&template.template_id].clone();
+    }
+
+    for rendered in &rendered_templates {
+        let task_id = id_map[&rendered.template_id].clone();
 
         // Remap after from template_ids to real task_ids
         let mut real_after: Vec<String> = Vec::new();
-        for dep in &template.after {
+        for dep in &rendered.after {
             if let Some(real_id) = id_map.get(dep) {
                 real_after.push(real_id.clone());
             } else {
                 eprintln!(
                     "Warning: after '{}' in template '{}' not found in function",
-                    dep, template.template_id
+                    dep, rendered.template_id
                 );
             }
         }
 
         // Add external --after for root tasks (those with no internal after)
-        if template.after.is_empty() {
+        if rendered.after.is_empty() {
             real_after.extend(after.iter().cloned());
         }
 
@@ -232,10 +302,11 @@ pub fn run(
             // Show plan without creating tasks
             print_dry_run_task(
                 &task_id,
-                &rendered,
+                rendered,
                 &real_after,
                 &tags,
                 task_model.as_deref(),
+                assign_map.get(&rendered.template_id).map(String::as_str),
             );
         } else {
             let task = Task {
@@ -278,7 +349,12 @@ pub fn run(
                 executor_preset_name: None,
                 verify: rendered.verify.clone(),
                 verify_timeout: None,
-                agent: None,
+                // `agent`, not `assigned`: `assigned` is the transient claim slot the
+                // dispatcher fills and `cron` clears on every instantiation, while
+                // `agent` is the durable identity binding the executor reads to load
+                // the helper's role prompt and bound-session memory. It is the field
+                // `wg assign` writes and the field the live cadence cron carries.
+                agent: assign_map.get(&rendered.template_id).cloned(),
                 loop_iteration: 0,
                 last_iteration_completed_at: None,
                 cycle_failure_restarts: 0,
@@ -570,9 +646,15 @@ fn print_dry_run_task(
     after: &[String],
     tags: &[String],
     model: Option<&str>,
+    agent: Option<&str>,
 ) {
     println!("  Task: {} (Open)", task_id);
     println!("    Title: {}", rendered.title);
+    // The owning identity is the one thing a dry run must not hide: a template that
+    // addresses a named helper in its body and lands on nobody is the whole defect.
+    if let Some(a) = agent {
+        println!("    Agent: {}", a);
+    }
     if !after.is_empty() {
         println!("    After: {}", after.join(", "));
     }
@@ -763,6 +845,7 @@ mod tests {
                     after: vec![],
                     loops_to: vec![],
                     role_hint: Some("analyst".to_string()),
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -775,6 +858,7 @@ mod tests {
                     after: vec!["plan".to_string()],
                     loops_to: vec![],
                     role_hint: Some("programmer".to_string()),
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -787,6 +871,7 @@ mod tests {
                     after: vec!["implement".to_string()],
                     loops_to: vec![],
                     role_hint: None,
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -804,6 +889,7 @@ mod tests {
                         delay: None,
                     }],
                     role_hint: None,
+                    assign: None,
                     deliverables: vec![],
                     verify: None,
                     tags: vec![],
@@ -1802,6 +1888,7 @@ mod tests {
                 after: vec![],
                 loops_to: vec![],
                 role_hint: None,
+                assign: None,
                 deliverables: vec![],
                 verify: None,
                 tags: vec![],
@@ -1865,6 +1952,7 @@ mod tests {
                 after: vec![],
                 loops_to: vec![],
                 role_hint: None,
+                assign: None,
                 deliverables: vec![],
                 verify: None,
                 tags: vec![],
@@ -1952,5 +2040,242 @@ mod tests {
     fn extract_yaml_block_empty() {
         let text = "```yaml\n```";
         assert!(extract_yaml_block(text).is_none());
+    }
+
+    // ── `assign:` — the second hop of a two-hop dispatch must land on a helper ──
+    //
+    // THE DEFECT THESE LOCK. A household cadence cron (hop 1) is assigned to the
+    // point of contact and its whole body is "run `wg func apply <fn>`". The task
+    // that call mints (hop 2) is the one that actually does the work — and it was
+    // born with no owner at all while its description opened "You are <the
+    // coordinator>, bound session <id>…". The graph said "anybody", the prompt said
+    // "you specifically", and any generic worker that picked it up wore the name.
+    // `role_hint` could not fix it: it becomes a `role:<Name>` tag that no reader in
+    // this codebase consults, which the first test below states as an assertion so
+    // nobody re-reaches for it.
+
+    /// Write a minimal but REAL agent definition into the agency store, so these
+    /// tests resolve through `find_agent_by_prefix` — the same lookup `wg assign`
+    /// uses — rather than through a stub that would pass whatever we wrote.
+    fn seed_agent(dir: &Path, id: &str, name: &str) {
+        let agents_dir = dir.join("agency").join("cache/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join(format!("{}.yaml", id)),
+            format!(
+                "id: {id}\nrole_id: role-fixture\ntradeoff_id: tradeoff-fixture\n\
+                 name: {name}\nperformance:\n  task_count: 0\n  avg_score: null\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn one_task_function(id: &str, assign: Option<&str>, role_hint: Option<&str>) -> TraceFunction {
+        let mut func = sample_function();
+        func.id = id.to_string();
+        func.inputs = vec![];
+        func.tasks = vec![TaskTemplate {
+            template_id: "plan".to_string(),
+            title: "Draft next week's plan".to_string(),
+            description: "You are the coordinator. Draft the week.".to_string(),
+            skills: vec![],
+            after: vec![],
+            loops_to: vec![],
+            role_hint: role_hint.map(String::from),
+            assign: assign.map(String::from),
+            deliverables: vec![],
+            verify: None,
+            tags: vec![],
+        }];
+        func
+    }
+
+    const FIXTURE_AGENT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn apply_binds_template_assign_to_the_tasks_agent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_workgraph(dir);
+        seed_agent(dir, FIXTURE_AGENT, "Household Coordinator");
+        // A PREFIX, not the full hash — the same abbreviation `wg assign` accepts,
+        // proving we resolve through the store instead of copying the string across.
+        setup_function(
+            dir,
+            &one_task_function("cadence", Some(&FIXTURE_AGENT[..12]), None),
+        );
+
+        run(
+            dir,
+            "cadence",
+            None,
+            &[],
+            None,
+            Some("hop2"),
+            false,
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+
+        let graph = load_graph(dir.join("graph.jsonl")).unwrap();
+        let task = graph.get_task("hop2-plan").expect("hop 2 task created");
+        assert_eq!(
+            task.agent.as_deref(),
+            Some(FIXTURE_AGENT),
+            "the minted task must be BOUND to the identity its own body addresses; \
+             an unowned hop-2 is dispatched to a generic worker impersonating it"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_an_assign_that_names_no_agent_and_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_workgraph(dir);
+        seed_agent(dir, FIXTURE_AGENT, "Household Coordinator");
+        setup_function(
+            dir,
+            &one_task_function("cadence", Some("nobody-by-that-name"), None),
+        );
+
+        let err = run(
+            dir,
+            "cadence",
+            None,
+            &[],
+            None,
+            Some("hop2"),
+            false,
+            &[],
+            None,
+            false,
+        )
+        .expect_err("an assignment to a non-existent identity must be fatal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nobody-by-that-name") && msg.contains("plan"),
+            "the refusal must name the unresolvable id and the template: {msg}"
+        );
+
+        // Fail CLOSED: refusing after writing the task would leave the household with
+        // exactly the orphan this change exists to prevent.
+        let graph = load_graph(dir.join("graph.jsonl")).unwrap();
+        assert!(
+            graph.get_task("hop2-plan").is_none(),
+            "a refused apply must not leave a half-created, unowned task behind"
+        );
+    }
+
+    #[test]
+    fn role_hint_alone_does_not_bind_an_owner() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_workgraph(dir);
+        seed_agent(dir, FIXTURE_AGENT, "Household Coordinator");
+        setup_function(
+            dir,
+            &one_task_function("cadence", None, Some("Household Coordinator")),
+        );
+
+        run(
+            dir,
+            "cadence",
+            None,
+            &[],
+            None,
+            Some("hop2"),
+            false,
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+
+        let graph = load_graph(dir.join("graph.jsonl")).unwrap();
+        let task = graph.get_task("hop2-plan").unwrap();
+        // Documented, not desired: the role becomes a decorative tag and the task
+        // stays unowned. This is the state the household's plan task shipped in, and
+        // it is why `assign:` had to exist. If a future change makes `role_hint`
+        // resolve to an identity, this assertion should be the one that fails.
+        assert!(
+            task.tags
+                .contains(&"role:Household Coordinator".to_string()),
+            "role_hint still renders its tag"
+        );
+        assert_eq!(
+            task.agent, None,
+            "role_hint is a label, not a binding — only `assign:` owns a task"
+        );
+    }
+
+    #[test]
+    fn apply_resolves_an_assign_carried_in_an_input() {
+        // TEETH FOR THE SUBSTITUTION ITSELF. The previous round added `assign:` to
+        // `substitute_task_template` and reported a mutation proof for it; the
+        // substitution was unreachable (the resolver re-substituted by hand off the
+        // RAW template) and no test could see it either way. This one can only pass
+        // if the value the resolver reads went through `substitute`: the template
+        // never contains an agent id, only `{{input.owner}}`, and an unsubstituted
+        // placeholder resolves to no agent and aborts the apply.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_workgraph(dir);
+        seed_agent(dir, FIXTURE_AGENT, "Household Coordinator");
+
+        let mut func = one_task_function("cadence", Some("{{input.owner}}"), None);
+        func.inputs = vec![FunctionInput {
+            name: "owner".to_string(),
+            input_type: InputType::String,
+            description: "Agent id of the helper this plan belongs to".to_string(),
+            required: true,
+            default: None,
+            example: None,
+            min: None,
+            max: None,
+            values: None,
+        }];
+        setup_function(dir, &func);
+
+        run(
+            dir,
+            "cadence",
+            None,
+            &[format!("owner={}", &FIXTURE_AGENT[..12])],
+            None,
+            Some("hop2"),
+            false,
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+
+        let graph = load_graph(dir.join("graph.jsonl")).unwrap();
+        let task = graph.get_task("hop2-plan").expect("hop 2 task created");
+        assert_eq!(
+            task.agent.as_deref(),
+            Some(FIXTURE_AGENT),
+            "`assign: {{{{input.owner}}}}` must render before it is resolved"
+        );
+    }
+
+    #[test]
+    fn assign_survives_the_yaml_round_trip() {
+        // The household template carries `assign:` as YAML text rendered by the
+        // installer. A field the parser silently drops would put the defect back
+        // with the fix still in the tree, and nothing else in this file would notice.
+        let yaml = "kind: trace-function\nversion: 2\nid: cadence\nname: Cadence\n\
+                    description: d\ninputs: []\ntasks:\n- template_id: plan\n  \
+                    title: t\n  role_hint: Family Assistant\n  \
+                    assign: \"1111111111111111111111111111111111111111111111111111111111111111\"\n  \
+                    description: d\noutputs: []\n";
+        let func: TraceFunction = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            func.tasks[0].assign.as_deref(),
+            Some(FIXTURE_AGENT),
+            "`assign:` must survive deserialization of a rendered function"
+        );
     }
 }

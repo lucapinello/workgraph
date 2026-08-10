@@ -310,6 +310,12 @@ fn build_template(
         after,
         loops_to,
         role_hint,
+        // Deliberately NOT `task.agent`. Extraction turns a run into a reusable —
+        // and potentially federated — definition, and a content-addressed Agent id
+        // is this box's identity: baking it in is the "template ships someone else's
+        // household" leak. `role_hint` is the anonymised carry-over; an owner is
+        // added back by whoever renders the template for a specific roster.
+        assign: None,
         deliverables: task.deliverables.clone(),
         verify: task.verify.clone(),
         tags: task.tags.clone(),
@@ -1001,6 +1007,7 @@ pub fn run_generative(
         after: vec![],
         loops_to: vec![],
         role_hint: Some("architect".to_string()),
+        assign: None,
         deliverables: vec![],
         verify: None,
         tags: vec![],
