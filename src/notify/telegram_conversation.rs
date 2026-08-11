@@ -246,9 +246,40 @@ pub fn onboarding_line(inviter: Option<&str>) -> String {
 }
 
 /// Graceful fallback when the addressed agent has no bound session yet.
+///
+/// THIS IS A FAILURE NOTICE, NOT AN ANSWER, AND THE WORDS NOW SAY SO (live
+/// incident 2026-08-10 22:25). It used to read
+///
+///     "I'm here! 🙂 Give me a little while to get settled and I'll be able to
+///      help properly."
+///
+/// and it was delivered — over Telegram, mirrored into the family feed with
+/// `replyPhase: final` — as the ANSWER to "one about singers". The family asked
+/// for a joke and read the house's own boot chatter, in the slot where the joke
+/// belonged.
+///
+/// The old copy was wrong twice over, and neither is a wording quibble:
+///
+///   · IT PROMISED A LATER ANSWER THE HOUSE HAS NO MECHANISM TO KEEP. "give me a
+///     little while … and I'll be able to help properly" is a holding line, and
+///     a holding line is only honest if something supersedes it (the joke
+///     holding line is superseded; a clarify is delivered late through the
+///     clarify ledger). Nothing supersedes this one: `TurnOutcome::Sessionless`
+///     is terminal, no rebind is scheduled, and no session appears because a
+///     minute passed. It was a promise by construction unkeepable.
+///   · IT DESCRIBED THE PLUMBING, NOT THE ASK. Nothing is "getting settled": the
+///     addressed helper has no bound session and will not have one until the
+///     bindings are re-established. A family reading it learns nothing they can
+///     act on.
+///
+/// So it says the true thing in the same shape as [`glitch_line`] — an honest "I
+/// could not", warm, no jargon, no diagnosis the family cannot use, and a retry
+/// invitation rather than a promise. The retry is real on the surfaces that have
+/// a recovery lane (the gateway re-composes a heavy turn on its transport-free
+/// lane, and self-heals once), which is exactly the difference between inviting
+/// a retry and promising to come back unprompted.
 pub fn sessionless_line() -> String {
-    "I'm here! \u{1f642} Give me a little while to get settled and I'll be able to help properly."
-        .to_string()
+    "Sorry \u{1f605} — I can't pick that up right now. Mind trying me again?".to_string()
 }
 
 /// Human-facing line sent when the reply composition fails or times out — the
@@ -2276,8 +2307,36 @@ async fn run_conversation_turn_with_week_context(
             Ok(TurnOutcome::Onboarded)
         }
         ConversationPlan::Sessionless { route, .. } => {
+            // PHASE `Failure`, FOR THE SAME REASON `persist_and_deliver_glitch`
+            // USES IT — and this is the structural half of the 2026-08-10 fix.
+            //
+            // The bare `send` is the FINAL path: it consumes the turn's one
+            // finality reservation and mirrors the row into the family feed
+            // stamped `replyPhase: final`. So a line that answers nothing took
+            // the answer's slot, and every downstream reader that asks "was this
+            // turn delivered?" — the gateway's promise watchdog, its self-heal
+            // retry, its transport-free recovery lane, its pane-notice guard —
+            // read a `kind:agent` row bound to the turn and said yes. The
+            // measured consequence: the turn was recorded as answered, no
+            // recovery ran, and the family's pane then contradicted itself.
+            //
+            // A sessionless fallback is precisely what the schema's phase enum
+            // already has a name for: "watchdog, failure and addendum are never
+            // counted as final" (docs/schemas, `feed_row_correlation_fields`).
+            // It is the same class as the glitch line — a graceful non-answer —
+            // and it was simply never converted when the phased sink landed.
+            //
+            // Not reserving finality is the load-bearing part: the real answer
+            // can still be delivered later by a self-heal attempt, and because
+            // `send_phase` records this message's id as the resume pointer, that
+            // answer EDITS this line forward instead of landing beside it.
             durable_sink
-                .send(&route.bot_id, &route.chat_id, &sessionless_line())
+                .send_phase(
+                    &route.bot_id,
+                    &route.chat_id,
+                    &sessionless_line(),
+                    crate::notify::relay_receipt::ReplyPhase::Failure,
+                )
                 .await?;
             Ok(TurnOutcome::Sessionless)
         }
@@ -3946,6 +4005,175 @@ mod tests {
             Some("1"),
             "the resumed turn would edit the second voice's line into the answer",
         );
+    }
+
+    /// A SESSIONLESS FALLBACK IS NOT THE TURN'S ANSWER (live incident 2026-08-10
+    /// 22:25). Luca asked for a joke; the elected helper had no bound session,
+    /// and the family read the house's settling-in line — delivered as the
+    /// turn's FINAL and mirrored into `.casa/group-feed.jsonl` with
+    /// `replyPhase: "final"`, bound to that ask. Downstream, every reader that
+    /// asks "was this turn delivered?" then said yes about a line that answered
+    /// nothing: the promise watchdog filed the "On it." as kept, the gateway's
+    /// transport-free recompose was skipped, and its pane-notice guard
+    /// substituted a sentence about the family's phones for a turn whose own
+    /// receipt recorded a Telegram message id.
+    ///
+    /// It is the same class as the glitch line — a graceful non-answer — and it
+    /// simply was never converted when the phased sink landed. Two properties,
+    /// and the SECOND is the load-bearing one:
+    ///   · the bytes go out under `ReplyPhase::Failure`, so the mirrored feed row
+    ///     is stamped as not-the-answer at the only moment anyone knows;
+    ///   · the turn's one finality reservation is NOT consumed, so a self-heal
+    ///     attempt can still deliver the real answer — and, because the phase
+    ///     path records this message as the resume pointer, that answer EDITS
+    ///     this line forward instead of landing beside it.
+    #[tokio::test]
+    async fn a_sessionless_fallback_is_a_failure_phase_and_never_claims_finality() {
+        use crate::notify::relay_receipt::ReplyPhase;
+
+        #[derive(Default)]
+        struct PhaseSink {
+            sent: Mutex<Vec<(String, ReplyPhase)>>,
+        }
+        #[async_trait]
+        impl ReplySink for PhaseSink {
+            async fn send(&self, b: &str, c: &str, t: &str) -> Result<Option<String>> {
+                // A sink that only implements `send` would silently collapse
+                // every phase to Final and make the assertion below vacuous, so
+                // the bare send is routed through the phased one and TYPED as
+                // the final it is.
+                self.send_phase(b, c, t, ReplyPhase::Final).await
+            }
+            async fn send_phase(
+                &self,
+                _b: &str,
+                _c: &str,
+                text: &str,
+                phase: ReplyPhase,
+            ) -> Result<Option<String>> {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push((text.to_string(), phase));
+                Ok(Some(sent.len().to_string()))
+            }
+            async fn edit(&self, _b: &str, _c: &str, _m: &str, _t: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let timing = AckTiming {
+            ack_after: Duration::from_millis(80),
+            reply_timeout: Duration::from_millis(500),
+            poll: Duration::from_millis(20),
+        };
+        let route = ReplyRoute {
+            bot_id: "bot".to_string(),
+            chat_id: "-100".to_string(),
+        };
+
+        let dir = tempdir().unwrap();
+        let transport = PhaseSink::default();
+        let plan = ConversationPlan::Sessionless {
+            agent_id: "persona-with-no-session".to_string(),
+            route: route.clone(),
+            entry: Entry::GroupElected,
+        };
+        let outcome = run_conversation_turn(
+            dir.path(),
+            &plan,
+            "one about singers",
+            CANON_TURN,
+            timing,
+            None,
+            &transport,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, TurnOutcome::Sessionless);
+
+        // NON-VACUITY: the line really did reach the transport. Without this the
+        // phase assertion would pass against a branch that sent nothing at all.
+        let sent = transport.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, sessionless_line());
+        assert_eq!(
+            sent[0].1,
+            ReplyPhase::Failure,
+            "the sessionless fallback went out as the turn's answer",
+        );
+
+        // THE PROPERTY THAT MATTERS. A fresh sink for the SAME turn must still be
+        // able to deliver — the fallback did not spend the one final.
+        let heal = TurnDeliverySink::new(dir.path(), CANON_TURN, "bot", "-100", &transport);
+        assert!(
+            !heal.already_claimed(),
+            "the sessionless fallback consumed the turn's finality — the real answer \
+             can never be delivered for this ask",
+        );
+
+        // THE CONTROL, so "never claims" is not just what this sink always does:
+        // the onboarding one-liner IS terminal by design and takes the final. A
+        // change that made every plan non-final would redden here.
+        let onboard_dir = tempdir().unwrap();
+        let onboard = ConversationPlan::Onboard {
+            route,
+            entry: Entry::GroupElected,
+        };
+        run_conversation_turn(
+            onboard_dir.path(),
+            &onboard,
+            "hello?",
+            CANON_TURN,
+            timing,
+            None,
+            &transport,
+        )
+        .await
+        .unwrap();
+        let after_onboard =
+            TurnDeliverySink::new(onboard_dir.path(), CANON_TURN, "bot", "-100", &transport);
+        assert!(
+            after_onboard.already_claimed(),
+            "the reservation is not being taken at all — the sessionless assertion above \
+             proves nothing",
+        );
+    }
+
+    /// AND THE WORDS ARE AN HONEST "I COULD NOT", NOT A PROMISE.
+    ///
+    /// The retired copy — "I'm here! 🙂 Give me a little while to get settled and
+    /// I'll be able to help properly." — is a HOLDING line, and a holding line is
+    /// only honest if something supersedes it. Nothing supersedes this one:
+    /// `TurnOutcome::Sessionless` is terminal, no rebind is scheduled, and no
+    /// session appears because a minute passed. It also described the plumbing
+    /// rather than the ask, which is how a family came to read boot chatter in
+    /// the slot where a joke belonged.
+    #[test]
+    fn the_sessionless_line_promises_nothing_it_cannot_keep() {
+        let line = sessionless_line();
+        // No promise of a later, unprompted answer.
+        for banned in ["settled", "a little while", "i'll be able to"] {
+            assert!(
+                !line.to_lowercase().contains(banned),
+                "the sessionless fallback promises a later answer nothing will deliver: {line}",
+            );
+        }
+        // It IS an honest refusal with a way forward — the same shape as the
+        // glitch line, which is the sibling this branch should always have used.
+        assert!(
+            line.to_lowercase().contains("can't") || line.to_lowercase().contains("sorry"),
+            "the sessionless fallback does not admit it could not help: {line}",
+        );
+        assert!(
+            line.to_lowercase().contains("again"),
+            "the sessionless fallback offers the family no next move: {line}",
+        );
+        // No jargon: the family never hears about sessions, bindings or bots.
+        for jargon in ["session", "bind", "bot", "agent", "token", "config"] {
+            assert!(
+                !line.to_lowercase().contains(jargon),
+                "the sessionless fallback leaks plumbing vocabulary ({jargon}): {line}",
+            );
+        }
     }
 
     /// RELEASE ON FAILURE, the other direction: a transport that PROVABLY failed
