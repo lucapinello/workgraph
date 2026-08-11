@@ -1000,15 +1000,21 @@ script = "b.sh"
         std::fs::create_dir_all(&young).unwrap();
         std::fs::create_dir_all(&old).unwrap();
 
-        // Backdate the "old" dir's mtime via `touch -d` so it counts as aged.
-        // Avoids pulling in a new crate just for the test.
+        // Backdate the "old" dir's mtime so it counts as aged. Avoids pulling
+        // in a new crate just for the test.
+        //
+        // `-t [[CC]YY]MMDDhhmm[.SS]` is the POSIX form and works everywhere.
+        // The previous spelling, `-d 2020-01-01`, is a GNU coreutils extension:
+        // BSD/macOS touch also has `-d` but demands full ISO-8601
+        // (`YYYY-MM-DDThh:mm:SS`) and exits 1 on a bare date, so this test could
+        // never pass on a Mac.
         let status = Command::new("touch")
-            .arg("-d")
-            .arg("2020-01-01")
+            .arg("-t")
+            .arg("202001010000")
             .arg(&old)
             .status()
             .expect("touch must be available for this test");
-        assert!(status.success(), "touch -d failed");
+        assert!(status.success(), "touch -t failed");
 
         sweep_smoke_leaks_under(&root, Duration::from_secs(3600));
 

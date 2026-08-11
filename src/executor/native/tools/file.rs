@@ -659,46 +659,64 @@ mod tests {
     // against other cwd-sensitive tests via serial_test. Using a fresh
     // TempDir per test isolates them from each other.
 
+    /// Restores the previous cwd on drop, including when the test panics.
+    ///
+    /// Restoring with a trailing `set_current_dir(prev)` statement is not
+    /// enough: a failed assertion unwinds before that line runs, the `TempDir`
+    /// is then deleted out from under the process, and *every* later test that
+    /// touches `current_dir()` fails with ENOENT — including tests in other
+    /// modules running in parallel. One real failure was masquerading as three
+    /// (and intermittently more) for exactly this reason.
+    struct CwdGuard(PathBuf);
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let prev = std::env::current_dir().expect("cwd readable before entering");
+            std::env::set_current_dir(dir).expect("enter test cwd");
+            Self(prev)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_sandbox_allows_relative_path_inside_cwd() {
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::enter(tmp.path());
         let resolved =
             resolve_inside_cwd("a/b/c.txt", false).expect("relative path should be allowed");
         assert!(resolved.starts_with(tmp.path().canonicalize().unwrap()));
         assert!(resolved.ends_with("a/b/c.txt"));
-        std::env::set_current_dir(prev).unwrap();
     }
 
     #[test]
     #[serial_test::serial]
     fn test_sandbox_allows_absolute_path_inside_cwd() {
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::enter(tmp.path());
         let canon_cwd = tmp.path().canonicalize().unwrap();
         let abs = canon_cwd.join("foo.txt");
         let resolved = resolve_inside_cwd(abs.to_str().unwrap(), false)
             .expect("abs path inside cwd should be OK");
         assert_eq!(resolved, abs);
-        std::env::set_current_dir(prev).unwrap();
     }
 
     #[test]
     #[serial_test::serial]
     fn test_sandbox_rejects_absolute_path_outside_cwd() {
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::enter(tmp.path());
         let err = resolve_inside_cwd("/etc/passwd", false).expect_err("should reject escape");
         assert!(
             err.contains("outside the working directory"),
             "got: {}",
             err
         );
-        std::env::set_current_dir(prev).unwrap();
     }
 
     #[test]
@@ -708,8 +726,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let inner = tmp.path().join("inner");
         std::fs::create_dir_all(&inner).unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&inner).unwrap();
+        let _cwd = CwdGuard::enter(&inner);
         let err = resolve_inside_cwd("../outside.txt", false)
             .expect_err("dotdot escape should be rejected");
         assert!(
@@ -717,7 +734,6 @@ mod tests {
             "got: {}",
             err
         );
-        std::env::set_current_dir(prev).unwrap();
     }
 
     #[test]
@@ -725,11 +741,9 @@ mod tests {
     fn test_sandbox_permits_nonexistent_target_inside_cwd() {
         // The target file doesn't exist yet; sandbox should still validate its parent.
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::enter(tmp.path());
         let resolved = resolve_inside_cwd("does/not/exist/yet.txt", false).expect("new paths OK");
         assert!(resolved.starts_with(tmp.path().canonicalize().unwrap()));
-        std::env::set_current_dir(prev).unwrap();
     }
 
     // ─── yolo mode (allow_outside_cwd) tests ───────────────────────────
@@ -739,12 +753,21 @@ mod tests {
     fn test_yolo_allows_absolute_path_outside_cwd() {
         // The exact escape rejected above is permitted when yolo is on.
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::enter(tmp.path());
         let resolved = resolve_inside_cwd("/etc/passwd", true)
             .expect("yolo should permit absolute path outside cwd");
-        assert_eq!(resolved, Path::new("/etc/passwd"));
-        std::env::set_current_dir(prev).unwrap();
+        // `resolve_inside_cwd` resolves symlinks by contract — that is the whole
+        // point of the non-yolo boundary check, and yolo only drops the check,
+        // not the resolution. So the expectation is the *canonical* form of the
+        // target, not the literal spelling: on macOS `/etc` is a symlink to
+        // `/private/etc`. Asserting the literal string would be asserting that
+        // the sandbox does no resolution at all.
+        assert_eq!(
+            resolved,
+            Path::new("/etc/passwd").canonicalize().unwrap(),
+            "yolo must still return the resolved path"
+        );
+        assert!(resolved.ends_with("passwd"));
     }
 
     #[test]
@@ -753,14 +776,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let inner = tmp.path().join("inner");
         std::fs::create_dir_all(&inner).unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&inner).unwrap();
+        let _cwd = CwdGuard::enter(&inner);
         let resolved =
             resolve_inside_cwd("../outside.txt", true).expect("yolo should permit dotdot escape");
         // Resolves to the parent (tmp) dir's sibling file, outside cwd (inner).
         assert!(resolved.ends_with("outside.txt"));
         assert!(!resolved.starts_with(inner.canonicalize().unwrap()));
-        std::env::set_current_dir(prev).unwrap();
     }
 
     #[test]
@@ -768,12 +789,10 @@ mod tests {
     fn test_yolo_still_allows_paths_inside_cwd() {
         // yolo is a superset: paths inside cwd keep working.
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _cwd = CwdGuard::enter(tmp.path());
         let resolved =
             resolve_inside_cwd("a/b/c.txt", true).expect("inside-cwd path should still resolve");
         assert!(resolved.starts_with(tmp.path().canonicalize().unwrap()));
-        std::env::set_current_dir(prev).unwrap();
     }
 
     #[tokio::test]

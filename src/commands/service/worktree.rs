@@ -377,11 +377,10 @@ pub fn verify_worktree_cleanup(
 
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout);
-        let worktree_str = worktree_path.to_string_lossy();
 
         for line in text.lines() {
             if let Some(path) = line.strip_prefix("worktree ")
-                && path == worktree_str.as_ref()
+                && same_worktree_path(Path::new(path), worktree_path)
             {
                 verification_errors.push(format!("Stale worktree entry found in git: {}", path));
                 break;
@@ -624,6 +623,50 @@ pub fn cleanup_dead_agent_worktree_with_config(
     }
 }
 
+/// Normalize `path` for identity comparison: the canonical path when it (or its
+/// deepest existing ancestor) can be resolved, otherwise the path as given.
+///
+/// Falling back to the deepest existing ancestor matters for post-removal
+/// verification, where the leaf is already gone but its symlinked ancestors
+/// still need resolving.
+fn canonical_or_lexical(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut ancestor = path;
+    while let Some(parent) = ancestor.parent() {
+        ancestor = parent;
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(canonical) = ancestor.canonicalize() {
+            return match path.strip_prefix(ancestor) {
+                Ok(tail) => canonical.join(tail),
+                Err(_) => path.to_path_buf(),
+            };
+        }
+    }
+    path.to_path_buf()
+}
+
+/// True when two paths name the same location, tolerating symlinked ancestors.
+///
+/// `git worktree list --porcelain` prints the **canonical** path — git resolves
+/// symlinks — while callers hold the lexical path they built from the project
+/// root. On macOS `/tmp` is a symlink to `/private/tmp` and `$TMPDIR` lives under
+/// `/var/folders` → `/private/var/folders`, so `git` says
+/// `/private/tmp/p/.wg-worktrees/agent-x` where the caller says
+/// `/tmp/p/.wg-worktrees/agent-x`. A plain string compare never matches, and the
+/// same holds on Linux for any checkout reached through a symlink or automount.
+///
+/// This is load-bearing, not cosmetic: when the compare fails,
+/// [`find_branch_for_worktree`] returns `None`, [`is_safe_to_reap`] refuses on a
+/// `None` branch, and **every** worktree is preserved forever — the GC becomes a
+/// silent no-op and worktrees accumulate until the disk fills.
+pub fn same_worktree_path(a: &Path, b: &Path) -> bool {
+    a == b || canonical_or_lexical(a) == canonical_or_lexical(b)
+}
+
 /// Parse `git worktree list --porcelain` output to find the branch for a given worktree path.
 pub fn find_branch_for_worktree(project_root: &Path, worktree_path: &Path) -> Option<String> {
     let output = Command::new("git")
@@ -633,7 +676,6 @@ pub fn find_branch_for_worktree(project_root: &Path, worktree_path: &Path) -> Op
         .ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let worktree_str = worktree_path.to_string_lossy();
 
     // Porcelain output is blocks separated by blank lines.
     // Each block has: worktree <path>\nHEAD <sha>\nbranch refs/heads/<name>\n
@@ -643,7 +685,7 @@ pub fn find_branch_for_worktree(project_root: &Path, worktree_path: &Path) -> Op
             current_path = Some(path);
         } else if let Some(branch_ref) = line.strip_prefix("branch ") {
             if let Some(cp) = current_path
-                && cp == worktree_str.as_ref()
+                && same_worktree_path(Path::new(cp), worktree_path)
             {
                 // Convert refs/heads/wg/agent-X/task-Y to wg/agent-X/task-Y
                 return Some(
@@ -1959,6 +2001,45 @@ mod tests {
         assert_eq!(found, Some(branch.clone()));
 
         // Clean up
+        remove_worktree(&project, &wt_path, &branch).unwrap();
+    }
+
+    /// The branch lookup must survive a symlinked ancestor on the project path.
+    ///
+    /// This is the whole worktree-GC failure in one assertion: `git worktree
+    /// list --porcelain` prints the resolved path, the caller holds the lexical
+    /// one, a string compare misses, `find_branch_for_worktree` answers `None`,
+    /// `is_safe_to_reap` refuses on a `None` branch, and every worktree is kept
+    /// forever. On macOS `$TMPDIR` and `/tmp` are already symlinks so the test
+    /// above happens to cover it there; the symlink here is explicit so the
+    /// guarantee also holds on Linux, where `/tmp` usually is not.
+    #[test]
+    #[cfg(unix)]
+    fn find_branch_for_worktree_survives_a_symlinked_project_root() {
+        let temp = TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let project = real.join("project");
+        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+
+        let (wt_path, branch) = create_test_worktree(&project, "agent-6", "task-symlink");
+
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let project_via_link = link.join("project");
+        let wt_via_link = project_via_link.join(WORKTREES_DIR).join("agent-6");
+        assert_ne!(
+            wt_via_link, wt_path,
+            "the two spellings must differ lexically or this proves nothing"
+        );
+
+        assert_eq!(
+            find_branch_for_worktree(&project_via_link, &wt_via_link),
+            Some(branch.clone()),
+            "a symlinked project root must still resolve the worktree's branch"
+        );
+
         remove_worktree(&project, &wt_path, &branch).unwrap();
     }
 

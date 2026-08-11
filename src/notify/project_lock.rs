@@ -2511,10 +2511,22 @@ mod tests {
     fn tokens_are_crypto_random_and_never_derived_from_pid_time_or_host() {
         let seen: std::collections::HashSet<String> = (0..256).map(|_| mint_token()).collect();
         assert_eq!(seen.len(), 256, "two acquisitions never share one token");
+
+        // A pid-derived token embeds the pid in *every* token. A crypto-random
+        // one embeds it only by coincidence — and coincidence is not rare here:
+        // a 4-digit pid has 29 landing spots in 32 hex chars, so a per-token
+        // `assert!(!t.contains(&pid))` trips on roughly one full-suite run in
+        // ten. (Measured: this test was one of two intermittent reds in an
+        // otherwise green suite.) Assert the systematic property instead, with
+        // a threshold no random source can plausibly reach: the expected hit
+        // count is ~0.1, so five is beyond one-in-a-hundred-million, while
+        // derivation scores 256.
         let pid = std::process::id().to_string();
-        for t in &seen {
-            assert!(!t.contains(&pid));
-        }
+        let pid_hits = seen.iter().filter(|t| t.contains(&pid)).count();
+        assert!(
+            pid_hits < 5,
+            "{pid_hits}/256 tokens contain pid {pid} — tokens look pid-derived"
+        );
     }
 
     /// §2: the visible transition is "no lock" → "a whole, parseable lock". A

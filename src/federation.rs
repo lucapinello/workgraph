@@ -1870,6 +1870,17 @@ mod tests {
         assert_eq!(merged.generation, 1);
     }
 
+    /// `resolve_store` canonicalizes on purpose so that two spellings of one
+    /// store (`~/x`, `./x`, a symlinked mount) resolve to a single dedupable
+    /// identity. An expectation built by joining onto `TempDir::path()` is
+    /// therefore the *un*-canonicalized twin: on macOS `$TMPDIR` sits under
+    /// `/var/folders`, a symlink to `/private/var/folders`. Canonicalize the
+    /// expectation rather than weakening the function.
+    fn canonical(path: &Path) -> PathBuf {
+        path.canonicalize()
+            .unwrap_or_else(|e| panic!("canonicalize {}: {e}", path.display()))
+    }
+
     #[test]
     fn resolve_store_finds_project_store() {
         let tmp = TempDir::new().unwrap();
@@ -1877,7 +1888,7 @@ mod tests {
         agency::init(&wg).unwrap();
 
         let store = resolve_store(tmp.path().to_str().unwrap()).unwrap();
-        assert_eq!(store.store_path(), wg);
+        assert_eq!(store.store_path(), canonical(&wg));
     }
 
     #[test]
@@ -1887,7 +1898,7 @@ mod tests {
         agency::init(&bare).unwrap();
 
         let store = resolve_store(tmp.path().to_str().unwrap()).unwrap();
-        assert_eq!(store.store_path(), bare);
+        assert_eq!(store.store_path(), canonical(&bare));
     }
 
     #[test]
@@ -1897,7 +1908,7 @@ mod tests {
         agency::init(&direct).unwrap();
 
         let store = resolve_store(direct.to_str().unwrap()).unwrap();
-        assert_eq!(store.store_path(), direct);
+        assert_eq!(store.store_path(), canonical(&direct));
     }
 
     #[test]

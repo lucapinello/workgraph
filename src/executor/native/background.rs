@@ -1121,7 +1121,33 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = JobStore::new(tmp.path().to_path_buf()).unwrap();
         store.run("natural", "exit 0", tmp.path()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Wait for the natural exit to actually land rather than assuming it
+        // fits inside a fixed 150 ms. Under full-suite load it sometimes does
+        // not: `kill` then finds the group alive, signals it, and correctly
+        // reports Cancelled — so the test failed for a reason that has nothing
+        // to do with the behaviour it names. Poll the same predicate `kill`
+        // uses, then assert the precondition before exercising it.
+        let mut waited = Duration::ZERO;
+        let limit = Duration::from_secs(10);
+        let step = Duration::from_millis(25);
+        while waited < limit
+            && !matches!(
+                inspect_job_process(store.get("natural").unwrap()),
+                JobProcessState::Gone
+            )
+        {
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+        assert!(
+            matches!(
+                inspect_job_process(store.get("natural").unwrap()),
+                JobProcessState::Gone
+            ),
+            "precondition: `exit 0` must have exited on its own before kill"
+        );
+
         store.kill("natural").await.unwrap();
         assert_eq!(store.get("natural").unwrap().status, JobStatus::Orphaned);
     }

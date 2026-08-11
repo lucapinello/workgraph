@@ -702,9 +702,40 @@ fn has_open_files(path: &Path) -> bool {
     }
     false
 }
+/// Same predicate for platforms without `/proc`, via `lsof`.
+///
+/// Returning a bare `true` here (the previous behaviour) is not a conservative
+/// default — it is a kill switch. `safe_remove_owned_path` treats "has open
+/// files" as a hard refusal, so on macOS and the BSDs *every* owned cache was
+/// preserved forever and the disk sentinel could never reclaim a byte, no
+/// matter how dead its owner was. Probe for real, and fail closed only when the
+/// probe itself is inconclusive.
+///
+/// `lsof -t` lists just PIDs, and exits 1 when it finds nothing — an expected
+/// outcome, not an error — so both 0 and 1 are trusted and the answer is read
+/// off stdout. Any other exit, or a missing `lsof`, keeps the old fail-closed
+/// behaviour. As on Linux, an unprivileged process cannot see other users'
+/// descriptors; that limit is identical to being unable to read their
+/// `/proc/<pid>/fd`.
 #[cfg(not(target_os = "linux"))]
-fn has_open_files(_path: &Path) -> bool {
-    true
+fn has_open_files(path: &Path) -> bool {
+    let mut cmd = std::process::Command::new("lsof");
+    // `-w` drops permission warnings, `-n`/`-P` skip DNS and service lookups.
+    cmd.args(["-t", "-w", "-n", "-P"]);
+    if path.is_dir() {
+        // `+D` descends the tree, catching a file held open *inside* the dir —
+        // the case that actually matters for a cargo target directory.
+        cmd.arg("+D").arg(path);
+    } else {
+        cmd.arg("--").arg(path);
+    }
+    match cmd.output() {
+        Ok(out) => match out.status.code() {
+            Some(0) | Some(1) => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            _ => true,
+        },
+        Err(_) => true,
+    }
 }
 
 fn path_contains_registered_artifact(

@@ -123,13 +123,55 @@ pub fn collect_process_descendants(root_pid: u32) -> Vec<u32> {
     descendants
 }
 
+/// Read the whole system's pid → ppid map on platforms without `/proc`.
+///
+/// `ps -A -o pid=,ppid=` is POSIX and present on macOS and the BSDs. An empty
+/// map (ps missing or unreadable) is reported as `None` so callers can tell
+/// "no children" apart from "could not look".
 #[cfg(not(target_os = "linux"))]
-pub fn collect_process_descendants(_root_pid: u32) -> Vec<u32> {
-    // /proc-based descendant discovery is Linux-specific. On other Unix
-    // platforms we fall through to signaling just the root PID, which at
-    // least handles the common case where the child is in the same
-    // process group.
-    Vec::new()
+fn parent_map_via_ps() -> Option<std::collections::HashMap<u32, u32>> {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if let (Some(pid), Some(ppid)) = (fields.next(), fields.next())
+            && let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>())
+        {
+            map.insert(pid, ppid);
+        }
+    }
+    if map.is_empty() { None } else { Some(map) }
+}
+
+/// Non-Linux twin of the `/proc`-walking descendant collector.
+///
+/// Returning an empty vec unconditionally (the previous behaviour) meant a tree
+/// kill on macOS signalled only the root PID, leaving the `wg native-exec`
+/// grandchild alive and still writing — precisely the leak the Linux
+/// implementation exists to prevent.
+#[cfg(not(target_os = "linux"))]
+pub fn collect_process_descendants(root_pid: u32) -> Vec<u32> {
+    let Some(parent_of) = parent_map_via_ps() else {
+        return Vec::new();
+    };
+    let mut descendants: Vec<u32> = Vec::new();
+    let mut frontier: Vec<u32> = vec![root_pid];
+    while let Some(current) = frontier.pop() {
+        for (&child, &parent) in &parent_of {
+            if parent == current && child != root_pid && !descendants.contains(&child) {
+                descendants.push(child);
+                frontier.push(child);
+            }
+        }
+    }
+    descendants
 }
 
 /// Send `signal` to `pid`, swallowing ESRCH (process already gone).
@@ -445,9 +487,22 @@ pub fn has_active_children(pid: u32) -> bool {
     false
 }
 
+/// Non-Linux twin, backed by the `ps` parent map.
+///
+/// The constant `false` this replaces was not a harmless stub. Both callers use
+/// this predicate to *spare* an agent: `zero_output` skips the kill when the
+/// agent still has children (it is waiting on a build or a model subprocess),
+/// and `triage` suppresses the stuck-stream warning. Hard-coding `false` on
+/// macOS disabled both, so a legitimately busy agent was reported stuck and
+/// killed for producing no output while its child compiled.
 #[cfg(not(target_os = "linux"))]
-pub fn has_active_children(_pid: u32) -> bool {
-    false
+pub fn has_active_children(pid: u32) -> bool {
+    let Some(parent_of) = parent_map_via_ps() else {
+        return false;
+    };
+    parent_of
+        .iter()
+        .any(|(&child, &parent)| parent == pid && child != pid)
 }
 
 /// Check whether the process at `pid` is the same one that was started at
@@ -564,6 +619,65 @@ mod tests {
         let mut child = child;
         child.kill().ok();
         child.wait().ok();
+    }
+
+    /// The GRANDCHILD is the whole point, and it was untested.
+    ///
+    /// `collect_process_descendants` existed on Linux and returned an empty vec on every
+    /// other platform. A tree kill therefore signalled only the root, and a `wg
+    /// native-exec` grandchild kept running and writing — the exact leak the Linux
+    /// implementation was written to prevent. The non-Linux twin that replaced the stub
+    /// had no test at all: gutting it back to `Vec::new()` left the suite green, which
+    /// makes the fix indistinguishable from the stub it replaced.
+    ///
+    /// So this asserts the transitive case specifically. A test that only checked the
+    /// direct child would pass against a one-level implementation and miss the leak.
+    #[test]
+    fn collect_process_descendants_finds_a_grandchild_not_just_a_child() {
+        // sh -c 'sleep 60' → the shell is our child, `sleep` is its child: a real
+        // two-level tree, which is the shape `native-exec` produces.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .expect("failed to spawn sh");
+        let child_pid = child.id();
+
+        // Give the shell a moment to fork its own child before we look.
+        let mut found: Vec<u32> = Vec::new();
+        for _ in 0..50 {
+            found = collect_process_descendants(std::process::id());
+            if found.len() > 1 && found.contains(&child_pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        assert!(
+            found.contains(&child_pid),
+            "the direct child {child_pid} is missing from {found:?}"
+        );
+        // NON-VACUITY / the actual guarantee: strictly MORE than the direct child, i.e.
+        // the walk recursed. Against the old `Vec::new()` stub this is empty; against a
+        // one-level implementation it is exactly one.
+        assert!(
+            found.len() > 1,
+            "expected the grandchild too, got only {found:?} — the walk did not recurse, \
+             so a tree kill would leave the grandchild alive"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn collect_process_descendants_is_empty_for_a_pid_with_no_children() {
+        // Control: the collector must not invent descendants for a pid that has none,
+        // or the assertion above would pass on an implementation that returns everything.
+        assert!(
+            collect_process_descendants(u32::MAX - 1).is_empty(),
+            "a nonexistent pid must have no descendants"
+        );
     }
 
     #[test]

@@ -163,13 +163,19 @@ pub fn find_worktree_for_task(project_root: &Path, task_id: &str) -> Option<(Pat
             .ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
         let mut current: Option<&str> = None;
-        let path_str = path.to_string_lossy();
         for line in text.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
                 current = Some(p);
             } else if let Some(b) = line.strip_prefix("branch ") {
                 let branch_name = b.strip_prefix("refs/heads/").unwrap_or(b);
-                if current == Some(path_str.as_ref()) && branch_name == expected {
+                // git prints the symlink-resolved path while `path` is lexical;
+                // a plain string compare silently defeats resume-in-place and
+                // forks a second worktree. See `same_worktree_path`.
+                if branch_name == expected
+                    && current.is_some_and(|c| {
+                        crate::commands::service::worktree::same_worktree_path(Path::new(c), &path)
+                    })
+                {
                     return Some((path.clone(), branch_name.to_string()));
                 }
             } else if line.is_empty() {
@@ -286,6 +292,46 @@ mod tests {
     // `strip_verbatim_prefix` unit tests live with the consolidated helper in
     // `spawn/mod.rs` (it moved there from this file as part of the `\\?\`
     // consolidation of njt's #24/#25/#28).
+
+    /// Resume-in-place must find an existing worktree even when the project is
+    /// reached through a symlinked ancestor.
+    ///
+    /// `git worktree list --porcelain` prints the resolved path, so comparing it
+    /// as a string against the lexical path the caller built silently returns
+    /// `None`: `wg retry` then believes there is no worktree to resume, forks a
+    /// second one, and abandons the WIP the retention policy went to such
+    /// lengths to preserve. The symlink is created explicitly rather than
+    /// relying on the platform's `$TMPDIR` so this stays a real assertion on
+    /// Linux, where `/tmp` is usually not a symlink.
+    #[test]
+    #[cfg(unix)]
+    fn find_worktree_for_task_survives_a_symlinked_project_root() {
+        let temp = TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let project = real.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+
+        let wg_dir = project.join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let info = create_worktree(&project, &wg_dir, "agent-1", "task-resume").unwrap();
+
+        // Reach the very same project through a symlinked ancestor.
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_link = link.join("project");
+        assert_ne!(via_link, project, "the two spellings must differ lexically");
+
+        let found = find_worktree_for_task(&via_link, "task-resume");
+        assert!(
+            found.is_some(),
+            "existing worktree must be found through a symlinked project root"
+        );
+        assert_eq!(found.unwrap().1, "wg/agent-1/task-resume");
+
+        remove_worktree(&project, &info.path, &info.branch).unwrap();
+    }
 
     #[test]
     fn test_create_worktree() {
