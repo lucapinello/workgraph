@@ -284,6 +284,12 @@ while IFS= read -r refusal; do
         loud_fail "a REFUSAL created a plan of record: $refusal"
     fi
     recognize_is "$refusal" no
+#
+# THE SECOND HALF OF THE SAME P0, and why this list grew. The phrasings above
+# were the ones in front of the guard when it was written; run against the built
+# binary at 20bf0958 the five below still WROTE A PLAN OF RECORD, because the
+# marker list spelled "do not" and "not yet" but never bare "not", and no
+# closed list can spell the contracted auxiliaries English forms productively.
 done <<'REFUSALS'
 Don't start the week.
 Do not start the week yet.
@@ -292,12 +298,25 @@ Not yet — don't set up this week.
 Stop — do not plan this week.
 Please cancel that, don't draft this week's family plan.
 Hold off, no need to start the week.
+Let's not start the week.
+I'd rather not start the week.
+We won't start the week yet.
+You cannot start the week.
+I can't start the week right now.
+We shouldn't start the week before Friday.
+There's no reason to start the week.
+No point starting the week now.
 REFUSALS
 
 # …and the negation gate did not eat the asks it sits next to. A "don't" inside
 # the QUOTED carriage is the family's EDIT, not a refusal of the ask carrying it.
 recognize_is "Please draft this week's family plan — start the week." yes
 recognize_is "Non-stop week ahead — start the week." yes
+# …and widening that gate to catch bare "not" did not start eating the ordinary
+# words that merely CONTAIN its letters. Each of these is a real ask.
+recognize_is "Another quiet week — start the week." yes
+recognize_is "Nothing special this week, please start the week." yes
+recognize_is "Make a note of it and start the week." yes
 recognize_is 'Please draft this week'"'"'s family plan — start the week. Keep what I just asked for: "Don'"'"'t put fish on Tuesday."' \
     yes "Don't put fish on Tuesday."
 

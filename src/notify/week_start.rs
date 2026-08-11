@@ -210,14 +210,35 @@ const QUESTION_OPENERS: &[&str] = &[
 /// this scan for the same reason it is excluded from the instruction scan — a
 /// carried request that happens to say "don't" ("Don't put fish on Tuesday.") is
 /// the family's EDIT, not a refusal of the ask that carries it.
+///
+/// THE LIST IS NOT THE WHOLE GATE, and the day it was is the reason this
+/// paragraph exists. Written from the phrasings in front of it, it caught every
+/// one of them and missed the commonest refusal in the language: bare "not". Run
+/// against the built binary, "Let's not start the week.", "I'd rather not start
+/// the week.", "We won't start the week yet.", "You cannot start the week." and
+/// "There's no reason to start the week." each WROTE A PLAN OF RECORD — the
+/// original P0 exactly, surviving in the phrasings nobody had typed that day.
+/// So `not` is now a marker in its own right (the multi-word `do not` / `not yet`
+/// entries below are kept only because they say out loud what a reader scans the
+/// list for), and contracted auxiliaries — which English forms productively and
+/// no closed list can spell — are caught by [`has_negating_contraction`] instead.
 const NEGATION_MARKERS: &[&str] = &[
     "don't",
     "don’t",
     "do not",
     "dont",
     "never",
+    // Bare "not", matched as a WHOLE word: "let's not", "rather not", "is not",
+    // "will not". It cannot reach inside "another"/"nothing"/"note" (the letters
+    // are word-internal there) nor inside "won't" (an apostrophe is word-internal
+    // too, so a contraction is one word) — which is what the suffix rule is for.
+    "not",
+    // "cannot" is ONE word, so the "not" above cannot see it.
+    "cannot",
     "not yet",
     "no need",
+    "no reason",
+    "no point",
     "without starting",
     "without setting up",
     "cancel",
@@ -227,6 +248,23 @@ const NEGATION_MARKERS: &[&str] = &[
     "no thanks",
     "skip",
 ];
+
+/// Does any word here negate BY CONTRACTION — "won't", "can't", "shouldn't",
+/// "isn't"? A closed marker list cannot answer this: English builds these
+/// productively, and every one of them turns "start the week" into a refusal of
+/// it. The rule is the SUFFIX, so a form nobody thought to list ("mustn't",
+/// "ain't") is caught on the same terms as the ones that were.
+///
+/// Both apostrophes count, for the reason `don’t` is in the list beside `don't`:
+/// the family's keyboard picks which one they get, and the guard may not depend
+/// on that choice. A bare `n't` is not a word and does not negate anything.
+fn has_negating_contraction(low: &str) -> bool {
+    low.split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}' || c == '-'))
+        .any(|word| {
+            let word = word.trim_matches('-');
+            word.chars().count() > 3 && (word.ends_with("n't") || word.ends_with("n\u{2019}t"))
+        })
+}
 
 /// Is `needle` present in `haystack` as WHOLE words? "stop" must refuse "stop
 /// the week" without refusing a dish called "stopper" — a substring test on a
@@ -331,10 +369,13 @@ pub fn detect(message: &str) -> Option<WeekStartAsk> {
     if low.contains('?') && !low.contains("please") && !low.contains("let's") {
         return None;
     }
-    // "Don't start the week." must not START THE WEEK.
+    // "Don't start the week." must not START THE WEEK. Two independent tests,
+    // because a refusal is spelled two ways: with a word from the list, or with a
+    // contracted auxiliary the list has no way to enumerate.
     if NEGATION_MARKERS
         .iter()
         .any(|n| contains_word_phrase(low, n))
+        || has_negating_contraction(low)
     {
         return None;
     }
@@ -1359,6 +1400,97 @@ mod tests {
         )
         .expect("a carried request containing \"don't\" refused the whole ask");
         assert_eq!(ask.carried, vec!["Don't put fish on Tuesday."]);
+    }
+
+    /// THE SECOND HALF OF THE SAME P0. The marker list caught the phrasings it
+    /// was written from and missed the ones nobody typed that day: every line
+    /// below was RUN against the built binary on `20bf0958` and five of them
+    /// wrote a plan of record for a week the family had just refused.
+    ///
+    /// They divide into the two holes this test pins open — a refusal built on
+    /// bare "not" ("let's not", "rather not"), and one built on a contracted
+    /// auxiliary ("won't", "cannot") that no `don't`-shaped entry can spell.
+    #[test]
+    fn a_refusal_the_marker_list_never_spelled_is_still_a_refusal() {
+        for refusal in [
+            // Bare "not" — the marker list only had the multi-word "do not" and
+            // "not yet", so the commonest refusal of all walked straight past it.
+            "Let's not start the week.",
+            "I'd rather not start the week.",
+            "Please do not start the week.",
+            "We are not starting the week today.",
+            // Contracted auxiliaries. English forms these productively; a closed
+            // list that spells "don't" and stops has no way to reach the rest.
+            "We won't start the week yet.",
+            "You cannot start the week.",
+            "I can't start the week right now.",
+            "We shouldn't start the week before Friday.",
+            "That isn't a reason to start the week.",
+            // "no <noun>" refusals in the same family as the listed "no need".
+            "There's no reason to start the week.",
+            "No point starting the week now.",
+        ] {
+            assert!(
+                detect(refusal).is_none(),
+                "a REFUSAL was read as an instruction to draft the week: {refusal:?}",
+            );
+        }
+    }
+
+    /// The widened gate must not start eating ordinary words that merely CONTAIN
+    /// a negation's letters. Every string here is a real ask and must still draft.
+    #[test]
+    fn widening_the_gate_did_not_swallow_the_words_around_it() {
+        // "not" lives inside all of these and negates none of them.
+        for ask in [
+            "Another quiet week — start the week.",
+            "Nothing special this week, please start the week.",
+            "Make a note of it and start the week.",
+            "Cannonball run this week — start the week.",
+            "Non-stop week ahead — start the week.",
+        ] {
+            assert!(
+                detect(ask).is_some(),
+                "an ordinary ask was refused as a negation: {ask:?}",
+            );
+        }
+        // The word-boundary rule is what makes that true, stated directly.
+        assert!(!contains_word_phrase("another quiet week", "not"));
+        assert!(!contains_word_phrase("nothing special", "not"));
+        assert!(!contains_word_phrase("make a note", "not"));
+        assert!(!contains_word_phrase("cannonball", "cannot"));
+        assert!(contains_word_phrase("let's not start", "not"));
+        // A contraction is ONE word to the boundary rule, so a bare "not" needle
+        // can never reach inside it — the suffix rule is what sees "won't".
+        assert!(!contains_word_phrase("we won't start", "not"));
+        assert!(has_negating_contraction("we won't start"));
+        assert!(!has_negating_contraction("start the week"));
+        // "n't" alone is not a word, and a hyphenated tail must not fake one.
+        assert!(!has_negating_contraction("n't"));
+    }
+
+    /// THE ARTIFACT ASSERTION for the widened gate, in the same shape as the
+    /// original P0's: the refusals above write NO PLAN against a real scratch
+    /// project, not merely `None` from the classifier.
+    #[test]
+    fn the_newly_caught_refusals_write_no_plan_file() {
+        for refusal in [
+            "Let's not start the week.",
+            "We won't start the week yet.",
+            "You cannot start the week.",
+            "There's no reason to start the week.",
+        ] {
+            let dir = scratch(true);
+            let ask = detect(refusal);
+            assert!(ask.is_none(), "{refusal:?} was read as an ask");
+            assert!(
+                !dir.path()
+                    .join("plans")
+                    .join("2026-W31-family-plan.md")
+                    .exists(),
+                "a plan of record was created for a week the family refused: {refusal:?}",
+            );
+        }
     }
 
     /// The negation list is matched as WHOLE WORDS — a substring test on the
