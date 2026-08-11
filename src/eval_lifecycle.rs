@@ -611,37 +611,167 @@ fn verify_evaluation_digest(dir: &Path, verdict: &DurableEvalVerdict) -> Result<
     Ok(())
 }
 
-pub fn load_durable_verdicts(dir: &Path) -> Result<Vec<DurableEvalVerdict>> {
+/// A verdict file that failed verification and was therefore EXCLUDED from the
+/// usable set. Quarantine is deliberately per-file: an unverifiable verdict must
+/// never be consumed, but it must also never take the rest of the store down
+/// with it.
+#[derive(Debug, Clone)]
+pub struct QuarantinedVerdict {
+    /// The offending file.
+    pub path: PathBuf,
+    /// The source task the file claimed, when it parsed far enough to say.
+    pub source_task: Option<String>,
+    /// Why it was rejected, carrying the original `WG-EVAL-VERDICT-*` code.
+    pub reason: String,
+}
+
+/// The verdict store split into what may be consumed and what may not.
+#[derive(Debug, Clone, Default)]
+pub struct DurableVerdictStore {
+    /// Verdicts that passed every integrity and evidence check.
+    pub verdicts: Vec<DurableEvalVerdict>,
+    /// Files that failed a check, excluded from `verdicts`.
+    pub quarantined: Vec<QuarantinedVerdict>,
+}
+
+impl DurableVerdictStore {
+    /// A stable fingerprint of the quarantine set, so a caller can log a change
+    /// instead of re-logging the same unverifiable files on every tick.
+    pub fn quarantine_fingerprint(&self) -> String {
+        let mut ids: Vec<&str> = self
+            .quarantined
+            .iter()
+            .map(|entry| entry.path.to_str().unwrap_or("<non-utf8>"))
+            .collect();
+        ids.sort_unstable();
+        digest_bytes(ids.join("\n").as_bytes())
+    }
+}
+
+/// Read every durable verdict, verifying each one INDEPENDENTLY.
+///
+/// A per-file fault (unparseable bytes, id/filename mismatch, record digest
+/// mismatch, missing or mismatched evaluation evidence) quarantines exactly that
+/// file and leaves every other verdict usable. `Err` is reserved for a
+/// STORE-WIDE fault — the directory itself cannot be enumerated — because that
+/// is the only case where no per-file attribution is possible.
+///
+/// This scoping is the fix for the 2026-08 starve (`fix-the-graph`): the old
+/// reader `bail!`ed on the first bad file, so ONE verdict whose evidence had
+/// been gc'd returned `Err` for the whole store, the coordinator's
+/// `eval_evidence_usable` gate went false, `reconcile_durable_verdicts` was
+/// skipped on every tick for three weeks, and 91 tasks could never leave
+/// `PendingEval`. The security property is unchanged: an unverified verdict is
+/// still never consumed. What changes is that its neighbours no longer starve
+/// with it.
+pub fn load_durable_verdict_store(dir: &Path) -> Result<DurableVerdictStore> {
     let directory = verdicts_dir(dir);
     if !directory.exists() {
-        return Ok(Vec::new());
+        return Ok(DurableVerdictStore::default());
     }
-    let mut verdicts = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
+    let mut store = DurableVerdictStore::default();
+    // Enumerating the directory is the store-wide step: if THIS fails there is
+    // no per-file attribution to make, so it stays a hard error.
+    for entry in fs::read_dir(&directory).with_context(|| {
+        format!(
+            "error[WG-EVAL-VERDICT-STORE]: cannot enumerate {}",
+            directory.display()
+        )
+    })? {
+        let path = entry
+            .with_context(|| {
+                format!(
+                    "error[WG-EVAL-VERDICT-STORE]: cannot enumerate {}",
+                    directory.display()
+                )
+            })?
+            .path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let verdict: DurableEvalVerdict = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("loading durable verdict {}", path.display()))?;
-        let expected_file = format!("{}.json", verdict.verdict_id);
-        if path.file_name().and_then(|name| name.to_str()) != Some(expected_file.as_str()) {
-            anyhow::bail!(
+        match verify_verdict_file(dir, &path) {
+            Ok(verdict) => store.verdicts.push(verdict),
+            Err(rejection) => store.quarantined.push(rejection),
+        }
+    }
+    store
+        .verdicts
+        .sort_by(|a, b| a.verdict_id.cmp(&b.verdict_id));
+    store.quarantined.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(store)
+}
+
+/// Verify ONE verdict file. Every failure is attributable to this file alone, so
+/// every failure returns a `QuarantinedVerdict` rather than propagating.
+fn verify_verdict_file(
+    dir: &Path,
+    path: &Path,
+) -> std::result::Result<DurableEvalVerdict, QuarantinedVerdict> {
+    let reject = |source_task: Option<String>, reason: String| QuarantinedVerdict {
+        path: path.to_path_buf(),
+        source_task,
+        reason,
+    };
+    let bytes = fs::read(path).map_err(|error| {
+        reject(
+            None,
+            format!(
+                "error[WG-EVAL-VERDICT-INTEGRITY]: cannot read {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let verdict: DurableEvalVerdict = serde_json::from_slice(&bytes).map_err(|error| {
+        reject(
+            None,
+            format!(
+                "error[WG-EVAL-VERDICT-INTEGRITY]: cannot parse {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let source_task = Some(verdict.source_task.clone());
+    let expected_file = format!("{}.json", verdict.verdict_id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_file.as_str()) {
+        return Err(reject(
+            source_task,
+            format!(
                 "error[WG-EVAL-VERDICT-INTEGRITY]: verdict id/filename mismatch at {}",
                 path.display()
-            );
-        }
-        if verdict.verdict_digest != compute_verdict_digest(&verdict)? {
-            anyhow::bail!(
-                "error[WG-EVAL-VERDICT-INTEGRITY]: verdict digest mismatch at {}",
-                path.display()
-            );
-        }
-        verify_evaluation_digest(dir, &verdict)?;
-        verdicts.push(verdict);
+            ),
+        ));
     }
-    verdicts.sort_by(|a, b| a.verdict_id.cmp(&b.verdict_id));
-    Ok(verdicts)
+    match compute_verdict_digest(&verdict) {
+        Ok(digest) if digest == verdict.verdict_digest => {}
+        Ok(_) => {
+            return Err(reject(
+                source_task,
+                format!(
+                    "error[WG-EVAL-VERDICT-INTEGRITY]: verdict digest mismatch at {}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) => {
+            return Err(reject(
+                source_task,
+                format!(
+                    "error[WG-EVAL-VERDICT-INTEGRITY]: cannot digest {}: {error:#}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if let Err(error) = verify_evaluation_digest(dir, &verdict) {
+        return Err(reject(source_task, format!("{error:#}")));
+    }
+    Ok(verdict)
+}
+
+/// The verified-only view of the store. Callers that have nothing useful to do
+/// with a quarantine list keep using this.
+pub fn load_durable_verdicts(dir: &Path) -> Result<Vec<DurableEvalVerdict>> {
+    Ok(load_durable_verdict_store(dir)?.verdicts)
 }
 
 /// True when a durable EVALUATE-stage verdict scoring at or above `threshold`
@@ -2030,26 +2160,211 @@ mod tests {
             EVALUATION_DIGEST_DURABLE_BYTES_SCHEMA
         );
 
+        // A tampered verdict must never be CONSUMABLE. It is now quarantined
+        // rather than bailing the whole store (fix-the-graph), so assert the
+        // security property directly — excluded from `verdicts`, present in
+        // `quarantined`, carrying its diagnostic code — which is strictly
+        // stronger than the old `unwrap_err()` on the store as a whole.
         let original = fs::read(&verdict_path).unwrap();
         let mut tampered: serde_json::Value = serde_json::from_slice(&original).unwrap();
         tampered["score"] = serde_json::json!(0.1);
         fs::write(&verdict_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
-        assert!(
-            load_durable_verdicts(dir.path())
-                .unwrap_err()
-                .to_string()
-                .contains("INTEGRITY")
-        );
+        let store = load_durable_verdict_store(dir.path()).unwrap();
+        assert!(store.verdicts.is_empty(), "tampered verdict must not load");
+        assert_eq!(store.quarantined.len(), 1);
+        assert!(store.quarantined[0].reason.contains("INTEGRITY"));
 
         fs::write(&verdict_path, original).unwrap();
         evaluation.notes = "tampered after verdict".into();
         crate::agency::save_evaluation(&evaluation, &dir.path().join("agency/evaluations"))
             .unwrap();
+        let store = load_durable_verdict_store(dir.path()).unwrap();
         assert!(
-            load_durable_verdicts(dir.path())
-                .unwrap_err()
-                .to_string()
-                .contains("EVIDENCE")
+            store.verdicts.is_empty(),
+            "verdict whose evidence changed under it must not load"
+        );
+        assert_eq!(store.quarantined.len(), 1);
+        assert!(store.quarantined[0].reason.contains("EVIDENCE"));
+    }
+
+    /// Write a real, fully-verifiable verdict pair for `source` and return the
+    /// two satellites, already `Done`, exactly as the live graph carries them.
+    fn land_verified_verdicts(dir: &Path, source: &Task, score: f64) -> (Task, Task) {
+        let evaluations = dir.join("agency/evaluations");
+        let mut satellites = Vec::new();
+        for (stage, id) in [
+            (AgencyStage::FlipComparison, format!(".flip-{}", source.id)),
+            (AgencyStage::Evaluate, format!(".evaluate-{}", source.id)),
+        ] {
+            let mut satellite = planned_satellite(&id, source);
+            satellite.status = Status::Done;
+            let evaluation = Evaluation {
+                id: format!("evaluation-{}-{}", source.id, id),
+                task_id: source.id.clone(),
+                agent_id: "agent-1".into(),
+                role_id: "role".into(),
+                tradeoff_id: "tradeoff".into(),
+                score,
+                dimensions: std::collections::HashMap::new(),
+                notes: "verified".into(),
+                evaluator: "codex:gpt-5.5".into(),
+                timestamp: Utc::now().to_rfc3339(),
+                model: Some("codex:gpt-5.5".into()),
+                source: "llm".into(),
+                loop_iteration: 0,
+            };
+            crate::agency::save_evaluation(&evaluation, &evaluations).unwrap();
+            write_durable_verdict(dir, source, &satellite, stage, &evaluation).unwrap();
+            satellites.push(satellite);
+        }
+        let evaluate = satellites.pop().expect("evaluate satellite");
+        let flip = satellites.pop().expect("flip satellite");
+        (flip, evaluate)
+    }
+
+    /// Plant a verdict file whose evaluation evidence does not exist — the exact
+    /// shape of the 98 orphans found on the live instance, whose evidence the
+    /// daily gc reaped on 2026-07-20/21.
+    fn plant_orphaned_verdict(dir: &Path, source_task: &str) {
+        let mut orphan = DurableEvalVerdict {
+            schema: EVAL_LIFECYCLE_SCHEMA,
+            verdict_id: format!("verdict-orphan-{source_task}"),
+            verdict_digest: String::new(),
+            evaluation_id: format!("evaluation-reaped-by-gc-{source_task}"),
+            pipeline_id: "evalp-orphan".into(),
+            source_task: source_task.into(),
+            source_attempt: 1,
+            stage: AgencyStage::FlipComparison,
+            producer_run_id: "run-gone".into(),
+            score: 0.9,
+            evaluation_digest_schema: EVALUATION_DIGEST_DURABLE_BYTES_SCHEMA,
+            evaluation_digest: digest_bytes(b"whatever the reaped evidence was"),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        // Self-consistent record digest: the file is INTACT. Only its evaluation
+        // evidence is missing, so the loader must reject it on EVIDENCE grounds
+        // and nothing else.
+        orphan.verdict_digest = compute_verdict_digest(&orphan).unwrap();
+        let directory = verdicts_dir(dir);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(format!("{}.json", orphan.verdict_id)),
+            serde_json::to_vec_pretty(&orphan).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// THE REPRODUCER for `fix-the-graph`.
+    ///
+    /// Live shape, 2026-08-10: a task reached `PendingEval`, both its
+    /// `.evaluate-X` and `.flip-X` ran to `Done` and saved passing durable
+    /// verdicts — and the task never left `PendingEval`. 91 tasks were parked
+    /// this way, `wg ready` was empty, and the family's week evaporated.
+    ///
+    /// The cause is NOT in `reconcile_durable_verdicts`, which handles this
+    /// correctly when handed the verdicts. It is one directory over, in the
+    /// loader: `load_durable_verdicts` bailed on the FIRST unverifiable file, so
+    /// a single verdict whose evidence had been gc'd returned `Err` for the
+    /// entire store, and the coordinator's `eval_evidence_usable` gate then
+    /// skipped reconcile on every tick.
+    ///
+    /// So this test drives the loader→reconcile SEAM the coordinator actually
+    /// composes, not the reconcile alone — a test that hands verdicts straight
+    /// to `reconcile_durable_verdicts` passes on the broken build and proves
+    /// nothing.
+    #[test]
+    fn one_unverifiable_verdict_does_not_wedge_its_neighbours_in_pending_eval() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let mut healthy = source();
+        healthy.status = Status::PendingEval;
+        healthy.evaluation_lifecycle = Some(EvaluationLifecycle::for_source(&healthy));
+        let (flip, evaluate) = land_verified_verdicts(root, &healthy, 0.9);
+
+        // The poison pill: one orphaned verdict belonging to an UNRELATED task.
+        plant_orphaned_verdict(root, "some-other-task-from-three-weeks-ago");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(crate::graph::Node::Task(healthy));
+        graph.add_node(crate::graph::Node::Task(flip));
+        graph.add_node(crate::graph::Node::Task(evaluate));
+
+        // Exactly the coordinator's composition (coordinator.rs phase 2.46–2.47),
+        // INCLUDING its fail-closed fallback — modelled rather than asserted
+        // away, so that under the defect this test fails on the family-visible
+        // symptom (the task never leaves PendingEval) instead of on the shape of
+        // the loader's return value.
+        let store = load_durable_verdict_store(root);
+        let (usable_verdicts, eval_evidence_usable) = match store.as_ref() {
+            Ok(store) => (store.verdicts.clone(), true),
+            Err(_) => (Vec::new(), false),
+        };
+        if eval_evidence_usable {
+            reconcile_durable_verdicts(&mut graph, &usable_verdicts, 0.7, true, 3, |_| true);
+        }
+
+        let reconciled = graph.get_task("source").unwrap();
+        assert_eq!(
+            reconciled.status,
+            Status::Done,
+            "a task whose .evaluate-X and .flip-X both reached Done, with a passing durable \
+             verdict on disk, MUST leave PendingEval without human intervention — one \
+             unrelated unverifiable verdict must not hold it (fix-the-graph)"
+        );
+
+        // And the unverifiable verdict is still refused, not quietly consumed.
+        let store = store.expect("a store containing one bad file is still enumerable");
+        assert_eq!(store.quarantined.len(), 1);
+        assert!(store.quarantined[0].reason.contains("EVIDENCE"));
+        assert_eq!(
+            store.quarantined[0].source_task.as_deref(),
+            Some("some-other-task-from-three-weeks-ago")
+        );
+        assert!(
+            !store
+                .verdicts
+                .iter()
+                .any(|v| v.verdict_id.contains("orphan")),
+            "quarantined verdict must be excluded from the consumable set"
+        );
+    }
+
+    /// Negative control for the reproducer above: with the poison pill REMOVED
+    /// the fixture must still reach Done. If this fails, the fixture itself is
+    /// broken and the reproducer above proves nothing about the poison pill.
+    #[test]
+    fn verified_verdict_pair_reaches_done_without_a_poison_pill() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut healthy = source();
+        healthy.status = Status::PendingEval;
+        healthy.evaluation_lifecycle = Some(EvaluationLifecycle::for_source(&healthy));
+        let (flip, evaluate) = land_verified_verdicts(root, &healthy, 0.9);
+        let mut graph = WorkGraph::new();
+        graph.add_node(crate::graph::Node::Task(healthy));
+        graph.add_node(crate::graph::Node::Task(flip));
+        graph.add_node(crate::graph::Node::Task(evaluate));
+        let store = load_durable_verdict_store(root).unwrap();
+        assert!(store.quarantined.is_empty(), "control has no poison pill");
+        reconcile_durable_verdicts(&mut graph, &store.verdicts, 0.7, true, 3, |_| true);
+        assert_eq!(graph.get_task("source").unwrap().status, Status::Done);
+    }
+
+    /// A store-wide fault is still a hard error: if the verdict directory cannot
+    /// be enumerated at all there is no per-file attribution to make, so
+    /// fail-closed remains correct there. This is the boundary the fix moves —
+    /// it must not move further.
+    #[test]
+    fn store_wide_fault_still_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = verdicts_dir(dir.path());
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        // A regular file where the verdicts DIRECTORY should be: read_dir fails.
+        fs::write(&directory, b"not a directory").unwrap();
+        assert!(
+            load_durable_verdict_store(dir.path()).is_err(),
+            "an unenumerable verdict store must still fail closed"
         );
     }
 

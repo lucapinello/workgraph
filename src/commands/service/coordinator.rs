@@ -32,6 +32,7 @@ use super::triage;
 use crate::commands::{graph_path, is_process_alive, kill_process_graceful, spawn};
 
 /// Result of a single coordinator tick
+#[derive(Default)]
 pub struct TickResult {
     /// Number of agents alive after the tick
     pub agents_alive: usize,
@@ -39,6 +40,166 @@ pub struct TickResult {
     pub tasks_ready: usize,
     /// Number of agents spawned in this tick
     pub agents_spawned: usize,
+    /// Why nothing was ready, when nothing was ready and work still remains.
+    /// `None` means either something WAS ready or the graph is genuinely
+    /// finished — both are fine and neither should alert.
+    pub starve: Option<StarveDiagnosis>,
+}
+
+/// A cohort large enough that it is worth naming as the suspect gets this many
+/// members. Below it, "nothing is ready" is ordinary graph shape, not a wedge.
+const PARKED_COHORT_ALERT: usize = 10;
+
+/// Fingerprint of the quarantine set last reported, so an unchanged quarantine
+/// is announced once per episode rather than once per tick. The old reader
+/// printed its fail-closed line 16,764 times on the live instance, which trained
+/// every reader to scroll past it — a detector nobody reads is not a detector.
+static REPORTED_QUARANTINE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Announce quarantined verdicts once per distinct quarantine set.
+///
+/// These files are excluded from reconcile, so the rest of the store still
+/// drains; the operator nevertheless needs to know that some sources will never
+/// transition until the quarantine is resolved.
+fn report_quarantined_verdicts(store: &worksgood::eval_lifecycle::DurableVerdictStore) {
+    let fingerprint = if store.quarantined.is_empty() {
+        None
+    } else {
+        Some(store.quarantine_fingerprint())
+    };
+    let mut reported = match REPORTED_QUARANTINE.lock() {
+        Ok(guard) => guard,
+        // A poisoned lock must not silence the report or kill the tick.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if *reported == fingerprint {
+        return;
+    }
+    *reported = fingerprint;
+    if store.quarantined.is_empty() {
+        eprintln!("[dispatcher] eval lifecycle: verdict quarantine is now empty");
+        return;
+    }
+    let affected: std::collections::BTreeSet<&str> = store
+        .quarantined
+        .iter()
+        .filter_map(|entry| entry.source_task.as_deref())
+        .collect();
+    eprintln!(
+        "[dispatcher] eval lifecycle: {} verdict(s) verified, {} QUARANTINED as unverifiable \
+         and excluded from reconcile — {} source task(s) affected. The other {} verdict(s) \
+         still reconcile normally.",
+        store.verdicts.len(),
+        store.quarantined.len(),
+        affected.len(),
+        store.verdicts.len(),
+    );
+    // Printed in full (once per episode, not once per tick): this list IS the
+    // remediation worklist, so truncating it would hide the work.
+    for entry in store.quarantined.iter().take(QUARANTINE_REPORT_LIMIT) {
+        eprintln!(
+            "[dispatcher]   quarantined {}: {}",
+            entry.source_task.as_deref().unwrap_or("<unparseable>"),
+            entry.reason
+        );
+    }
+    if store.quarantined.len() > QUARANTINE_REPORT_LIMIT {
+        eprintln!(
+            "[dispatcher]   … and {} more; the full set is every file under {} that fails \
+             verification",
+            store.quarantined.len() - QUARANTINE_REPORT_LIMIT,
+            worksgood::eval_lifecycle::verdicts_dir(std::path::Path::new(".")).display(),
+        );
+    }
+}
+
+/// How many quarantined verdicts to name per episode before summarizing.
+const QUARANTINE_REPORT_LIMIT: usize = 20;
+
+/// Why the dispatcher found nothing to run while work remained.
+///
+/// This exists because the pre-existing DISPATCH WATCHDOG only fires when
+/// `tasks_ready > 0`, so the complementary failure — `tasks_ready == 0` with 142
+/// tasks open and 86 parked in `pending-eval` — was its exact blind spot. That
+/// starve ticked quietly 1102 times and cost a family a whole week
+/// (`fix-the-graph`). A starve with a big single-status cohort behind it is a
+/// reportable event, not a silent no-op.
+#[derive(Debug, Clone)]
+pub struct StarveDiagnosis {
+    /// Non-terminal tasks that still want to run.
+    pub unfinished: usize,
+    /// The largest cohort sitting in one non-terminal status that the dispatcher
+    /// cannot itself dispatch out of (`pending-eval`, `blocked`, `waiting`, …).
+    pub cohort_status: String,
+    /// How many tasks are in that cohort.
+    pub cohort_count: usize,
+    /// Open, unpaused tasks EVERY one of whose predecessors sits in that cohort.
+    /// These are the tasks the cohort is directly holding down — the concrete
+    /// cost of the starve.
+    pub blocked_behind_cohort: usize,
+}
+
+impl StarveDiagnosis {
+    /// True when the cohort is big enough to be worth alerting an operator over.
+    pub fn is_alertable(&self) -> bool {
+        self.cohort_count >= PARKED_COHORT_ALERT
+    }
+
+    /// One-line operator-facing summary.
+    pub fn summary(&self) -> String {
+        format!(
+            "0 tasks ready but {} unfinished — {} task(s) are parked in '{}' \
+             (largest single-status cohort) and {} open task(s) have ALL their \
+             predecessors in it. The dispatcher cannot drain '{}' by spawning; \
+             check the phase that owns that transition.",
+            self.unfinished,
+            self.cohort_count,
+            self.cohort_status,
+            self.blocked_behind_cohort,
+            self.cohort_status,
+        )
+    }
+}
+
+/// Find the largest cohort of tasks parked in a single non-terminal status that
+/// the dispatcher cannot dispatch its way out of, and count what it holds down.
+///
+/// `Open` and `InProgress` are excluded as cohort candidates: those ARE the
+/// dispatchable/running states, so a pile of them is not a parked cohort.
+fn diagnose_starve(graph: &worksgood::graph::WorkGraph) -> Option<StarveDiagnosis> {
+    let unfinished = graph.tasks().filter(|t| !t.status.is_terminal()).count();
+    if unfinished == 0 {
+        return None;
+    }
+    let mut cohorts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for task in graph.tasks() {
+        if task.status.is_terminal() || matches!(task.status, Status::Open | Status::InProgress) {
+            continue;
+        }
+        *cohorts.entry(task.status.to_string()).or_default() += 1;
+    }
+    // Ties broken by status name so the reported cohort is deterministic.
+    let (cohort_status, cohort_count) = cohorts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))?;
+
+    let parked: std::collections::HashSet<&str> = graph
+        .tasks()
+        .filter(|t| t.status.to_string() == cohort_status)
+        .map(|t| t.id.as_str())
+        .collect();
+    let blocked_behind_cohort = graph
+        .tasks()
+        .filter(|t| t.status == Status::Open && !t.paused && !t.after.is_empty())
+        .filter(|t| t.after.iter().all(|dep| parked.contains(dep.as_str())))
+        .count();
+
+    Some(StarveDiagnosis {
+        unfinished,
+        cohort_status,
+        cohort_count,
+        blocked_behind_cohort,
+    })
 }
 
 /// Clean up dead agents and count alive ones. Returns `None` with an early
@@ -130,6 +291,8 @@ fn cleanup_and_count_alive(
             agents_alive: alive_count,
             tasks_ready: 0,
             agents_spawned: 0,
+            // Slots are full, so "nothing ready" was never evaluated: not a starve.
+            starve: None,
         }));
     }
 
@@ -251,10 +414,20 @@ fn check_ready_or_return(
                 eprintln!("[dispatcher] Warning: {}", diagnostic.message());
             }
         }
+        // Name the cohort that is holding the graph down. Without this the tick
+        // logs "No ready tasks" and nothing else, which is how a three-week
+        // starve stayed invisible (fix-the-graph).
+        let starve = diagnose_starve(graph);
+        if let Some(diagnosis) = starve.as_ref()
+            && diagnosis.is_alertable()
+        {
+            eprintln!("[dispatcher] STARVE: {}", diagnosis.summary());
+        }
         return Some(TickResult {
             agents_alive: alive_count,
             tasks_ready: 0,
             agents_spawned: 0,
+            starve,
         });
     }
     None
@@ -5317,8 +5490,15 @@ pub fn coordinator_tick(
             eprintln!("[dispatcher] eval lifecycle evidence unavailable (fail-closed): {error:#}");
             (Vec::new(), false)
         }
-        Ok(_) => match worksgood::eval_lifecycle::load_durable_verdicts(dir) {
-            Ok(verdicts) => (verdicts, true),
+        Ok(_) => match worksgood::eval_lifecycle::load_durable_verdict_store(dir) {
+            // A quarantined file is EXCLUDED from `store.verdicts`, so the
+            // surviving verdicts are safe to reconcile and the phase stays
+            // enabled. Only a store-wide fault (the directory cannot be
+            // enumerated) disables it — see `load_durable_verdict_store`.
+            Ok(store) => {
+                report_quarantined_verdicts(&store);
+                (store.verdicts, true)
+            }
             Err(error) => {
                 eprintln!(
                     "[dispatcher] eval lifecycle evidence unavailable (fail-closed): {error:#}"
@@ -5554,6 +5734,7 @@ pub fn coordinator_tick(
             agents_alive: alive_count,
             tasks_ready: ready_count,
             agents_spawned: 0,
+            starve: None,
         });
     }
 
@@ -5572,6 +5753,7 @@ pub fn coordinator_tick(
                 agents_alive: alive_count,
                 tasks_ready: ready_count,
                 agents_spawned: 0,
+                starve: None,
             });
         }
         Err(e) => {
@@ -5610,6 +5792,7 @@ pub fn coordinator_tick(
         agents_alive: alive_count + spawned,
         tasks_ready: ready_count,
         agents_spawned: spawned,
+        starve: None,
     })
 }
 
@@ -8833,6 +9016,121 @@ mod tests {
                 .all(|task| build_admission_denial(task, true, 0, 1, "low space").is_some())
         );
         assert!(build_admission_denial(&evaluator, true, 1, 1, "low space").is_none());
+    }
+
+    /// Build a graph shaped like the live 2026-08-10 starve: a big `pending-eval`
+    /// cohort, open tasks whose every predecessor is inside it, and nothing ready.
+    fn starved_graph(cohort: usize) -> worksgood::graph::WorkGraph {
+        let mut graph = worksgood::graph::WorkGraph::new();
+        for index in 0..cohort {
+            graph.add_node(worksgood::graph::Node::Task(Task {
+                id: format!("parked-{index}"),
+                title: format!("parked-{index}"),
+                status: Status::PendingEval,
+                ..Task::default()
+            }));
+        }
+        // Two dependents held down by the cohort, and one held by a Done task
+        // (which must NOT be counted — it is ready, not starved).
+        for index in 0..2 {
+            graph.add_node(worksgood::graph::Node::Task(Task {
+                id: format!("child-{index}"),
+                title: format!("child-{index}"),
+                status: Status::Open,
+                after: vec![format!("parked-{index}")],
+                ..Task::default()
+            }));
+        }
+        graph.add_node(worksgood::graph::Node::Task(Task {
+            id: "finished".into(),
+            title: "finished".into(),
+            status: Status::Done,
+            ..Task::default()
+        }));
+        graph.add_node(worksgood::graph::Node::Task(Task {
+            id: "child-of-done".into(),
+            title: "child-of-done".into(),
+            status: Status::Open,
+            after: vec!["finished".into()],
+            ..Task::default()
+        }));
+        graph
+    }
+
+    #[test]
+    fn starve_diagnosis_names_the_parked_cohort_and_what_it_holds_down() {
+        // The wedge must be LOUD: a tick that finds nothing ready while a large
+        // cohort sits in one non-dispatchable status is a reportable event, not
+        // a quiet no-op. This is the complement of the DISPATCH WATCHDOG, which
+        // only fires when tasks_ready > 0 and therefore missed this entirely for
+        // 1102 ticks (fix-the-graph).
+        let diagnosis = diagnose_starve(&starved_graph(PARKED_COHORT_ALERT + 5))
+            .expect("unfinished work present, so a diagnosis is owed");
+        assert_eq!(diagnosis.cohort_status, "pending-eval");
+        assert_eq!(diagnosis.cohort_count, PARKED_COHORT_ALERT + 5);
+        assert_eq!(
+            diagnosis.blocked_behind_cohort, 2,
+            "only the children whose every predecessor is parked count; \
+             child-of-done hangs off a Done task and is not starved"
+        );
+        assert!(diagnosis.is_alertable());
+        let summary = diagnosis.summary();
+        assert!(summary.contains("pending-eval"), "{summary}");
+        assert!(summary.contains("0 tasks ready"), "{summary}");
+    }
+
+    #[test]
+    fn starve_diagnosis_stays_quiet_on_a_small_cohort_and_a_finished_graph() {
+        // Negative controls, so the detector cannot pass by always alerting.
+        // (a) A cohort below the threshold is ordinary graph shape.
+        let small = diagnose_starve(&starved_graph(2)).expect("still unfinished");
+        assert_eq!(small.cohort_count, 2);
+        assert!(
+            !small.is_alertable(),
+            "a 2-task cohort must not raise a wedge alert"
+        );
+        // (b) A fully terminal graph is finished, not starved.
+        let mut done_graph = worksgood::graph::WorkGraph::new();
+        done_graph.add_node(worksgood::graph::Node::Task(Task {
+            id: "only".into(),
+            title: "only".into(),
+            status: Status::Done,
+            ..Task::default()
+        }));
+        assert!(
+            diagnose_starve(&done_graph).is_none(),
+            "an all-terminal graph must produce no starve diagnosis"
+        );
+    }
+
+    #[test]
+    fn starve_diagnosis_ignores_open_and_in_progress_as_cohorts() {
+        // Open and InProgress are the dispatchable/running states: a pile of
+        // them is not a parked cohort, and naming one would send operators
+        // chasing healthy work.
+        let mut graph = worksgood::graph::WorkGraph::new();
+        for index in 0..20 {
+            graph.add_node(worksgood::graph::Node::Task(Task {
+                id: format!("open-{index}"),
+                title: format!("open-{index}"),
+                status: Status::Open,
+                ..Task::default()
+            }));
+        }
+        for index in 0..3 {
+            graph.add_node(worksgood::graph::Node::Task(Task {
+                id: format!("waiting-{index}"),
+                title: format!("waiting-{index}"),
+                status: Status::Waiting,
+                ..Task::default()
+            }));
+        }
+        let diagnosis = diagnose_starve(&graph).expect("unfinished");
+        assert_eq!(
+            diagnosis.cohort_status, "waiting",
+            "the 20 Open tasks must not be reported as the parked cohort"
+        );
+        assert_eq!(diagnosis.cohort_count, 3);
     }
 
     #[test]
