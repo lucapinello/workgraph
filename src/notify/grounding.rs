@@ -6272,7 +6272,7 @@ label = "Fallback Member"
     /// delivered as composed — and a week with nothing pending can never fire,
     /// whatever the reply says.
     #[test]
-    fn a_settled_dinner_is_never_touched_the_flag_is_the_key() {
+    fn pending_guard_never_touches_a_settled_dinner_the_flag_is_the_key() {
         let wc = parse_week_context(&pending_week_context());
         for draft in [
             "Saturday's dinner is the sheet-pan margherita pizza \u{2014} all set. \u{1f355}",
