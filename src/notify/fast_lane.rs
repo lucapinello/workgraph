@@ -666,6 +666,12 @@ fn match_reminder(s: &str, now: NaiveDateTime) -> Option<FastLaneOp> {
     // "next Monday" is the STRICTLY following Monday — never today, even at 03:20
     // on a Monday with the clock still ahead of it.
     let strict_next = super::reminder::names_next_weekday(&body);
+    // Whether the day came from a RELATIVE word must survive `pull_day`, which
+    // hands back only the weekday such a word happens to land on. Without this,
+    // "today" was indistinguishable from a bare "Monday" and inherited the
+    // bare-weekday week-roll — which is how "today" once read back as a date
+    // seven days away.
+    let relative = super::reminder::relative_day_word(&body);
     let (day, body) = pull_day(&body, today);
     let (time, body) = pull_time(&body);
     let text = scrub_fillers(&body);
@@ -713,7 +719,17 @@ fn match_reminder(s: &str, now: NaiveDateTime) -> Option<FastLaneOp> {
     // DAYLESS ask to tomorrow ("remind me at 2:00 a.m." typed at 03:20 means the
     // next 2am, never the one that just passed). This lane could not see the time
     // of day until `classify_at`, and even then only rolled the weekday half.
+    //
+    // A RELATIVE day is neither: "today"/"tonight" names THIS day and nothing
+    // else, so an elapsed one has nowhere honest to roll to and is refused, as
+    // the DM parser refuses it — the family is asked. "Tomorrow" can never be
+    // elapsed and is left exactly where it landed.
     let date = if explicit.is_some() || strict_next.is_some() {
+        date
+    } else if let Some(rel) = relative {
+        if rel == super::reminder::RelativeDay::Today && date.and_time(clock) <= now {
+            return None;
+        }
         date
     } else if day.is_some() {
         if date.and_time(clock) <= now {
@@ -998,18 +1014,14 @@ fn upcoming_weekday(today: NaiveDate, wd: Weekday) -> NaiveDate {
 
 /// A relative day word ("today"/"tonight"/"this evening" → today,
 /// "tomorrow" → today+1), if present.
+///
+/// The word set lives in [`super::reminder::relative_day_word`] so both parsers
+/// read the same one; this only projects it onto a weekday.
 fn relative_day(s: &str, today: NaiveDate) -> Option<Weekday> {
-    if contains_word(s, "tomorrow") {
-        return Some((today + Duration::days(1)).weekday());
+    match super::reminder::relative_day_word(s)? {
+        super::reminder::RelativeDay::Tomorrow => Some((today + Duration::days(1)).weekday()),
+        super::reminder::RelativeDay::Today => Some(today.weekday()),
     }
-    if contains_word(s, "today")
-        || contains_word(s, "tonight")
-        || s.contains("this evening")
-        || s.contains("this morning")
-    {
-        return Some(today.weekday());
-    }
-    None
 }
 
 /// Pull the first day reference (named weekday or relative word) out of `frag`,
@@ -2866,6 +2878,85 @@ mod tests {
             Classification::FastLane(FastLaneOp::ReminderSet { date, time, .. }) => {
                 assert_eq!(date, NaiveDate::from_ymd_opt(2026, 7, 27).unwrap());
                 assert_eq!(time, None);
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn today_never_resolves_to_a_date_a_week_away() {
+        // "today" carries no typed date, so `pull_day` handed back the weekday it
+        // happens to fall on and the ask took the BARE-weekday roll: at 03:20 on
+        // Monday 27 July, "remind me today at 2:00 a.m." read back as "Monday,
+        // August 3" — the word "today" resolved to a date SEVEN DAYS away. An
+        // elapsed relative day is refused and asked about (the DM contract), and
+        // under no circumstances rolled a week.
+        let monday = NaiveDate::from_ymd_opt(2026, 7, 27).unwrap();
+        let a_week_on = NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        for (msg, now) in [
+            (
+                "remind me today at 2:00 a.m. to call the dentist",
+                monday_at(3, 20),
+            ),
+            (
+                "remind me tonight at 7:00 p.m. to call the dentist",
+                monday_at(20, 30),
+            ),
+            (
+                "remind me this morning at 2:00 a.m. to call the dentist",
+                monday_at(3, 20),
+            ),
+        ] {
+            match classify_at(msg, now) {
+                Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => panic!(
+                    "{msg:?} named an elapsed relative day and was written for {date} \
+                     (a week away: {})",
+                    date == a_week_on
+                ),
+                Classification::Fallback(_) => {}
+                other => panic!("expected a fallback, got {other:?}"),
+            }
+        }
+
+        // CONTROLS — a relative day is only refused once it is GONE.
+        match classify_at(
+            "remind me today at 9:00 a.m. to call the dentist",
+            monday_at(3, 20),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, time, .. }) => {
+                assert_eq!(date, monday, "a 'today' still ahead must stay on today");
+                assert_eq!(time.as_deref(), Some("09:00"));
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+        match classify_at(
+            "remind me tonight at 10:00 p.m. to call the dentist",
+            monday_at(20, 30),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, time, .. }) => {
+                assert_eq!(date, monday, "a 'tonight' still ahead must stay on today");
+                assert_eq!(time.as_deref(), Some("22:00"));
+            }
+            other => panic!("expected a reminder, got {other:?}"),
+        }
+        // "tomorrow" is never elapsed and must be untouched, at either hour.
+        for now in [monday_at(3, 20), monday_at(20, 30)] {
+            match classify_at("remind me tomorrow at 2:00 a.m. to call the dentist", now) {
+                Classification::FastLane(FastLaneOp::ReminderSet { date, time, .. }) => {
+                    assert_eq!(date, NaiveDate::from_ymd_opt(2026, 7, 28).unwrap());
+                    assert_eq!(time.as_deref(), Some("02:00"));
+                }
+                other => panic!("expected a reminder, got {other:?}"),
+            }
+        }
+        // CONTROL: a BARE weekday still rolls the whole week — that contract is
+        // untouched, and is exactly what "today" must not borrow.
+        match classify_at(
+            "remind me monday at 2:00 a.m. to call the dentist",
+            monday_at(3, 20),
+        ) {
+            Classification::FastLane(FastLaneOp::ReminderSet { date, .. }) => {
+                assert_eq!(date, a_week_on, "a bare elapsed weekday still rolls a week")
             }
             other => panic!("expected a reminder, got {other:?}"),
         }

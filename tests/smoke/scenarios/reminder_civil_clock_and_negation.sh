@@ -21,6 +21,17 @@
 #   5. the fast-lane confirmation dropped the resolved date, so three asks
 #      meaning two different days read back identically as "Monday at 09:00".
 #
+# A sixth break, on the ADJACENT relative-day case, was found by probing the
+# fixed tree (`fix-an-elapsed`) and the two parsers DISAGREED about it:
+#
+#   6. an ELAPSED "today"/"tonight" — "remind me today at 2:00 a.m." typed at
+#      03:20 — was FILED IN THE PAST by the DM parser (`DayKind::Relative` sat
+#      in the arm that leaves an elapsed instant alone) and rolled a WHOLE WEEK
+#      by the fast lane (`pull_day` hands back the weekday "today" falls on, so
+#      the ask inherited the bare-weekday roll and read back as "Monday,
+#      August 3"). Both now refuse it, as an elapsed typed date is refused;
+#      "tomorrow" is never elapsed and is untouched.
+#
 # So this scenario drives the FULL set against the installed binary: the set
 # forms, the readback (`--ask` / `--list`), the cancel, and every negative
 # control — through BOTH seams, each pinned at `--now 2026-07-27T03:20`.
@@ -141,23 +152,54 @@ refuses "Next Monday at 9:00 a.m. is unrelated; this isn't a reminder request."
 refuses 'Cancel the reminder about the dentist'
 echo "    → all three refused"
 
-echo "2d. CONTROL — the leap day is a REAL date and is still filed:"
+echo "2d. an ELAPSED relative day ('today'/'tonight') is asked about, never filed in the past:"
+# Reproduction 1: at 03:20, "today at 2:00 a.m." named a moment eighty minutes
+# gone and was registered anyway. Reproduction 2 needs its own pin — 20:30, when
+# "tonight at 7:00 p.m." is ninety minutes behind.
+refuses 'Remind me today at 2:00 a.m. to call the dentist'
+refuses 'Remind me tonight at 7:00 p.m. to call the dentist' '2026-07-27T20:30'
+echo "    → both refused"
+
+echo "2e. CONTROL — a relative day still AHEAD is filed, and 'tomorrow' is untouched:"
+got="$(due_for 'Remind me today at 9:00 a.m. to feed the cat')"
+[ "$got" = "2026-07-27T09:00" ] || loud_fail "'today' still ahead → $got, expected 2026-07-27T09:00"
+echo "    → today: $got"
+got="$(due_for 'Remind me tonight at 10:00 p.m. to lock the shed' '2026-07-27T20:30')"
+[ "$got" = "2026-07-27T22:00" ] || loud_fail "'tonight' still ahead → $got, expected 2026-07-27T22:00"
+echo "    → tonight: $got"
+# "Tomorrow" can never be elapsed — at 03:20 and at 20:30 alike it is 28 July.
+for pin in "$NOW" '2026-07-27T20:30'; do
+    got="$(due_for 'Remind me tomorrow at 2:00 a.m. to take the bins out' "$pin")"
+    [ "$got" = "2026-07-28T02:00" ] \
+        || loud_fail "'tomorrow' at $pin → $got, expected 2026-07-28T02:00"
+done
+echo "    → tomorrow: 2026-07-28T02:00 from both pins"
+
+echo "2f. CONTROL — the leap day is a REAL date and is still filed:"
 got="$(due_for 'Remind me to renew the passport on February 29 at 9:00 a.m.')"
 [ "$got" = "2028-02-29T09:00" ] || loud_fail "29 February → $got, expected 2028-02-29T09:00"
 echo "    → $got"
 
 # ── 3. READBACK: the store, and the answer the family gets back ──────────────
 
-echo "3a. the four filed reminders are all readable, on four distinct dates:"
+echo "3a. every filed reminder is readable, on the date it was resolved to:"
 list="$( (cd "$scratch" && WG_DIR="$scratch/.wg" wg --json telegram remind --list --now "$NOW") )"
-for want in 2026-08-03T09:00 2026-07-27T09:00 2026-07-28T02:00 2028-02-29T09:00; do
+for want in 2026-08-03T09:00 2026-07-27T09:00 2026-07-28T02:00 2026-07-27T22:00 2028-02-29T09:00; do
     case "$list" in
         *"$want"*) ;;
         *) loud_fail "readback is missing $want: $list" ;;
     esac
 done
 [ -f "$scratch/.casa/reminders-adhoc.json" ] || loud_fail "ad-hoc store not written"
-echo "    → four dates present"
+# And the store carries no row the clock has already passed: the two elapsed
+# instants above must be absent from the FILE, not merely absent from a reply.
+for gone in 2026-07-27T02:00 2026-07-27T19:00; do
+    if grep -q "$gone" "$scratch/.casa/reminders-adhoc.json"; then
+        loud_fail "an elapsed instant ($gone) was written to the store:
+$(cat "$scratch/.casa/reminders-adhoc.json")"
+    fi
+done
+echo "    → five dates present, no elapsed row in the store"
 
 echo "3b. asking WHEN one is set for answers with its resolved date:"
 answer="$( (cd "$scratch" && WG_DIR="$scratch/.wg" \
@@ -194,7 +236,45 @@ case "$(fl 'remind me to move the car at 2:00 a.m.')" in
 esac
 echo "    → Tuesday, July 28 at 02:00"
 
-echo "4c. every negative control falls back on the fast lane as well:"
+echo "4c. 'today' never resolves to a date a WEEK away on the fast lane:"
+# Reproduction 3, verbatim: this replied "Done — I'll remind you to call the
+# dentist Monday, August 3 at 02:00". The word "today" carries no typed date, so
+# `pull_day` handed back the weekday it falls on and the ask inherited the
+# bare-weekday week-roll. An elapsed relative day is refused here too.
+out="$(fl 'remind me today at 2:00 a.m. to call the dentist')"
+case "$out" in
+    *"August 3"*) loud_fail "the fast lane resolved 'today' to a date a week away: $out" ;;
+    *"reminder-set"*|*"I'll remind you"*|*"I.ll remind you"*)
+        loud_fail "the fast lane filed an elapsed 'today': $out" ;;
+esac
+out="$(fl 'remind me tonight at 7:00 p.m. to call the dentist' '2026-07-27T20:30')"
+case "$out" in
+    *"reminder-set"*|*"I'll remind you"*|*"I.ll remind you"*)
+        loud_fail "the fast lane filed an elapsed 'tonight': $out" ;;
+esac
+echo "    → both refused, and neither named 3 August"
+
+echo "4d. CONTROL — a relative day still ahead, and 'tomorrow', are named correctly:"
+case "$(fl 'remind me today at 9:00 a.m. to feed the cat')" in
+    *"Monday, July 27 at 09:00"*) ;;
+    *) loud_fail "'today' still ahead was not filed for today: $(fl 'remind me today at 9:00 a.m. to feed the cat')" ;;
+esac
+case "$(fl 'remind me tonight at 10:00 p.m. to lock the shed' '2026-07-27T20:30')" in
+    *"Monday, July 27 at 22:00"*) ;;
+    *) loud_fail "'tonight' still ahead was not filed for tonight: $(fl 'remind me tonight at 10:00 p.m. to lock the shed' '2026-07-27T20:30')" ;;
+esac
+case "$(fl 'remind me tomorrow at 2:00 a.m. to take the bins out')" in
+    *"Tuesday, July 28 at 02:00"*) ;;
+    *) loud_fail "'tomorrow' did not resolve to 28 July: $(fl 'remind me tomorrow at 2:00 a.m. to take the bins out')" ;;
+esac
+# And the BARE weekday roll the relative case must not borrow is still intact.
+case "$(fl 'remind me monday at 2:00 a.m. to call the dentist')" in
+    *"Monday, August 3 at 02:00"*) ;;
+    *) loud_fail "a bare elapsed weekday stopped rolling a week: $(fl 'remind me monday at 2:00 a.m. to call the dentist')" ;;
+esac
+echo "    → today/tonight stay on 27 July, tomorrow is 28 July, a bare Monday still rolls to 3 August"
+
+echo "4e. every negative control falls back on the fast lane as well:"
 for bad in 'remind me to call the dentist on Monday, July 27, 2026 at 2:00 a.m.' \
            'remind me to call the vet on Monday, February 30, 2027 at 9:00 a.m.' \
            'remind me to call the vet on 2027-02-30 at 9:00 a.m.' \
@@ -242,4 +322,4 @@ $(cat "$plan")"
 fi
 echo "    → gone"
 
-echo "PASS: reminder civil-clock + negation contract — an elapsed instant, an impossible date, a dayless clock and a negation are all refused, and both parsers name the date they resolved"
+echo "PASS: reminder civil-clock + negation contract — an elapsed instant (typed date OR 'today'/'tonight'), an impossible date, a dayless clock and a negation are all refused, 'tomorrow' is untouched, and both parsers name the date they resolved"

@@ -559,12 +559,19 @@ pub fn parse_reminder_intent(text: &str, now: NaiveDateTime) -> Option<AdHocInte
     // "call the dentist on Monday, July 27 at 2:00 a.m.", typed at 03:20 that
     // same Monday, names a moment eighty minutes gone, and only the family knows
     // whether they meant tomorrow, next week, or a typo. They are asked.
+    //
+    // "today" / "tonight" is refused on the SAME grounds. It names this day and
+    // no other, so there is nothing to roll to that the family actually said:
+    // adding a day invents "tomorrow", adding a week invents a date seven days
+    // out, and keeping it files a reminder in the past that can never fire.
+    // "Tomorrow" is never elapsed — no clock typed today can be behind it — so
+    // it is untouched here.
     let due = if due <= now {
         match day_kind {
             DayKind::None => (date + Duration::days(1)).and_time(time),
             DayKind::BareWeekday => (date + Duration::days(7)).and_time(time),
-            DayKind::CivilDate => return None,
-            DayKind::Relative | DayKind::NextWeekday => due,
+            DayKind::CivilDate | DayKind::RelativeToday => return None,
+            DayKind::RelativeTomorrow | DayKind::NextWeekday => due,
         }
     } else {
         due
@@ -815,15 +822,49 @@ fn scrub_cancel_noise(frag: &str) -> String {
         .join(" ")
 }
 
+/// A RELATIVE day word — one that names a day by its distance from now rather
+/// than by name or date. The two halves behave differently once a clock has
+/// elapsed, so they are distinguished: "today" can be gone by the time it is
+/// typed, "tomorrow" never can. Defined once here and read by BOTH parsers
+/// ([`parse_reminder_intent`] and the fast lane), because a relative day that
+/// means one thing on one seam and another on the other is the drift the
+/// two-parser contract exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelativeDay {
+    /// "today" / "tonight" / "this morning" / "this evening" — THIS day.
+    Today,
+    /// "tomorrow" — the next day, and therefore never already elapsed.
+    Tomorrow,
+}
+
+/// The relative day word a message carries, if any. "tomorrow" is tested first:
+/// "remind me tomorrow, not today" names tomorrow.
+pub(crate) fn relative_day_word(low: &str) -> Option<RelativeDay> {
+    if contains_word(low, "tomorrow") {
+        return Some(RelativeDay::Tomorrow);
+    }
+    if contains_word(low, "today")
+        || contains_word(low, "tonight")
+        || low.contains("this evening")
+        || low.contains("this morning")
+    {
+        return Some(RelativeDay::Today);
+    }
+    None
+}
+
 /// How the day part of a time expression was resolved. The caller needs this to
 /// decide whether a due instant that has already passed may be rolled forward:
-/// a BARE weekday rolls a whole week, an EXPLICIT date never does.
+/// a BARE weekday rolls a whole week, an EXPLICIT date never does, and an
+/// elapsed "today" is refused outright.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DayKind {
     /// No day word at all — the date defaulted to today.
     None,
-    /// "today" / "tonight" / "tomorrow".
-    Relative,
+    /// "today" / "tonight" / "this morning" — THIS day, and no other.
+    RelativeToday,
+    /// "tomorrow" — the next day, which cannot already be elapsed.
+    RelativeTomorrow,
     /// A bare weekday name ("Monday") — today counts when today is that weekday.
     BareWeekday,
     /// "next Monday" — the STRICTLY following Monday, never today.
@@ -841,7 +882,7 @@ pub(crate) enum DayKind {
 /// 1. an **explicit civil date** — when the family writes "Monday, August 3,
 ///    2026" the DATE is what they mean; the weekday word beside it is prose, and
 ///    resolving it as a weekday is how "August 3" once landed on July 27;
-/// 2. `today` / `tonight` / `tomorrow`;
+/// 2. a relative day word — `today` / `tonight` / `this morning` / `tomorrow`;
 /// 3. `next <weekday>` — the strictly FOLLOWING occurrence, never today;
 /// 4. a bare `<weekday>` — the next occurrence on or after today.
 fn resolve_day(low: &str, today: NaiveDate) -> (NaiveDate, Option<String>, DayKind) {
@@ -852,15 +893,18 @@ fn resolve_day(low: &str, today: NaiveDate) -> (NaiveDate, Option<String>, DayKi
             DayKind::CivilDate,
         );
     }
-    if contains_word(low, "tomorrow") {
-        return (
-            today + Duration::days(1),
-            Some("tomorrow".to_string()),
-            DayKind::Relative,
-        );
-    }
-    if contains_word(low, "today") || contains_word(low, "tonight") {
-        return (today, Some("today".to_string()), DayKind::Relative);
+    match relative_day_word(low) {
+        Some(RelativeDay::Tomorrow) => {
+            return (
+                today + Duration::days(1),
+                Some("tomorrow".to_string()),
+                DayKind::RelativeTomorrow,
+            );
+        }
+        Some(RelativeDay::Today) => {
+            return (today, Some("today".to_string()), DayKind::RelativeToday);
+        }
+        None => {}
     }
     if let Some(wd) = names_next_weekday(low) {
         return (
@@ -2111,6 +2155,62 @@ mod tests {
         let today = parse_reminder_intent("remind me to call the dentist at 9:00 a.m.", now)
             .expect("intent");
         assert_eq!(today.due, dt(2026, 7, 27, 9, 0));
+    }
+
+    #[test]
+    fn an_elapsed_relative_day_is_never_filed_in_the_past() {
+        // "today" and "tonight" name THIS day and no other. When the clock beside
+        // them has already gone, the ask names a moment that no longer exists —
+        // and only the family knows whether they meant tonight, tomorrow, or
+        // mistyped. Filing it in the past guarantees it never fires; rolling it
+        // silently invents a day they did not say. So it is refused and asked
+        // about, exactly as an elapsed typed date now is.
+        let now = dt(2026, 7, 27, 3, 20);
+        assert_eq!(
+            parse_reminder_intent("Remind me today at 2:00 a.m. to call the dentist", now),
+            None,
+            "an elapsed 'today' was filed eighty minutes in the past",
+        );
+        let evening = dt(2026, 7, 27, 20, 30);
+        assert_eq!(
+            parse_reminder_intent(
+                "Remind me tonight at 7:00 p.m. to call the dentist",
+                evening
+            ),
+            None,
+            "an elapsed 'tonight' was filed ninety minutes in the past",
+        );
+        // "this morning" / "this evening" name today just as plainly, and the
+        // fast lane already read them that way; both parsers refuse them elapsed.
+        assert_eq!(
+            parse_reminder_intent(
+                "Remind me this morning at 2:00 a.m. to call the dentist",
+                now
+            ),
+            None,
+            "an elapsed 'this morning' was filed in the past",
+        );
+
+        // CONTROLS — a relative day is only refused once it is GONE.
+        let ahead = parse_reminder_intent("Remind me today at 9:00 a.m. to call the dentist", now)
+            .expect("a 'today' still ahead is filed as asked");
+        assert_eq!(ahead.due, dt(2026, 7, 27, 9, 0));
+        let tonight = parse_reminder_intent(
+            "Remind me tonight at 10:00 p.m. to call the dentist",
+            dt(2026, 7, 27, 20, 30),
+        )
+        .expect("a 'tonight' still ahead is filed as asked");
+        assert_eq!(tonight.due, dt(2026, 7, 27, 22, 0));
+        // "tomorrow" is never elapsed — no clock typed today can be behind it —
+        // and must be untouched by the refusal, at either hour.
+        for anchor in [dt(2026, 7, 27, 3, 20), dt(2026, 7, 27, 20, 30)] {
+            let tomorrow = parse_reminder_intent(
+                "Remind me tomorrow at 2:00 a.m. to call the dentist",
+                anchor,
+            )
+            .expect("'tomorrow' is never elapsed");
+            assert_eq!(tomorrow.due, dt(2026, 7, 28, 2, 0));
+        }
     }
 
     #[test]
