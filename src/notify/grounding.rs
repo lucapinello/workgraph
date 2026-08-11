@@ -2842,8 +2842,30 @@ pub struct WeekContext {
     /// Weekdays the plan marks as no-cook (out / takeaway / leftovers). Not dishes:
     /// a sentence about cooking must never be "named" by one and rewritten.
     non_cook: std::collections::HashSet<String>,
+    /// The dinners the plan has LINED UP but the family has NOT agreed to — the ⏳
+    /// rows (task engine-twin-grounding, docs/20 §6 rule 12). Held in the block's own
+    /// order so a multi-day correction names the days the way the plan lists them.
+    /// Deliberately NOT merged into `by_day`: the "- " dinner row already carries the
+    /// dish, and a pending row is a QUALIFIER on that dinner, never a second one.
+    pending: Vec<PendingWeekRow>,
     today: Option<String>,
     tomorrow: Option<String>,
+}
+
+/// One dinner the plan has lined up while the family has not said yes to it: the
+/// `\u{2022} Awaiting the family's OK \u{2014} Friday (Jul 24): Salmon\u{2026}` row the gateway
+/// states in words (`weekSource.buildWeekContext`). The JS twin's `pendingRowsOf`
+/// shape, field for field, so the two guards reason over the same rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWeekRow {
+    /// Capitalised weekday ("Friday") — the shape the truth line states.
+    pub day: String,
+    /// The slot the row is for. The gateway states pending DINNERS, so this is
+    /// "dinner"; it is carried explicitly because the truth line names it and the
+    /// JS twin's rows carry a slot too.
+    pub slot: String,
+    /// The dish exactly as the plan spells it.
+    pub dish: String,
 }
 
 impl WeekContext {
@@ -2886,6 +2908,34 @@ pub fn parse_week_context(text: &str) -> WeekContext {
         // with no cooking. A "- " line is still a DINNER and nothing else, so an
         // engine build that predates this still reads exactly the map it always did.
         if let Some(rest) = line.strip_prefix("\u{2022} ") {
+            // \u{23f3} PENDING DINNERS (task engine-twin-grounding, docs/20 §6 rule 12). The
+            // gateway states each unagreed dinner on its own bulleted line, LEADING with
+            // "Awaiting the family's OK \u{2014} " — which is precisely why the generic branch
+            // below cannot read it (the head before the colon holds no weekday) and so why
+            // the gateway could ship its half alone without changing what any engine
+            // grounded on. Read now, as a QUALIFIER on the "- " dinner row: `by_day` is
+            // untouched, because the dish is already there and a proposal is not a second
+            // dinner.
+            if let Some(row) = strip_pending_prefix(rest) {
+                if let Some((left, dish)) = row.split_once(':') {
+                    let day = left.split('(').next().unwrap_or(left).trim().to_lowercase();
+                    let dish = dish.trim();
+                    if weekday_token(&day).is_some()
+                        && !dish.is_empty()
+                        && !dish.eq_ignore_ascii_case("not planned yet")
+                    {
+                        let day = capitalize_weekday(&day);
+                        if !wc.pending.iter().any(|p| p.day == day) {
+                            wc.pending.push(PendingWeekRow {
+                                day,
+                                slot: "dinner".to_string(),
+                                dish: dish.to_string(),
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some((left, dish)) = rest.split_once(':') {
                 let head = left.trim().to_lowercase();
                 let day = head.split('(').next().unwrap_or(&head).trim().to_string();
@@ -2919,6 +2969,22 @@ pub fn parse_week_context(text: &str) -> WeekContext {
         }
     }
     wc
+}
+
+/// The lead phrase the gateway puts on a \u{23f3} pending-dinner row, byte-identical to
+/// `weekSource.buildWeekContext`'s template. Both apostrophe forms are accepted so a
+/// typographic pass on the gateway copy cannot silently mute the guard.
+const PENDING_ROW_LEADS: &[&str] = &[
+    "Awaiting the family's OK \u{2014} ",
+    "Awaiting the family\u{2019}s OK \u{2014} ",
+];
+
+/// The `Friday (Jul 24): dish` remainder of a pending row, or `None` when this
+/// bulleted line is not one (a lunch row, a no-cook night, anything later).
+fn strip_pending_prefix(rest: &str) -> Option<&str> {
+    PENDING_ROW_LEADS
+        .iter()
+        .find_map(|lead| rest.strip_prefix(lead))
 }
 
 /// The first token in `s` that is a weekday name, lowercased (e.g. from "Friday
@@ -3527,6 +3593,265 @@ pub fn week_placement_rewrite(draft: &str, claims: &[MisplacedWeekClaim]) -> Str
     out.push_str(&draft[cursor..]);
     // A spliced-away trailing clause can leave dangling separators ("… — ").
     out.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// PENDING-DINNER GUARD (task engine-twin-grounding) — docs/20 §6 rule 12 on the
+// HEAVY lane, the ENGINE half. The twin of `composerGuard.mjs` §6.14
+// (`pendingMealClaims` / `pendingMealTruthLine` / `applyPendingMealRewrite`).
+//
+// THE FOURTH LIE DIRECTION. The three guards above cover DENYING a planned dish,
+// INVENTING one, and MOVING one. This one covers a dinner that is real, on the
+// right day, at the right slot — and NOT AGREED TO. A dinner carrying the plan's
+// own ⏳ is LINED UP, and the Week view renders it as an actionable "needs your OK"
+// chip; a reply that reports it as settled ("Friday's salmon is all set") makes the
+// same dinner a question on one surface and a fact on the other, which is how a
+// household shops for a Friday nobody said yes to.
+//
+// THE GATEWAY SHIPPED ITS HALF FIRST (task carry-the-pending): `buildWeekContext`
+// now states the ⏳ rows in words, on "• Awaiting the family's OK — Day (date):
+// dish" lines chosen precisely so an engine WITHOUT this guard drops them. Live
+// replies are composed HERE (CONTRIBUTING §2, the "both twins" rule), so until this
+// existed the enforcing copy was missing on the path that delivers most replies.
+//
+// THE RULE. A sentence that ASSERTS a pending dinner — declares it final ("all set",
+// "locked in"), or simply states it flat with its day/slot as this week's fact — is
+// corrected to name the dish, the day AND that it still needs the family's OK.
+// Exactly what §6.12 exempts is exempt here, for the same reasons, plus one more: a
+// sentence that ALREADY says it is not agreed ("still needs your OK", "pencilled
+// in", "a proposal") is the honest form we are steering toward and is never
+// rewritten — which is also what makes both rewrites idempotent.
+//
+// TWO SHAPES, because a sentence can name more than one pending dish and then there
+// is no single truth to substitute: exactly one → the sentence is SPLICED with the
+// truthful line (§6.12's surgical shape); more than one → the sentence survives and
+// the reply gains the fast read lane's own clause. The wording of both is
+// byte-identical to the JS twin and to `latencyTier.weekPendingClause`, so no two
+// lanes tell the family this in different words.
+// ---------------------------------------------------------------------------
+
+/// Cues that a sentence ALREADY states the dinner is not agreed. Matched against
+/// NORMALISED text, so apostrophes are gone ("hasn't" → "hasnt"). Byte-identical to
+/// the JS twin's `PENDING_ACK_CUES`.
+const PENDING_ACK_CUES: &[&str] = &[
+    "still needs",
+    "still need",
+    "needs your ok",
+    "need your ok",
+    "needs an ok",
+    "needs the ok",
+    "your ok",
+    "not yet agreed",
+    "not agreed",
+    "to confirm",
+    "confirm with",
+    "unconfirmed",
+    "pencilled",
+    "penciled",
+    "pencil",
+    "tentative",
+    "proposal",
+    "proposed",
+    "propose",
+    "provisional",
+    "up to you",
+    "if youre happy",
+    "sound ok",
+    "sounds ok",
+    "sound good",
+    "say the word",
+    "lined up",
+    "waiting on",
+    "awaiting",
+    "not locked",
+    "nothing locked",
+];
+
+/// Cues that a sentence declares the dinner DECIDED. Narrow on purpose: each is a
+/// claim of finality that a ⏳ row does not back. The JS twin's `SETTLED_CUES`.
+const PENDING_SETTLED_CUES: &[&str] = &[
+    "all set",
+    "is set",
+    "are set",
+    "all sorted",
+    "sorted",
+    "locked in",
+    "settled",
+    "confirmed",
+    "good to go",
+    "all done",
+    "taken care of",
+    "nailed down",
+    "squared away",
+    "decided",
+    "final",
+    "definitely",
+    "for sure",
+    "no need to",
+];
+
+/// A sentence that presents PENDING dinners as decided: the pending rows it names,
+/// the days they fall on (deduped, in the plan's order), and the sentence's byte
+/// span in the draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWeekClaim {
+    /// The pending rows this sentence names. Exactly one ⇒ the sentence is spliced
+    /// with the truth; more than one ⇒ the days ride in a trailing clause instead.
+    pub rows: Vec<PendingWeekRow>,
+    /// The capitalised weekdays those rows fall on, deduped, plan order.
+    pub days: Vec<String>,
+    /// Byte range of the offending sentence within the draft.
+    pub span: (usize, usize),
+}
+
+/// Sentences of `draft` that report a PENDING dinner as settled, against the
+/// forwarded week context. `[]` when the context states nothing pending — the guard
+/// is opt-in, so every settled week and every non-food turn is unchanged. Pure;
+/// spans are sorted and disjoint.
+pub fn pending_week_claims(draft: &str, wc: &WeekContext) -> Vec<PendingWeekClaim> {
+    if wc.pending.is_empty() {
+        return Vec::new();
+    }
+    // The multi-dish correction is a REPLY-level clause ("Friday and Sunday still
+    // need your OK."), so a reply-level acknowledgement anywhere already satisfies it
+    // — which is what makes appending the clause idempotent. A single-dish splice
+    // stays sentence-level: a reply that says "all set" in one breath and "still
+    // needs your OK" in the next is contradicting itself, and the settled half is
+    // still the half the family will believe.
+    let draft_acks = {
+        let whole = normalize(draft);
+        PENDING_ACK_CUES.iter().any(|cue| whole.contains(cue))
+    };
+    let mut out: Vec<PendingWeekClaim> = Vec::new();
+    for sentence in split_sentences_with_spans(draft) {
+        // A question or an offer PROPOSES rather than asserts — the shape we want.
+        if sentence.asks
+            || PLACEMENT_PROPOSAL_PHRASES
+                .iter()
+                .any(|cue| sentence.norm.contains(cue))
+            || PLACEMENT_PROPOSAL_WORDS
+                .iter()
+                .any(|w| norm_has_word(&sentence.norm, w))
+        {
+            continue;
+        }
+        // …and a sentence that already names the pending state is the honest form.
+        if PENDING_ACK_CUES
+            .iter()
+            .any(|cue| sentence.norm.contains(cue))
+        {
+            continue;
+        }
+        let named: Vec<PendingWeekRow> = wc
+            .pending
+            .iter()
+            .filter(|row| sentence_names_dish(&sentence.norm, &row.dish))
+            .cloned()
+            .collect();
+        if named.is_empty() || (named.len() > 1 && draft_acks) {
+            continue;
+        }
+        if mentions_leftovers(&sentence.norm) {
+            continue;
+        }
+        // ASSERTIVE either by declaring finality, or by placing the dish on a
+        // day/slot as this week's fact — the flat listing that reads exactly like a
+        // settled dinner. A casual mention with neither ("that salmon was a hit")
+        // claims nothing and is left alone.
+        let assertive = PENDING_SETTLED_CUES
+            .iter()
+            .any(|cue| sentence.norm.contains(cue))
+            || !claimed_days_in(&sentence.norm, wc).is_empty()
+            || claimed_slot_in(&sentence.norm).is_some();
+        if !assertive {
+            continue;
+        }
+        let mut days: Vec<String> = Vec::new();
+        for row in &named {
+            if !days.contains(&row.day) {
+                days.push(row.day.clone());
+            }
+        }
+        out.push(PendingWeekClaim {
+            rows: named,
+            days,
+            span: (sentence.start, sentence.end),
+        });
+    }
+    out.sort_by_key(|c| c.span.0);
+    out
+}
+
+/// The truthful sentence for ONE pending dinner — the placement §6.12 would state,
+/// plus the fact that makes it a proposal. NO emoji: this splices into a reply that
+/// already carries the persona's own glyph (as `week_placement_truth_line` does).
+/// Byte-identical to the JS twin's `pendingMealTruthLine`.
+pub fn week_pending_truth_line(row: &PendingWeekRow) -> String {
+    let slot = if row.slot.is_empty() {
+        "dinner"
+    } else {
+        row.slot.as_str()
+    };
+    format!(
+        "{}'s {} is {}, but it still needs your OK.",
+        row.day, slot, row.dish
+    )
+}
+
+/// "Friday and Sunday still need your OK." — the clause appended when a sentence
+/// names more than one pending dinner. Byte-identical wording to the JS twin's
+/// `pendingMealNoteLine` and to the fast read lane's `latencyTier.weekPendingClause`,
+/// so the lanes never disagree about how this is said.
+pub fn week_pending_note_line(days: &[String]) -> String {
+    let list = if days.len() <= 1 {
+        days.first().cloned().unwrap_or_default()
+    } else {
+        format!(
+            "{} and {}",
+            days[..days.len() - 1].join(", "),
+            days[days.len() - 1]
+        )
+    };
+    let verb = if days.len() == 1 { "needs" } else { "need" };
+    format!("{list} still {verb} your OK.")
+}
+
+/// Rewrite `draft` so each single-dish pending claim states the truth in place, and
+/// any multi-dish claim's days are named once in a trailing clause. Every other byte
+/// survives. Claims must come from `pending_week_claims` on the SAME draft (sorted,
+/// disjoint spans). Idempotent: both corrections acknowledge the pending state, so a
+/// second pass finds nothing to fix.
+pub fn week_pending_rewrite(draft: &str, claims: &[PendingWeekClaim]) -> String {
+    if claims.is_empty() {
+        return draft.to_string();
+    }
+    let mut out = String::with_capacity(draft.len() + 48);
+    let mut cursor = 0usize;
+    let mut note_days: Vec<String> = Vec::new();
+    for claim in claims {
+        if claim.rows.len() != 1 {
+            for day in &claim.days {
+                if !note_days.contains(day) {
+                    note_days.push(day.clone());
+                }
+            }
+            continue;
+        }
+        let (start, end) = claim.span;
+        if start < cursor || end > draft.len() {
+            continue; // defensive: never splice with a stale span
+        }
+        out.push_str(&draft[cursor..start]);
+        out.push_str(&week_pending_truth_line(&claim.rows[0]));
+        cursor = end;
+    }
+    out.push_str(&draft[cursor..]);
+    let out = out.trim().to_string();
+    if note_days.is_empty() {
+        out
+    } else {
+        format!("{out} {}", week_pending_note_line(&note_days))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5762,6 +6087,327 @@ label = "Fallback Member"
                 "a no-cook row was treated as a dish: {draft}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PENDING DINNERS (task engine-twin-grounding) — docs/20 §6 rule 12, the
+    // engine twin of composerGuard §6.14.
+    // -----------------------------------------------------------------------
+
+    /// THE REAL BLOCK, byte-for-byte as `weekSource.buildWeekContext` emits it for a
+    /// week whose Friday and Sunday dinners carry the plan's ⏳ and whose Saturday
+    /// does not (meals fixture + `nowMs` = 2026-07-24T12:00:00Z, TZ=UTC). Saturday is
+    /// the negative control that proves the guard is keyed on the FLAG and not on "is
+    /// this a dinner". The byte identity is not decorative: it is re-derived from the
+    /// live gateway builder by `tests/smoke/scenarios/engine_pending_dinner_cross_impl.sh`,
+    /// so a wording change on either side of the wire fails loudly instead of silently
+    /// muting this guard.
+    fn pending_week_context() -> String {
+        "This week's meals, parsed from the family plan. Answer any meal question (today,\n\
+         tomorrow, a named day, dinner OR lunch) FROM this list \u{2014} never from the plan's prose\n\
+         notes or a week \"skeleton\", and never from another day's row. If a day below has an\n\
+         entry, that day is planned:\n\
+         - Friday (Jul 24): Salmon over warm Puy lentils\n\
+         - Saturday (Jul 25): Sheet-pan margherita pizza\n\
+         - Sunday (Jul 26): Clear-the-fridge frittata\n\
+         These dinners are LINED UP but the family has NOT agreed to them yet (the plan\n\
+         marks each with \u{23f3} and the Week view shows it as a \"needs your OK\" chip). Treat\n\
+         them as PROPOSALS: name the day and the dish if asked, say plainly that it still\n\
+         needs their OK, and never report one as settled, sorted, locked in or good to go:\n\
+         \u{2022} Awaiting the family's OK \u{2014} Friday (Jul 24): Salmon over warm Puy lentils\n\
+         \u{2022} Awaiting the family's OK \u{2014} Sunday (Jul 26): Clear-the-fridge frittata\n\
+         The plan names no lunches this week \u{2014} say so plainly if asked; do not answer a\n\
+         lunch question with a dinner.\n\
+         Today is Friday \u{2014} dinner: Salmon over warm Puy lentils.\n\
+         Tomorrow is Saturday \u{2014} dinner: Sheet-pan margherita pizza."
+            .to_string()
+    }
+
+    /// The drafts the cross-impl gate compares the two implementations on. Each is a
+    /// live reply SHAPE, not a synthetic string: a settled claim, a flat listing, the
+    /// settled-dinner control, the four truthful forms, a casual mention, a multi-dish
+    /// listing, and the moved-dish chain (§6.12 then rule 12).
+    fn pending_parity_drafts() -> Vec<&'static str> {
+        vec![
+            "Friday's dinner is the salmon over Puy lentils \u{2014} all set. \u{1f373}",
+            "Sunday: clear-the-fridge frittata.",
+            "Saturday's dinner is the sheet-pan margherita pizza \u{2014} all set. \u{1f355}",
+            "I've lined up salmon over Puy lentils for Friday, but it still needs your OK.",
+            "Friday's salmon is pencilled in \u{2014} happy with it, or shall I swap it?",
+            "Want me to put the clear-the-fridge frittata on Sunday?",
+            "Sunday's frittata is a proposal \u{2014} say the word and I'll lock it in.",
+            "That salmon was a hit last time. \u{1f373}",
+            "This week's dinners: Friday salmon over Puy lentils, Saturday pizza, Sunday the clear-the-fridge frittata.",
+            "Enjoy that clear-the-fridge frittata tomorrow \u{2014} perfect for lunch! \u{1f373}",
+        ]
+    }
+
+    /// The guard chain `finalize_composed_reply` runs, in its order: the placement
+    /// rewrite first, then rule 12 ON ITS OUTPUT. Used by the parity fixture so the
+    /// cross-impl comparison is against the JS `finalizeComposedReply` chain and not
+    /// against one function in isolation.
+    fn pending_guard_chain(draft: &str, wc: &WeekContext) -> String {
+        let text = week_placement_rewrite(draft, &misplaced_week_claims(draft, wc));
+        week_pending_rewrite(&text, &pending_week_claims(&text, wc))
+    }
+
+    /// THE READ HALF. The gateway states its ⏳ rows in words; the engine used to drop
+    /// them on the floor (its "• " branch records only a lunch head or a "no cooking"
+    /// dish), which is exactly what made the gateway's half safe to ship alone. They
+    /// are read now, day and dish, in the plan's own order.
+    #[test]
+    fn parse_week_context_reads_the_pending_rows_the_gateway_states() {
+        let wc = parse_week_context(&pending_week_context());
+        assert_eq!(
+            wc.pending,
+            vec![
+                PendingWeekRow {
+                    day: "Friday".to_string(),
+                    slot: "dinner".to_string(),
+                    dish: "Salmon over warm Puy lentils".to_string(),
+                },
+                PendingWeekRow {
+                    day: "Sunday".to_string(),
+                    slot: "dinner".to_string(),
+                    dish: "Clear-the-fridge frittata".to_string(),
+                },
+            ],
+            "the \u{23f3} rows must be read, in the plan's order"
+        );
+        // The SETTLED dinner is not among them — the flag is the key.
+        assert!(
+            !wc.pending.iter().any(|p| p.day == "Saturday"),
+            "a settled dinner was recorded as pending: {:?}",
+            wc.pending
+        );
+    }
+
+    /// …AND THE DINNER MAP IS UNCHANGED BY THOSE LINES. A pending row is a QUALIFIER
+    /// on the "- " dinner row, not a second dinner: if it leaked into `by_day` the
+    /// placement guard would see two rows for one day and a truthful reply could start
+    /// being "corrected". Proven against the same block with the pending lines
+    /// deleted, so this is an identity, not a spot check.
+    #[test]
+    fn pending_rows_leave_the_dinner_map_untouched() {
+        let full = pending_week_context();
+        let without: String = full
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("\u{2022} Awaiting"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            without.len() < full.len(),
+            "the fixture must actually carry pending lines"
+        );
+        let wc = parse_week_context(&full);
+        let bare = parse_week_context(&without);
+        let mut got: Vec<(&String, &String)> = wc.by_day.iter().collect();
+        let mut want: Vec<(&String, &String)> = bare.by_day.iter().collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "the pending lines changed the DINNER map");
+        assert_eq!(wc.by_day.len(), 3, "{:?}", wc.by_day);
+        assert_eq!(
+            wc.by_day.get("friday").map(String::as_str),
+            Some("Salmon over warm Puy lentils")
+        );
+        // …and they invent no lunch and no no-cook night either.
+        assert!(wc.lunch_by_day.is_empty(), "{:?}", wc.lunch_by_day);
+        assert!(wc.non_cook.is_empty(), "{:?}", wc.non_cook);
+        assert_eq!(wc.today.as_deref(), Some("friday"));
+        assert_eq!(wc.tomorrow.as_deref(), Some("saturday"));
+        // The pre-pending block parses to NO pending rows, so an older gateway (and
+        // every settled week) leaves this guard inert.
+        assert!(bare.pending.is_empty(), "{:?}", bare.pending);
+        assert!(parse_week_context(&c004_week_context()).pending.is_empty());
+    }
+
+    /// THE LIE RULE 12 FORBIDS: a dinner nobody agreed to, reported as decided. The
+    /// offending sentence is spliced with the truth; the persona's glyph survives.
+    #[test]
+    fn a_pending_dinner_asserted_as_settled_is_corrected() {
+        let wc = parse_week_context(&pending_week_context());
+        let draft = "Friday's dinner is the salmon over Puy lentils \u{2014} all set. \u{1f373}";
+        let claims = pending_week_claims(draft, &wc);
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].days, vec!["Friday".to_string()]);
+        assert_eq!(claims[0].rows.len(), 1);
+        let fixed = week_pending_rewrite(draft, &claims);
+        assert_eq!(
+            fixed,
+            "Friday's dinner is Salmon over warm Puy lentils, but it still needs your OK. \u{1f373}"
+        );
+        assert!(fixed.ends_with('\u{1f373}'), "{fixed}");
+        // IDEMPOTENT: the correction itself acknowledges the pending state.
+        assert!(
+            pending_week_claims(&fixed, &wc).is_empty(),
+            "the correction was re-flagged"
+        );
+    }
+
+    /// A FLAT LISTING is an assertion too — no settled vocabulary at all, the lie is
+    /// that a proposal is stated with exactly the confidence of a decision. This is
+    /// the live shape rule 12 was written for.
+    #[test]
+    fn a_flat_listing_of_a_pending_dinner_is_an_assertion_too() {
+        let wc = parse_week_context(&pending_week_context());
+        let draft = "Sunday: clear-the-fridge frittata.";
+        let claims = pending_week_claims(draft, &wc);
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(
+            week_pending_rewrite(draft, &claims),
+            "Sunday's dinner is Clear-the-fridge frittata, but it still needs your OK."
+        );
+        assert_eq!(
+            week_pending_truth_line(&PendingWeekRow {
+                day: "Sunday".to_string(),
+                slot: "dinner".to_string(),
+                dish: "Clear-the-fridge frittata".to_string(),
+            }),
+            "Sunday's dinner is Clear-the-fridge frittata, but it still needs your OK."
+        );
+    }
+
+    /// THE NEGATIVE CONTROL. A SETTLED dinner said in exactly the flagged shapes is
+    /// delivered as composed — and a week with nothing pending can never fire,
+    /// whatever the reply says.
+    #[test]
+    fn a_settled_dinner_is_never_touched_the_flag_is_the_key() {
+        let wc = parse_week_context(&pending_week_context());
+        for draft in [
+            "Saturday's dinner is the sheet-pan margherita pizza \u{2014} all set. \u{1f355}",
+            "Saturday: sheet-pan margherita pizza.",
+        ] {
+            assert!(
+                pending_week_claims(draft, &wc).is_empty(),
+                "flagged a settled dinner: {draft}"
+            );
+            assert_eq!(week_pending_rewrite(draft, &[]), draft);
+        }
+        let settled: String = pending_week_context()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("\u{2022} Awaiting"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let settled = parse_week_context(&settled);
+        assert!(
+            pending_week_claims(
+                "Friday's dinner is the salmon over Puy lentils \u{2014} all set.",
+                &settled
+            )
+            .is_empty(),
+            "a week with no \u{23f3} row fired the guard"
+        );
+        // The env-unset path (no block at all) is inert too.
+        assert!(
+            pending_week_claims("Friday's salmon is all set.", &parse_week_context("")).is_empty()
+        );
+    }
+
+    /// A TRUTHFUL reply about the same pending dinner passes untouched — the honest
+    /// forms are what the guard steers toward, so rewriting one would be a regression
+    /// AND would break idempotence.
+    #[test]
+    fn a_truthful_pending_reply_passes_untouched() {
+        let wc = parse_week_context(&pending_week_context());
+        for draft in [
+            "I've lined up salmon over Puy lentils for Friday, but it still needs your OK.",
+            "Friday's salmon is pencilled in \u{2014} happy with it, or shall I swap it?",
+            "Want me to put the clear-the-fridge frittata on Sunday?",
+            "Sunday's frittata is a proposal \u{2014} say the word and I'll lock it in.",
+            // A casual, past-tense mention claims nothing about the plan either.
+            "That salmon was a hit last time. \u{1f373}",
+        ] {
+            assert!(
+                pending_week_claims(draft, &wc).is_empty(),
+                "flagged a truthful line: {draft}"
+            );
+            assert_eq!(week_pending_rewrite(draft, &[]), draft);
+        }
+    }
+
+    /// TWO pending dishes in one sentence: there is no single truth to substitute, so
+    /// the sentence survives and the reply gains the fast read lane's own clause.
+    #[test]
+    fn a_multi_dish_pending_assertion_gains_the_note_clause() {
+        let wc = parse_week_context(&pending_week_context());
+        let draft = "This week's dinners: Friday salmon over Puy lentils, Saturday pizza, Sunday the clear-the-fridge frittata.";
+        let claims = pending_week_claims(draft, &wc);
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(
+            claims[0].days,
+            vec!["Friday".to_string(), "Sunday".to_string()]
+        );
+        let fixed = week_pending_rewrite(draft, &claims);
+        assert_eq!(
+            fixed,
+            format!("{draft} Friday and Sunday still need your OK.")
+        );
+        assert_eq!(
+            week_pending_note_line(&["Friday".to_string(), "Sunday".to_string()]),
+            "Friday and Sunday still need your OK."
+        );
+        assert_eq!(
+            week_pending_note_line(&["Friday".to_string()]),
+            "Friday still needs your OK."
+        );
+        // IDEMPOTENT: the appended clause is itself an acknowledgement.
+        assert!(pending_week_claims(&fixed, &wc).is_empty(), "{fixed}");
+    }
+
+    /// THE CHAIN, in `finalize_composed_reply`'s order. §6.12 fires first and states a
+    /// bare "Sunday's dinner is …" — which on a ⏳ row is itself the settled claim rule
+    /// 12 forbids, so rule 12 must run ON ITS OUTPUT or the guard chain manufactures
+    /// the very lie it exists to stop.
+    #[test]
+    fn a_moved_pending_dish_is_put_back_and_kept_a_proposal() {
+        let wc = parse_week_context(&pending_week_context());
+        let draft =
+            "Enjoy that clear-the-fridge frittata tomorrow \u{2014} perfect for lunch! \u{1f373}";
+        let moved = misplaced_week_claims(draft, &wc);
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        let placed = week_placement_rewrite(draft, &moved);
+        assert_eq!(
+            placed, "Sunday's dinner is Clear-the-fridge frittata. \u{1f373}",
+            "the placement guard's own output states it as settled"
+        );
+        let fixed = pending_guard_chain(draft, &wc);
+        assert_eq!(
+            fixed,
+            "Sunday's dinner is Clear-the-fridge frittata, but it still needs your OK. \u{1f373}"
+        );
+        assert!(!fixed.to_lowercase().contains("tomorrow"), "{fixed}");
+    }
+
+    /// THE CROSS-IMPL FIXTURE. Prints the block and every draft's chained output so
+    /// `tests/smoke/scenarios/engine_pending_dinner_cross_impl.sh` can diff this
+    /// implementation against the JS twin's `finalizeComposedReply` on the SAME bytes.
+    /// It asserts too — a printer that asserted nothing could print anything — but the
+    /// judgement of parity is the scenario's, run with `-- --nocapture`.
+    #[test]
+    fn pending_parity_fixture_prints_both_the_block_and_every_output() {
+        let block = pending_week_context();
+        let wc = parse_week_context(&block);
+        assert_eq!(wc.pending.len(), 2, "the fixture must carry \u{23f3} rows");
+        println!(
+            "PARITY-BLOCK {}",
+            serde_json::to_string(&block).expect("block json")
+        );
+        let mut corrected = 0usize;
+        for draft in pending_parity_drafts() {
+            let out = pending_guard_chain(draft, &wc);
+            if out != draft {
+                corrected += 1;
+            }
+            println!(
+                "PARITY-CASE {}",
+                serde_json::json!({ "draft": draft, "out": out })
+            );
+        }
+        assert!(
+            corrected >= 4,
+            "the parity corpus must contain corrected cases, not only inert ones"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -3263,6 +3263,34 @@ async fn finalize_composed_reply(
             );
             reply_text = grounding::week_placement_rewrite(&reply_text, &misplaced);
         }
+        // PENDING-DINNER GUARD (task engine-twin-grounding, docs/20 §6 rule 12): the
+        // FOURTH lie direction, and the engine half of a rule that shipped on the
+        // gateway alone (task carry-the-pending). The three guards above catch a
+        // planned dish DENIED, INVENTED or MOVED; this catches one that is real, on
+        // the right day, at the right slot — and NOT AGREED TO. A dinner carrying the
+        // plan's ⏳ is lined up, and the Week view shows it as an actionable "needs
+        // your OK" chip, so a reply calling it settled makes the same dinner a
+        // question on one surface and a fact on the other — which is how a household
+        // shops for a Friday nobody said yes to.
+        //
+        // LAST OF THE FOUR, ON PURPOSE. It must see the OUTPUT of the two rewrites
+        // above, because both of them state a bare "Friday's dinner is X" — which on
+        // a ⏳ row is itself the settled claim rule 12 forbids. Running it earlier
+        // would let the guard chain manufacture the very lie it exists to stop.
+        // Opt-in and inert on a settled week: the gateway only states ⏳ rows when the
+        // plan marks some, and an engine reading a block without them finds nothing.
+        let pending = grounding::pending_week_claims(&reply_text, &wc);
+        if !pending.is_empty() {
+            eprintln!(
+                "[{}] pending-dinner guard: {agent_id}'s draft reports unagreed dinner(s) {:?} as settled — restating them as proposals",
+                chrono::Utc::now().format("%H:%M:%S"),
+                pending
+                    .iter()
+                    .flat_map(|c| c.rows.iter().map(|r| format!("{} {}", r.day, r.dish)))
+                    .collect::<Vec<_>>(),
+            );
+            reply_text = grounding::week_pending_rewrite(&reply_text, &pending);
+        }
     }
 
     // REPETITION GUARD (rule 2): never send the same summary a third time. If
@@ -8198,6 +8226,172 @@ domains = ["calendar", "coordination", "shopping"]
         );
         // The honest, calendar-referencing fallback went out instead.
         assert!(lc.contains("calendar"), "not the honest fallback: {last}");
+    }
+
+    /// The gateway's real `buildWeekContext` block for a week whose Friday and
+    /// Sunday dinners carry the plan's ⏳ and whose Saturday does not — Saturday is
+    /// the negative control. Byte-identical to the fixture in `grounding.rs`, which
+    /// the cross-impl smoke scenario re-derives from the live gateway builder.
+    fn pending_week_block() -> &'static str {
+        "This week's meals, parsed from the family plan. Answer any meal question (today,\n\
+         tomorrow, a named day, dinner OR lunch) FROM this list — never from the plan's prose\n\
+         notes or a week \"skeleton\", and never from another day's row. If a day below has an\n\
+         entry, that day is planned:\n\
+         - Friday (Jul 24): Salmon over warm Puy lentils\n\
+         - Saturday (Jul 25): Sheet-pan margherita pizza\n\
+         - Sunday (Jul 26): Clear-the-fridge frittata\n\
+         These dinners are LINED UP but the family has NOT agreed to them yet (the plan\n\
+         marks each with ⏳ and the Week view shows it as a \"needs your OK\" chip). Treat\n\
+         them as PROPOSALS: name the day and the dish if asked, say plainly that it still\n\
+         needs their OK, and never report one as settled, sorted, locked in or good to go:\n\
+         • Awaiting the family's OK — Friday (Jul 24): Salmon over warm Puy lentils\n\
+         • Awaiting the family's OK — Sunday (Jul 26): Clear-the-fridge frittata\n\
+         The plan names no lunches this week — say so plainly if asked; do not answer a\n\
+         lunch question with a dinner.\n\
+         Today is Friday — dinner: Salmon over warm Puy lentils.\n\
+         Tomorrow is Saturday — dinner: Sheet-pan margherita pizza."
+    }
+
+    /// Drive one composed turn with `draft` as the model's reply and the pending
+    /// week block forwarded, and return exactly what was SENT to the family.
+    async fn delivered_with_pending_week(
+        request_id: &str,
+        human_message: &str,
+        draft: &str,
+        week: Option<&str>,
+    ) -> (String, tempfile::TempDir, String) {
+        let dir = tempdir().unwrap();
+        let wg = dir.path().join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let cfg = cfg_with_bots(&[("nora", Some("nora"))]);
+        let uuid = create_session(&wg, SessionKind::Interactive, &[], None).unwrap();
+        bind_agent(&wg, "nora", &uuid).unwrap();
+        confirm_human(&wg, "luca-1", "human-luca", "nora");
+        let plan = plan_conversation(&wg, &cfg, "telegram:nora", "555", "luca-1", Entry::Direct);
+        let sink = RecSink::default();
+        let composer = FakeComposer::ok(draft);
+        run_conversation_turn_with_week_context(
+            &wg,
+            &plan,
+            human_message,
+            request_id,
+            fast_timing(),
+            Some(&composer),
+            &sink,
+            week,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+        )
+        .await
+        .unwrap();
+        let delivered = sink.calls().last().unwrap().2.clone();
+        // The scratch dir must outlive the caller's outbox assertions, so it is handed
+        // back rather than dropped here (a dropped TempDir deletes the session).
+        (delivered, dir, uuid)
+    }
+
+    /// PENDING-DINNER GUARD ON THE REAL DELIVERY PATH (task engine-twin-grounding,
+    /// docs/20 §6 rule 12). `carry-the-pending` shipped the gateway half; live
+    /// replies are composed HERE, so this is the half that decides what the family
+    /// actually reads. A ⏳ dinner reported as settled is restated as the proposal it
+    /// is — in the SENT bytes and in the session outbox, not merely in a unit test of
+    /// the guard.
+    #[tokio::test]
+    async fn ground_pending_dinner_is_restated_as_a_proposal_on_the_real_path() {
+        let (delivered, dir, uuid) = delivered_with_pending_week(
+            "req-pending-settled",
+            "anything happening Friday?",
+            "Friday's dinner is the salmon over Puy lentils — all set. 🍳",
+            Some(pending_week_block()),
+        )
+        .await;
+        assert_eq!(
+            delivered,
+            "Friday's dinner is Salmon over warm Puy lentils, but it still needs your OK. 🍳",
+            "the settled claim reached the family"
+        );
+        let outbox = chat::read_outbox_since_ref(&dir.path().join(".wg"), &uuid, 0).unwrap();
+        assert_eq!(
+            outbox.last().map(|m| m.content.as_str()),
+            Some(delivered.as_str()),
+            "the corrected copy must be what the outbox / TUI / casa feed replay"
+        );
+
+        // TEETH 1 — the SETTLED dinner in the very same shape is delivered as
+        // composed. The guard is keyed on the plan's flag, not on "is this a dinner".
+        let (settled, _, _) = delivered_with_pending_week(
+            "req-pending-settled-control",
+            "anything happening Saturday?",
+            "Saturday's dinner is the sheet-pan margherita pizza — all set. 🍕",
+            Some(pending_week_block()),
+        )
+        .await;
+        assert_eq!(
+            settled, "Saturday's dinner is the sheet-pan margherita pizza — all set. 🍕",
+            "a settled dinner was rewritten"
+        );
+
+        // TEETH 2 — OPT-IN: with no forwarded block (the Telegram-listener path) the
+        // guard cannot fire, so the same draft is delivered untouched.
+        let (unforwarded, _, _) = delivered_with_pending_week(
+            "req-pending-no-context",
+            "anything happening Friday?",
+            "Friday's dinner is the salmon over Puy lentils — all set. 🍳",
+            None,
+        )
+        .await;
+        assert_eq!(
+            unforwarded, "Friday's dinner is the salmon over Puy lentils — all set. 🍳",
+            "the guard fired without a forwarded week block"
+        );
+    }
+
+    /// THE ORDER IS LOAD-BEARING, AND THIS IS THE CASE THAT PROVES IT. The
+    /// never-claim-empty rewrite emits a bare "Friday's dinner is <dish>." — which on
+    /// a ⏳ row is itself the settled claim rule 12 forbids. The draft here names no
+    /// dish at all, so rule 12 has nothing to catch in it: run BEFORE those rewrites
+    /// the guard is inert and the manufactured settled claim is what the family reads.
+    /// Run last — as it is wired — the chain ends on the truth.
+    #[tokio::test]
+    async fn ground_pending_guard_runs_after_the_earlier_week_rewrites() {
+        let (delivered, _, _) = delivered_with_pending_week(
+            "req-pending-after-empty",
+            "anything happening Friday?",
+            "Nothing's locked in for Friday yet.",
+            Some(pending_week_block()),
+        )
+        .await;
+        assert_eq!(
+            delivered,
+            "Friday's dinner is Salmon over warm Puy lentils, but it still needs your OK.",
+            "the never-claim-empty rewrite's own settled claim reached the family"
+        );
+    }
+
+    /// …and the placement guard's correction is held to the same rule: it also states
+    /// a bare "Sunday's dinner is …", so a MOVED pending dish must be put back AND
+    /// kept a proposal in one pass. This case does not by itself pin the ORDER (rule
+    /// 12's truth line names the plan's real day, so running it first happens to fix
+    /// the placement too) — the test above is what makes the order load-bearing. What
+    /// this pins is that the chain COMPOSES: disarm the rule-12 call site and the
+    /// delivered line becomes the placement guard's own "Sunday's dinner is …".
+    #[tokio::test]
+    async fn ground_pending_guard_runs_on_the_placement_rewrites_output() {
+        let (delivered, _, _) = delivered_with_pending_week(
+            "req-pending-moved",
+            "what should I look forward to?",
+            "Enjoy that clear-the-fridge frittata tomorrow — perfect for lunch! 🍳",
+            Some(pending_week_block()),
+        )
+        .await;
+        assert_eq!(
+            delivered,
+            "Sunday's dinner is Clear-the-fridge frittata, but it still needs your OK. 🍳",
+            "the moved dish must be put back AND kept a proposal"
+        );
+        assert!(
+            !delivered.to_lowercase().contains("tomorrow"),
+            "{delivered}"
+        );
     }
 
     /// ENGINE DELIVERY-SEAM REGRESSION: a composed reply is cleaned on the
