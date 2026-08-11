@@ -2158,6 +2158,13 @@ fn try_reminder_readback(
 /// matches more than one. It never creates anything: this runs BEFORE
 /// [`try_register_reminder`] precisely so a cancel phrase cannot be filed as a
 /// brand-new reminder (date-reminder-fail (c)).
+///
+/// AMBIGUITY IS DECIDED ACROSS BOTH SURFACES, NOT JUST THIS ONE (task
+/// cross-surface-reminder). The same words can name a `⏰ Reminder` row in the week
+/// plan as easily as an ad-hoc one, and this lane sees only the ad-hoc store — so
+/// "the one match" it used to act on could be one of two live reminders, and the
+/// family got "Cancelled — …" for a reminder they still had. It now surveys the
+/// plan too and stands down unless the ad-hoc row is the ONLY candidate anywhere.
 fn try_cancel_reminder(
     workgraph_dir: &Path,
     sender: &str,
@@ -2179,6 +2186,16 @@ fn try_cancel_reminder(
     }
 
     let root = project_root(workgraph_dir);
+
+    // ONE unambiguous target across both surfaces, or nothing goes. A plan row in
+    // the count means this lane is not the one to act: the fast lane owns the plan
+    // surface and will either remove that row or ask, and either way it must not
+    // find the ad-hoc reminder already deleted underneath it.
+    let survey = worksgood::notify::fast_lane::cancel_candidates(&root, &req.target, req.day, now);
+    if survey.total() != 1 || survey.adhoc != 1 {
+        return None;
+    }
+
     let path = AdHocStore::path(&root);
     let mut store = AdHocStore::load(&path);
     let cancelled = match store.cancel(&req, now) {
@@ -11343,6 +11360,106 @@ domains = ["coordination"]
         );
     }
 
+    /// cross-surface-reminder: this lane sees only the ad-hoc store, so "the one
+    /// match" it acts on may be one of TWO live reminders — the other being a
+    /// `⏰ Reminder` row in the week plan. It used to delete its own and confirm,
+    /// leaving the family a reminder they thought they had cancelled (and the fast
+    /// lane a plan row to remove or ask about, with its ad-hoc twin already gone).
+    /// Ambiguity is now decided across both surfaces before either is touched.
+    #[test]
+    fn a_dm_cancel_stands_down_when_the_plan_holds_a_match_too() {
+        use worksgood::notify::reminder::AdHocStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::create_dir_all(root.join("plans")).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "garden-relay"
+name = "Garden Relay"
+domains = ["coordination"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
+
+        // Sunday 2026-07-12; the plan week that follows carries its OWN pending
+        // dentist reminder on the Thursday.
+        std::fs::write(
+            root.join("plans").join("2026-W29-family-plan.md"),
+            "# Family plan — 2026-W29\n\n\
+             **Week of Monday 2026-07-13 → Sunday 2026-07-19**\n\n\
+             ## 3. Calendar (Otto) — combined projection\n\n\
+             | Day | Time | Event | Source |\n\
+             |-----|------|-------|--------|\n\
+             | Thu 07-16 | 09:00 | ⏰ Reminder: book the dentist | Otto |\n",
+        )
+        .unwrap();
+
+        let now =
+            chrono::NaiveDateTime::parse_from_str("2026-07-12T10:00", "%Y-%m-%dT%H:%M").unwrap();
+        assert!(try_register_reminder(
+            &wg,
+            "7001001",
+            "household-handle",
+            "remind me Thursday at 9am to call the dentist",
+            now,
+        )
+        .is_some());
+        let before = std::fs::read(AdHocStore::path(root)).unwrap();
+
+        assert!(
+            try_cancel_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "cancel the reminder about the dentist",
+                now,
+            )
+            .is_none(),
+            "two live candidates across the two surfaces must not be resolved here"
+        );
+        assert_eq!(
+            std::fs::read(AdHocStore::path(root)).unwrap(),
+            before,
+            "the ad-hoc reminders must be byte-identical when the lane stands down"
+        );
+
+        // CONTROL: with the plan's own row gone, the same words are unambiguous
+        // again and this lane does act.
+        std::fs::write(
+            root.join("plans").join("2026-W29-family-plan.md"),
+            "# Family plan — 2026-W29\n\n\
+             **Week of Monday 2026-07-13 → Sunday 2026-07-19**\n\n\
+             ## 3. Calendar (Otto) — combined projection\n\n\
+             | Day | Time | Event | Source |\n\
+             |-----|------|-------|--------|\n\
+             | Thu 07-16 | 18:30 | Cook: chickpea & spinach curry | Bruno |\n",
+        )
+        .unwrap();
+        let confirmation = try_cancel_reminder(
+            &wg,
+            "7001001",
+            "household-handle",
+            "cancel the reminder about the dentist",
+            now,
+        )
+        .expect("the sole remaining candidate is cancelled");
+        assert!(
+            confirmation.to_lowercase().contains("dentist"),
+            "the confirmation names what went: {confirmation}"
+        );
+        assert!(
+            AdHocStore::load(&AdHocStore::path(root))
+                .reminders
+                .is_empty(),
+            "the ad-hoc reminder should be gone once it is the only candidate"
+        );
+    }
     /// reminder-readback-lane: the DM seam must READ a filed reminder back from
     /// what is on disk — with the date the STORE holds, never the one the
     /// question asserts — scope it to the person asking, and write nothing.

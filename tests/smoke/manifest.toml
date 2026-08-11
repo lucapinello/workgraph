@@ -2340,6 +2340,15 @@ description = "Pins the reminder contract at its EDGES, in BOTH parsers, against
 timeout_seconds = 60
 
 [[scenario]]
+name = "reminder_cancel_cross_surface"
+script = "scenarios/reminder_cancel_cross_surface.sh"
+owners = [
+    "cross-surface-reminder",
+]
+description = "Pins the cancellation caveat the C052 engine-contract audit left open (task cross-surface-reminder): a reminder cancel is ALL-OR-NOTHING across BOTH surfaces it can point at — the plan's `## 3. Calendar` ⏰ rows and the DM path's `.casa/reminders-adhoc.json`. The fast lane used to clear the matching ad-hoc reminder BEFORE it located, locked or edited the plan, so (1) 'cancel the reminder about the dentist' with a match on each surface removed one from EACH — two reminders gone from one sentence, neither asked about; (2) ambiguity was judged once per surface instead of once per turn, so two candidates could each look unique; and (3) when the plan leg then could not run (week held by another writer, lock record unreadable, plan unreadable) the ad-hoc deletion had already happened — the family was told nothing was saved while their reminder was gone. Now both surfaces are surveyed inside the week-mutation lock before either is touched: exactly one unambiguous target is removed, otherwise NONE and the family is asked which one they meant, and the surface that does not own the target is left byte-identical (not even resaved). Drives the real binary at one clock pin (`--now 2026-07-27T08:00`) through both seams — `wg telegram remind --add` seeds the ad-hoc surface, `wg --json telegram shopping … --apply --root <scratch> --calendar-owner Otto` runs the cancel — and asserts the JSON outcome/lane plus byte-identity of the untouched file at every step: a both-surfaces match answers `reminder-cancel-ambiguous` and writes nothing; a plan-only match removes the row and never rewrites the ad-hoc store; an ad-hoc-only match removes the row and never rewrites the plan; an unattributable `week-mutation.lock` (fail-closed per docs/42 §3/§5) makes the turn save nothing on either surface with the ad-hoc reminder still on file; and two controls prove the refusals were not vacuous — clearing the lock returns the ambiguity ask, and removing the plan's twin lets the identical sentence finally act. Complements the notify::fast_lane cross-surface unit tests and the commands::telegram DM-lane stand-down test. Credential-free: only the scratch project's own plans/ and .casa/ are written; nothing is sent."
+timeout_seconds = 60
+
+[[scenario]]
 name = "lifecycle_report_back"
 script = "scenarios/lifecycle_report_back.sh"
 owners = [

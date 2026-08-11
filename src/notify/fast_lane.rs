@@ -2062,30 +2062,8 @@ fn remove_reminder_row(
     day: Option<Weekday>,
     not_before: NaiveDate,
 ) -> Result<String, FastLaneError> {
-    let year = year_of_week_code(week_code);
-    let mut in_cal = false;
-    let mut hits: Vec<usize> = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if let Some(h2) = trimmed.strip_prefix("## ") {
-            in_cal = h2.to_lowercase().contains("calendar");
-            continue;
-        }
-        if !in_cal || !trimmed.starts_with('|') {
-            continue;
-        }
-        let Some(cells) = split_cells(trimmed) else {
-            continue;
-        };
-        if cells.len() < 3 {
-            continue;
-        }
-        let date = calendar_cell_date(&cells[0], year);
-        if cancel_matches(&cells[2], date, target, day, not_before) {
-            hits.push(i);
-        }
-    }
+    let hits = matching_reminder_rows(week_code, content, target, day, not_before);
     match hits.len() {
         0 => Err(FastLaneError::NotApplicable(
             "no pending reminder matches that".into(),
@@ -2106,6 +2084,44 @@ fn remove_reminder_row(
     }
 }
 
+/// The line numbers of the pending `⏰ Reminder` rows a cancel ask matches.
+///
+/// The COUNTING and the REMOVING must never be able to disagree — a survey that
+/// said "one candidate" while the edit found two would be exactly the split the
+/// all-or-nothing rule exists to close — so [`remove_reminder_row`] and the
+/// cross-surface survey in [`cancel_one_reminder`] both read this one function.
+fn matching_reminder_rows(
+    week_code: &str,
+    content: &str,
+    target: &str,
+    day: Option<Weekday>,
+    not_before: NaiveDate,
+) -> Vec<usize> {
+    let year = year_of_week_code(week_code);
+    let mut in_cal = false;
+    let mut hits: Vec<usize> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if let Some(h2) = trimmed.strip_prefix("## ") {
+            in_cal = h2.to_lowercase().contains("calendar");
+            continue;
+        }
+        if !in_cal || !trimmed.starts_with('|') {
+            continue;
+        }
+        let Some(cells) = split_cells(trimmed) else {
+            continue;
+        };
+        if cells.len() < 3 {
+            continue;
+        }
+        let date = calendar_cell_date(&cells[0], year);
+        if cancel_matches(&cells[2], date, target, day, not_before) {
+            hits.push(i);
+        }
+    }
+    hits
+}
 /// Does this calendar row name the pending reminder a cancel ask points at?
 ///
 /// A row qualifies only when it IS a reminder, is still pending, and every
@@ -2379,19 +2395,18 @@ pub fn run_fast_lane_at(
         };
     }
 
-    // A cancel may match a reminder the DM path filed in the ad-hoc store rather
-    // than a plan row, so it clears both surfaces.
-    let adhoc_cleared = match &op {
-        FastLaneOp::ReminderCancel {
-            target,
-            day,
-            not_before,
-        } => match cancel_adhoc_reminders(root, target, *day, *not_before) {
-            Ok(n) => n,
-            Err(reason) => return FastLaneResult::Fallback { reason },
-        },
-        _ => 0,
-    };
+    // A CANCEL SPANS TWO SURFACES AND IS ALL-OR-NOTHING ACROSS BOTH (task
+    // cross-surface-reminder). A reminder the family asked for in a DM lives in
+    // the ad-hoc store; one that came off the week lives in the plan's calendar —
+    // and "cancel the reminder about the dentist" cannot know which. This lane
+    // used to clear the ad-hoc match FIRST and only then go looking for the plan,
+    // which meant one cancel could take a row off each surface, and a plan leg
+    // that later turned out ambiguous (or was refused the lock) left the ad-hoc
+    // deletion already on disk. Both surfaces are now surveyed before either is
+    // touched: exactly one candidate is removed, or nothing is.
+    if matches!(op, FastLaneOp::ReminderCancel { .. }) {
+        return cancel_one_reminder(root, today, op, calendar_owner);
+    }
 
     // A reminder is filed on its RESOLVED date, which can fall in the next plan
     // week ("remind me Monday", said on a Sunday). Write it to the plan that
@@ -2445,13 +2460,6 @@ pub fn run_fast_lane_at(
                     week_code,
                 }
             }
-            // A cancel that found nothing in the plan still succeeded when it cleared
-            // the ad-hoc reminder the family meant.
-            Err(_) if adhoc_cleared > 0 => FastLaneResult::Applied {
-                report: report_line(&op),
-                op,
-                week_code,
-            },
             // A removal that matched no row is ANSWERED honestly, not handed to the
             // composer: "took it off" for a row that was never there is the same lie in the
             // other direction (task engine-shopping-language).
@@ -2492,35 +2500,267 @@ pub fn run_fast_lane_at(
     }
 }
 
-/// Clear the ad-hoc reminders a cancel ask matches, returning how many went.
+/// How many cancellable reminders a cancel ask matches, per surface.
 ///
-/// `Err(reason)` means AMBIGUOUS — more than one pending ad-hoc reminder matched
-/// — and nothing was removed: the caller falls back so the family is asked which
-/// one they meant. A cancel never touches an already-elapsed reminder.
-fn cancel_adhoc_reminders(
+/// The plan's `## 3. Calendar` rows and the DM path's ad-hoc store are two places
+/// the SAME ask can point at, so the count that decides "is this unambiguous?" is
+/// the count across both ([`CancelSurvey::total`]) — never one surface's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelSurvey {
+    /// Pending `⏰ Reminder` rows in the plan of record that match.
+    pub plan: usize,
+    /// Pending ad-hoc reminders (`.casa/reminders-adhoc.json`) that match.
+    pub adhoc: usize,
+}
+
+impl CancelSurvey {
+    /// Candidates across BOTH surfaces. `1` is the only actionable count.
+    pub fn total(self) -> usize {
+        self.plan + self.adhoc
+    }
+}
+
+/// Survey both reminder surfaces for a cancel ask, WITHOUT removing anything.
+///
+/// `plan` is the `(week_code, content)` the caller already holds — the fast lane
+/// reads it under the week lock, so the count and the removal cannot straddle
+/// another writer. `since` is the instant an ad-hoc reminder must still be ahead
+/// of to be cancellable, and the caller supplies it so the survey and that
+/// caller's own removal share ONE predicate: the fast lane passes the start of
+/// `not_before` (day-granular, matching the plan rows), the DM lane passes its
+/// wall clock. The loaded store and request are handed back so the caller does not
+/// re-read the file it just counted.
+fn survey_cancel_targets(
     root: &Path,
+    plan: Option<(&str, &str)>,
     target: &str,
     day: Option<Weekday>,
     not_before: NaiveDate,
-) -> Result<usize, String> {
+    since: NaiveDateTime,
+) -> (
+    CancelSurvey,
+    super::reminder::AdHocStore,
+    super::reminder::CancelRequest,
+) {
     use super::reminder::{AdHocStore, CancelRequest};
-    let path = AdHocStore::path(root);
-    let mut store = AdHocStore::load(&path);
+    let plan_hits = plan
+        .map(|(week_code, content)| {
+            matching_reminder_rows(week_code, content, target, day, not_before).len()
+        })
+        .unwrap_or(0);
+    let store = AdHocStore::load(&AdHocStore::path(root));
     let req = CancelRequest {
         target: target.to_string(),
         day,
     };
-    // Pending as of the START of today, so a reminder due later today is still
-    // cancellable — the same day-granular rule the plan rows use.
-    let since = not_before.and_hms_opt(0, 0, 0).unwrap_or_default();
-    match store.cancel(&req, since) {
-        Ok(None) => Ok(0),
-        Ok(Some(_)) => match store.save(&path) {
-            Ok(()) => Ok(1),
-            Err(e) => Err(format!("could not update the ad-hoc reminders: {e}")),
+    let adhoc_hits = store.matching(&req, since).len();
+    (
+        CancelSurvey {
+            plan: plan_hits,
+            adhoc: adhoc_hits,
         },
-        Err(_) => Err("more than one pending reminder matches that — asking instead".into()),
+        store,
+        req,
+    )
+}
+
+/// The line the family gets when a cancel points at more than one live reminder.
+///
+/// Plain and specific: it says nothing went, and it asks for the one detail that
+/// would settle it. It must never read like a confirmation.
+fn ambiguous_cancel_line(target: &str, day: Option<Weekday>) -> String {
+    let named = match (target.trim().is_empty(), day) {
+        (false, _) => format!(" about {}", target.trim()),
+        (true, Some(d)) => format!(" for {}", weekday_name(d)),
+        (true, None) => String::new(),
+    };
+    format!(
+        "You have more than one reminder{named} coming up, so I haven't cancelled anything yet. \
+         Which one did you mean — tell me the day or a few more words from it?"
+    )
+}
+
+/// Cancel EXACTLY ONE reminder, or none, deciding across both surfaces first.
+///
+/// The whole turn — surveying the plan, surveying the ad-hoc store, and removing
+/// the single candidate — happens inside the `week-mutation` lock, so no other
+/// writer can add or take a reminder between the count and the removal, and a leg
+/// that cannot run removes nothing at all. Three outcomes:
+///
+/// * exactly one candidate anywhere → it is removed, and the OTHER surface is not
+///   rewritten (not even resaved: byte-identical);
+/// * two or more, on one surface or split across the two → `Answered` with an ask
+///   and nothing is touched;
+/// * none → `Fallback`, exactly as before, so the composer can answer.
+fn cancel_one_reminder(
+    root: &Path,
+    today: NaiveDate,
+    op: FastLaneOp,
+    calendar_owner: Option<&str>,
+) -> FastLaneResult {
+    let FastLaneOp::ReminderCancel {
+        ref target,
+        day,
+        not_before,
+    } = op
+    else {
+        return FastLaneResult::Fallback {
+            reason: "not a reminder cancellation".into(),
+        };
+    };
+    let target = target.clone();
+    let plan_file = current_plan_file(root, today).map(|(path, week_code, _)| (path, week_code));
+
+    let locked = super::project_lock::with_week_mutation_lock(root, || {
+        // A plan we cannot READ is a surface we cannot count. Refusing here is the
+        // point of the ordering: the old code had already deleted the ad-hoc row by
+        // this line, so an unreadable plan meant a half-applied cancel.
+        let plan_read = match &plan_file {
+            Some((path, week_code)) => match std::fs::read_to_string(path) {
+                Ok(content) => Some((path.clone(), week_code.clone(), content)),
+                Err(e) => {
+                    return FastLaneResult::Fallback {
+                        reason: format!("read plan: {e}"),
+                    };
+                }
+            },
+            None => None,
+        };
+        // Pending as of the START of `not_before`, so a reminder due later today is
+        // still cancellable on BOTH surfaces — the plan rows' own day-granular rule.
+        let since = not_before.and_hms_opt(0, 0, 0).unwrap_or_default();
+        let (survey, mut store, req) = survey_cancel_targets(
+            root,
+            plan_read
+                .as_ref()
+                .map(|(_, week_code, content)| (week_code.as_str(), content.as_str())),
+            &target,
+            day,
+            not_before,
+            since,
+        );
+
+        match survey.total() {
+            // Nothing live matches on either surface — unchanged behaviour: the
+            // composer owns the turn and answers.
+            0 => FastLaneResult::Fallback {
+                reason: "no pending reminder matches that — deferring to full pipeline".to_string(),
+            },
+            1 if survey.plan == 1 => {
+                let Some((path, week_code, content)) = plan_read else {
+                    return FastLaneResult::Fallback {
+                        reason: "no current plan file".into(),
+                    };
+                };
+                match apply_to_content_with_calendar_owner(
+                    &week_code,
+                    &content,
+                    &op,
+                    calendar_owner,
+                ) {
+                    Ok(edited) => {
+                        if let Err(e) = crate::atomic_file::write_atomic(&path, edited.as_bytes()) {
+                            return FastLaneResult::Fallback {
+                                reason: format!("write plan: {e}"),
+                            };
+                        }
+                        FastLaneResult::Applied {
+                            report: report_line(&op),
+                            op,
+                            week_code,
+                        }
+                    }
+                    // The survey said one row and the edit disagreed. That should be
+                    // impossible — both read `matching_reminder_rows` — so it is
+                    // reported as a refusal rather than papered over: the ad-hoc
+                    // store has not been touched, and nothing is half-applied.
+                    Err(e) => FastLaneResult::Fallback {
+                        reason: format!("direct edit refused ({e}) — deferring to full pipeline"),
+                    },
+                }
+            }
+            1 => {
+                match store.cancel(&req, since) {
+                    Ok(Some(_)) => {
+                        let path = super::reminder::AdHocStore::path(root);
+                        match store.save(&path) {
+                            Ok(()) => {
+                                let week_code = plan_read
+                                    .map(|(_, week_code, _)| week_code)
+                                    .unwrap_or_default();
+                                FastLaneResult::Applied {
+                                    report: report_line(&op),
+                                    op,
+                                    week_code,
+                                }
+                            }
+                            Err(e) => FastLaneResult::Fallback {
+                                reason: format!("could not update the ad-hoc reminders: {e}"),
+                            },
+                        }
+                    }
+                    // Same impossible disagreement, on the other surface.
+                    Ok(None) | Err(_) => FastLaneResult::Fallback {
+                        reason:
+                            "the reminder to cancel changed under us — deferring to full pipeline"
+                                .to_string(),
+                    },
+                }
+            }
+            // TWO OR MORE, wherever they live: ask, and touch neither surface.
+            _ => FastLaneResult::Answered {
+                reply: ambiguous_cancel_line(&target, day),
+                lane: "reminder-cancel-ambiguous".to_string(),
+            },
+        }
+    });
+    match locked {
+        Ok(completed) => completed.regardless_of_release(),
+        // The plan leg could not run, so NOTHING ran — including the ad-hoc leg,
+        // which used to have gone already by this point (task
+        // cross-surface-reminder). The family is told plainly that nothing was
+        // saved, and that is now true of both surfaces.
+        Err(refusal) => FastLaneResult::Answered {
+            reply: "Someone else is changing this week's plan right now, so I didn't cancel that. \
+                    Give it a moment and say it again."
+                .to_string(),
+            lane: if refusal.retryable() {
+                "week-lock-busy".to_string()
+            } else {
+                "week-lock-unavailable".to_string()
+            },
+        },
     }
+}
+
+/// The cross-surface cancel survey for a caller OUTSIDE this lane (the DM
+/// reminder short-circuit in `commands::telegram`), which needs to know whether it
+/// may act at all before it touches the ad-hoc store.
+///
+/// With no plan of record on disk the ad-hoc store is the only surface, and its
+/// own count decides — `plan` is then `0`.
+pub fn cancel_candidates(
+    root: &Path,
+    target: &str,
+    day: Option<Weekday>,
+    now: NaiveDateTime,
+) -> CancelSurvey {
+    let today = now.date();
+    let plan = current_plan_file(root, today).and_then(|(path, week_code, _)| {
+        std::fs::read_to_string(&path)
+            .ok()
+            .map(|content| (week_code, content))
+    });
+    let (survey, _, _) = survey_cancel_targets(
+        root,
+        plan.as_ref()
+            .map(|(week_code, content)| (week_code.as_str(), content.as_str())),
+        target,
+        day,
+        today,
+        now,
+    );
+    survey
 }
 
 /// The plan file whose week covers `date`, when one exists on disk.
@@ -4173,6 +4413,221 @@ domains = ["meals"]
         );
     }
 
+    // ── A CANCEL SPANS TWO SURFACES AND IS ALL-OR-NOTHING ACROSS BOTH ───────
+    //
+    // Task `cross-surface-reminder`, from the C052 engine-contract audit's
+    // "Cancellation caveat": the lane used to clear the matching ad-hoc reminder
+    // BEFORE it ever located, locked or edited the plan. So one cancel could take
+    // a row off EACH surface; a plan leg that then turned ambiguous, or was
+    // refused the lock, left the ad-hoc removal already on disk; and "is this
+    // ambiguous?" was asked once per surface instead of once per turn.
+
+    /// A scratch project holding `plan` (when given) as the W29 plan of record and
+    /// one pending ad-hoc reminder per `(text, due date)`.
+    fn cross_surface_fixture(
+        plan: Option<&str>,
+        adhoc: &[(&str, NaiveDate)],
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use crate::notify::reminder::{AdHocStore, Reminder, ReminderSource};
+
+        let root = tempfile::tempdir().unwrap();
+        let plan_path = root.path().join("plans").join("2026-W29-family-plan.md");
+        if let Some(content) = plan {
+            std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+            std::fs::write(&plan_path, content).unwrap();
+        }
+        let store_path = AdHocStore::path(root.path());
+        let mut store = AdHocStore::default();
+        for (text, date) in adhoc {
+            store.add(Reminder {
+                id: format!("adhoc:{}", text.to_lowercase().replace(' ', "-")),
+                due: date.and_hms_opt(9, 0, 0).unwrap(),
+                recipient: "Household Member".into(),
+                bot: "harbor".into(),
+                text: (*text).to_string(),
+                source: ReminderSource::AdHoc,
+            });
+        }
+        store.save(&store_path).unwrap();
+        (root, plan_path, store_path)
+    }
+
+    fn on(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn a_cancel_matching_on_both_surfaces_removes_nothing_and_asks() {
+        // ONE pending plan row and ONE pending ad-hoc row both answer to
+        // "the dentist". Two candidates is two candidates — it does not matter
+        // that they sit on different surfaces — so the turn removes NOTHING and
+        // asks which one was meant.
+        let (root, plan_path, store_path) = cross_surface_fixture(
+            Some(&w29_with_reminders()),
+            &[("Book the dentist", on(2026, 7, 16))],
+        );
+        let plan_before = std::fs::read(&plan_path).unwrap();
+        let adhoc_before = std::fs::read(&store_path).unwrap();
+
+        match run_fast_lane_with_calendar_owner(
+            root.path(),
+            "cancel the reminder about the dentist",
+            today(),
+            Some("harbor"),
+        ) {
+            FastLaneResult::Answered { reply, lane } => {
+                assert_eq!(lane, "reminder-cancel-ambiguous");
+                let low = reply.to_lowercase();
+                assert!(
+                    low.contains("more than one"),
+                    "the ask must say why nothing was cancelled: {reply:?}"
+                );
+                assert!(
+                    !low.starts_with("done"),
+                    "nothing was cancelled, so nothing is 'done': {reply:?}"
+                );
+            }
+            other => panic!("a cancel matching both surfaces must ASK, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read(&plan_path).unwrap(),
+            plan_before,
+            "the plan must be byte-identical after an ambiguous cancel"
+        );
+        assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            adhoc_before,
+            "the ad-hoc reminders must be byte-identical after an ambiguous cancel"
+        );
+    }
+
+    #[test]
+    fn exactly_one_target_across_both_surfaces_is_removed_and_the_other_surface_is_untouched() {
+        // (a) The one match is a PLAN row; the ad-hoc store holds something else
+        //     entirely and must not be rewritten at all.
+        let (root, plan_path, store_path) = cross_surface_fixture(
+            Some(&w29_with_reminders()),
+            &[("Water the plants", on(2026, 7, 16))],
+        );
+        let adhoc_before = std::fs::read(&store_path).unwrap();
+        match run_fast_lane_with_calendar_owner(
+            root.path(),
+            "cancel the reminder about the dentist",
+            today(),
+            Some("harbor"),
+        ) {
+            FastLaneResult::Applied { report, .. } => {
+                assert_eq!(report, "Done — cancelled the reminder about dentist ✓");
+            }
+            other => panic!("the single plan match must be removed, got {other:?}"),
+        }
+        let after = std::fs::read_to_string(&plan_path).unwrap();
+        assert!(
+            !after.to_lowercase().contains("book the dentist"),
+            "the plan row the family named survived:\n{after}"
+        );
+        assert!(
+            after.contains("defrost the trout"),
+            "only the named row may go:\n{after}"
+        );
+        assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            adhoc_before,
+            "a plan cancel must leave the ad-hoc reminders byte-identical"
+        );
+
+        // (b) The one match is an AD-HOC row; the plan is not rewritten.
+        let (root, plan_path, store_path) = cross_surface_fixture(
+            Some(&w29_with_reminders()),
+            &[("Rotate the tyres", on(2026, 7, 16))],
+        );
+        let plan_before = std::fs::read(&plan_path).unwrap();
+        match run_fast_lane_with_calendar_owner(
+            root.path(),
+            "cancel the reminder about the tyres",
+            today(),
+            Some("harbor"),
+        ) {
+            FastLaneResult::Applied { .. } => {}
+            other => panic!("the single ad-hoc match must be removed, got {other:?}"),
+        }
+        assert!(
+            crate::notify::reminder::AdHocStore::load(&store_path)
+                .reminders
+                .is_empty(),
+            "the ad-hoc reminder the family named is still there"
+        );
+        assert_eq!(
+            std::fs::read(&plan_path).unwrap(),
+            plan_before,
+            "an ad-hoc cancel must leave the plan byte-identical"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(project_lock)]
+    fn a_plan_leg_that_cannot_run_leaves_the_adhoc_reminder_in_place() {
+        // The plan leg FAILS — another writer holds the week — while the single
+        // matching reminder lives in the ad-hoc store. The old order cleared the
+        // ad-hoc row first and only then met the refusal, so the family was told
+        // nothing was saved while their reminder had in fact been deleted. Now the
+        // whole decision happens under the lock: a refusal removes nothing.
+        let (root, _plan_path, store_path) = cross_surface_fixture(
+            Some(&w29_with_reminders()),
+            &[("Book the dentist", on(2026, 7, 16))],
+        );
+        // Held from ANOTHER thread: the lock is re-entrant per (thread, path), so a
+        // same-stack holder would read as this very writer re-entering.
+        let held_root = root.path().to_path_buf();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (holding, held) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            let lock = super::super::project_lock::acquire(
+                &held_root,
+                super::super::project_lock::WEEK_MUTATION,
+                &super::super::project_lock::Options::waiting(2_000),
+            )
+            .unwrap();
+            holding.send(()).unwrap();
+            let _ = wait.recv();
+            lock.release()
+        });
+        held.recv().unwrap();
+
+        // "dentist" now matches the ad-hoc row AND the plan row, so this is also
+        // the ambiguous shape — but under a held lock the turn cannot even survey
+        // the plan, and the honest answer is the refusal. Either way: nothing goes.
+        let result = run_fast_lane_with_calendar_owner(
+            root.path(),
+            "cancel the reminder about the dentist",
+            today(),
+            Some("harbor"),
+        );
+        match &result {
+            FastLaneResult::Answered { reply, lane } => {
+                assert!(
+                    lane.starts_with("week-lock"),
+                    "expected the lock refusal, got lane {lane:?} / {reply:?}"
+                );
+                assert!(
+                    !reply.to_lowercase().starts_with("done"),
+                    "nothing was cancelled: {reply:?}"
+                );
+            }
+            other => panic!("expected a refusal while the week is held, got {other:?}"),
+        }
+        assert_eq!(
+            crate::notify::reminder::AdHocStore::load(&store_path)
+                .reminders
+                .len(),
+            1,
+            "the ad-hoc reminder must survive a cancel whose plan leg never ran"
+        );
+
+        let _ = go.send(());
+        other.join().unwrap();
+    }
     #[test]
     fn e2e_remind_me_what_never_touches_the_plan() {
         let root = tempfile::tempdir().unwrap();
