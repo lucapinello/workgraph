@@ -54,6 +54,7 @@
 //!
 //! The lock is advisory: it binds only writers that take it.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use super::project_lock;
@@ -79,17 +80,23 @@ pub const DEFAULT_WAIT_MS: u64 = 1000;
 /// giving the family a refusal is a product decision each caller makes for itself,
 /// and neither side has to agree about it for the two to serialise correctly.
 ///
-/// WHY THREE, MEASURED (`feed-lock-retry`, docs/42 §9). The engine's real
-/// `wg telegram feed-write` takes this lock three times in sequence — the row
-/// ([`super::casa_feed::append_entry_proving`]), the delivery receipt
-/// ([`super::relay_receipt::append`]) and the audience record
-/// ([`super::casa_audience::record_audience`]) — and each held section reads the
-/// whole live feed plus every archive segment. Six concurrent writers of that
-/// shape were measured at **986 ms of the 1000 ms budget**: zero refusals in one
-/// run and 73 % refusals in another, at the SAME offered load. Three attempts
-/// buys ~3 s of patience, which covers roughly eighteen concurrent writers —
-/// far past anything a household produces — while still ENDING. Past that,
-/// "busy" has stopped being the true answer and a refusal is the honest one.
+/// WHY THREE, MEASURED (`feed-lock-retry`, docs/42 §9). `wg telegram feed-write`
+/// used to take this lock TWICE in sequence — the row and its receipt in one
+/// section ([`super::casa_feed::append_entry_proving`]), then the audience record
+/// in another ([`super::casa_audience::record_audience`]) — and each held section
+/// read the whole live feed plus every archive segment. Six concurrent writers of
+/// that shape were measured at **986 ms of the 1000 ms budget**: zero refusals in
+/// one run and 73 % refusals in another, at the SAME offered load. Three attempts
+/// buys ~3 s of patience while still ENDING; past that, "busy" has stopped being
+/// the true answer and a refusal is the honest one.
+///
+/// **THE SHAPE THAT NUMBER WAS TAKEN ON IS GONE (`feed-lock-section`).** The
+/// audience now rides in the row's section ([`super::casa_audience::record_audience_locked`])
+/// and the history read happens outside the lock, so one `feed-write` enters ONE
+/// section — asserted, not asserted-about, by [`distinct_acquisitions`]. The
+/// budget stays at three: it is the answer to "how long may a writer wait for a
+/// lock that is legitimately busy", which a shorter section makes rarer without
+/// making it impossible.
 pub const DEFAULT_ATTEMPTS: u32 = 3;
 
 /// How old an attributable lock whose owner is provably dead must be before the
@@ -104,6 +111,69 @@ pub fn lock_path_for(feed_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(LOCK_NAME)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// How many times this process took the lock — the number `feed-lock-section`
+// exists to bring down, made countable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Sections actually ENTERED by this writer: acquisitions that published a
+    /// record of their own.
+    static DISTINCT_ACQUISITIONS: Cell<u64> = const { Cell::new(0) };
+    /// Nested frames that re-entered a lock this thread already held (docs/42
+    /// §6). Counted apart because they are not a second section — they cost no
+    /// `link(2)`, no `fsync` and no contention, and folding them into the number
+    /// above would make a re-entrant helper look like a writer that took the
+    /// lock twice.
+    static REENTRANT_FRAMES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many DISTINCT feed-lock sections THIS WRITER has entered so far.
+///
+/// **WHY IT IS ALWAYS COMPILED AND NOT `cfg(test)`.** The thing worth asserting
+/// is what the real `wg telegram feed-write` does, and `src/commands/telegram.rs`
+/// lives in the BINARY crate while this module lives in the library: a
+/// `cfg(test)` counter here is simply absent when the binary's own tests run, so
+/// the only reachable assertion would be an in-library look-alike of the seam
+/// rather than the seam itself. It is one non-atomic increment per acquisition —
+/// unmeasurable beside the `fsync`s that same acquisition performs — and it buys
+/// a claim a refactor cannot quietly undo: one `feed-write` enters ONE section.
+///
+/// **WHY PER-THREAD AND NOT PER-PROCESS.** A "writer" is a call stack, not an
+/// image: the listener runs many of them at once, so a process-wide total would
+/// add up unrelated writers' sections and could never answer "how many did THIS
+/// one take". It is the same reason the protocol keys re-entrancy per thread
+/// (docs/42 §6). For the one-shot `wg telegram feed-write` process the two
+/// readings are the same number, which is what the printed
+/// `feedLockAcquisitions=` line reports. It also makes the number measurable in
+/// a test binary at all — process-global, every concurrently running test's
+/// locks land in the same counter and the assertion is a coin flip.
+pub fn distinct_acquisitions() -> u64 {
+    DISTINCT_ACQUISITIONS.with(Cell::get)
+}
+
+/// How many nested re-entrant frames this writer has opened — see
+/// [`distinct_acquisitions`] for why the two are counted apart.
+pub fn reentrant_frames() -> u64 {
+    REENTRANT_FRAMES.with(Cell::get)
+}
+
+/// Zero both counters, so a test can measure ONE seam rather than the whole
+/// thread's history.
+pub fn reset_acquisition_counters() {
+    DISTINCT_ACQUISITIONS.with(|c| c.set(0));
+    REENTRANT_FRAMES.with(|c| c.set(0));
+}
+
+fn count_acquisition(lock: &project_lock::ProjectLock) {
+    let counter = if lock.is_reentrant() {
+        &REENTRANT_FRAMES
+    } else {
+        &DISTINCT_ACQUISITIONS
+    };
+    counter.with(|c| c.set(c.get() + 1));
 }
 
 /// Why an acquisition did not happen. Every variant means the caller's work did
@@ -252,7 +322,10 @@ pub fn acquire(feed_path: &Path, wait_ms: u64) -> Result<FeedLock, LockRefusal> 
         ..project_lock::Options::default()
     };
     match project_lock::acquire(&root, project_lock::FEED_ROTATION, &opts) {
-        Ok(inner) => Ok(FeedLock { inner: Some(inner) }),
+        Ok(inner) => {
+            count_acquisition(&inner);
+            Ok(FeedLock { inner: Some(inner) })
+        }
         Err(e) => Err(refusal_of(e)),
     }
 }

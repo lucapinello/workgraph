@@ -4439,37 +4439,61 @@ impl FamilyReplyDelivery {
         // single critical section, or neither does. Two transactions would let a
         // refused or corrupt receipt leave behind exactly the unprovable row the
         // whole contract exists to eliminate.
+        //
+        // WHO SAW IT (`casa_audience`, task audit-does-any) RIDES IN THE SAME
+        // SECTION (docs/42 §9, `feed-lock-section`) — sharing the exclusion, NOT
+        // the rollback. The reply has already physically reached the family group
+        // by the time we mirror it, so the audience is a FACT whichever way the
+        // row goes: its result is carried out of the closure rather than
+        // returned, so a refused audience can never take the row back out, and
+        // the fallback below still records it when there was no section at all.
+        // What changes is only that a successful mirror stops paying for a second
+        // acquisition of the same lock.
+        //
+        // Before the audience call existed the gateway instrumented every reply
+        // seam it owned and THIS process — the listener, which the gateway is not
+        // in the loop for at all — appended agent rows carrying a turnId with no
+        // audience record anywhere. An auditor reading the ledger for such a turn
+        // got "no reply recorded", which is indistinguishable from "no reply".
+        let mut audience_recorded = false;
         let written = casa_feed::append_entry_proving(&self.feed_path, &entry, |feed_id, lock| {
             let Some(turn) = turn.as_deref() else {
                 // No canonical turn: a legacy or listener-initiated reply. It
                 // gets no receipt — inventing a turn would forge the very link a
                 // receipt exists to prove — and the row stands as unbound, which
-                // is precisely what a sealed run refuses.
+                // is precisely what a sealed run refuses. It has no audience to
+                // record either: there is no turn to join one to.
                 return Ok(());
             };
-            self.write_engine_receipt(
-                turn, feed_id, &agent_id, bot_id, message_id, outcome, phase, lock,
-            )
-            // Written inside THIS transaction, so the receipt frame released
-            // nothing; the section's verdict arrives with the row below.
-            .map(relay_receipt::Appended::regardless_of_release)
+            let receipt = self
+                .write_engine_receipt(
+                    turn, feed_id, &agent_id, bot_id, message_id, outcome, phase, lock,
+                )
+                // Written inside THIS transaction, so the receipt frame released
+                // nothing; the section's verdict arrives with the row below.
+                .map(relay_receipt::Appended::regardless_of_release);
+            if receipt.is_ok() {
+                // Only on the path where the row SURVIVES. A receipt failure
+                // truncates the row back out, and an audience record for a row
+                // that no longer exists is worse than the second section.
+                audience_recorded = true;
+                self.report_audience(casa_audience::record_group_reply_locked(
+                    &self.feed_path,
+                    turn,
+                    &agent_id,
+                    casa_feed::now_ms(),
+                    lock,
+                ));
+            }
+            receipt
         });
 
-        // WHO SAW IT (`casa_audience`, task audit-does-any). The reply has
-        // already physically reached the family group by the time we mirror it,
-        // so the audience is a FACT whichever way the row above went — a feed
-        // write that failed does not un-send it, which is why this is recorded
-        // outside the row's transaction and on both outcomes. It is a separate
-        // critical section on purpose: the row and its receipt are one fact and
-        // roll back together, while an audience record must survive a row that
-        // could not be proven, since the family saw the reply either way.
-        //
-        // Before this call the gateway instrumented every reply seam it owned
-        // and THIS process — the listener, which the gateway is not in the loop
-        // for at all — appended agent rows carrying a turnId with no audience
-        // record anywhere. An auditor reading the ledger for such a turn got
-        // "no reply recorded", which is indistinguishable from "no reply".
-        self.record_reply_audience(turn.as_deref(), &agent_id);
+        // THE ROW DID NOT SURVIVE ITS SECTION — but the family still saw the
+        // reply, so the audience is still a fact and is recorded in a section of
+        // its own, exactly as every mirror used to do.
+        if !audience_recorded {
+            self.record_reply_audience(turn.as_deref(), &agent_id);
+        }
 
         match written {
             // THE SECTION'S RELEASE VERDICT TRAVELS WITH THE ROW (blocker 2).
@@ -4511,17 +4535,25 @@ impl FamilyReplyDelivery {
     /// the listener's log, never swallowed.
     fn record_reply_audience(&self, turn: Option<&str>, agent_id: &str) {
         let Some(turn) = turn else { return };
-        match casa_audience::record_group_reply(
+        self.report_audience(casa_audience::record_group_reply(
             &self.feed_path,
             turn,
             agent_id,
             casa_feed::now_ms(),
-        ) {
-            Ok(_) => {}
-            Err(e) => eprintln!(
+        ));
+    }
+
+    /// The one place a mirrored reply's audience outcome is reported, so the
+    /// in-section write and the fallback cannot report it two different ways.
+    fn report_audience(
+        &self,
+        outcome: Result<casa_audience::AudienceOutcome, casa_audience::AudienceError>,
+    ) {
+        if let Err(e) = outcome {
+            eprintln!(
                 "[{}] casa audience: the reply was sent but its audience was NOT recorded: {e}",
                 chrono::Utc::now().format("%H:%M:%S"),
-            ),
+            );
         }
     }
 
@@ -6158,28 +6190,59 @@ pub fn run_feed_write(
     // listener's: a diagnostic is still a row the family's pane shows and an
     // auditor counts, and `feed-write --kind agent` is precisely the shape that
     // put unattributable helper rows into a certification run.
+    //
+    // AND IT IS ONE SECTION, NOT TWO (docs/42 §9, `feed-lock-section`). The
+    // audience record used to be written after this call returned, in a second
+    // acquisition of the same lock — the one most likely to arrive after the
+    // patience was already spent, and a whole extra queue position for every
+    // other writer. It is written below, inside this section, with the held lock
+    // as a witness. What did NOT move is the rollback boundary: the row and its
+    // receipt are one fact and fail together, while a refused audience is
+    // carried out and REPORTED rather than taking the row back out.
     let mut proved = false;
+    let mut audience: Option<Result<casa_audience::AudienceOutcome, casa_audience::AudienceError>> =
+        None;
     let written = casa_feed::append_entry_proving(&feed_path, &entry, |feed_id, lock| {
         // The phase is destructured HERE rather than defaulted above: a row with a
         // turn always carries one (the bail above), so pattern-matching it costs
         // nothing and leaves no `unwrap_or_default()` that could quietly stand in
         // for a declaration on some future path.
-        let (Some(turn), Some(mid), Some(phase)) = (turn_id.as_deref(), message_id, phase) else {
-            return Ok(());
-        };
-        proved = true;
-        write_engine_receipt_at(
-            root,
-            turn,
-            feed_id,
-            role,
-            bot_id.unwrap_or(role),
-            Some(mid),
-            relay_receipt::RelayOutcome::Send,
-            phase,
-            Some(lock),
-        )
-        .map(relay_receipt::Appended::regardless_of_release)
+        if let (Some(turn), Some(mid), Some(phase)) = (turn_id.as_deref(), message_id, phase) {
+            proved = true;
+            // THE ONLY `?` IN THIS SECTION. A refused receipt rolls the row back
+            // out; nothing below may, which is why the audience result is stored
+            // instead of propagated.
+            write_engine_receipt_at(
+                root,
+                turn,
+                feed_id,
+                role,
+                bot_id.unwrap_or(role),
+                Some(mid),
+                relay_receipt::RelayOutcome::Send,
+                phase,
+                Some(lock),
+            )
+            .map(relay_receipt::Appended::regardless_of_release)?;
+        }
+        // WHO SAW IT, in this section. Gated on the turn alone and NOT on the
+        // receipt: a row bound to a turn with no `--message-id` has no delivery
+        // to prove and still has an audience, and that asymmetry is why this is
+        // not folded into the branch above.
+        if kind == "agent"
+            && let Some(turn) = turn_id.as_deref()
+        {
+            audience = Some(casa_audience::record_group_reply_locked(
+                &feed_path,
+                turn,
+                role,
+                casa_feed::now_ms(),
+                lock,
+            ));
+        }
+        // Spelled out: `?` above converts through `From`, so with no annotation
+        // the proof error type is ambiguous rather than "obviously the receipt's".
+        Ok::<(), relay_receipt::ReceiptError>(())
     })
     .map_err(|e| anyhow::anyhow!("{e}"))
     .with_context(|| format!("failed to append to feed {}", feed_path.display()))?;
@@ -6215,15 +6278,11 @@ pub fn run_feed_write(
     //                         answering privately
     //   refused   <reason>    the row exists and its audience does NOT. The hole
     //                         this ledger closes, reported rather than swallowed.
-    match (kind, turn_id.as_deref()) {
-        ("agent", Some(turn)) => {
-            match casa_audience::record_group_reply(&feed_path, turn, role, casa_feed::now_ms()) {
-                Ok(outcome) => println!("audience={}", outcome.as_str()),
-                Err(e) => {
-                    eprintln!("casa audience: the row was written but its audience was NOT: {e}");
-                    println!("audience=refused reason={e}");
-                }
-            }
+    match (kind, audience) {
+        (_, Some(Ok(outcome))) => println!("audience={}", outcome.as_str()),
+        (_, Some(Err(e))) => {
+            eprintln!("casa audience: the row was written but its audience was NOT: {e}");
+            println!("audience=refused reason={e}");
         }
         ("agent", None) => println!(
             "audience=skipped reason={}",
@@ -6231,6 +6290,16 @@ pub fn run_feed_write(
         ),
         _ => println!("audience=skipped reason=inbound"),
     }
+    // HOW MANY TIMES THIS PROCESS TOOK THE CONVERSATION LOCK, stated on every run
+    // (docs/42 §9, `feed-lock-section`). The number is the whole finding: every
+    // section is a queue position for every other writer, and six concurrent
+    // writers of this shape were measured at 986 ms of a 1000 ms budget while it
+    // was more than one. A scripted certifier — and the twin gate — can now read
+    // it from the real process instead of inferring it from a comment.
+    println!(
+        "feedLockAcquisitions={}",
+        worksgood::notify::feed_lock::distinct_acquisitions()
+    );
     if proved {
         println!("receipt=written");
     }
@@ -15234,5 +15303,239 @@ domains = ["calendar"]
             !feed.exists() || feed_lines(&feed).is_empty(),
             "an undelivered digest must not appear in the ledger"
         );
+    }
+
+    // --- one section per feed-write (feed-lock-section, docs/42 §9) --------
+    //
+    // THE FINDING THIS PINS. `wg telegram feed-write --kind agent --turn-id
+    // --message-id` used to take `.conversation.lock` more than once in one
+    // process: the row and its receipt in one section, then the audience record
+    // in a second. Every section is a queue position for every other writer, and
+    // six concurrent writers of this shape were measured at 785 ms average /
+    // 986 ms peak against a 1000 ms budget — a coin flip, decided by the
+    // scheduler, over whether the family's message is recorded or the house says
+    // it never heard them.
+    //
+    // The counter is on `feed_lock::acquire` itself and is always compiled, for
+    // the reason its doc comment gives: this module is the BINARY crate and
+    // `feed_lock` is the library, so a `cfg(test)` counter there would simply not
+    // exist here, and the only reachable assertion would be about a look-alike of
+    // the seam rather than the seam.
+
+    fn audience_lines(feed: &Path) -> Vec<String> {
+        feed_lines(&casa_audience::audience_path_for(feed))
+    }
+
+    fn receipt_lines(root: &Path) -> Vec<String> {
+        feed_lines(&relay_receipt::ledger_path_for(root))
+    }
+
+    /// ONE `feed-write`, ONE SECTION — and all three artifacts still land.
+    ///
+    /// The count alone would be satisfied by a writer that stopped recording the
+    /// audience, which is the cheapest wrong way to make this number go down, so
+    /// the row, the receipt AND the audience record are asserted present in the
+    /// same test. `reentrant_frames` is asserted zero as well: a nested acquire
+    /// of a lock this thread already holds is not a second section, but it is
+    /// also not how any of this is meant to work, and counting the two apart is
+    /// what stops "one acquisition" from hiding a re-entrant one.
+    #[test]
+    #[serial_test::serial]
+    fn one_feed_write_enters_exactly_one_conversation_lock_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        worksgood::notify::feed_lock::reset_acquisition_counters();
+        run_feed_write(
+            dir.path(),
+            "agent",
+            None,
+            Some("harbor"),
+            "Dinner is the soup.",
+            None,
+            Some(ENGINE_TURN),
+            Some("final"),
+            None,
+            Some("4242"),
+            None,
+        )
+        .expect("the writer must land the row");
+
+        assert_eq!(
+            worksgood::notify::feed_lock::distinct_acquisitions(),
+            1,
+            "one feed-write took .conversation.lock this many times — the row, its receipt and \
+             its audience are ONE section (docs/42 §9, feed-lock-section)"
+        );
+        assert_eq!(
+            worksgood::notify::feed_lock::reentrant_frames(),
+            0,
+            "a re-entrant frame appeared: the section is nested, not shortened"
+        );
+        // …and the section still did all three jobs.
+        assert_eq!(feed_lines(&feed).len(), 1, "the row");
+        assert_eq!(receipt_lines(dir.path()).len(), 1, "the delivery receipt");
+        assert_eq!(audience_lines(&feed).len(), 1, "the audience record");
+    }
+
+    /// The audience is gated on the TURN, not on the receipt. A turn-bound row
+    /// with no `--message-id` has no delivery to prove and still has an audience
+    /// — folding the audience into the receipt's branch would silently drop it
+    /// for every ack the gateway writes without a transport answer.
+    #[test]
+    #[serial_test::serial]
+    fn a_row_with_a_turn_and_no_delivery_still_records_its_audience_in_one_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        worksgood::notify::feed_lock::reset_acquisition_counters();
+        run_feed_write(
+            dir.path(),
+            "agent",
+            None,
+            Some("harbor"),
+            "On it.",
+            None,
+            Some(ENGINE_TURN),
+            Some("ack"),
+            None,
+            None, // no --message-id: nothing delivered, nothing to prove
+            None,
+        )
+        .expect("the writer must land the row");
+
+        assert_eq!(worksgood::notify::feed_lock::distinct_acquisitions(), 1);
+        assert_eq!(feed_lines(&feed).len(), 1, "the row");
+        assert!(
+            receipt_lines(dir.path()).is_empty(),
+            "a receipt was invented for a row with no transport answer"
+        );
+        assert_eq!(
+            audience_lines(&feed).len(),
+            1,
+            "the audience record is gated on the receipt — an ack with no message id lost it"
+        );
+    }
+
+    /// THE ROW AND ITS RECEIPT ARE STILL ONE TRANSACTION — neither survives
+    /// without the other.
+    ///
+    /// This is the rule `feed-lock-section` was told not to break while
+    /// shortening the section, and the reason the audience record is written
+    /// with the held lock but NOT inside the `?` chain: sharing the exclusion is
+    /// not the same as sharing the rollback.
+    ///
+    /// The receipt is refused with a state the ledger's own strictness produces:
+    /// a final line with no terminating newline is a write interrupted at the
+    /// delimiter, which `read_strict` refuses rather than parses. So the prove
+    /// closure fails, and the row it had already appended is truncated back out.
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_receipt_takes_the_row_back_out_and_writes_no_audience() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let ledger = relay_receipt::ledger_path_for(dir.path());
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        std::fs::write(&ledger, "{\"v\":1,\"turnId\":\"torn").unwrap();
+        let ledger_before = std::fs::read(&ledger).unwrap();
+
+        worksgood::notify::feed_lock::reset_acquisition_counters();
+        let outcome = run_feed_write(
+            dir.path(),
+            "agent",
+            None,
+            Some("harbor"),
+            "Dinner is the soup.",
+            None,
+            Some(ENGINE_TURN),
+            Some("final"),
+            None,
+            Some("4242"),
+            None,
+        );
+
+        let err = outcome.expect_err("a receipt the ledger refuses must fail the write");
+        assert!(
+            !feed.exists() || feed_lines(&feed).is_empty(),
+            "the row survived a receipt that did not: {:?} ({err:#})",
+            feed_lines(&feed)
+        );
+        assert_eq!(
+            std::fs::read(&ledger).unwrap(),
+            ledger_before,
+            "the refused receipt touched the ledger"
+        );
+        assert!(
+            audience_lines(&feed).is_empty(),
+            "an audience was recorded for a row that was taken back out"
+        );
+        assert_eq!(
+            worksgood::notify::feed_lock::distinct_acquisitions(),
+            1,
+            "the failed transaction still took one section, not two"
+        );
+    }
+
+    /// THE CONTROL FOR THE TEST ABOVE, and it is not optional. `run_feed_write`
+    /// erroring proves nothing about the transaction unless the SAME call on a
+    /// healthy ledger lands both halves — otherwise a writer that refused every
+    /// row would pass the rollback test perfectly.
+    #[test]
+    #[serial_test::serial]
+    fn the_same_write_on_a_healthy_ledger_lands_the_row_and_the_receipt_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        run_feed_write(
+            dir.path(),
+            "agent",
+            None,
+            Some("harbor"),
+            "Dinner is the soup.",
+            None,
+            Some(ENGINE_TURN),
+            Some("final"),
+            None,
+            Some("4242"),
+            None,
+        )
+        .expect("the healthy control must land");
+        assert_eq!(feed_lines(&feed).len(), 1, "the row");
+        assert_eq!(receipt_lines(dir.path()).len(), 1, "the receipt");
+    }
+
+    /// A REFUSED AUDIENCE DOES NOT TAKE THE ROW BACK OUT. The rollback boundary
+    /// is where it was: the row and the receipt roll back together, and the
+    /// audience — a fact about a message the family has already seen — is
+    /// reported rather than allowed to destroy the record of the reply.
+    ///
+    /// The refusal is produced by putting a DIRECTORY where the ledger's file
+    /// belongs, so the append fails with `EISDIR` inside the section.
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_audience_leaves_the_row_and_its_receipt_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        std::fs::create_dir_all(&casa_audience::audience_path_for(&feed)).unwrap();
+
+        worksgood::notify::feed_lock::reset_acquisition_counters();
+        run_feed_write(
+            dir.path(),
+            "agent",
+            None,
+            Some("harbor"),
+            "Dinner is the soup.",
+            None,
+            Some(ENGINE_TURN),
+            Some("final"),
+            None,
+            Some("4242"),
+            None,
+        )
+        .expect("an audience the ledger refuses must NOT fail the row");
+        assert_eq!(feed_lines(&feed).len(), 1, "the row was rolled back");
+        assert_eq!(
+            receipt_lines(dir.path()).len(),
+            1,
+            "the receipt went with it"
+        );
+        assert_eq!(worksgood::notify::feed_lock::distinct_acquisitions(), 1);
     }
 }

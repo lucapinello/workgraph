@@ -367,7 +367,7 @@ pub fn audience_for_turn(feed_path: &Path, turn_id: &str) -> Vec<AudienceRecord>
     records.into_iter().filter(|r| r.turn_id == want).collect()
 }
 
-/// Record that a reply reached an audience.
+/// Record that a reply reached an audience — TAKING the conversation lock.
 ///
 /// The whole thing runs inside the cross-process conversation lock — the SAME
 /// lock the feed row was written under, and the same one the gateway's writer
@@ -377,16 +377,20 @@ pub fn audience_for_turn(feed_path: &Path, turn_id: &str) -> Vec<AudienceRecord>
 /// The append happens BEFORE the trim, so a record is never lost to make room
 /// for itself; and a failed trim is not a lost audience (the record is already
 /// on disk), so it is not reported as one.
+///
+/// **THIS IS THE ENTRY POINT FOR A CALLER THAT HOLDS NOTHING.** A caller already
+/// inside the feed transaction that wrote the row calls
+/// [`record_audience_locked`] instead, and takes no second section — see there
+/// for why that is not merely a saving.
 pub fn record_audience(
     feed_path: &Path,
     raw: &AudienceRecord,
 ) -> Result<AudienceOutcome, AudienceError> {
     let record = sanitize(raw).map_err(AudienceError::Malformed)?;
-    // THE THIRD ACQUISITION OF THE SAME LOCK IN ONE `feed-write` (the row, the
-    // receipt, then this), and so the one most likely to arrive after the budget
-    // has already been eaten. It retries on the same terms as the other two
-    // (docs/42 §9, `feed-lock-retry`): only a typed `Timeout`, around the
-    // acquisition only, and a spent budget still refuses. `write_locked` is
+    // A SECOND ACQUISITION OF THE SAME LOCK, and so the one most likely to arrive
+    // after the budget has already been eaten. It retries on the same terms as
+    // the row's (docs/42 §9, `feed-lock-retry`): only a typed `Timeout`, around
+    // the acquisition only, and a spent budget still refuses. `write_locked` is
     // idempotent on the (turn, audience) key anyway, but it is never given the
     // chance to prove it — the section runs at most once.
     let completed = super::feed_lock::with_feed_lock_retrying(
@@ -397,6 +401,38 @@ pub fn record_audience(
     )
     .map_err(|refusal| AudienceError::Locked(refusal.to_string()))?;
     completed.regardless_of_release()
+}
+
+/// [`record_audience`]'s body, for a caller that ALREADY HOLDS the feed lock —
+/// the delivery seam, which writes the row, its receipt and its audience in one
+/// section (docs/42 §9, `feed-lock-section`).
+///
+/// The `_lock` parameter is a witness, not a hint, exactly as it is in
+/// [`relay_receipt::append_locked`](super::relay_receipt::append_locked): a
+/// [`FeedLock`] can only be obtained by acquiring one, so this cannot be called
+/// from outside a transaction and cannot deadlock by taking the lock twice (it
+/// is not reentrant across sequential sections, and the protocol's re-entrancy
+/// is keyed per thread, so a nested `acquire` here would silently succeed and
+/// prove nothing).
+///
+/// **WHAT THIS IS NOT.** It is not the audience record joining the ROW's
+/// transaction. The row and its receipt are one fact and roll back together
+/// ([`super::casa_feed::append_entry_proving`]); the audience is a separate fact
+/// about a message the family has ALREADY seen, so a caller must not let a
+/// refused audience take the row back out, and must still record the audience
+/// when the row itself could not be written. Both callers keep that shape: they
+/// write the audience inside the section and carry its outcome out, and the
+/// listener falls back to [`record_audience`] on the path where there was no
+/// section at all. What is shared is the exclusion, not the rollback.
+///
+/// [`FeedLock`]: super::feed_lock::FeedLock
+pub fn record_audience_locked(
+    feed_path: &Path,
+    raw: &AudienceRecord,
+    _lock: &super::feed_lock::FeedLock,
+) -> Result<AudienceOutcome, AudienceError> {
+    let record = sanitize(raw).map_err(AudienceError::Malformed)?;
+    write_locked(feed_path, &record, MAX_RECORDS, KEEP_RECORDS)
 }
 
 /// The critical section's body, with the horizon injectable so the trim is
@@ -449,22 +485,42 @@ pub fn record_group_reply(
     responder_id: &str,
     at: i64,
 ) -> Result<AudienceOutcome, AudienceError> {
-    let responder = scrub(responder_id, MAX_ID);
-    record_audience(
+    record_audience(feed_path, &group_reply_record(turn_id, responder_id, at))
+}
+
+/// [`record_group_reply`] for a caller already inside the feed transaction —
+/// the same six fields, written in the section that wrote the row rather than in
+/// a second one. See [`record_audience_locked`].
+pub fn record_group_reply_locked(
+    feed_path: &Path,
+    turn_id: &str,
+    responder_id: &str,
+    at: i64,
+    lock: &super::feed_lock::FeedLock,
+) -> Result<AudienceOutcome, AudienceError> {
+    record_audience_locked(
         feed_path,
-        &AudienceRecord {
-            turn_id: turn_id.to_string(),
-            responder_id: if responder.is_empty() {
-                HOUSE_RESPONDER.to_string()
-            } else {
-                responder
-            },
-            audience: AUDIENCE_GROUP.to_string(),
-            chat: GROUP_CHAT.to_string(),
-            via: VIA_FAMILY_CHAT.to_string(),
-            at,
-        },
+        &group_reply_record(turn_id, responder_id, at),
+        lock,
     )
+}
+
+/// The record both group-reply seams write, built once so the locked and
+/// unlocked forms cannot drift into recording two different things.
+fn group_reply_record(turn_id: &str, responder_id: &str, at: i64) -> AudienceRecord {
+    let responder = scrub(responder_id, MAX_ID);
+    AudienceRecord {
+        turn_id: turn_id.to_string(),
+        responder_id: if responder.is_empty() {
+            HOUSE_RESPONDER.to_string()
+        } else {
+            responder
+        },
+        audience: AUDIENCE_GROUP.to_string(),
+        chat: GROUP_CHAT.to_string(),
+        via: VIA_FAMILY_CHAT.to_string(),
+        at,
+    }
 }
 
 #[cfg(test)]
@@ -834,5 +890,90 @@ mod tests {
         let (records, malformed) = read_audience(&f);
         assert_eq!(records.len(), 1);
         assert_eq!(malformed.len(), 2);
+    }
+
+    // --- the audience rides in the row's section (feed-lock-section) --------
+
+    /// [`record_audience_locked`] WRITES IN THE CALLER'S SECTION AND TAKES NO
+    /// SECOND LOCK.
+    ///
+    /// This is the whole point of the seam: the delivery writers used to take
+    /// `.conversation.lock`, write the row and its receipt, let go, and take it
+    /// again for the audience — a second queue position for every other writer,
+    /// arriving after the patience budget was already partly spent. The counter
+    /// is the assertion; the record landing is the control that stops "one
+    /// acquisition" from being achieved by not writing at all.
+    #[test]
+    #[serial]
+    fn record_audience_locked_writes_in_the_callers_section_and_takes_no_second_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed_path = feed(&dir);
+        super::super::feed_lock::reset_acquisition_counters();
+
+        let lock =
+            super::super::feed_lock::acquire(&feed_path, 1000).expect("the caller's section");
+        let outcome = record_group_reply_locked(&feed_path, TURN, "harbor", 1, &lock)
+            .expect("the audience must land inside the caller's section");
+        assert!(
+            matches!(outcome, AudienceOutcome::Recorded(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            super::super::feed_lock::distinct_acquisitions(),
+            1,
+            "the locked seam took a lock of its own — that is the second section this exists \
+             to remove (docs/42 §9, feed-lock-section)"
+        );
+        assert_eq!(super::super::feed_lock::reentrant_frames(), 0);
+        assert_eq!(lock.release(), super::super::feed_lock::Release::Released);
+
+        let (records, bad) = read_audience(&feed_path);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].turn_id, TURN);
+    }
+
+    /// THE CONTROL — the unlocked entry point still exists and still takes a
+    /// section of its own, because the listener falls back to it on the path
+    /// where the row's transaction failed and there is no section to ride in.
+    /// Without this, replacing `record_audience` with the locked form would go
+    /// unnoticed until an audience was silently dropped.
+    #[test]
+    #[serial]
+    fn the_unlocked_entry_point_still_takes_its_own_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed_path = feed(&dir);
+        super::super::feed_lock::reset_acquisition_counters();
+        record_group_reply(&feed_path, TURN, "harbor", 1).expect("the standalone writer must land");
+        assert_eq!(
+            super::super::feed_lock::distinct_acquisitions(),
+            1,
+            "the standalone writer must still serialise itself"
+        );
+        assert_eq!(read_audience(&feed_path).0.len(), 1);
+    }
+
+    /// THE TWO FORMS RECORD THE SAME SIX FIELDS. They are two entry points to
+    /// one record, and an auditor joining on the ledger cannot be made to care
+    /// which one wrote a line — so the only difference permitted between them is
+    /// the timestamp.
+    #[test]
+    #[serial]
+    fn the_locked_and_unlocked_group_seams_write_the_same_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed_path = feed(&dir);
+        record_group_reply(&feed_path, TURN, "harbor", 7).expect("standalone");
+
+        let other = tempfile::tempdir().unwrap();
+        let feed_path2 = feed(&other);
+        let lock = super::super::feed_lock::acquire(&feed_path2, 1000).unwrap();
+        record_group_reply_locked(&feed_path2, TURN, "harbor", 7, &lock).expect("in-section");
+        lock.release();
+
+        assert_eq!(
+            to_json_line(&read_audience(&feed_path).0[0]),
+            to_json_line(&read_audience(&feed_path2).0[0]),
+            "the two seams record different things"
+        );
     }
 }

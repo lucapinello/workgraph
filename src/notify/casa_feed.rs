@@ -715,12 +715,14 @@ fn is_canonical_feed_archive_name(name: &OsStr) -> bool {
         && &bytes[18..] == b".jsonl"
 }
 
-fn archived_count_from_bytes(feed_path: &Path) -> Result<usize, FeedWriteError> {
-    let dir = archive_dir_for(feed_path);
-    let entries = match fs::read_dir(&dir) {
+/// Every canonical archive segment, in rotation order. Fails closed for the
+/// reason [`archived_count_from_bytes`] gives: an archive we cannot LIST is not
+/// the fact "nothing has rotated".
+fn canonical_segments(dir: &Path) -> Result<Vec<PathBuf>, FeedWriteError> {
+    let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         // Nothing has rotated yet. That IS zero archived rows.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
             return Err(FeedWriteError::ReadUnknown {
                 what: "feed archive directory",
@@ -742,20 +744,286 @@ fn archived_count_from_bytes(feed_path: &Path) -> Result<usize, FeedWriteError> 
     // File order: the segments are named so that lexical order IS rotation
     // order, matching the gateway's `feedSegments`.
     names.sort();
+    Ok(names)
+}
+
+/// Enough of a file's identity to recognise the SAME bytes later without
+/// reading them again — and no more than that.
+///
+/// **WHAT THIS IS NOT.** It is not `manifest.json`, and the rule the module
+/// header states about the manifest is untouched: a count WRITTEN DOWN by
+/// another process, in another artifact, validated only by a name-set check, is
+/// never believed. What this recognises is bytes THIS process read moments ago,
+/// against an inode it re-`stat`s under the held lock. A segment that was
+/// appended to, rewritten, replaced or rotated changes its length, its mtime or
+/// its inode, and every one of those makes the identity unequal and sends the
+/// allocator back to the bytes.
+///
+/// The residue, stated rather than hidden: an in-place rewrite that preserves
+/// the inode, the byte length AND the nanosecond mtime would be accepted. No
+/// writer in either implementation rewrites a SEALED archive segment at all —
+/// rotation creates segments and appends to the newest one, both of which move
+/// length and mtime — so this is a shape neither twin can produce, not a shape
+/// we are choosing to tolerate. The live feed carries the same identity check
+/// and one extra condition (see [`LivePrecount`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_s: i64,
+    mtime_ns: i64,
+}
+
+#[cfg(unix)]
+fn identity_of(meta: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        len: meta.len(),
+        mtime_s: meta.mtime(),
+        mtime_ns: meta.mtime_nsec(),
+    })
+}
+
+/// Off Unix there is no inode to compare, so there is no identity — and `None`
+/// is never equal to anything, which makes every section recount from the bytes
+/// exactly as it did before. A platform we cannot prove sameness on pays the
+/// full price rather than guessing.
+#[cfg(not(unix))]
+fn identity_of(_meta: &fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
+fn identity_at(path: &Path) -> Option<FileIdentity> {
+    identity_of(&fs::metadata(path).ok()?)
+}
+
+/// One archive segment counted from its bytes, with the identity of the inode
+/// those bytes came from.
+#[derive(Debug, Clone)]
+struct CountedSegment {
+    path: PathBuf,
+    id: FileIdentity,
+    entries: usize,
+}
+
+/// The archive as it was OUTSIDE the lock — the expensive read, moved off the
+/// critical section (docs/42 §9, `feed-lock-section`).
+///
+/// The archive is the unbounded half of the feed's history: the live file is
+/// bounded by rotation, the archive grows a segment a month forever, and every
+/// held section used to read every byte of it to derive one id. It is also the
+/// STABLE half — only a rotation touches it, and a rotation holds this same lock
+/// — so reading it before the acquire and re-proving it by identity inside costs
+/// one `stat` per segment where it used to cost the whole history.
+///
+/// It is only ever a FAST PATH. A segment whose identity does not match, a
+/// segment that appeared, one that is missing, an unreadable one, an unstable
+/// one, a platform with no inodes: each of those falls straight back to reading
+/// that segment's bytes inside the section, which is what every section did
+/// before. Nothing here can produce an id; it can only save a read.
+#[derive(Debug, Clone, Default)]
+struct ArchivePrecount {
+    segments: Vec<CountedSegment>,
+}
+
+impl ArchivePrecount {
+    fn entries_for(&self, path: &Path, id: FileIdentity) -> Option<usize> {
+        self.segments
+            .iter()
+            .find(|s| s.path == path && s.id == id)
+            .map(|s| s.entries)
+    }
+}
+
+/// Count every archive segment BEFORE taking the lock, remembering what each
+/// count was taken from. Any trouble at all yields no precount for that segment:
+/// this runs unserialised, so it is allowed to be wrong and never allowed to be
+/// believed.
+fn precount_archive(feed_path: &Path) -> ArchivePrecount {
+    let dir = archive_dir_for(feed_path);
+    let Ok(names) = canonical_segments(&dir) else {
+        return ArchivePrecount::default();
+    };
+    let mut segments = Vec::with_capacity(names.len());
+    for path in names {
+        // STAT, READ, STAT. A segment that changed UNDER the read produces a
+        // count of a mixture of two states; requiring the identity to be equal
+        // on both sides of the read is what makes the remembered count a count
+        // OF the remembered identity rather than merely near it.
+        let Some(before) = identity_at(&path) else {
+            continue;
+        };
+        let Ok(entries) = count_entries_in_file(&path) else {
+            continue;
+        };
+        let Some(after) = identity_at(&path) else {
+            continue;
+        };
+        if before != after {
+            continue;
+        }
+        segments.push(CountedSegment {
+            path,
+            id: after,
+            entries,
+        });
+    }
+    ArchivePrecount { segments }
+}
+
+/// THE UNCACHED ARITHMETIC — every segment read from the bytes, no precount at
+/// all. This is what the allocator did before `feed-lock-section`, kept as the
+/// CONTROL the shortened path is checked against
+/// (`ids_over_a_feed_with_history_match_the_uncached_arithmetic`): a fast path
+/// with no slow path to disagree with is a fast path nobody can audit.
+#[cfg(test)]
+fn archived_count_from_bytes(feed_path: &Path) -> Result<usize, FeedWriteError> {
+    archived_count_reusing(feed_path, &ArchivePrecount::default())
+}
+
+/// Count entries in every canonical `group-feed-YYYY-MM.jsonl` archive segment
+/// FROM THE BYTES, in file order — reusing only those segments an out-of-section
+/// [`precount_archive`] already counted AND that are still, by inode, length and
+/// mtime, the same file. Every other segment is read here.
+///
+/// Deliberately NOT from `manifest.json`. The manifest is a read accelerator
+/// that is believed whenever its name set matches the files on disk — a wrong
+/// per-segment COUNT is invisible to a name-set check, and an id is permanent.
+/// That is exactly how the gateway slice reproduced the duplicate id `[1, 2, 2]`.
+/// The allocator pays for the recount. The precount is not that: see
+/// [`FileIdentity`] for what is and is not being believed here.
+///
+/// AND IT FAILS CLOSED. A missing archive directory is a FACT — an install that
+/// has never rotated has zero archived rows — but an archive we cannot READ is
+/// not that fact, it is the absence of an answer. Returning `0` for the two
+/// cases alike is how the exact-tree control got `feedId=1` for a row whose
+/// global id was 2: one unreadable directory, and a permanent id was reissued to
+/// a second row. Every unreadable segment, and the unreadable directory itself,
+/// is [`FeedWriteError::ReadUnknown`], and the write does not happen — with a
+/// precount in hand exactly as without one.
+fn archived_count_reusing(
+    feed_path: &Path,
+    precount: &ArchivePrecount,
+) -> Result<usize, FeedWriteError> {
+    let dir = archive_dir_for(feed_path);
+    let names = canonical_segments(&dir)?;
     let mut total = 0usize;
     for path in &names {
-        let body = fs::read_to_string(path).map_err(|e| FeedWriteError::ReadUnknown {
-            what: "feed archive segment",
-            detail: e.to_string(),
-        })?;
-        total += count_entries(&body);
+        // The `stat` is not an optimisation we could skip when there is no
+        // precount: an unreadable segment must refuse the write, and asking for
+        // its metadata is how a segment that vanished between the listing and
+        // here becomes an error rather than a silent zero.
+        let reusable = identity_at(path).and_then(|id| precount.entries_for(path, id));
+        total += match reusable {
+            Some(entries) => entries,
+            None => count_entries_in_file(path).map_err(|e| FeedWriteError::ReadUnknown {
+                what: "feed archive segment",
+                detail: e.to_string(),
+            })?,
+        };
     }
     Ok(total)
 }
 
 /// Non-blank lines — one entry per line, matching the reader's parse.
+///
+/// THE REFERENCE the streaming counter below is held to. Production reads files,
+/// not strings, so this survives as the definition
+/// [`count_entries_in_file`] is compared against on every shape that could make
+/// the two disagree — and a disagreement of one reissues a permanent id.
+#[cfg(test)]
 fn count_entries(body: &str) -> usize {
     body.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+/// [`count_entries`] over a file, WITHOUT holding the file in memory.
+///
+/// The old shape was `read_to_string` then `count_entries`: a whole archive
+/// segment — megabytes, once a household has a year of conversation — allocated
+/// and UTF-8-validated as one `String` inside the critical section, to produce
+/// one integer. This streams it in a fixed buffer and allocates only the longest
+/// line.
+///
+/// IT COUNTS THE SAME THING, and that is not a detail: the global feed id is
+/// this number, and a count that drifts from `count_entries` by one reissues a
+/// permanent id. `str::lines()` splits on `\n` and yields a final unterminated
+/// remainder, and `trim()` is Unicode-aware — so each `\n`-delimited slice is
+/// trimmed the same way here, and validity is checked per line, which is
+/// equivalent to checking the whole body because `\n` never occurs inside a
+/// multi-byte sequence. An invalid-UTF-8 file is still `InvalidData`, exactly as
+/// `read_to_string` reported it, so it still refuses the write.
+fn count_entries_in_file(path: &Path) -> std::io::Result<usize> {
+    let file = fs::File::open(path)?;
+    count_entries_in_reader(std::io::BufReader::with_capacity(64 * 1024, file))
+}
+
+fn count_entries_in_reader<R: std::io::BufRead>(mut reader: R) -> std::io::Result<usize> {
+    let mut count = 0usize;
+    let mut line: Vec<u8> = Vec::with_capacity(512);
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let body = line.strip_suffix(b"\n").unwrap_or(&line[..]);
+        let text = std::str::from_utf8(body).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("stream did not contain valid UTF-8: {e}"),
+            )
+        })?;
+        if !text.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// The LIVE feed as it was outside the lock — the other half of the history read
+/// (docs/42 §9, `feed-lock-section`).
+///
+/// Reusing this is subject to everything [`ArchivePrecount`] is subject to, plus
+/// one condition of its own: **the counted bytes must end with a newline**.
+/// [`append_entry_durable`] appends with no leading newline, so if the file's
+/// last line were unterminated our row would WELD onto it and the file would
+/// gain no entry — `count + 1` would then issue an id already in use. In that
+/// state (and in every mismatch) the section reads the file back after the
+/// append exactly as it always did, which counts the weld correctly.
+#[derive(Debug, Clone, Copy)]
+struct LivePrecount {
+    id: FileIdentity,
+    entries: usize,
+}
+
+/// Count the live feed before taking the lock. `None` for an absent, unstable,
+/// unreadable or unterminated file — in each case the section counts it itself.
+fn precount_live(feed_path: &Path) -> Option<LivePrecount> {
+    let before = identity_at(feed_path)?;
+    let entries = count_entries_in_file(feed_path).ok()?;
+    let after = identity_at(feed_path)?;
+    if before != after || !ends_with_newline(feed_path, after.len) {
+        return None;
+    }
+    Some(LivePrecount { id: after, entries })
+}
+
+/// Does the file's last byte terminate its last record? An empty file does.
+fn ends_with_newline(path: &Path, len: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    if len == 0 {
+        return true;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(len - 1)).is_err() {
+        return false;
+    }
+    let mut last = [0u8; 1];
+    matches!(file.read_exact(&mut last), Ok(())) && last[0] == b'\n'
 }
 
 /// A row that has DECLARED, in the type system, why no delivery receipt can
@@ -922,6 +1190,16 @@ pub fn append_entry_proving<E>(
         fs::create_dir_all(parent)
             .map_err(|e| ProveFailure::Feed(FeedWriteError::Io(e.to_string())))?;
     }
+    // THE HISTORY IS READ BEFORE THE LOCK IS TAKEN, NOT INSIDE IT (docs/42 §9,
+    // `feed-lock-section`). Deriving one id used to cost a full read of every
+    // archive segment plus a full read-back of the live file, all of it inside
+    // the section every other writer is queued behind. Both reads happen out
+    // here now, unserialised, and the section RE-PROVES them by identity: one
+    // `stat` per file where it is still the same inode, the same length and the
+    // same mtime, and the bytes where it is not. Nothing below trusts these
+    // values; they can only save a read. See [`ArchivePrecount`], [`LivePrecount`].
+    let archive_precount = precount_archive(feed_path);
+    let live_precount = precount_live(feed_path);
     // A MOMENTARY CONTENTION LOSS IS NOT A LOST MESSAGE (docs/42 §9,
     // `feed-lock-retry`). Six concurrent writers of the shape `wg telegram
     // feed-write` actually performs were measured at 986 ms of the 1000 ms
@@ -940,10 +1218,11 @@ pub fn append_entry_proving<E>(
             // we hold the lock, and asking first means an unreadable archive costs
             // nothing: no row is written, no id is issued, and the refusal is a
             // typed unknown rather than a silent zero.
-            let archived = archived_count_from_bytes(feed_path).map_err(ProveFailure::Feed)? as i64;
-            let before = match fs::metadata(feed_path) {
-                Ok(m) => m.len(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            let archived = archived_count_reusing(feed_path, &archive_precount)
+                .map_err(ProveFailure::Feed)? as i64;
+            let (before, before_id) = match fs::metadata(feed_path) {
+                Ok(m) => (m.len(), identity_of(&m)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, None),
                 Err(e) => {
                     return Err(ProveFailure::Feed(FeedWriteError::ReadUnknown {
                         what: "live feed",
@@ -968,18 +1247,28 @@ pub fn append_entry_proving<E>(
             // instant — no counter is needed and none can drift. A live file we
             // cannot read back is the same unknown as an unreadable archive, so it
             // rolls our row back out instead of counting as an empty feed.
-            let live = match fs::read_to_string(feed_path) {
-                Ok(body) => count_entries(&body),
-                Err(e) => {
-                    let unknown = FeedWriteError::ReadUnknown {
-                        what: "live feed",
-                        detail: e.to_string(),
-                    };
-                    return Err(match roll_back(feed_path, before, 0) {
-                        Ok(()) => ProveFailure::Feed(unknown),
-                        Err(orphan) => ProveFailure::Feed(orphan),
-                    });
-                }
+            //
+            // The `+ 1` is reached ONLY when the file this section appended to is,
+            // by inode/length/mtime, the very file the out-of-section count was
+            // taken from, and that file ended with a newline so our line could not
+            // weld onto an unterminated one ([`LivePrecount`]). Anything else —
+            // another writer got in, a rotation replaced the file, it was absent,
+            // it was torn — reads it back, which is what every section did before.
+            let live = match live_precount.filter(|p| before_id == Some(p.id)) {
+                Some(counted) => counted.entries + 1,
+                None => match count_entries_in_file(feed_path) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let unknown = FeedWriteError::ReadUnknown {
+                            what: "live feed",
+                            detail: e.to_string(),
+                        };
+                        return Err(match roll_back(feed_path, before, 0) {
+                            Ok(()) => ProveFailure::Feed(unknown),
+                            Err(orphan) => ProveFailure::Feed(orphan),
+                        });
+                    }
+                },
             };
             let feed_id = archived + live as i64;
 
@@ -2615,5 +2904,259 @@ emoji = "①"
         );
         let _ = go.send(());
         holder.join().unwrap();
+    }
+
+    // --- the history read left the critical section (feed-lock-section) ------
+    //
+    // Deriving one global id used to read the WHOLE feed history INSIDE the
+    // lock: every archive segment in full, then the live file back again after
+    // the append. Both reads now happen before the acquire and are RE-PROVED by
+    // identity inside it — one `stat` per file where the inode, the length and
+    // the mtime are unchanged, and the bytes where they are not.
+    //
+    // Everything below is about the one thing that can go wrong with that: an id
+    // is PERMANENT, so a count that is off by one reissues a number that is
+    // already on a row somebody said.
+
+    /// THE STREAMING COUNTER COUNTS EXACTLY WHAT THE STRING ONE COUNTED.
+    ///
+    /// `read_to_string` + [`count_entries`] was replaced by
+    /// [`count_entries_in_file`], which never holds the file in memory. If the
+    /// two ever disagree by one, the allocator issues a duplicate id — so they
+    /// are compared here on the shapes that actually distinguish them: a missing
+    /// final newline, CRLF, blank and whitespace-only lines, a NON-ASCII
+    /// whitespace line (`trim()` is Unicode-aware and a byte-wise ASCII check is
+    /// not), and multi-byte text.
+    #[test]
+    fn the_streaming_entry_count_agrees_with_the_string_one_on_every_shape() {
+        let bodies: &[&str] = &[
+            "",
+            "\n",
+            "{\"a\":1}\n",
+            "{\"a\":1}",
+            "{\"a\":1}\n{\"b\":2}\n",
+            "{\"a\":1}\n\n{\"b\":2}\n",
+            "{\"a\":1}\r\n{\"b\":2}\r\n",
+            "   \n\t\n{\"a\":1}\n",
+            "\u{a0}\n{\"a\":1}\n",
+            "{\"t\":\"caffè — ok\"}\n{\"t\":\"日本語\"}\n",
+            "{\"a\":1}\n   ",
+        ];
+        let dir = tempdir().unwrap();
+        for (i, body) in bodies.iter().enumerate() {
+            let path = dir.path().join(format!("body-{i}.jsonl"));
+            fs::write(&path, body).unwrap();
+            assert_eq!(
+                count_entries_in_file(&path).unwrap(),
+                count_entries(body),
+                "the two counters disagree on body {i}: {body:?}"
+            );
+        }
+    }
+
+    /// …and invalid UTF-8 is still the refusal it was. `read_to_string` reported
+    /// `InvalidData`, which the archive path turns into `ReadUnknown` and the
+    /// live path turns into a rollback. A streaming counter that skipped the
+    /// validation would count a damaged file instead of refusing it.
+    #[test]
+    fn a_segment_that_is_not_utf8_is_still_refused_rather_than_counted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("broken.jsonl");
+        fs::write(&path, b"{\"a\":1}\n\xff\xfe not utf8\n").unwrap();
+        let err = count_entries_in_file(&path).expect_err("invalid UTF-8 must not count");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+    }
+
+    /// THE PRECOUNT IS ACTUALLY REUSED — the visible control for a fast path
+    /// that is otherwise invisible from the outside.
+    ///
+    /// Every other test here passes just as well against an
+    /// [`archived_count_reusing`] that ignored its precount and read the bytes
+    /// every time: the answer would be identical and only the clock would know.
+    /// So this one hands it a precount that is DELIBERATELY WRONG for an
+    /// unchanged segment and requires the wrong number back. A build that stops
+    /// reusing goes red here and nowhere else, which is the point — it is the
+    /// only assertion in the file that can tell "shorter" from "unchanged".
+    ///
+    /// Nothing in production can construct this state: the only mint is
+    /// [`precount_archive`], which counts the bytes it remembers.
+    #[test]
+    fn a_matching_precount_is_reused_and_a_changed_segment_is_not() {
+        let (dir, feed) = scratch_feed();
+        let archive = dir.path().join(".casa").join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let segment = archive.join("group-feed-2026-06.jsonl");
+        fs::write(&segment, "{\"ts\":1}\n{\"ts\":2}\n{\"ts\":3}\n").unwrap();
+
+        // The honest precount, and the honest answer.
+        let precount = precount_archive(&feed);
+        assert_eq!(archived_count_reusing(&feed, &precount).unwrap(), 3);
+        assert_eq!(archived_count_from_bytes(&feed).unwrap(), 3);
+
+        // THE PROBE. Same identity, a count that is a lie: if the section still
+        // reads the bytes, this returns 3 and the fast path is dead code.
+        let id = identity_at(&segment).expect("a unix inode");
+        let lying = ArchivePrecount {
+            segments: vec![CountedSegment {
+                path: segment.clone(),
+                id,
+                entries: 999,
+            }],
+        };
+        assert_eq!(
+            archived_count_reusing(&feed, &lying).unwrap(),
+            999,
+            "the precount was not reused — the archive read never left the critical section"
+        );
+
+        // …and the identity is what licenses it. Append to the segment and the
+        // remembered count is refused: the bytes are read again.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(b"{\"ts\":4}\n")
+            .unwrap();
+        assert_eq!(
+            archived_count_reusing(&feed, &lying).unwrap(),
+            4,
+            "a segment that CHANGED was counted from a stale remembered number"
+        );
+        assert_eq!(
+            archived_count_reusing(&feed, &precount).unwrap(),
+            4,
+            "the honest precount is stale too, and must also be refused"
+        );
+    }
+
+    /// A SEGMENT THAT APPEARED AFTER THE PRECOUNT IS COUNTED, not ignored. The
+    /// precount is keyed per segment, so a rotation between the out-of-section
+    /// read and the acquire adds a file the remembered set says nothing about —
+    /// and "nothing about it" must mean "read it", never "zero".
+    #[test]
+    fn a_segment_that_rotated_in_after_the_precount_is_read_not_skipped() {
+        let (dir, feed) = scratch_feed();
+        let archive = dir.path().join(".casa").join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(
+            archive.join("group-feed-2026-06.jsonl"),
+            "{\"ts\":1}\n{\"ts\":2}\n",
+        )
+        .unwrap();
+        let precount = precount_archive(&feed);
+        fs::write(
+            archive.join("group-feed-2026-07.jsonl"),
+            "{\"ts\":3}\n{\"ts\":4}\n{\"ts\":5}\n",
+        )
+        .unwrap();
+        assert_eq!(archived_count_reusing(&feed, &precount).unwrap(), 5);
+    }
+
+    /// AN UNREADABLE SEGMENT STILL REFUSES THE WRITE even with a precount in
+    /// hand. The fail-closed rule is the reason the id is trustworthy at all; a
+    /// fast path that answered from memory for a segment it can no longer read
+    /// would turn "I do not know" back into a silent number.
+    #[test]
+    fn an_unreadable_segment_refuses_even_when_it_was_precounted() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, feed) = scratch_feed();
+        let archive = dir.path().join(".casa").join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let segment = archive.join("group-feed-2026-06.jsonl");
+        fs::write(&segment, "{\"ts\":1}\n{\"ts\":2}\n").unwrap();
+        let precount = precount_archive(&feed);
+        assert_eq!(archived_count_reusing(&feed, &precount).unwrap(), 2);
+
+        // Rewrite it (new mtime, so the remembered identity no longer matches)
+        // and take away the read bit.
+        fs::write(&segment, "{\"ts\":1}\n{\"ts\":2}\n{\"ts\":3}\n").unwrap();
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = archived_count_reusing(&feed, &precount)
+            .expect_err("an unreadable segment is not a count");
+        assert!(
+            matches!(err, FeedWriteError::ReadUnknown { what, .. } if what == "feed archive segment"),
+            "{err:?}"
+        );
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(dir);
+    }
+
+    /// A LIVE FILE WHOSE LAST RECORD IS UNTERMINATED IS NOT REUSED — and the
+    /// row that WELDS onto it gets no duplicate id.
+    ///
+    /// [`append_entry_durable`] writes no leading newline, so appending to a
+    /// torn tail produces one line where there were two halves: the file gains
+    /// no entry, and `precounted + 1` would hand out an id the previous row
+    /// already holds. [`precount_live`] refuses to remember such a file, so the
+    /// section reads it back and counts the weld, exactly as it always did.
+    #[test]
+    fn a_torn_live_tail_is_read_back_and_the_welded_row_reuses_no_id() {
+        let (_dir, feed) = scratch_feed();
+        fs::create_dir_all(feed.parent().unwrap()).unwrap();
+        fs::write(&feed, "{\"ts\":1}\n{\"ts\":2}").unwrap();
+        assert!(precount_live(&feed).is_none(), "a torn tail was remembered");
+
+        let entry = agent_entry(&catalog(), "harbor", "the welded row", 9)
+            .with_turn(TURN, ReplyPhase::Final);
+        let id = certified_id(write_row(&feed, &entry).unwrap());
+        assert_eq!(
+            id,
+            count_entries(&fs::read_to_string(&feed).unwrap()) as i64,
+            "the id and the file disagree about how many entries there are"
+        );
+        assert_eq!(id, 2, "the weld was counted as a new entry: {id}");
+    }
+
+    /// …and the CONTROL: a properly terminated live file IS remembered, so the
+    /// test above is about the torn tail and not about the precount never
+    /// working. Without this, deleting `precount_live` outright would leave the
+    /// file green.
+    #[test]
+    fn a_terminated_live_file_is_remembered_and_the_next_row_is_one_more() {
+        let (_dir, feed) = scratch_feed();
+        fs::create_dir_all(feed.parent().unwrap()).unwrap();
+        fs::write(&feed, "{\"ts\":1}\n{\"ts\":2}\n").unwrap();
+        let counted = precount_live(&feed).expect("a terminated live file must be remembered");
+        assert_eq!(counted.entries, 2);
+
+        let entry =
+            agent_entry(&catalog(), "harbor", "the next row", 9).with_turn(TURN, ReplyPhase::Final);
+        assert_eq!(certified_id(write_row(&feed, &entry).unwrap()), 3);
+    }
+
+    /// AND THE ID IS THE SAME NUMBER THE OLD ALLOCATOR WOULD HAVE ISSUED, over a
+    /// feed with real history: archives plus a live file, every row written
+    /// through the production seam. `archived_count_from_bytes` (no precount at
+    /// all — the pre-change arithmetic) is asserted against the id the section
+    /// actually allocated, so the two paths cannot drift apart in silence.
+    #[test]
+    fn ids_over_a_feed_with_history_match_the_uncached_arithmetic() {
+        let (dir, feed) = scratch_feed();
+        let archive = dir.path().join(".casa").join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(
+            archive.join("group-feed-2026-06.jsonl"),
+            "{\"ts\":1}\n{\"ts\":2}\n{\"ts\":3}\n",
+        )
+        .unwrap();
+        fs::write(archive.join("group-feed-2026-07.jsonl"), "{\"ts\":4}\n").unwrap();
+
+        for expected in 5..=9i64 {
+            let entry = agent_entry(
+                &catalog(),
+                "harbor",
+                "a row with history behind it",
+                expected,
+            )
+            .with_turn(TURN, ReplyPhase::Final);
+            let id = certified_id(write_row(&feed, &entry).unwrap());
+            assert_eq!(id, expected, "the allocator skipped or reissued an id");
+            let uncached = archived_count_from_bytes(&feed).unwrap() as i64
+                + count_entries(&fs::read_to_string(&feed).unwrap()) as i64;
+            assert_eq!(
+                id, uncached,
+                "the shortened section and the full read disagree"
+            );
+        }
     }
 }
