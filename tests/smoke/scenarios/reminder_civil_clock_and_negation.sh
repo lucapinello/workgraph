@@ -232,7 +232,30 @@ before="$(cat "$plan")"
 $(diff <(printf '%s' "$before") "$plan" || true)"
 echo "    → unchanged"
 
-echo "5c. the cancel really removes the row it names:"
+# AMENDED BY task `cross-surface-reminder`. Step 1a filed an ad-hoc "call the
+# dentist" for 2026-08-03 09:00 and step 5a wrote a plan row for the same thing, so
+# by here the family has TWO live dentist reminders. A cancel now decides ambiguity
+# across BOTH surfaces before touching either — which is the whole point: removing
+# one of two and reporting "Done" is the half-applied cancel that task exists to
+# close. So the ambiguous ask is pinned first, and the original assertion (a cancel
+# really removes the row it names) follows once the other surface is clear.
+echo "5c. while an ad-hoc twin is also live, the cancel removes NOTHING and asks:"
+out="$( (cd "$scratch" && WG_DIR="$scratch/.wg" \
+    wg --json telegram shopping 'cancel the reminder about the dentist' \
+       --now "$NOW" --apply --root "$scratch" --calendar-owner Otto) )"
+case "$out" in
+    *reminder-cancel-ambiguous*) ;;
+    *) loud_fail "two live dentist reminders must be asked about, not guessed at: $out" ;;
+esac
+grep -q 'Reminder: call the dentist' "$plan" \
+    || loud_fail "the plan row went while the ask was still ambiguous:
+$(cat "$plan")"
+grep -q 'dentist' "$scratch/.casa/reminders-adhoc.json" \
+    || loud_fail "the ad-hoc twin went while the ask was still ambiguous: $(cat "$scratch/.casa/reminders-adhoc.json")"
+echo "    → nothing removed on either surface"
+
+echo "5d. with the ad-hoc twin cleared, the cancel really removes the row it names:"
+rm -f "$scratch/.casa/reminders-adhoc.json"
 (cd "$scratch" && WG_DIR="$scratch/.wg" \
     wg telegram shopping 'cancel the reminder about the dentist' \
        --now "$NOW" --apply --root "$scratch" --calendar-owner Otto) >/dev/null
