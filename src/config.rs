@@ -4625,8 +4625,21 @@ fn default_max_build_agents() -> usize {
 fn default_estimated_build_bytes() -> u64 {
     16 * 1024 * 1024 * 1024
 }
+/// How often the sentinel re-walks every registered cache to build its snapshot.
+///
+/// This is NOT the disk-pressure guard. Admission calls `current_admission` — a
+/// `statfs` over a few mounts — on every tick and every spawn, so free space is
+/// still checked continuously and this interval cannot let the disk fill up.
+/// The walk exists to attribute bytes and growth to individual caches for
+/// `wg disk doctor` and cleanup.
+///
+/// It was 30s: a full recursive walk of every registered cargo target twice a
+/// minute. On the live household that is ~25GB over 128 caches, and it was the
+/// largest single consumer in the daemon — 19.5% of a core, indefinitely, on a
+/// laptop (2026-08-11). Per-cache sizes do not move meaningfully in 30 seconds,
+/// and growth attribution is if anything less noisy over a longer base.
 fn default_disk_scan_interval_seconds() -> u64 {
-    30
+    300
 }
 fn default_disk_scan_max_entries() -> usize {
     200_000
@@ -10559,6 +10572,31 @@ profile = "openrouter"
         let config: Config = merged.try_into().unwrap();
 
         assert_eq!(config.profile, Some("openrouter".to_string()));
+    }
+
+    #[test]
+    /// The sentinel's per-cache walk must not run at tick cadence.
+    ///
+    /// At the old 30s default the daemon re-walked every registered cargo target
+    /// twice a minute and spent 19.5% of a core doing it forever. Expressed
+    /// against the poll interval rather than as a bare number so it stays
+    /// meaningful if either default moves: the walk is a periodic report, not a
+    /// per-tick check, and disk-pressure admission does not depend on it
+    /// (`current_admission` statfs's on every tick regardless).
+    #[test]
+    fn disk_scan_walk_is_not_at_tick_cadence() {
+        let config: Config = toml::from_str("").unwrap();
+        let scan = config
+            .coordinator
+            .resource_management
+            .disk_scan_interval_seconds;
+        let poll = config.coordinator.poll_interval;
+        assert!(
+            scan >= poll * 20,
+            "disk scan interval {scan}s must be far above the {poll}s poll interval; \
+             re-walking every cache at tick cadence burned a core on the live box"
+        );
+        assert!(scan >= 300, "disk scan interval regressed to {scan}s");
     }
 
     #[test]

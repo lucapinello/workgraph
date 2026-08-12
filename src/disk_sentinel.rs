@@ -523,6 +523,20 @@ fn owner_is_stale(
     registry: &AgentRegistry,
     graph: Option<&crate::graph::WorkGraph>,
 ) -> bool {
+    // A record that is GONE is terminal, not inconclusive. The registry is
+    // pruned (by wg's own reaper, and by operators) and the graph is archived,
+    // so a long-dead agent's record disappears well before its cache does.
+    // Reading "no record" as "might still be running" made those caches
+    // immortal: on the live household 1,180 of 1,283 registered caches named
+    // agents no longer in the registry, `wg disk cleanup` reported
+    // considered=1156 reaped=0 on every run, and 77GB of dead worktree targets
+    // accumulated. Worse, it inverted the incentive — pruning the registry, a
+    // routine cleanup, is what MADE those caches unreapable (2026-08-11).
+    //
+    // Safety does not rest on this conjunct. It rests on the two below, which
+    // are the ones that can actually observe a running build: the lease must
+    // have expired AND the recorded pid must be dead or recycled. A live agent
+    // fails both regardless of what the registry remembers.
     let agent_terminal = registry
         .get_agent(&cache.agent_id)
         .map(|a| {
@@ -531,11 +545,16 @@ fn owner_is_stale(
                 AgentStatus::Done | AgentStatus::Failed | AgentStatus::Dead | AgentStatus::Parked
             )
         })
-        .unwrap_or(false);
-    let task_terminal = graph
-        .and_then(|g| g.get_task(&cache.task_id))
-        .map(|t| t.status.is_terminal())
-        .unwrap_or(false);
+        .unwrap_or(true);
+    // An unreadable graph stays inconclusive — that is a different thing from a
+    // graph that loaded and does not contain the task.
+    let task_terminal = match graph {
+        Some(graph) => graph
+            .get_task(&cache.task_id)
+            .map(|t| t.status.is_terminal())
+            .unwrap_or(true),
+        None => false,
+    };
     let lease_expired = DateTime::parse_from_rfc3339(&cache.lease_expires_at)
         .map(|t| t.with_timezone(&Utc) <= Utc::now())
         .unwrap_or(false);
@@ -578,9 +597,22 @@ pub fn refresh_snapshot(dir: &Path, cfg: &ResourceManagementConfig) -> Result<Di
         })
         .unwrap_or_default();
     let mut targets = Vec::new();
+    // Spend the walk budget on paths that can actually contribute bytes, and on
+    // each distinct path once. The bound below is a cap on WORK, but it was
+    // being consumed by entries with nothing to measure: on the live household
+    // 493 of the 512 walked were paths that no longer existed and the rest were
+    // repeats of the same target dir, so 84 real caches were never measured at
+    // all — the sentinel was blind to most of the disk it exists to watch.
+    // Several owners may share one absolute CARGO_TARGET_DIR, so dedupe by path
+    // here for MEASUREMENT only; `cleanup_owned` still groups every owner of a
+    // path and reaps only when all of them are stale.
+    let mut measured: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let live_caches = ownership.caches.iter().filter(|cache| {
+        measured.insert(cache.path.as_str()) && Path::new(&cache.path).exists()
+    });
     // Both target count and entries-per-target are bounded so a corrupt or
     // adversarial registry cannot turn a status refresh into an unbounded walk.
-    for cache in ownership.caches.iter().take(512) {
+    for cache in live_caches.take(512) {
         let usage = bounded_size(Path::new(&cache.path), cfg.disk_scan_max_entries);
         let old = old_sizes
             .get(cache.path.as_str())
@@ -1042,7 +1074,15 @@ pub fn cleanup_owned(
             // is intentionally not called.
             let p = Path::new(&path);
             let absolute = absolute_lexical(p);
-            let reason = if representative.mount_id != mount_id(p) {
+            let reason = if !p.exists() {
+                // Mirror `safe_remove_owned_path`, which returns Ok(0) for a
+                // vanished path before reaching any guard. Without this the
+                // dry-run mis-predicts execute: it ran `mount_id` on a path that
+                // is not there, could not match the recorded id, and reported
+                // "mount identity changed" — 1,014 times on the live household —
+                // for entries execute would simply drop.
+                None
+            } else if representative.mount_id != mount_id(p) {
                 Some("mount identity changed since registration")
             } else if absolute == Path::new("/")
                 || absolute_lexical(project_root).starts_with(&absolute)
@@ -1238,6 +1278,77 @@ mod tests {
             ..Default::default()
         };
         (dir, cfg)
+    }
+
+    /// A cache whose agent and task records are GONE must still be reapable.
+    ///
+    /// This is the live 77GB leak (2026-08-11): `wg` prunes its own agent
+    /// registry, so the oldest caches are exactly the ones whose owner record no
+    /// longer exists. Treating absent as inconclusive made them permanent —
+    /// `wg disk cleanup` reported considered=1156 reaped=0 — and made pruning
+    /// the registry the act that caused it.
+    #[test]
+    fn cache_whose_owner_records_were_pruned_away_is_still_reapable() {
+        let root = tempfile::Builder::new()
+            .prefix("wg-disk-pruned-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let owned = root.path().join("wg-target-pruned-owner");
+        fs::create_dir_all(&owned).unwrap();
+        fs::write(owned.join("blob"), vec![7u8; 4096]).unwrap();
+        let (dir, cfg) = terminal_fixture(root.path(), &owned, None);
+
+        // Prune the owner out of both records, leaving only the cache entry —
+        // the state a long-running household actually reaches.
+        AgentRegistry::new().save(&dir).unwrap();
+        save_graph(&WorkGraph::new(), dir.join("graph.jsonl")).unwrap();
+
+        let report = cleanup_owned(&dir, &cfg, true).unwrap();
+        assert_eq!(
+            report.reaped, 1,
+            "a cache whose owner records were pruned must be reapable, got: {:?}",
+            report.preserved
+        );
+        assert!(!owned.exists(), "the dead target should be gone");
+    }
+
+    /// The safety of the change above rests entirely on the lease and pid
+    /// conjuncts, so prove each one alone still preserves a pruned-owner cache.
+    /// Without these, "absent means terminal" would reap live builds.
+    #[test]
+    fn pruned_owner_alone_never_reaps_a_live_or_leased_cache() {
+        for (label, live_pid, lease_offset) in [
+            ("unexpired lease", false, 3600i64),
+            ("live pid", true, -5i64),
+        ] {
+            let root = tempfile::Builder::new()
+                .prefix("wg-disk-guard-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let owned = root.path().join("wg-target-guarded");
+            fs::create_dir_all(&owned).unwrap();
+            fs::write(owned.join("blob"), vec![7u8; 4096]).unwrap();
+            let (dir, cfg) = terminal_fixture(root.path(), &owned, None);
+            AgentRegistry::new().save(&dir).unwrap();
+            save_graph(&WorkGraph::new(), dir.join("graph.jsonl")).unwrap();
+
+            // Rewrite the single cache entry with the one guard under test.
+            let mut ownership = load_ownership(&dir).unwrap();
+            for cache in ownership.caches.iter_mut() {
+                cache.lease_expires_at =
+                    (Utc::now() + chrono::Duration::seconds(lease_offset)).to_rfc3339();
+                if live_pid {
+                    cache.pid = std::process::id();
+                    cache.pid_start_epoch =
+                        crate::service::read_proc_start_time_secs(std::process::id());
+                }
+            }
+            save_ownership(&dir, &ownership).unwrap();
+
+            let report = cleanup_owned(&dir, &cfg, true).unwrap();
+            assert_eq!(report.reaped, 0, "{label} must still preserve the cache");
+            assert!(owned.exists(), "{label}: target must survive");
+        }
     }
 
     #[test]

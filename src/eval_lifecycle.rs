@@ -477,7 +477,7 @@ pub fn write_durable_verdict(
             // 1 to scheme 2 a no-op: both schemes must pin the same bytes, but
             // observational timestamps/run ids and the digest encoding itself
             // are not semantic conflicts.
-            verify_evaluation_digest(dir, &parsed)?;
+            verify_evaluation_digest(&EvaluationIndex::load(dir), &parsed)?;
             if parsed.schema != verdict.schema
                 || parsed.verdict_id != verdict.verdict_id
                 || parsed.evaluation_id != verdict.evaluation_id
@@ -551,35 +551,130 @@ fn compact_durable_json(bytes: &[u8]) -> Vec<u8> {
     compact
 }
 
-fn load_evaluation_evidence(dir: &Path, evaluation_id: &str) -> Result<EvaluationEvidence> {
-    let directory = dir.join("agency/evaluations");
-    let mut matching = Vec::new();
-    if directory.exists() {
-        for entry in fs::read_dir(&directory)? {
-            let path = entry?.path();
+/// Every durable evaluation on disk, grouped by `evaluation.id`, from ONE pass
+/// over `agency/evaluations`.
+///
+/// The reader this replaces re-scanned that whole directory — reading and
+/// JSON-parsing every file — for each id it was asked about, and the verdict
+/// store asks once per verdict. That is O(verdicts x evaluations): on a
+/// household with 782 verdicts and 2,065 evaluations it is 1.6M reads and ~6.7GB
+/// of parsing per store load, and `coordinator_tick` loads the store twice. The
+/// dispatcher stopped finishing ticks and sat at 100% of a core, silently
+/// (2026-08-11). Building the index once makes a store load O(evaluations).
+///
+/// Faults are CARRIED, not returned, and surface on every lookup. That is not
+/// tidiness: the old reader scanned the whole directory for every id, so one
+/// unreadable file failed every lookup and each verdict was quarantined
+/// individually by `verify_verdict_file`. Returning `Err` from the build instead
+/// would turn a per-file fault into the store-wide failure that
+/// `load_durable_verdict_store` exists to prevent — the 2026-08 starve.
+struct EvaluationIndex {
+    by_id: std::collections::HashMap<String, Vec<EvaluationEvidence>>,
+    /// First read/parse fault seen while indexing, verbatim, so lookups report
+    /// exactly what the scanning reader reported.
+    fault: Option<String>,
+}
+
+// Evaluation files read while indexing, on THIS thread.
+//
+// The cost `EvaluationIndex` exists to remove is invisible to an outcome
+// assertion — the old reader returned exactly the same verdicts, just after a
+// million more `open`s — so the regression test counts reads instead.
+//
+// Thread-local and ALWAYS COMPILED, per the engine instrumentation convention:
+// a `cfg(test)` counter in the LIB does not exist when the BIN tests run, and a
+// process-global counter is a coin flip because the harness runs tests
+// concurrently. One `Cell` increment beside an `fs::read` is free.
+thread_local! {
+    static EVALUATION_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl EvaluationIndex {
+    /// Infallible by construction — see the type docs on why a fault must not
+    /// become an `Err` here.
+    fn load(dir: &Path) -> Self {
+        let mut index = EvaluationIndex {
+            by_id: std::collections::HashMap::new(),
+            fault: None,
+        };
+        let directory = dir.join("agency/evaluations");
+        if !directory.exists() {
+            return index;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                index.fault = Some(error.to_string());
+                return index;
+            }
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    index.fault.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+            };
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = fs::read(&path)?;
-            let evaluation: Evaluation = serde_json::from_slice(&bytes)
-                .with_context(|| format!("loading evaluation evidence {}", path.display()))?;
-            if evaluation.id == evaluation_id {
-                matching.push(EvaluationEvidence { evaluation, bytes });
+            EVALUATION_FILE_READS.with(|count| count.set(count.get() + 1));
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    index.fault.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<Evaluation>(&bytes) {
+                Ok(evaluation) => index
+                    .by_id
+                    .entry(evaluation.id.clone())
+                    .or_default()
+                    .push(EvaluationEvidence { evaluation, bytes }),
+                Err(error) => {
+                    index.fault.get_or_insert_with(|| {
+                        format!("loading evaluation evidence {}: {error}", path.display())
+                    });
+                }
             }
         }
+        index
     }
-    if matching.len() != 1 {
-        anyhow::bail!(
-            "error[WG-EVAL-VERDICT-EVIDENCE]: evaluation {:?} has {} durable matches",
-            evaluation_id,
-            matching.len()
-        );
+
+    fn evidence(&self, evaluation_id: &str) -> Result<&EvaluationEvidence> {
+        if let Some(fault) = &self.fault {
+            anyhow::bail!("{fault}");
+        }
+        let matching = self
+            .by_id
+            .get(evaluation_id)
+            .map_or(&[][..], |found| found.as_slice());
+        if matching.len() != 1 {
+            anyhow::bail!(
+                "error[WG-EVAL-VERDICT-EVIDENCE]: evaluation {:?} has {} durable matches",
+                evaluation_id,
+                matching.len()
+            );
+        }
+        Ok(&matching[0])
     }
-    Ok(matching.pop().expect("one matching evaluation"))
 }
 
-fn verify_evaluation_digest(dir: &Path, verdict: &DurableEvalVerdict) -> Result<()> {
-    let evidence = load_evaluation_evidence(dir, &verdict.evaluation_id).map_err(|error| {
+/// One-shot lookup for callers holding no index. Still one directory pass, so it
+/// costs exactly what the old scanning reader cost for a single id.
+fn load_evaluation_evidence(dir: &Path, evaluation_id: &str) -> Result<EvaluationEvidence> {
+    let index = EvaluationIndex::load(dir);
+    let evidence = index.evidence(evaluation_id)?;
+    Ok(EvaluationEvidence {
+        evaluation: evidence.evaluation.clone(),
+        bytes: evidence.bytes.clone(),
+    })
+}
+
+fn verify_evaluation_digest(index: &EvaluationIndex, verdict: &DurableEvalVerdict) -> Result<()> {
+    let evidence = index.evidence(&verdict.evaluation_id).map_err(|error| {
         anyhow::anyhow!(
             "error[WG-EVAL-VERDICT-EVIDENCE]: verdict {}: {error:#}",
             verdict.verdict_id
@@ -670,8 +765,12 @@ pub fn load_durable_verdict_store(dir: &Path) -> Result<DurableVerdictStore> {
         return Ok(DurableVerdictStore::default());
     }
     let mut store = DurableVerdictStore::default();
-    // Enumerating the directory is the store-wide step: if THIS fails there is
-    // no per-file attribution to make, so it stays a hard error.
+    // Index the evaluations ONCE for the whole store rather than once per
+    // verdict; see `EvaluationIndex`. An index fault is per-verdict quarantine,
+    // not a store-wide error, exactly as when each verdict rescanned the dir.
+    let index = EvaluationIndex::load(dir);
+    // Enumerating the VERDICTS directory is the store-wide step: if THIS fails
+    // there is no per-file attribution to make, so it stays a hard error.
     for entry in fs::read_dir(&directory).with_context(|| {
         format!(
             "error[WG-EVAL-VERDICT-STORE]: cannot enumerate {}",
@@ -689,7 +788,7 @@ pub fn load_durable_verdict_store(dir: &Path) -> Result<DurableVerdictStore> {
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        match verify_verdict_file(dir, &path) {
+        match verify_verdict_file(&index, &path) {
             Ok(verdict) => store.verdicts.push(verdict),
             Err(rejection) => store.quarantined.push(rejection),
         }
@@ -704,7 +803,7 @@ pub fn load_durable_verdict_store(dir: &Path) -> Result<DurableVerdictStore> {
 /// Verify ONE verdict file. Every failure is attributable to this file alone, so
 /// every failure returns a `QuarantinedVerdict` rather than propagating.
 fn verify_verdict_file(
-    dir: &Path,
+    index: &EvaluationIndex,
     path: &Path,
 ) -> std::result::Result<DurableEvalVerdict, QuarantinedVerdict> {
     let reject = |source_task: Option<String>, reason: String| QuarantinedVerdict {
@@ -762,7 +861,7 @@ fn verify_verdict_file(
             ));
         }
     }
-    if let Err(error) = verify_evaluation_digest(dir, &verdict) {
+    if let Err(error) = verify_evaluation_digest(index, &verdict) {
         return Err(reject(source_task, format!("{error:#}")));
     }
     Ok(verdict)
@@ -801,15 +900,24 @@ pub fn has_passing_eval_verdict(dir: &Path, source: &Task, threshold: f64) -> bo
 /// Missing source timestamps and zero/multiple candidates are deliberately left
 /// untouched for operator review; this function never chooses "latest".
 pub fn migrate_unambiguous_legacy_verdicts(dir: &Path) -> Result<usize> {
-    let existing = load_durable_verdicts(dir)?;
+    // Read the graph FIRST and leave if there is nothing to migrate. This runs
+    // on every coordinator tick, and the two loads below are the expensive ones
+    // (a full verdict-store verification and every evaluation on disk), while
+    // the loop touches only PendingEval sources. A settled household has none,
+    // so it paid for both reads on every tick to migrate nothing.
     let graph = crate::parser::load_graph(&dir.join("graph.jsonl"))?;
+    let pending: Vec<_> = graph
+        .tasks()
+        .filter(|task| matches!(task.status, Status::PendingEval | Status::FailedPendingEval))
+        .collect();
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let existing = load_durable_verdicts(dir)?;
     let evaluations = crate::agency::load_all_evaluations_or_warn(&dir.join("agency/evaluations"));
     let mut migrated = 0;
 
-    for source in graph
-        .tasks()
-        .filter(|task| matches!(task.status, Status::PendingEval | Status::FailedPendingEval))
-    {
+    for source in pending {
         let Some(started_at) = source
             .started_at
             .as_deref()
@@ -2220,6 +2328,45 @@ mod tests {
         let evaluate = satellites.pop().expect("evaluate satellite");
         let flip = satellites.pop().expect("flip satellite");
         (flip, evaluate)
+    }
+
+    /// A store load must read each evaluation ONCE, not once per verdict.
+    ///
+    /// The reader before `EvaluationIndex` rescanned all of `agency/evaluations`
+    /// for every id it resolved, and the store resolves one per verdict. On the
+    /// live household (782 verdicts, 2,065 evaluations) that was 1.6M reads per
+    /// load and `coordinator_tick` loads the store twice, so the dispatcher
+    /// never finished a tick and burned 100% of a core with an empty log.
+    ///
+    /// Asserted as reads rather than duration: the verdicts returned are
+    /// identical either way, so no outcome assertion can see this, and a
+    /// wall-clock bound would just be a flake. With 6 sources this is 12 vs 144.
+    #[test]
+    fn verdict_store_reads_each_evaluation_once_not_once_per_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..6 {
+            let mut source = source();
+            source.id = format!("source-{index}");
+            land_verified_verdicts(dir.path(), &source, 0.9);
+        }
+        let evaluations = fs::read_dir(dir.path().join("agency/evaluations"))
+            .unwrap()
+            .count();
+        assert_eq!(evaluations, 12, "fixture should hold 12 evaluations");
+
+        EVALUATION_FILE_READS.with(|count| count.set(0));
+        let store = load_durable_verdict_store(dir.path()).unwrap();
+        let reads = EVALUATION_FILE_READS.with(|count| count.get());
+
+        assert_eq!(store.verdicts.len(), 12, "every verdict should verify");
+        assert!(store.quarantined.is_empty(), "nothing should quarantine");
+        assert_eq!(
+            reads, evaluations,
+            "store load read {reads} evaluation files for {} verdicts over {evaluations} \
+             evaluations; one indexed pass is {evaluations}, per-verdict rescanning is {}",
+            store.verdicts.len(),
+            store.verdicts.len() * evaluations
+        );
     }
 
     /// Plant a verdict file whose evaluation evidence does not exist — the exact
