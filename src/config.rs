@@ -4634,12 +4634,18 @@ fn default_estimated_build_bytes() -> u64 {
 /// `wg disk doctor` and cleanup.
 ///
 /// It was 30s: a full recursive walk of every registered cargo target twice a
-/// minute. On the live household that is ~25GB over 128 caches, and it was the
-/// largest single consumer in the daemon — 19.5% of a core, indefinitely, on a
-/// laptop (2026-08-11). Per-cache sizes do not move meaningfully in 30 seconds,
-/// and growth attribution is if anything less noisy over a longer base.
+/// minute. On the live household that is ~25GB over 128 caches costing ~20 CPU
+/// seconds per walk, and it was the largest single consumer in the daemon —
+/// a core pegged indefinitely on a laptop (2026-08-11).
+///
+/// 900s rather than merely "less often": most of what it measures is pinned
+/// anyway. A cache is only reapable once its worktree has no uncommitted
+/// source, so the caches that dominate the walk are precisely the ones cleanup
+/// can never act on — re-measuring them every few minutes buys nothing. Sizes
+/// do not move meaningfully at this scale, and `growth_bytes_per_sec` is
+/// computed against the elapsed interval, so a longer base is less noisy.
 fn default_disk_scan_interval_seconds() -> u64 {
-    300
+    900
 }
 fn default_disk_scan_max_entries() -> usize {
     200_000
@@ -10596,7 +10602,7 @@ profile = "openrouter"
             "disk scan interval {scan}s must be far above the {poll}s poll interval; \
              re-walking every cache at tick cadence burned a core on the live box"
         );
-        assert!(scan >= 300, "disk scan interval regressed to {scan}s");
+        assert!(scan >= 900, "disk scan interval regressed to {scan}s");
     }
 
     #[test]

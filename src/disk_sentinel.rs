@@ -575,7 +575,16 @@ fn pid_identity_stale(cache: &OwnedCache) -> bool {
     }
 }
 
+// Full per-cache walks performed on THIS thread. A walk changes no output a
+// caller can assert on — the snapshot it writes is identical when nothing moved
+// — so "did we walk twice" is only observable by counting. Thread-local and
+// always compiled, per the engine instrumentation convention.
+thread_local! {
+    static SNAPSHOT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn refresh_snapshot(dir: &Path, cfg: &ResourceManagementConfig) -> Result<DiskSnapshot> {
+    SNAPSHOT_WALKS.with(|count| count.set(count.get() + 1));
     let previous =
         load_snapshot(dir)?.filter(|s| DateTime::parse_from_rfc3339(&s.generated_at).is_ok());
     let (level, reason, mounts) = current_admission(dir, cfg);
@@ -1125,7 +1134,22 @@ pub fn cleanup_owned(
     }
     compress_terminal_streams(dir, cfg, &registry, &graph, execute, &mut report);
     deduplicate_terminal_outputs(dir, cfg, &registry, &graph, execute, &mut report);
-    let _ = refresh_snapshot(dir, cfg);
+    // Re-measure only when this run actually changed the bytes on disk.
+    //
+    // This was unconditional, which made it the single most expensive thing the
+    // daemon did: `coordinator_tick` calls `refresh_if_due` (one full walk of
+    // every registered cache) and then `cleanup_owned` (a second, identical
+    // walk) on the same tick, so the interval bought half of what it looked
+    // like. In steady state cleanup reaps nothing — the snapshot taken moments
+    // earlier is still exact, and re-walking ~25GB of cargo targets to confirm
+    // it is pure duplicate work. It also bypassed `disk_scan_interval_seconds`
+    // entirely, so this walk ran at tick cadence no matter how the operator
+    // configured the sentinel (2026-08-11).
+    let changed =
+        report.reaped > 0 || report.compressed_files > 0 || report.deduplicated_files > 0;
+    if changed {
+        let _ = refresh_snapshot(dir, cfg);
+    }
     Ok(report)
 }
 
@@ -1278,6 +1302,57 @@ mod tests {
             ..Default::default()
         };
         (dir, cfg)
+    }
+
+    /// A no-op cleanup must not re-walk every cache; a real one must.
+    ///
+    /// `coordinator_tick` calls `refresh_if_due` and then `cleanup_owned` on the
+    /// same tick, and `cleanup_owned` used to end with an unconditional
+    /// `refresh_snapshot` — a second identical walk of every registered cargo
+    /// target, bypassing `disk_scan_interval_seconds` entirely. It was 82.7% of
+    /// the daemon's active samples. Counted rather than timed: the snapshot
+    /// written is byte-identical when nothing moved, so no outcome assertion can
+    /// tell one walk from two.
+    #[test]
+    fn a_cleanup_that_reaps_nothing_does_not_rewalk_every_cache() {
+        let root = tempfile::Builder::new()
+            .prefix("wg-disk-walks-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let owned = root.path().join("wg-target-walks");
+        fs::create_dir_all(&owned).unwrap();
+        fs::write(owned.join("blob"), vec![7u8; 4096]).unwrap();
+        let (dir, cfg) = terminal_fixture(root.path(), &owned, None);
+
+        // A live owner: nothing is reapable, so this run changes no bytes.
+        let mut ownership = load_ownership(&dir).unwrap();
+        for cache in ownership.caches.iter_mut() {
+            cache.lease_expires_at = (Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339();
+        }
+        save_ownership(&dir, &ownership).unwrap();
+
+        SNAPSHOT_WALKS.with(|c| c.set(0));
+        let report = cleanup_owned(&dir, &cfg, true).unwrap();
+        let walks = SNAPSHOT_WALKS.with(|c| c.get());
+        assert_eq!(report.reaped, 0, "fixture should reap nothing");
+        assert_eq!(
+            walks, 0,
+            "a cleanup that changed nothing must not re-walk every cache"
+        );
+
+        // Now make it reapable: a run that DOES change bytes must re-measure,
+        // or the snapshot would keep reporting space that is already freed.
+        let mut ownership = load_ownership(&dir).unwrap();
+        for cache in ownership.caches.iter_mut() {
+            cache.lease_expires_at = (Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        }
+        save_ownership(&dir, &ownership).unwrap();
+
+        SNAPSHOT_WALKS.with(|c| c.set(0));
+        let report = cleanup_owned(&dir, &cfg, true).unwrap();
+        let walks = SNAPSHOT_WALKS.with(|c| c.get());
+        assert_eq!(report.reaped, 1, "the cache should now be reaped");
+        assert_eq!(walks, 1, "a cleanup that freed bytes must re-measure");
     }
 
     /// A cache whose agent and task records are GONE must still be reapable.
