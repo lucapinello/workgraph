@@ -948,6 +948,85 @@ impl<'a> TurnDeliverySink<'a> {
         }
     }
 
+    /// Claim the right to send this delivery's NON-ANSWER line, on a key of its
+    /// own.
+    ///
+    /// Two properties were riding on one claim file and pulled apart when the
+    /// sessionless fallback stopped reserving finality:
+    ///
+    ///   · a physical refire of the same `(turn, attempt)` must not send twice;
+    ///   · a self-heal must still be able to deliver the REAL answer afterwards.
+    ///
+    /// Taking the answer's claim gave the first and lost the second (the family
+    /// got the settling line and never the answer). Taking no claim at all — the
+    /// state this replaces — gave the second and lost the first, so a redelivered
+    /// turn sent "give me a little while" twice. A sibling key gives both: it is
+    /// keyed on the same delivery, so a refire finds it, and it is not the
+    /// answer's reservation, so nothing about the final is spent.
+    ///
+    /// `Ok(Some(id))` means already sent — suppress, reusing the recorded id.
+    /// `Ok(None)` means the caller now owns it and should send.
+    fn claim_non_answer(&self) -> Result<Option<Option<String>>> {
+        let Some(path) = self.non_answer_claim_path() else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create Telegram non-answer ledger {}",
+                    parent.display()
+                )
+            })?;
+        }
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(b"pending\n")
+                    .and_then(|_| file.sync_all())
+                    .with_context(|| {
+                        format!("Failed to persist non-answer claim {}", path.display())
+                    })?;
+                Ok(None)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let message_id = std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|body| body.trim().to_string())
+                    .filter(|body| !body.is_empty() && body != "pending");
+                Ok(Some(message_id))
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!("Failed to claim Telegram non-answer {}", path.display())
+            }),
+        }
+    }
+
+    fn non_answer_claim_path(&self) -> Option<PathBuf> {
+        self.claim_path
+            .as_ref()
+            .map(|path| path.with_extension("nonanswer"))
+    }
+
+    /// Record the id so a refire returns the same message instead of resending.
+    /// Best-effort: the claim above already prevents the duplicate.
+    fn persist_non_answer_id(&self, message_id: Option<&str>) {
+        let Some(path) = self.non_answer_claim_path() else {
+            return;
+        };
+        let body = message_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("sent");
+        let _ = crate::atomic_file::write_atomic(&path, format!("{body}\n").as_bytes());
+    }
+
+    /// Release the non-answer claim when the send provably failed, so a retry
+    /// can still tell the family something.
+    fn release_non_answer(&self) {
+        if let Some(path) = self.non_answer_claim_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn persist_message_id(&self, message_id: Option<&str>) {
         let Some(path) = self.claim_path.as_ref() else {
             return;
@@ -1140,6 +1219,16 @@ impl ReplySink for TurnDeliverySink<'_> {
         match phase {
             ReplyPhase::Final => self.send(bot_id, chat_id, text).await,
             ReplyPhase::Ack | ReplyPhase::Watchdog | ReplyPhase::Failure | ReplyPhase::Addendum => {
+                // A failure notice can be the turn's ENTIRE output — the
+                // sessionless fallback is exactly that — and since this arm
+                // deliberately takes no answer reservation, nothing downstream
+                // suppresses a physical redelivery of it. Claim a sibling key so
+                // a refire is dropped without spending the final.
+                if phase == ReplyPhase::Failure
+                    && let Some(already_sent) = self.claim_non_answer()?
+                {
+                    return Ok(already_sent);
+                }
                 match self.inner.send_phase(bot_id, chat_id, text, phase).await {
                     Ok(message_id) => {
                         // AN ADDENDUM'S ID IS NOT THE RESUME POINTER, and this
@@ -1161,12 +1250,20 @@ impl ReplySink for TurnDeliverySink<'_> {
                         {
                             *self.ack_message_id.lock().unwrap() = Some(id.to_string());
                         }
+                        if phase == ReplyPhase::Failure {
+                            self.persist_non_answer_id(message_id.as_deref());
+                        }
                         Ok(message_id)
                     }
                     Err(error) => {
                         // The final was never reserved, so there is nothing to
                         // release — but the next attempt still needs to know
                         // this one failed, or it composes a second inbox turn.
+                        if phase == ReplyPhase::Failure {
+                            // The line provably did not go out, so the claim
+                            // taken above must not silence the retry.
+                            self.release_non_answer();
+                        }
                         self.mark_retryable("send");
                         Err(error)
                     }

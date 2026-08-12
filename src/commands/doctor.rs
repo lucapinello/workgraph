@@ -819,7 +819,15 @@ if ((code !== "ENOBUFS" && code !== "EAGAIN" && code !== "EWOULDBLOCK") || retry
         {
             std::os::unix::fs::symlink(&cli, tmp.path().join("pi")).unwrap();
             let (found_guard, kind) = inspect_pi_guard(&tmp.path().join("pi")).unwrap();
-            assert_eq!(found_guard, guard);
+            // Compare by identity, not spelling: resolving the symlink is the
+            // behaviour under test, and on macOS the temp root is ITSELF a
+            // symlink (`/var/folders/…` → `/private/var/…`), so the resolved
+            // guard and `guard` name the same file in two spellings. A wrong
+            // file still fails.
+            assert_eq!(
+                std::fs::canonicalize(&found_guard).unwrap(),
+                std::fs::canonicalize(&guard).unwrap()
+            );
             assert_eq!(kind, PiGuardKind::Fixed);
         }
         #[cfg(not(unix))]

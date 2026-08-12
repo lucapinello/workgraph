@@ -391,7 +391,42 @@ pub fn read_proc_start_time_secs(pid: u32) -> Option<i64> {
     Some(boot_time + (starttime_ticks / clk_tck) as i64)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS has no `/proc`. Ask the kernel directly for the process start time.
+///
+/// This is not cosmetic. `disk_sentinel::pid_identity_stale` treats a live PID
+/// whose identity it cannot establish as "never safe to reap", so returning
+/// `None` here disabled PID-reuse detection on macOS entirely — and that
+/// conjunct is now load-bearing, because a cache whose owner records were
+/// pruned away is reaped on the strength of the lease and PID checks alone.
+/// Fail-safe either way (an unknown identity preserves), but on the platform
+/// this project is developed and deployed on, the check never actually ran.
+/// Must be the process's ACTUAL start time, never `now - elapsed`. The value is
+/// compared for equality against the one recorded at spawn, and a mismatch means
+/// "PID was recycled, the cache is reapable" — so a reading that jitters by a
+/// second between calls would mark a live agent's cache stale and delete it.
+/// `pbi_start_tvsec` is fixed for the life of the process.
+#[cfg(target_os = "macos")]
+pub fn read_proc_start_time_secs(pid: u32) -> Option<i64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    // Short or zero return means the process is gone or unreadable; only a
+    // fully-populated struct is an answer.
+    if written != size {
+        return None;
+    }
+    Some(info.pbi_start_tvsec as i64)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn read_proc_start_time_secs(_pid: u32) -> Option<i64> {
     None
 }
@@ -668,6 +703,37 @@ mod tests {
 
         child.kill().ok();
         child.wait().ok();
+    }
+
+    /// The start time must be readable, STABLE, and absent for a dead pid.
+    ///
+    /// Stability is the safety property, not a nicety: `pid_identity_stale`
+    /// compares this against the value recorded at spawn and reads any
+    /// difference as "the PID was recycled, this cache is reapable". An
+    /// implementation derived from `now - elapsed` would drift by a second
+    /// between calls and delete a live agent's build cache.
+    ///
+    /// It must also actually return something on this platform — it returned
+    /// `None` on every non-Linux host until 2026-08-12, which silently disabled
+    /// PID-reuse detection on macOS.
+    #[test]
+    fn proc_start_time_is_present_and_stable_for_a_live_pid() {
+        let me = std::process::id();
+        let first = read_proc_start_time_secs(me);
+        assert!(
+            first.is_some(),
+            "this platform must report a process start time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(
+            read_proc_start_time_secs(me),
+            first,
+            "start time must not move while the process is alive"
+        );
+        assert!(
+            read_proc_start_time_secs(u32::MAX - 1).is_none(),
+            "a nonexistent pid must have no start time"
+        );
     }
 
     #[test]

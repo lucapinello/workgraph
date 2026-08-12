@@ -1993,12 +1993,24 @@ mod tests {
         // 24×80 (verified via pty.fork()).
         let script = r#"
 printf '\x1b[?2004h\x1b[>7u\x1b[?1004h\x1b[6n\x1b[?u\x1b[c\x1b]10;?\x1b\\'
-# Drain whatever the responder sends. -N 64 = up to 64 bytes;
-# -t 3 = 3-second timeout per read attempt. Loop a couple of times
-# in case the responses are delivered in chunks.
+# Drain whatever the responder sends. -n 64 = up to 64 bytes;
+# -t 1 = one second per attempt. Loop a few times in case the responses
+# arrive in chunks.
+#
+# `-n`, NOT `-N`: macOS ships bash 3.2.57 as /bin/bash, where `-N` is not a
+# valid option, so `read` exited 2 (usage error) three times in a row and the
+# test reported an empty response set within milliseconds. That looked exactly
+# like "the emulator answered nothing" and hid whatever the real behaviour was.
+# `-N` would be the better read (it ignores delimiters), but no reply here
+# contains a newline, so `-n` collects the same bytes on a bash that has both.
+#
+# KNOWN RED on macOS even so: with the option fixed, `read` reaches the tty and
+# still gets EOF (rc=1) rather than the replies, while `[ -t 0 ]` confirms stdin
+# IS the pty slave and `compute_query_replies` unit tests pass. The remaining
+# gap is in delivery from the master writer to the slave on this platform.
 got=""
 for _ in 1 2 3; do
-  IFS= read -r -t 1 -N 64 chunk || true
+  IFS= read -r -t 1 -n 64 chunk || true
   got="$got$chunk"
 done
 b64=$(printf %s "$got" | base64 | tr -d '\n')

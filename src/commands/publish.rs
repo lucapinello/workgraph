@@ -134,6 +134,42 @@ pub fn parse_rsync_flags_str(s: &str) -> Vec<String> {
     s.split_whitespace().map(|t| t.to_string()).collect()
 }
 
+/// Does the `rsync` on PATH understand `--mkpath` (rsync 3.2.3+)?
+///
+/// Asked as a capability probe rather than by parsing a version string, because
+/// the thing actually shipped as `rsync` on macOS is openrsync, which reports
+/// itself as "rsync version 2.6.9 compatible" — a version comparison would have
+/// to encode which numbers are lies. `--help` exits 0 on both implementations
+/// and only the real one lists the flag. Unreadable output → assume absent,
+/// which costs a local `mkdir` we did not need.
+pub fn rsync_supports_mkpath() -> bool {
+    Command::new("rsync")
+        .arg("--help")
+        .output()
+        .map(|out| {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            text.contains("--mkpath")
+        })
+        .unwrap_or(false)
+}
+
+/// The destination as a local path, or `None` when it names a remote.
+///
+/// rsync remotes are `host:path`, `user@host:path` or a `scheme://` URL. A colon
+/// only counts when it appears before the first `/`: `/srv/a:b/site` is a local
+/// directory whose name contains a colon, not a host called `/srv/a`.
+pub fn local_rsync_destination(target: &str) -> Option<std::path::PathBuf> {
+    if target.contains("://") {
+        return None;
+    }
+    let head = target.split('/').next().unwrap_or(target);
+    if head.contains(':') {
+        return None;
+    }
+    Some(std::path::PathBuf::from(target))
+}
+
 /// Cron-task ID for a deployment.
 pub fn cron_task_id(name: &str) -> String {
     format!("{}{}", PUBLISH_TASK_PREFIX, name)
@@ -529,7 +565,36 @@ fn execute_run(workgraph_dir: &Path, dep: &Deployment, dry_run: bool) -> Result<
     }
 
     let mut cmd = Command::new("rsync");
-    let flags = dep.rsync_flags.clone().unwrap_or_else(default_rsync_flags);
+    let mut flags = dep.rsync_flags.clone().unwrap_or_else(default_rsync_flags);
+    // `--mkpath` is rsync 3.2.3+. macOS ships openrsync ("rsync version 2.6.9
+    // compatible"), which rejects it outright — so `wg publish --mkpath` died
+    // with a bare "rsync exited with non-zero status: exit status: 1" on every
+    // stock Mac. For a LOCAL destination we can do exactly what the flag does
+    // and then drop it; for a remote one only rsync can create the path, so say
+    // so plainly instead of letting the operator read an exit code.
+    if flags.iter().any(|f| f == "--mkpath") && !rsync_supports_mkpath() {
+        if let Some(local) = local_rsync_destination(&dep.rsync_target) {
+            std::fs::create_dir_all(&local).with_context(|| {
+                format!(
+                    "creating destination {} for --mkpath (this rsync has no --mkpath)",
+                    local.display()
+                )
+            })?;
+            flags.retain(|f| f != "--mkpath");
+            println!(
+                "[publish] this rsync has no --mkpath; created {} directly",
+                local.display()
+            );
+        } else {
+            bail!(
+                "this rsync does not support --mkpath (it is likely openrsync, which macOS ships \
+                 as `rsync`), and the destination '{}' is remote, so the path cannot be created \
+                 locally. Create it on the remote first, or install rsync 3.2.3+ \
+                 (e.g. `brew install rsync`).",
+                dep.rsync_target
+            );
+        }
+    }
     cmd.args(&flags);
 
     if let Some(key) = &dep.ssh_key {
@@ -717,6 +782,65 @@ Edit via `wg html publish edit` or remove via `wg html publish remove {}`.\n",
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The `--mkpath` fallback creates the destination itself, so misreading a
+    /// remote as local would silently `mkdir` a directory named `user@host:/srv`
+    /// in the cwd and then rsync to the real remote anyway.
+    #[test]
+    fn rsync_destinations_are_classified_local_or_remote() {
+        for remote in [
+            "user@host:/srv/site",
+            "host:/srv/site",
+            "rsync://host/module",
+            "host:relative/path",
+        ] {
+            assert!(
+                local_rsync_destination(remote).is_none(),
+                "{remote} must be treated as remote"
+            );
+        }
+        for (local, expected) in [
+            ("/srv/site", "/srv/site"),
+            ("./out", "./out"),
+            // A colon AFTER the first slash is part of a local directory name,
+            // not a host separator.
+            ("/srv/a:b/site", "/srv/a:b/site"),
+        ] {
+            assert_eq!(
+                local_rsync_destination(local),
+                Some(std::path::PathBuf::from(expected)),
+                "{local} must be treated as local"
+            );
+        }
+    }
+
+    /// The probe must agree with what this machine's rsync actually does, or the
+    /// fallback fires on a host that never needed it (or fails to fire on one
+    /// that did). Compares the probe against a real rejection of the flag.
+    #[test]
+    fn mkpath_probe_matches_this_rsyncs_real_behaviour() {
+        let Ok(out) = Command::new("rsync").arg("--help").output() else {
+            eprintln!("no rsync on PATH — skipping");
+            return;
+        };
+        let _ = out;
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let dest = tmp.path().join("made/by/mkpath");
+        let accepted = Command::new("rsync")
+            .args(["-a", "--mkpath"])
+            .arg(format!("{}/", src.display()))
+            .arg(&dest)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert_eq!(
+            rsync_supports_mkpath(),
+            accepted,
+            "probe disagrees with this rsync's real handling of --mkpath"
+        );
+    }
 
     fn fresh_dir() -> TempDir {
         let tmp = TempDir::new().unwrap();

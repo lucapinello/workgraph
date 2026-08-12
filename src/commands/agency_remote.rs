@@ -216,6 +216,21 @@ mod tests {
         LocalStore::new(path)
     }
 
+    /// Assert two paths name the same directory, by identity rather than by
+    /// spelling.
+    ///
+    /// `resolve_store_with_remotes` canonicalizes what it returns, and on macOS
+    /// the temp root is itself a symlink (`/var/folders/…` → `/private/var/…`).
+    /// The resolved path and the `TempDir` path therefore name the SAME
+    /// directory in two spellings, and a bare `assert_eq!` fails on this
+    /// platform only. Canonicalizing both sides keeps the assertion — a wrong
+    /// directory still fails — without pinning a spelling.
+    fn assert_same_dir(resolved: &std::path::Path, expected: &std::path::Path) {
+        let left = std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+        let right = std::fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
+        assert_eq!(left, right);
+    }
+
     #[test]
     fn add_and_list_remote() {
         let tmp = TempDir::new().unwrap();
@@ -361,7 +376,7 @@ mod tests {
         .unwrap();
 
         let resolved = federation::resolve_store_with_remotes("upstream", &wg_dir).unwrap();
-        assert_eq!(resolved.store_path(), store.store_path());
+        assert_same_dir(resolved.store_path(), store.store_path());
     }
 
     #[test]
@@ -374,6 +389,6 @@ mod tests {
         let resolved =
             federation::resolve_store_with_remotes(store.store_path().to_str().unwrap(), &wg_dir)
                 .unwrap();
-        assert_eq!(resolved.store_path(), store.store_path());
+        assert_same_dir(resolved.store_path(), store.store_path());
     }
 }

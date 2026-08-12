@@ -294,6 +294,23 @@ mod tests {
         }
     }
 
+    /// The wrapper script with whole-line shell comments removed.
+    ///
+    /// Negative assertions ("the wrapper must never do X") are substring
+    /// searches, and the wrapper documents the very hazards it guards against —
+    /// so the prose explaining why WIP is preserved before a worktree can be
+    /// force-removed matched a search for that removal and failed the test while
+    /// the generated script was correct. Only full-line comments are dropped: a
+    /// real command never begins with `#`, so nothing that could actually run is
+    /// hidden from the search.
+    fn runnable_lines(script: &str) -> String {
+        script
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn get_unique_id() -> String {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1122,18 +1139,25 @@ args = ["-lc", "true"]
 
         // Sacred invariant: the wrapper must NOT force-remove worktrees inline.
         // Cleanup eligibility is marked for the explicit operator surface, not
-        // inline `git worktree remove --force`. This keeps the wrapper crash-safe:
-        // a killed wrapper leaves the worktree intact for orphan recovery.
+        // inline force-removal. This keeps the wrapper crash-safe: a killed
+        // wrapper leaves the worktree intact for orphan recovery.
+        //
+        // Asserted against the RUNNABLE lines only. The wrapper explains, in a
+        // shell comment, that it preserves WIP precisely because a later sweep
+        // may force-remove the worktree — so a whole-text substring search
+        // matched the wrapper's own prose and failed this test while the
+        // invariant was perfectly intact. A comment cannot delete a worktree.
+        let runnable = runnable_lines(&script);
         assert!(
-            !script.contains("worktree remove --force"),
+            !runnable.contains("worktree remove --force"),
             "Wrapper script must not auto-remove worktrees (sacred-worktree invariant)"
         );
         assert!(
-            !script.contains(r#"branch -D "$WG_BRANCH""#),
+            !runnable.contains(r#"branch -D "$WG_BRANCH""#),
             "Wrapper script must not auto-delete worktree branches"
         );
         assert!(
-            !script.contains(r#"rm -f "$WG_WORKTREE_PATH/.wg""#),
+            !runnable.contains(r#"rm -f "$WG_WORKTREE_PATH/.wg""#),
             "Wrapper script must not remove the .wg symlink"
         );
     }
