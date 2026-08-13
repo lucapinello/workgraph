@@ -5680,7 +5680,12 @@ pub fn run_web_inbound(
                     // the one thing bind_clarify_exchange refuses, and on that refusal we
                     // deliberately fall through to a fresh election rather than guessing.
                     let election = match election {
-                        Election::One { bot, reply_chat, addressed_by, .. } => Election::One {
+                        Election::One {
+                            bot,
+                            reply_chat,
+                            addressed_by,
+                            ..
+                        } => Election::One {
                             bot,
                             reply_chat,
                             body: message.trim().to_string(),
@@ -5705,22 +5710,22 @@ pub fn run_web_inbound(
                     )
                 }
             } else {
-            // A genuinely fresh web-origin message is first-class GROUP inbound:
-            // run the exact listener election seam (supergroup, no reply-chain,
-            // never bot-sent). Continuations never enter this branch.
-            let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
-            let human_count = human_agent_id_set(workgraph_dir).len();
-            (
-                elect_group_inbound_with_owner_map(
-                    &target,
-                    message,
-                    &mention_usernames,
-                    human_count,
-                    &config,
-                    &owner_map,
-                ),
-                None,
-            )
+                // A genuinely fresh web-origin message is first-class GROUP inbound:
+                // run the exact listener election seam (supergroup, no reply-chain,
+                // never bot-sent). Continuations never enter this branch.
+                let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
+                let human_count = human_agent_id_set(workgraph_dir).len();
+                (
+                    elect_group_inbound_with_owner_map(
+                        &target,
+                        message,
+                        &mention_usernames,
+                        human_count,
+                        &config,
+                        &owner_map,
+                    ),
+                    None,
+                )
             }
         }
     };
@@ -11471,14 +11476,16 @@ domains = ["coordination"]
 
         let now =
             chrono::NaiveDateTime::parse_from_str("2026-07-12T10:00", "%Y-%m-%dT%H:%M").unwrap();
-        assert!(try_register_reminder(
-            &wg,
-            "7001001",
-            "household-handle",
-            "remind me Thursday at 9am to call the dentist",
-            now,
-        )
-        .is_some());
+        assert!(
+            try_register_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "remind me Thursday at 9am to call the dentist",
+                now,
+            )
+            .is_some()
+        );
         let before = std::fs::read(AdHocStore::path(root)).unwrap();
 
         assert!(

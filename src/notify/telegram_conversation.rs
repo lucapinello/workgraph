@@ -994,9 +994,8 @@ impl<'a> TurnDeliverySink<'a> {
                     .filter(|body| !body.is_empty() && body != "pending");
                 Ok(Some(message_id))
             }
-            Err(error) => Err(error).with_context(|| {
-                format!("Failed to claim Telegram non-answer {}", path.display())
-            }),
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to claim Telegram non-answer {}", path.display())),
         }
     }
 

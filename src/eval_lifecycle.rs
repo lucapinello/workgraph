@@ -2361,7 +2361,8 @@ mod tests {
         assert_eq!(store.verdicts.len(), 12, "every verdict should verify");
         assert!(store.quarantined.is_empty(), "nothing should quarantine");
         assert_eq!(
-            reads, evaluations,
+            reads,
+            evaluations,
             "store load read {reads} evaluation files for {} verdicts over {evaluations} \
              evaluations; one indexed pass is {evaluations}, per-verdict rescanning is {}",
             store.verdicts.len(),

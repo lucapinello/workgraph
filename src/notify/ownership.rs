@@ -1709,8 +1709,14 @@ mod tests {
         ]);
 
         // (a) NAMES A COMPILED DOMAIN → re-elect. Its content is somebody's business.
-        assert_ne!(classify_domain("what's for dinner tonight?"), Domain::Coordination);
-        assert_ne!(classify_domain("another workout please"), Domain::Coordination);
+        assert_ne!(
+            classify_domain("what's for dinner tonight?"),
+            Domain::Coordination
+        );
+        assert_ne!(
+            classify_domain("another workout please"),
+            Domain::Coordination
+        );
 
         // (b) NAMES A DECLARED DOMAIN → re-elect (docs/47).
         assert_eq!(m.owner_for_declared_tag("another joke"), Some("chiller"));
@@ -1725,23 +1731,49 @@ mod tests {
                 n.len() >= 3 && low.split(|c: char| !c.is_alphanumeric()).any(|w| w == n)
             })
         };
-        assert!(addresses("otto can you check"), "an explicit name must end continuity");
-        assert!(!addresses("can we have risotto"), "'risotto' must not read as an address to otto");
+        assert!(
+            addresses("otto can you check"),
+            "an explicit name must end continuity"
+        );
+        assert!(
+            !addresses("can we have risotto"),
+            "'risotto' must not read as an address to otto"
+        );
         assert!(!addresses("tell me one about pineapple"));
 
         // (d) CONTINUES: the shapes that carry no addressee and no subject. The middle
         // one is the phrasing the stem list missed and the family actually used.
-        for t in ["another one", "tell me one about pineapple", "one more", "again", "keep going"] {
-            assert_eq!(classify_domain(t), Domain::Coordination, "{t:?} should name no compiled domain");
-            assert_eq!(m.owner_for_declared_tag(t), None, "{t:?} should name no declared domain");
+        for t in [
+            "another one",
+            "tell me one about pineapple",
+            "one more",
+            "again",
+            "keep going",
+        ] {
+            assert_eq!(
+                classify_domain(t),
+                Domain::Coordination,
+                "{t:?} should name no compiled domain"
+            );
+            assert_eq!(
+                m.owner_for_declared_tag(t),
+                None,
+                "{t:?} should name no declared domain"
+            );
             assert!(!addresses(t), "{t:?} should address nobody");
         }
 
         // NON-VACUITY: the discriminator must genuinely separate the two groups. If
         // classify_domain returned Coordination for everything, (a) above would be
         // vacuous and every ask would inherit.
-        assert_eq!(classify_domain("tell me one about pineapple"), Domain::Coordination);
-        assert_ne!(classify_domain("what's for dinner tonight?"), Domain::Coordination);
+        assert_eq!(
+            classify_domain("tell me one about pineapple"),
+            Domain::Coordination
+        );
+        assert_ne!(
+            classify_domain("what's for dinner tonight?"),
+            Domain::Coordination
+        );
     }
 
     // ---- declared (non-compiled) domains ---------------------------------
@@ -1764,12 +1796,18 @@ mod tests {
         ]);
 
         // THE REPORTED BUG. Both of these returned the concierge (otto) before.
-        assert_eq!(m.owner_for_ask("tell me a joke about a banana"), Some("chiller"));
+        assert_eq!(
+            m.owner_for_ask("tell me a joke about a banana"),
+            Some("chiller")
+        );
         assert_eq!(m.owner_for_ask("tell me a joke"), Some("chiller"));
         // Plural/singular tolerance: the tag is "jokes", the ask says "joke".
         assert_eq!(m.owner_for_ask("any good jokes?"), Some("chiller"));
         // Another declared tag on the same helper.
-        assert_eq!(m.owner_for_ask("can we play a game tonight"), Some("chiller"));
+        assert_eq!(
+            m.owner_for_ask("can we play a game tonight"),
+            Some("chiller")
+        );
 
         // NON-REGRESSION — the compiled fast path still answers first and unchanged.
         assert_eq!(m.owner_for_ask("what's for dinner tonight?"), Some("nora"));
@@ -1785,8 +1823,14 @@ mod tests {
         // NON-VACUITY. The compiled path really does classify these as the catch-all,
         // so the four assertions above are exercising the new fallback and not some
         // pre-existing match. Without it they would every one return the concierge.
-        assert_eq!(classify_domain("tell me a joke about a banana"), Domain::Coordination);
-        assert_eq!(classify_domain("can we play a game tonight"), Domain::Coordination);
+        assert_eq!(
+            classify_domain("tell me a joke about a banana"),
+            Domain::Coordination
+        );
+        assert_eq!(
+            classify_domain("can we play a game tonight"),
+            Domain::Coordination
+        );
         assert_eq!(m.owner_for_domain(Domain::Coordination), Some("otto"));
     }
 

@@ -616,9 +616,10 @@ pub fn refresh_snapshot(dir: &Path, cfg: &ResourceManagementConfig) -> Result<Di
     // here for MEASUREMENT only; `cleanup_owned` still groups every owner of a
     // path and reaps only when all of them are stale.
     let mut measured: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let live_caches = ownership.caches.iter().filter(|cache| {
-        measured.insert(cache.path.as_str()) && Path::new(&cache.path).exists()
-    });
+    let live_caches = ownership
+        .caches
+        .iter()
+        .filter(|cache| measured.insert(cache.path.as_str()) && Path::new(&cache.path).exists());
     // Both target count and entries-per-target are bounded so a corrupt or
     // adversarial registry cannot turn a status refresh into an unbounded walk.
     for cache in live_caches.take(512) {
@@ -1145,8 +1146,7 @@ pub fn cleanup_owned(
     // it is pure duplicate work. It also bypassed `disk_scan_interval_seconds`
     // entirely, so this walk ran at tick cadence no matter how the operator
     // configured the sentinel (2026-08-11).
-    let changed =
-        report.reaped > 0 || report.compressed_files > 0 || report.deduplicated_files > 0;
+    let changed = report.reaped > 0 || report.compressed_files > 0 || report.deduplicated_files > 0;
     if changed {
         let _ = refresh_snapshot(dir, cfg);
     }
