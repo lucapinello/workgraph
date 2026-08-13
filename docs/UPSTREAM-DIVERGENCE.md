@@ -49,26 +49,46 @@ Three facts, each verified rather than assumed:
    — `fix(macos): three inert safety systems…` landed in B only because it contains the
    word "family". Treat the shape as real and every individual row as unverified.
 
-## Known bucket-A candidates
+## What we actually send upstream
 
-Confirmed still present upstream unless noted:
+**Default is: send nothing.** This is someone else's project and a fork's backlog is not
+their inbox. A change earns a PR only by passing all four:
 
-| commit | what | status |
+1. the code is **still broken in `gwwg/main` today** — verified, not assumed;
+2. it hurts a **wg user who has never heard of Casa**;
+3. it is a **bug fix, not a redesign** — no opinion they have to agree with;
+4. it is **small enough to review in one sitting**.
+
+Anything failing (3) is at most an issue with evidence, letting them choose the fix.
+Anything failing (1) or (2) stays in our fork and is nobody's problem but ours.
+
+### Passes — send
+
+| what | why it qualifies | status |
 |---|---|---|
-| `d72abfa0` | verdict store is accidentally quadratic (96% → 2% of a core) | patch written |
-| — | absent agent record makes caches immortal | patch written |
-| — | `pipe2` breaks the macOS build | **PR branch pushed** |
-| `2db5230c` | one unverifiable verdict starves the whole graph — upstream still bails on the first bad file | to send |
-| `bfed378c` | transport-exhausted → per-task quarantine | to send |
-| `9b823397` | self-healing spawn circuit breaker | to send |
-| `ee9c45d1` | heartbeat guard uses fd 9, not a bash-4 named fd | to send |
-| `691965eb` | cron-fanout orphaning, zombie handler locks, poison-task stall | to send |
-| `f9f92435` | protect production crons from a cleanup sweep | to send |
-| `b949bbe5` | `classify_error` done-spoof hides a real provider outage | to send |
-| `16888d31` | unwedge PendingEval | to send |
+| `pipe2` breaks the macOS build | won't compile on Darwin at all; no judgment involved | **branch pushed**, awaiting go-ahead |
+| verdict store is accidentally quadratic | O(verdicts × evaluations) in their own code; semantics unchanged, their 30 tests still pass. Their agency machinery is what generates the evaluations, so it bites them harder than us | patch written, hold until the first lands |
+
+### Fails (3) — evidence only, if they want it
+
+| what | why not a PR |
+|---|---|
+| absent agent record makes caches immortal | real bug (1,180 of 1,283 caches unreapable; `considered=1156 reaped=0` every run) but the fix picks a fail-safe posture they may reasonably disagree with. Their call, not ours to land |
+| `classify_error` treats exit 0 as `FatalTask` | their comment says this is deliberate. Disagreeing is an opinion, not a defect report |
+| one unverifiable verdict starves the whole graph | a genuine trap, but our fix is a design change (per-file quarantine). Too opinionated to arrive as a patch |
+
+### Checked and dropped
+
+| candidate | why |
+|---|---|
+| `ee9c45d1` heartbeat bash-4 named fd | **0 such sites upstream** — already gone or never there |
+| `9b823397` spawn circuit breaker | a feature, not a fix. Features are noise in someone else's roadmap |
+| `691965eb` dispatcher resilience | three unrelated fixes in one commit; would need splitting, and each is arguable |
+| `f9f92435` protect production crons | "production cron" is a Casa concept |
+| `bfed378c`, `16888d31` | entangled with our persona/satellite model |
 
 We have contributed upstream before (`217dc029` references their PR #53), so the channel
-exists.
+exists — which is a reason to spend it carefully, not freely.
 
 Prepared patches and their verification notes:
 `casa-cert-run3/prep/upstream-patches/`.
