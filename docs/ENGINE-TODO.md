@@ -72,48 +72,60 @@ worktree, and none are ever reclaimed.
 
 ---
 
-## 2. RETRACTED — there is no week-lock bypass (it was a stale test binary)
+## 2. RETRACTED — there is no week-lock bypass (the gate certified its own mutant)
 
 **This entry previously claimed, as CONFIRMED, that the `shopping-add` fast lane
 writes the week plan without taking the week-mutation lock. That was wrong.** The
 engine is correct. Kept rather than deleted because the way I got it wrong is the
-reusable lesson.
+reusable lesson — and because it took two attempts to find the real mechanism.
 
-**What is actually true.** Against a binary freshly built from HEAD, holding
-`week-mutation` from a separate process:
+**What is actually true**, with `week-mutation` held from a separate process, against
+the live release binary:
 
 ```
-waited 5s   plan file unchanged
+engine ms=5090   plan changed: no
 {"lane":"week-lock-busy","outcome":"answered","reply":"Someone else is changing this week's …"}
 ```
 
-Fails closed, waits its whole budget, writes nothing. Exactly what leg 3 asserts.
+Waits its whole budget, writes nothing, fails closed — exactly what leg 3 asserts.
+The same probe shows it creating `<root>/.casa/locks/`: it takes the lock, visibly,
+on disk.
 
-**The real defect was in the scenario.** `week_mutation_cross_impl` installs its
-engine to a FIXED path (`$TMPDIR/wg-cross-impl-lock/install-good`), and
-`cargo install --path` REFUSES to reinstall a package whose version is already
-present — this engine is permanently `0.1.0`. So the gate served a build from
-**10:48** against a **14:22** HEAD, from source predating the lock being wired into
-that lane. Leg 3 went red and reproduced 6/6, which read exactly like a
-deterministic product bug.
+**The defect was in the scenario, in two layers.**
 
-Fixed by adding `--force` to both install paths, plus an independent
-`assert_fresh` that fails loudly if the installed binary is older than any tracked
-engine source. A gate pinned to a stale binary does not merely miss regressions —
-it invents them.
+*Layer 1 — a fixed install path.* The gate installs to
+`$TMPDIR/wg-cross-impl-lock/install-good`, and `cargo install --path` REFUSES to
+reinstall a package whose version is already present — this engine is permanently
+`0.1.0`. So it served a 10:48 build against a 14:22 HEAD. Fixed with `--force` plus
+an `assert_fresh` mtime check.
+
+*Layer 2 — a shared target dir, found only while verifying the fix for layer 1.*
+With `--force` in place the gate STILL went red, and the installed "good" binary was
+**byte-identical to this scenario's own teeth mutant** — the deliberately lockless
+engine. Proven two ways: `cmp` on the two installs, and the mutant's signature
+behaviour, which is that it never creates `.casa/locks` at all. One
+`CARGO_TARGET_DIR` was shared by the main tree and the mutant worktree, both building
+`worksgood v0.1.0`, so the previous run's mutant artifacts satisfied the next good
+build — `Finished in 2.07s`, no recompile, mutant installed as the subject.
+
+Fixed with a target dir per source tree, both binaries built before either is judged,
+and `assert_distinct`: the subject may not be byte-identical to its own control. That
+check is mechanism-independent — it holds whatever cargo does next.
 
 **How I fooled myself, worth remembering:**
 
 - I ran my "independent" separate-process experiment with **the same cached binary
   the scenario uses**, so it confirmed the scenario rather than testing the claim.
   The one variable that mattered was the one I never varied.
-- Two facts sat in front of me and I did not weigh them: the binary was stamped
-  10:48 while HEAD was 14:22, and *the same binary had passed earlier that day* —
-  which no product-bug theory explains. A theory that cannot explain the earlier
-  pass is not yet a diagnosis.
+- Two facts sat in front of me and I did not weigh them: the binary was stamped 10:48
+  while HEAD was 14:22, and *the same binary had passed earlier that day* — which no
+  product-bug theory explains. A theory that cannot explain the earlier pass is not
+  yet a diagnosis.
 - Determinism felt like proof. 6/6 identical failures made me more confident, not
   more suspicious — but a stale artefact is perfectly deterministic too.
+- After fixing layer 1 I nearly called the engine broken a second time, because the
+  red persisted and the binary was now provably fresh *by mtime*. Freshness of the
+  artifact is not identity of the code inside it.
 
-**Before believing any engine finding from a smoke gate: check that the binary
-under test is the code you think it is.**
-
+**Before believing any engine finding from a smoke gate: check that the binary under
+test is the code you think it is — and that it is not the gate's own control.**
