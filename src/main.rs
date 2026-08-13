@@ -18,6 +18,7 @@ use clap::{CommandFactory, Parser};
 use std::path::{Path, PathBuf};
 use worksgood::config::Config;
 
+mod casa;
 mod cli;
 mod commands;
 mod terminal_host;
@@ -4157,7 +4158,7 @@ fn main() -> Result<()> {
                 update,
                 reply,
                 list,
-            } => commands::telegram::run_photo_plan(
+            } => casa::telegram_photo::run_photo_plan(
                 &workgraph_dir,
                 &update,
                 reply.as_deref(),
@@ -4172,7 +4173,7 @@ fn main() -> Result<()> {
                 mock_mutation_log,
                 mock_send_log,
                 fail_send,
-            } => commands::telegram::run_photo_replay(
+            } => casa::telegram_photo::run_photo_replay(
                 &workgraph_dir,
                 &update,
                 &reply,
