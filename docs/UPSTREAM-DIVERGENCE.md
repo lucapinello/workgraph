@@ -66,8 +66,8 @@ Anything failing (1) or (2) stays in our fork and is nobody's problem but ours.
 
 | what | why it qualifies | status |
 |---|---|---|
-| `pipe2` breaks the macOS build | won't compile on Darwin at all; no judgment involved | **branch pushed**, awaiting go-ahead |
-| verdict store is accidentally quadratic | O(verdicts × evaluations) in their own code; semantics unchanged, their 30 tests still pass. Their agency machinery is what generates the evaluations, so it bites them harder than us | patch written, hold until the first lands |
+| `pipe2` breaks the macOS build | won't compile on Darwin at all; no judgment involved | **[PR #62](https://github.com/graphwork/wg/pull/62)** — opened 2026-08-12, 1 file +43/−2 |
+| verdict store is accidentally quadratic | O(verdicts × evaluations) in their own code; semantics unchanged, their 30 tests still pass. Their agency machinery is what generates the evaluations, so it bites them harder than us | patch written — **held** until #62 lands, so the first thing they see from us is the smallest possible ask |
 
 ### Fails (3) — evidence only, if they want it
 
