@@ -843,15 +843,21 @@ mod tests {
         append_sites.sort();
 
         // The two reply seams, both wired to `record_group_reply`:
-        //   commands/telegram.rs  ReplySink::mirror   — the live listener relay
-        //   commands/telegram.rs  run_feed_write      — `wg telegram feed-write`
+        //   casa/reply_delivery.rs  ReplySink::mirror  — the live listener relay
+        //   commands/telegram.rs    run_feed_write     — `wg telegram feed-write`
+        //
+        // `mirror` moved out of `commands/telegram.rs` when Casa's reply-delivery
+        // layer was lifted off upstream's file (docs/UPSTREAM-DIVERGENCE.md). The
+        // code is unchanged and still calls `record_group_reply` beside its append;
+        // only its home did. Still an EXACT ordered list, not a set — a set would
+        // let a genuinely new writer hide behind a name already on it.
         let reply_files: Vec<&str> = reply_sites
             .iter()
             .map(|s| s.split(':').next().unwrap_or(""))
             .collect();
         assert_eq!(
             reply_files,
-            vec!["commands/telegram.rs", "commands/telegram.rs"],
+            vec!["casa/reply_delivery.rs", "commands/telegram.rs"],
             "A NEW writer builds an agent (reply) feed row: {reply_sites:?}\n\
              Every reply row must also record WHO SAW IT, or an audience \
              complaint about it cannot be diagnosed. Call \
@@ -863,9 +869,17 @@ mod tests {
             .iter()
             .map(|s| s.split(':').next().unwrap_or(""))
             .collect();
+        // One of the four moved with Casa's reply-delivery layer; the other three
+        // are still inbound human lines and `run_feed_write` in upstream's file.
+        // Sorted, so this remains an exact ordered list.
         assert_eq!(
             append_files,
-            vec!["commands/telegram.rs"; 4],
+            vec![
+                "casa/reply_delivery.rs",
+                "commands/telegram.rs",
+                "commands/telegram.rs",
+                "commands/telegram.rs",
+            ],
             "The set of engine feed appenders changed: {append_sites:?}\n\
              Two of the four are inbound human lines (exempt); the other two are \
              replies and must record an audience. Read the header of \

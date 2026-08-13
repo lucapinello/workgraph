@@ -22,10 +22,8 @@ use worksgood::notify::telegram_group::{
     Election, elect_responders_with_owner_map, parse_at_mention_tokens,
 };
 
-use crate::commands::telegram::{
-    FamilyReplyDelivery, GuardPolicy, ReplyScope, human_agent_id_set, load_telegram_config,
-    project_root,
-};
+use crate::casa::reply_delivery::{FamilyReplyDelivery, GuardPolicy, ReplyScope};
+use crate::commands::telegram::{human_agent_id_set, load_telegram_config, project_root};
 /// Run one photo → shopping-list vision turn end-to-end for an inbound photo
 /// that has ELECTED to a persona (task `photo-to-shopping`). Downloads the image
 /// with the RECEIVING bot's token (the `file_id` is bot-specific), reads the
