@@ -72,91 +72,48 @@ worktree, and none are ever reclaimed.
 
 ---
 
-## 2. `week_mutation_cross_impl` leg 3 — the engine does not fail closed on a held week lock
+## 2. RETRACTED — there is no week-lock bypass (it was a stale test binary)
 
-**Status: RED and deterministic. Do not paper over it.** `feedlock-and-postverify-reds-are-not-flakes`
-applies: an intermittent-looking red in the cross-impl lock seam is also what a real
-concurrency bug looks like, and widening a budget or adding a retry deletes the only
-evidence.
+**This entry previously claimed, as CONFIRMED, that the `shopping-add` fast lane
+writes the week plan without taking the week-mutation lock. That was wrong.** The
+engine is correct. Kept rather than deleted because the way I got it wrong is the
+reusable lesson.
 
-**What leg 3 asserts** (`claw3d-bridge/test/crossImplWeekLock.mjs:194`): the gateway
-holds `week-mutation`, and inside that hold the engine is asked to
-`add cardamom to the shopping list`. The engine should wait its ~5s budget, then
-refuse with `week-lock-busy`, leaving the plan byte-identical.
-
-**Observed, 6 runs out of 6 (2026-08-13):**
+**What is actually true.** Against a binary freshly built from HEAD, holding
+`week-mutation` from a separate process:
 
 ```
-lane:   shopping-add
-reply:  Done — cardamom on the shopping list 🛒
-apply:  {"outcome":"applied","report":"…","week":"2026-W33"}
+waited 5s   plan file unchanged
+{"lane":"week-lock-busy","outcome":"answered","reply":"Someone else is changing this week's …"}
 ```
 
-Three sub-assertions fail: no `week-lock-busy`, the plan file is NOT byte-identical
-("the engine wrote anyway"), and `result.ms < 4000` — so it never waited its budget.
-It acquired immediately and wrote.
+Fails closed, waits its whole budget, writes nothing. Exactly what leg 3 asserts.
 
-**Established facts, not inference:**
+**The real defect was in the scenario.** `week_mutation_cross_impl` installs its
+engine to a FIXED path (`$TMPDIR/wg-cross-impl-lock/install-good`), and
+`cargo install --path` REFUSES to reinstall a package whose version is already
+present — this engine is permanently `0.1.0`. So the gate served a build from
+**10:48** against a **14:22** HEAD, from source predating the lock being wired into
+that lane. Leg 3 went red and reproduced 6/6, which read exactly like a
+deterministic product bug.
 
-- Deterministic: 6/6, 7–10s each (the engine install is cached, so runs are cheap —
-  loop it, do not reason from one occurrence).
-- Legs 1, 2, 4 and 6 all PASS. So the lock works in general, and leg 6's control
-  (lockless engine ⇒ updates ARE lost) still has teeth.
-- **Leg 2 vs leg 3 is the only structural difference.** Leg 2 uses `engineAsync` —
-  spawn, verify nothing lands during the hold, release, verify it lands. It passes,
-  which proves the engine genuinely blocks on this lock. Leg 3 uses `engineSync`,
-  running the engine synchronously INSIDE the hold and thereby blocking the JS event
-  loop.
-- The command now routes through a dedicated **`shopping-add` fast lane**
-  (`fast_lane.rs:429`, `:1489`, `:1663`), which mutates plan content and should sit
-  inside the `with_week_mutation_lock` closure at `fast_lane.rs:2440`.
-- `projectLock.mjs` documents that age-based stealing was REMOVED (a holder's lock was
-  once unlinked when mtime age exceeded a 15s default even though the holder was alive;
-  "there is now NO age-based break"). And the engine returned in <4s, so age-based
-  stealing does not explain it either.
-- It PASSED earlier the same day (rc=0, ~20min, full build) with the SAME cached
-  binary that now fails. So the change is environmental, not the engine build.
+Fixed by adding `--force` to both install paths, plus an independent
+`assert_fresh` that fails loudly if the installed binary is older than any tracked
+engine source. A gate pinned to a stale binary does not merely miss regressions —
+it invents them.
 
-**HYPOTHESIS 1 IS CONFIRMED — this is a real lock bypass, not a test artefact.**
+**How I fooled myself, worth remembering:**
 
-The experiment named below was run (2026-08-13). A holder process took
-`week-mutation` on a scratch root and held it synchronously in ITS OWN process, so
-no event loop was blocked on the engine's behalf. Verified during the hold:
+- I ran my "independent" separate-process experiment with **the same cached binary
+  the scenario uses**, so it confirmed the scenario rather than testing the claim.
+  The one variable that mattered was the one I never varied.
+- Two facts sat in front of me and I did not weigh them: the binary was stamped
+  10:48 while HEAD was 14:22, and *the same binary had passed earlier that day* —
+  which no product-bug theory explains. A theory that cannot explain the earlier
+  pass is not yet a diagnosis.
+- Determinism felt like proof. 6/6 identical failures made me more confident, not
+  more suspicious — but a stale artefact is perfectly deterministic too.
 
-- the holder printed `HELD`;
-- `<root>/.casa/locks/week-mutation.lock` existed on disk;
-- the engine (`wg telegram shopping "add cardamom …" --apply`) returned in **0s**
-  and the plan file's md5 CHANGED.
+**Before believing any engine finding from a smoke gate: check that the binary
+under test is the code you think it is.**
 
-Reproduced twice, with different items. So `shopping-add` writes the week plan
-without respecting the week-mutation lock. Two writers, no serialisation, on the
-file that holds the family's week — that is the loss the lock exists to prevent.
-
-**Also suspect: leg 2's PASS may be vacuous.** It spawns the engine with
-`engineAsync` and immediately asserts the plan is unchanged "while the gateway
-holds". A just-spawned process has not reached its write yet either, so that
-assertion can pass without the lock doing anything. Given leg 3, leg 2 should be
-re-read as unproven rather than as evidence the lock works here.
-
-**Superseded hypotheses, kept for the record:**
-
-1. **A real lock bypass on the `shopping-add` lane** — the lane writes plan content
-   through a path that does not take (or takes a different) week lock. If so this is
-   family-data loss: two writers, no serialisation. Most serious; check first.
-2. **The Rust twin still steals where the JS side stopped** — the JS lock removed
-   age-based breaking; if `project_lock.rs` did not, the engine could break in on a
-   rule the gateway no longer plays by. The <4s timing argues against age-based, but
-   not against some other break rule.
-3. **Leg 3 is an invalid construction** — you may not be able to hold this lock while
-   blocking the event loop synchronously, in which case the test is asserting something
-   the design never promised, and leg 2 already covers the real property.
-
-**Next step — an ENGINE fix, and it is the highest-priority item in this file.**
-Find where the `shopping-add` lane reaches the plan writer and bring it inside the
-`with_week_mutation_lock` closure (`fast_lane.rs:2440`), or explain why this lane is
-exempt — but it demonstrably writes the same file the lock guards, so exemption is
-hard to justify. Then re-run leg 3, and re-derive leg 2 so it cannot pass on a
-process that simply has not started yet (wait for evidence the engine is BLOCKED, not
-merely silent).
-
-**Do not mark the smoke suite green while this is red.**
