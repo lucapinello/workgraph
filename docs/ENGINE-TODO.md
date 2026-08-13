@@ -117,7 +117,28 @@ It acquired immediately and wrote.
 - It PASSED earlier the same day (rc=0, ~20min, full build) with the SAME cached
   binary that now fails. So the change is environmental, not the engine build.
 
-**Competing hypotheses, none confirmed:**
+**HYPOTHESIS 1 IS CONFIRMED — this is a real lock bypass, not a test artefact.**
+
+The experiment named below was run (2026-08-13). A holder process took
+`week-mutation` on a scratch root and held it synchronously in ITS OWN process, so
+no event loop was blocked on the engine's behalf. Verified during the hold:
+
+- the holder printed `HELD`;
+- `<root>/.casa/locks/week-mutation.lock` existed on disk;
+- the engine (`wg telegram shopping "add cardamom …" --apply`) returned in **0s**
+  and the plan file's md5 CHANGED.
+
+Reproduced twice, with different items. So `shopping-add` writes the week plan
+without respecting the week-mutation lock. Two writers, no serialisation, on the
+file that holds the family's week — that is the loss the lock exists to prevent.
+
+**Also suspect: leg 2's PASS may be vacuous.** It spawns the engine with
+`engineAsync` and immediately asserts the plan is unchanged "while the gateway
+holds". A just-spawned process has not reached its write yet either, so that
+assertion can pass without the lock doing anything. Given leg 3, leg 2 should be
+re-read as unproven rather than as evidence the lock works here.
+
+**Superseded hypotheses, kept for the record:**
 
 1. **A real lock bypass on the `shopping-add` lane** — the lane writes plan content
    through a path that does not take (or takes a different) week lock. If so this is
@@ -130,10 +151,12 @@ It acquired immediately and wrote.
    blocking the event loop synchronously, in which case the test is asserting something
    the design never promised, and leg 2 already covers the real property.
 
-**Next step:** decide between (1) and (3) first, because they point opposite ways —
-(1) is an engine fix, (3) is deleting a test that proves nothing. The cheap experiment
-is to hold the lock from a SEPARATE process (not the same event loop) and re-run the
-same engine command: if it then refuses with `week-lock-busy`, leg 3 is the artefact;
-if it still writes, hypothesis 1 is live and urgent.
+**Next step — an ENGINE fix, and it is the highest-priority item in this file.**
+Find where the `shopping-add` lane reaches the plan writer and bring it inside the
+`with_week_mutation_lock` closure (`fast_lane.rs:2440`), or explain why this lane is
+exempt — but it demonstrably writes the same file the lock guards, so exemption is
+hard to justify. Then re-run leg 3, and re-derive leg 2 so it cannot pass on a
+process that simply has not started yet (wait for evidence the engine is BLOCKED, not
+merely silent).
 
 **Do not mark the smoke suite green while this is red.**
