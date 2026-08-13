@@ -120,5 +120,29 @@ rev bump plus whatever genuinely broke.
 Full phased plan, including the Telegram extraction that removes over half the sync cost:
 see the approved plan for this work.
 
+### Extraction log — `commands/telegram.rs`
+
+Upstream's file was **869 lines** at our fork point; we deleted 677 of them and added
+15,349. Every Casa item living there is a merge conflict waiting for the next sync, so
+the slices below move ours OUT to `src/casa/`, a path upstream does not have.
+
+| slice | moved | their file | `pub(crate)` exposed |
+|---|---|---|---|
+| 1 | `casa/telegram_photo.rs` — photo → shopping pipeline | 15,541 → 14,570 | 9 → 6 |
+| 2 | `casa/reply_delivery.rs` — family reply delivery | 14,570 → 14,073 | 6 → 5 |
+| 3 | `casa/remind.rs` — the `wg telegram remind` tick | 14,073 → 13,536 | 5 → **6** |
+
+Slice 3 went the wrong way on the marker count, deliberately and once:
+`resolve_dm_target` is ours (absent upstream at the fork point and on `gwwg/main`
+today) but still has one caller and two tests in their file, so it is exposed rather
+than dragged out with its tests. It follows the DM path out when that is extracted.
+The marker is the recorded price of a 537-line reduction, not an oversight.
+
+**Choosing a slice.** Prefer a cluster whose helpers are used ONLY by it — then nothing
+has to be exposed. Check provenance first (`git show <merge-base>:<path>`): a helper
+that exists upstream must stay, and one that does not is ours to move. `run_remind`
+qualified on both counts; `run_web_inbound` (512 lines) drags ten private helpers and
+two `pub` group handlers, so it wants its own slice.
+
 **Pin by `rev`, never a branch.** Bump monthly while the gap is small — the cost of a bump
 grows superlinearly with the gap, which is precisely how this fork got here.

@@ -3940,7 +3940,7 @@ fn main() -> Result<()> {
                 ask,
                 asker,
                 now,
-            } => commands::telegram::run_remind(
+            } => casa::remind::run_remind(
                 &workgraph_dir,
                 list,
                 dry_run,
