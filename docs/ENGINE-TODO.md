@@ -69,3 +69,71 @@ today.
 
 **Not urgent, but it does not shrink on its own** — every reaped agent adds a
 worktree, and none are ever reclaimed.
+
+---
+
+## 2. `week_mutation_cross_impl` leg 3 — the engine does not fail closed on a held week lock
+
+**Status: RED and deterministic. Do not paper over it.** `feedlock-and-postverify-reds-are-not-flakes`
+applies: an intermittent-looking red in the cross-impl lock seam is also what a real
+concurrency bug looks like, and widening a budget or adding a retry deletes the only
+evidence.
+
+**What leg 3 asserts** (`claw3d-bridge/test/crossImplWeekLock.mjs:194`): the gateway
+holds `week-mutation`, and inside that hold the engine is asked to
+`add cardamom to the shopping list`. The engine should wait its ~5s budget, then
+refuse with `week-lock-busy`, leaving the plan byte-identical.
+
+**Observed, 6 runs out of 6 (2026-08-13):**
+
+```
+lane:   shopping-add
+reply:  Done — cardamom on the shopping list 🛒
+apply:  {"outcome":"applied","report":"…","week":"2026-W33"}
+```
+
+Three sub-assertions fail: no `week-lock-busy`, the plan file is NOT byte-identical
+("the engine wrote anyway"), and `result.ms < 4000` — so it never waited its budget.
+It acquired immediately and wrote.
+
+**Established facts, not inference:**
+
+- Deterministic: 6/6, 7–10s each (the engine install is cached, so runs are cheap —
+  loop it, do not reason from one occurrence).
+- Legs 1, 2, 4 and 6 all PASS. So the lock works in general, and leg 6's control
+  (lockless engine ⇒ updates ARE lost) still has teeth.
+- **Leg 2 vs leg 3 is the only structural difference.** Leg 2 uses `engineAsync` —
+  spawn, verify nothing lands during the hold, release, verify it lands. It passes,
+  which proves the engine genuinely blocks on this lock. Leg 3 uses `engineSync`,
+  running the engine synchronously INSIDE the hold and thereby blocking the JS event
+  loop.
+- The command now routes through a dedicated **`shopping-add` fast lane**
+  (`fast_lane.rs:429`, `:1489`, `:1663`), which mutates plan content and should sit
+  inside the `with_week_mutation_lock` closure at `fast_lane.rs:2440`.
+- `projectLock.mjs` documents that age-based stealing was REMOVED (a holder's lock was
+  once unlinked when mtime age exceeded a 15s default even though the holder was alive;
+  "there is now NO age-based break"). And the engine returned in <4s, so age-based
+  stealing does not explain it either.
+- It PASSED earlier the same day (rc=0, ~20min, full build) with the SAME cached
+  binary that now fails. So the change is environmental, not the engine build.
+
+**Competing hypotheses, none confirmed:**
+
+1. **A real lock bypass on the `shopping-add` lane** — the lane writes plan content
+   through a path that does not take (or takes a different) week lock. If so this is
+   family-data loss: two writers, no serialisation. Most serious; check first.
+2. **The Rust twin still steals where the JS side stopped** — the JS lock removed
+   age-based breaking; if `project_lock.rs` did not, the engine could break in on a
+   rule the gateway no longer plays by. The <4s timing argues against age-based, but
+   not against some other break rule.
+3. **Leg 3 is an invalid construction** — you may not be able to hold this lock while
+   blocking the event loop synchronously, in which case the test is asserting something
+   the design never promised, and leg 2 already covers the real property.
+
+**Next step:** decide between (1) and (3) first, because they point opposite ways —
+(1) is an engine fix, (3) is deleting a test that proves nothing. The cheap experiment
+is to hold the lock from a SEPARATE process (not the same event loop) and re-run the
+same engine command: if it then refuses with `week-lock-busy`, leg 3 is the artefact;
+if it still writes, hypothesis 1 is live and urgent.
+
+**Do not mark the smoke suite green while this is red.**
