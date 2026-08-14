@@ -11,8 +11,12 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use worksgood::notify::ownership;
+use worksgood::notify::telegram_group::{
+    Election, elect_responders_with_owner_map, is_discussion_ask, parse_at_mention_tokens,
+    resolve_mentioned_bot,
+};
 
-use crate::commands::telegram::{load_telegram_config, project_root};
+use crate::commands::telegram::{human_agent_id_set, load_telegram_config, project_root};
 
 pub fn run_conversation_dryrun(
     workgraph_dir: &Path,
@@ -411,6 +415,115 @@ pub fn run_voice_dryrun(
                 println!("reply (in-persona): {}", failure.message());
             }
         }
+    }
+    Ok(())
+}
+
+// `wg telegram discuss --dry-run` joined its siblings here in slice 6: it answers the same
+// shape of question — "what WOULD this turn do" — without sending anything.
+/// `wg telegram discuss --dry-run` — show whether a group message would run a
+/// DISCUSSION ROUND, and the planned round, without sending anything.
+///
+/// Runs the exact [`elect_responders_with_owner_map`] decision the listener uses, then applies
+/// the same [`is_discussion_ask`] gate the live `Election::All` handler uses to
+/// split a collective election into a discussion round vs independent roster
+/// replies. Prints the category and, for a round, the household-authored voices
+/// in contribution order plus the configured coordination-owner synthesizer.
+/// This is the scripted-test seam (sibling of `wg telegram elect`): a discussion
+/// ask → `discussion-round`; a plain collective greeting →
+/// `collective-greeting`; a named/concierge ask → `single-voice`; small talk →
+/// `silence`. Nothing is sent.
+pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()> {
+    use worksgood::notify::telegram_discussion as discussion;
+    use worksgood::notify::telegram_standup as standup;
+
+    let config = load_telegram_config()?;
+    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
+    let human_count = human_agent_id_set(workgraph_dir).len();
+
+    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let election = elect_responders_with_owner_map(
+        Some("supergroup"),
+        Some("-1000000000001"),
+        message,
+        &mention_usernames,
+        None,
+        // The diagnostic is always run by a human operator, never a bot.
+        false,
+        human_count,
+        &config,
+        &owner_map,
+    );
+
+    let is_discussion = is_discussion_ask(message);
+    let roster_ids: Vec<String> =
+        standup::load_project_roster(&project_root(workgraph_dir), &config)?
+            .into_iter()
+            .map(|m| m.bot_id)
+            .collect();
+    let synthesizer_bot = owner_map
+        .owner_for_domain(ownership::Domain::Coordination)
+        .and_then(|owner| resolve_mentioned_bot(owner, &config))
+        .map(|bot| bot.bot_id);
+
+    // (category, plan) — plan is Some only for a discussion round.
+    let (category, plan): (&str, Option<discussion::DiscussionPlan>) = match &election {
+        Election::Private => ("private", None),
+        Election::Silence(_) => ("silence", None),
+        Election::One { .. } => ("single-voice", None),
+        Election::All { .. } => {
+            if is_discussion {
+                (
+                    "discussion-round",
+                    Some(discussion::plan_round(
+                        &roster_ids,
+                        synthesizer_bot.as_deref(),
+                    )),
+                )
+            } else {
+                ("collective-greeting", None)
+            }
+        }
+    };
+
+    if json {
+        let out = serde_json::json!({
+            "category": category,
+            "is_discussion_ask": is_discussion,
+            "voices": plan.as_ref().map(|p| p.take_voices.clone()),
+            "synthesizer": plan.as_ref().and_then(|p| p.synthesizer.clone()),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    match category {
+        "discussion-round" => {
+            let plan = plan.unwrap();
+            println!(
+                "discussion round — each voice gives a short take, in order: {}",
+                if plan.take_voices.is_empty() {
+                    "(none configured)".to_string()
+                } else {
+                    plan.take_voices.join(" → ")
+                },
+            );
+            match plan.synthesizer {
+                Some(s) => {
+                    println!("then {s} closes with a synthesis (only if ≥2 other voices weigh in)")
+                }
+                None => println!("no synthesizer configured — no closing wrap-up"),
+            }
+        }
+        "collective-greeting" => println!(
+            "collective greeting — the whole roster answers with brief independent hellos \
+             (no discussion round)"
+        ),
+        "single-voice" => {
+            println!("single voice — one bot answers (named/mention/reply/concierge); no round")
+        }
+        "silence" => println!("silence — no one responds; no round"),
+        _ => println!("private chat — 1:1 passthrough; no round"),
     }
     Ok(())
 }

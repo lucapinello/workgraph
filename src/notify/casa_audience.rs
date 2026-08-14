@@ -844,20 +844,21 @@ mod tests {
 
         // The two reply seams, both wired to `record_group_reply`:
         //   casa/reply_delivery.rs  ReplySink::mirror  — the live listener relay
-        //   commands/telegram.rs    run_feed_write     — `wg telegram feed-write`
+        //   casa/feed_write.rs      run_feed_write     — `wg telegram feed-write`
         //
-        // `mirror` moved out of `commands/telegram.rs` when Casa's reply-delivery
-        // layer was lifted off upstream's file (docs/UPSTREAM-DIVERGENCE.md). The
-        // code is unchanged and still calls `record_group_reply` beside its append;
-        // only its home did. Still an EXACT ordered list, not a set — a set would
-        // let a genuinely new writer hide behind a name already on it.
+        // BOTH have now moved off upstream's file: `mirror` with Casa's reply-delivery
+        // layer, and `run_feed_write` in slice 6 (docs/UPSTREAM-DIVERGENCE.md). Neither
+        // one's code changed — each still calls `record_group_reply` beside its append —
+        // only its home did, and this guard correctly went RED for the move, which is
+        // exactly what an exact list is for. Still an EXACT ordered list, not a set: a
+        // set would let a genuinely new writer hide behind a name already on it.
         let reply_files: Vec<&str> = reply_sites
             .iter()
             .map(|s| s.split(':').next().unwrap_or(""))
             .collect();
         assert_eq!(
             reply_files,
-            vec!["casa/reply_delivery.rs", "commands/telegram.rs"],
+            vec!["casa/feed_write.rs", "casa/reply_delivery.rs"],
             "A NEW writer builds an agent (reply) feed row: {reply_sites:?}\n\
              Every reply row must also record WHO SAW IT, or an audience \
              complaint about it cannot be diagnosed. Call \
@@ -869,14 +870,18 @@ mod tests {
             .iter()
             .map(|s| s.split(':').next().unwrap_or(""))
             .collect();
-        // One of the four moved with Casa's reply-delivery layer; the other three
-        // are still inbound human lines and `run_feed_write` in upstream's file.
-        // Sorted, so this remains an exact ordered list.
+        // Four sites, verified against the code rather than read off a diff:
+        //   casa/feed_write.rs:156      run_feed_write        (reply — records audience)
+        //   casa/reply_delivery.rs:256  ReplySink::mirror     (reply — records audience)
+        //   commands/telegram.rs:816    inbound human line    (exempt)
+        //   commands/telegram.rs:1003   inbound human line    (exempt)
+        // Two moved off upstream's file with Casa's layers; the two that remain are the
+        // inbound human lines. Sorted, so this remains an exact ordered list.
         assert_eq!(
             append_files,
             vec![
+                "casa/feed_write.rs",
                 "casa/reply_delivery.rs",
-                "commands/telegram.rs",
                 "commands/telegram.rs",
                 "commands/telegram.rs",
             ],

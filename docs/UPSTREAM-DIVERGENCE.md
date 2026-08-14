@@ -133,12 +133,32 @@ the slices below move ours OUT to `src/casa/`, a path upstream does not have.
 | 3 | `casa/remind.rs` — the `wg telegram remind` tick | 14,073 → 13,536 | 5 → **6** |
 | 4 | `casa/one_shot_answers.rs` — `owner`, `parity`, `capability` | 13,536 → 13,317 | 6 → 6 |
 | 5 | `casa/digest.rs`, `casa/dryruns.rs`, `casa/elect.rs` | 13,317 → 12,555 | 6 → **5** |
+| 6 | `casa/feed_write.rs`; `run_discuss` → `casa/dryruns.rs` | 12,555 → 12,210 | 5 → 5 |
 
 Slice 3 went the wrong way on the marker count, deliberately and once:
 `resolve_dm_target` is ours (absent upstream at the fork point and on `gwwg/main`
 today) but still has one caller and two tests in their file, so it is exposed rather
 than dragged out with its tests. It follows the DM path out when that is extracted.
 The marker is the recorded price of a 537-line reduction, not an oversight.
+
+Slice 6 tripped a guard, correctly. `notify/casa_audience.rs` pins the EXACT set of engine
+feed-writer files, and moving `run_feed_write` changed it — so the lib suite went
+3926/0 → 3925/1 the moment the file moved. That is the guard doing its job; a set instead of
+an exact list would have let the move pass silently. Both of its lists were updated, each
+site verified against the code (`casa/feed_write.rs:156` and `casa/reply_delivery.rs:256`
+record an audience; `commands/telegram.rs:816` and `:1003` are inbound human lines and
+exempt) rather than read off the failure diff, and the rewritten list was re-proven to bite
+by planting a synthetic append site in an unrelated Casa module.
+
+**What is left, and why the easy slices are done.** `run_listen` (2,363 lines with helpers),
+`run_send` and `run_ask` are UPSTREAM's functions — heavily rewritten by us, but they are
+theirs and do not move; their Casa content has to be teased out in place, which is a
+different and larger job. Of what remains ours: `run_web_inbound` (~1,076) needs the two
+group handlers exposed because upstream's `run_listen` also calls them; `run_week_start` and
+`run_shopping_language` need `web_physical_turn_key` / `web_fast_lane_now`, which become
+internal if they move WITH the `run_web_inbound` cluster — so those three are one slice, not
+three; `run_decide` needs `command_gate`, shared with `run_listen`, so it costs a permanent
+exposure.
 
 Slice 5 paid off slice 3's debt. `resolve_dm_target` was exposed there so `casa::remind`
 could reach it, on the promise that it would "follow the DM path out when that path is

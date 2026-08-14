@@ -4063,7 +4063,7 @@ fn main() -> Result<()> {
                 non_relay_type,
                 message_id,
                 bot_id,
-            } => commands::telegram::run_feed_write(
+            } => casa::feed_write::run_feed_write(
                 &root,
                 &kind,
                 sender.as_deref(),
@@ -4088,7 +4088,7 @@ fn main() -> Result<()> {
                 cli.json,
             ),
             TelegramCommands::Discuss { message } => {
-                commands::telegram::run_discuss(&workgraph_dir, &message, cli.json)
+                casa::dryruns::run_discuss(&workgraph_dir, &message, cli.json)
             }
             TelegramCommands::Decide { update } => {
                 commands::telegram::run_decide(&workgraph_dir, &update, cli.json)

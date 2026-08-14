@@ -2729,113 +2729,6 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
     Ok(())
 }
 
-/// `wg telegram discuss --dry-run` — show whether a group message would run a
-/// DISCUSSION ROUND, and the planned round, without sending anything.
-///
-/// Runs the exact [`elect_responders_with_owner_map`] decision the listener uses, then applies
-/// the same [`is_discussion_ask`] gate the live `Election::All` handler uses to
-/// split a collective election into a discussion round vs independent roster
-/// replies. Prints the category and, for a round, the household-authored voices
-/// in contribution order plus the configured coordination-owner synthesizer.
-/// This is the scripted-test seam (sibling of `wg telegram elect`): a discussion
-/// ask → `discussion-round`; a plain collective greeting →
-/// `collective-greeting`; a named/concierge ask → `single-voice`; small talk →
-/// `silence`. Nothing is sent.
-pub fn run_discuss(workgraph_dir: &Path, message: &str, json: bool) -> Result<()> {
-    use worksgood::notify::telegram_discussion as discussion;
-    use worksgood::notify::telegram_standup as standup;
-
-    let config = load_telegram_config()?;
-    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
-    let human_count = human_agent_id_set(workgraph_dir).len();
-
-    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-    let election = elect_responders_with_owner_map(
-        Some("supergroup"),
-        Some("-1000000000001"),
-        message,
-        &mention_usernames,
-        None,
-        // The diagnostic is always run by a human operator, never a bot.
-        false,
-        human_count,
-        &config,
-        &owner_map,
-    );
-
-    let is_discussion = is_discussion_ask(message);
-    let roster_ids: Vec<String> =
-        standup::load_project_roster(&project_root(workgraph_dir), &config)?
-            .into_iter()
-            .map(|m| m.bot_id)
-            .collect();
-    let synthesizer_bot = owner_map
-        .owner_for_domain(ownership::Domain::Coordination)
-        .and_then(|owner| resolve_mentioned_bot(owner, &config))
-        .map(|bot| bot.bot_id);
-
-    // (category, plan) — plan is Some only for a discussion round.
-    let (category, plan): (&str, Option<discussion::DiscussionPlan>) = match &election {
-        Election::Private => ("private", None),
-        Election::Silence(_) => ("silence", None),
-        Election::One { .. } => ("single-voice", None),
-        Election::All { .. } => {
-            if is_discussion {
-                (
-                    "discussion-round",
-                    Some(discussion::plan_round(
-                        &roster_ids,
-                        synthesizer_bot.as_deref(),
-                    )),
-                )
-            } else {
-                ("collective-greeting", None)
-            }
-        }
-    };
-
-    if json {
-        let out = serde_json::json!({
-            "category": category,
-            "is_discussion_ask": is_discussion,
-            "voices": plan.as_ref().map(|p| p.take_voices.clone()),
-            "synthesizer": plan.as_ref().and_then(|p| p.synthesizer.clone()),
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-
-    match category {
-        "discussion-round" => {
-            let plan = plan.unwrap();
-            println!(
-                "discussion round — each voice gives a short take, in order: {}",
-                if plan.take_voices.is_empty() {
-                    "(none configured)".to_string()
-                } else {
-                    plan.take_voices.join(" → ")
-                },
-            );
-            match plan.synthesizer {
-                Some(s) => {
-                    println!("then {s} closes with a synthesis (only if ≥2 other voices weigh in)")
-                }
-                None => println!("no synthesizer configured — no closing wrap-up"),
-            }
-        }
-        "collective-greeting" => println!(
-            "collective greeting — the whole roster answers with brief independent hellos \
-             (no discussion round)"
-        ),
-        "single-voice" => {
-            println!("single voice — one bot answers (named/mention/reply/concierge); no round")
-        }
-        "silence" => println!("silence — no one responds; no round"),
-        _ => println!("private chat — 1:1 passthrough; no round"),
-    }
-    Ok(())
-}
-
 /// `wg telegram compose-prompt` — print the assembled compose prompt for a
 /// message, WITHOUT spawning a model or sending anything.
 ///
@@ -4677,244 +4570,6 @@ pub fn run_web_inbound(
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         println!("web-inbound [{category}] from {sender}: {outcome_label}");
-    }
-    Ok(())
-}
-
-/// Mirror one synthetic line to the casa conversation-pane feed (diagnostic).
-///
-/// Drives the EXACT `casa_feed` writer the listener uses, so a smoke test can
-/// prove the feed writer end-to-end against the real binary without a live
-/// group: `--kind group` writes an inbound human line (needs `--sender`),
-/// `--kind agent` writes a relayed persona reply (needs `--agent-id`). Only the
-/// six display-safe fields are written — never a token or chat id.
-pub fn run_feed_write(
-    root: &Path,
-    kind: &str,
-    sender: Option<&str>,
-    agent_id: Option<&str>,
-    text: &str,
-    src_id: Option<&str>,
-    turn_id: Option<&str>,
-    reply_phase: Option<&str>,
-    non_relay_type: Option<&str>,
-    message_id: Option<&str>,
-    bot_id: Option<&str>,
-) -> Result<()> {
-    let personas = load_feed_persona_catalog(root);
-    let entry = match kind {
-        "group" => {
-            let sender = sender.context("--kind group requires --sender")?;
-            // Thread the caller-supplied opaque source id (docs/20 §2) so a smoke
-            // test can drive the real writer with the SAME id twice and prove the
-            // reader's srcId dedupe collapses the re-delivery to one pane line.
-            casa_feed::group_entry(
-                &personas,
-                sender,
-                text,
-                casa_feed::now_ms(),
-                src_id.map(str::to_string),
-            )
-        }
-        "agent" => {
-            let agent_id = agent_id.context("--kind agent requires --agent-id")?;
-            casa_feed::agent_entry(&personas, agent_id, text, casa_feed::now_ms())
-        }
-        other => anyhow::bail!("--kind must be 'group' or 'agent', got '{other}'"),
-    };
-
-    // The causal stamps, from the flags or from the environment the gateway
-    // dispatched us with. `WG_TURN_ID` carries the RAW accepted turn; it is
-    // passed through UNTOUCHED and validated at write, so a hashed or
-    // placeholder id produces no row rather than a row that certifies nothing.
-    let turn_id = turn_id
-        .map(str::to_string)
-        .or_else(|| std::env::var("WG_TURN_ID").ok())
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty());
-    // THE PHASE IS PARSED ONCE, AND IT IS NEVER GUESSED (task
-    // receipt-engine-reply). Row and receipt take it from the SAME value, so the
-    // two can never disagree about what this line was — it used to be parsed
-    // twice from the same flag, which is one edit away from disagreeing.
-    //
-    // AND THERE IS NO DEFAULT. This used to read `.unwrap_or("final")`, so a
-    // caller that named a turn and declared no phase had `final` stamped for it:
-    // the STRONGEST of the four claims, the one the turn's one-final reservation
-    // is keyed on, asserted by a writer that never said it. It also walked
-    // straight past `casa_feed::validate`'s `TurnWithoutPhase` — v9.1's required
-    // negative, unreachable from this seam because the default filled the exact
-    // hole the validator exists to catch. The writer KNOWS which of the five it
-    // is emitting; if it did not say, it is asked, not guessed for.
-    //
-    // THE VOCABULARY IS THE SCHEMA'S, AND IT IS A JOIN BETWEEN TWO REPOS. This
-    // arm-per-word list IS the engine's half of the closed enum, and the gateway
-    // asserts every member of ITS list is stamped verbatim by this binary
-    // (`claw3d-bridge/test/replyPhaseEngineTwin.test.mjs`). `addendum` was in the
-    // gateway's `REPLY_PHASES` from v9.2 and missing here, so the twin red-lined
-    // on the exact message below: a word one implementation writes and the other
-    // refuses is a row the gateway can produce and the engine cannot.
-    let phase = match reply_phase.map(str::trim) {
-        Some("ack") => Some(relay_receipt::ReplyPhase::Ack),
-        Some("final") => Some(relay_receipt::ReplyPhase::Final),
-        Some("addendum") => Some(relay_receipt::ReplyPhase::Addendum),
-        Some("watchdog") => Some(relay_receipt::ReplyPhase::Watchdog),
-        Some("failure") => Some(relay_receipt::ReplyPhase::Failure),
-        Some(other) => {
-            anyhow::bail!(
-                "--reply-phase must be one of ack|final|addendum|watchdog|failure, got '{other}'"
-            )
-        }
-        None => None,
-    };
-    let entry = match turn_id.as_deref() {
-        Some(turn) => {
-            // A turn-bound row must say WHICH reply of that turn it is. Refused
-            // BEFORE the append, so a refusal leaves no row.
-            let Some(phase) = phase else {
-                anyhow::bail!(
-                    "a row bound to a turn must declare --reply-phase \
-                     (ack|final|addendum|watchdog|failure) — the writer knows which it is \
-                     emitting, and an unstamped turn-bound agent row is a receipt/observe v9.1 \
-                     required negative"
-                );
-            };
-            entry.with_turn(turn, phase)
-        }
-        // No causal turn: its own single-row occurrence, with no turn to be a
-        // phase of. An inbound human mirror lands here.
-        None => entry,
-    };
-    let entry = match non_relay_type {
-        Some(kind) => entry.with_non_relay_type(kind.trim()),
-        None => entry,
-    };
-
-    let feed_path = casa_feed::feed_path_for(root);
-    let role = agent_id.unwrap_or("unknown");
-
-    // ONE TRANSACTION, through the very same writer the listener's delivery seam
-    // uses — so a smoke test drives the production path rather than a look-alike
-    // that can drift away from it. A receipt needs both a causal turn to join on
-    // and a transport answer to record, so it is written only when the caller
-    // supplies a `--message-id`; without one there is no delivery to prove and
-    // inventing a receipt would forge exactly the link the ledger establishes.
-    //
-    // The BOUND-OR-BLOCKED gate applies to this writer exactly as it does to the
-    // listener's: a diagnostic is still a row the family's pane shows and an
-    // auditor counts, and `feed-write --kind agent` is precisely the shape that
-    // put unattributable helper rows into a certification run.
-    //
-    // AND IT IS ONE SECTION, NOT TWO (docs/42 §9, `feed-lock-section`). The
-    // audience record used to be written after this call returned, in a second
-    // acquisition of the same lock — the one most likely to arrive after the
-    // patience was already spent, and a whole extra queue position for every
-    // other writer. It is written below, inside this section, with the held lock
-    // as a witness. What did NOT move is the rollback boundary: the row and its
-    // receipt are one fact and fail together, while a refused audience is
-    // carried out and REPORTED rather than taking the row back out.
-    let mut proved = false;
-    let mut audience: Option<Result<casa_audience::AudienceOutcome, casa_audience::AudienceError>> =
-        None;
-    let written = casa_feed::append_entry_proving(&feed_path, &entry, |feed_id, lock| {
-        // The phase is destructured HERE rather than defaulted above: a row with a
-        // turn always carries one (the bail above), so pattern-matching it costs
-        // nothing and leaves no `unwrap_or_default()` that could quietly stand in
-        // for a declaration on some future path.
-        if let (Some(turn), Some(mid), Some(phase)) = (turn_id.as_deref(), message_id, phase) {
-            proved = true;
-            // THE ONLY `?` IN THIS SECTION. A refused receipt rolls the row back
-            // out; nothing below may, which is why the audience result is stored
-            // instead of propagated.
-            write_engine_receipt_at(
-                root,
-                turn,
-                feed_id,
-                role,
-                bot_id.unwrap_or(role),
-                Some(mid),
-                relay_receipt::RelayOutcome::Send,
-                phase,
-                Some(lock),
-            )
-            .map(relay_receipt::Appended::regardless_of_release)?;
-        }
-        // WHO SAW IT, in this section. Gated on the turn alone and NOT on the
-        // receipt: a row bound to a turn with no `--message-id` has no delivery
-        // to prove and still has an audience, and that asymmetry is why this is
-        // not folded into the branch above.
-        if kind == "agent"
-            && let Some(turn) = turn_id.as_deref()
-        {
-            audience = Some(casa_audience::record_group_reply_locked(
-                &feed_path,
-                turn,
-                role,
-                casa_feed::now_ms(),
-                lock,
-            ));
-        }
-        // Spelled out: `?` above converts through `From`, so with no annotation
-        // the proof error type is ambiguous rather than "obviously the receipt's".
-        Ok::<(), relay_receipt::ReceiptError>(())
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))
-    .with_context(|| format!("failed to append to feed {}", feed_path.display()))?;
-
-    // The written line is itself display-safe (the field allowlist), so echoing
-    // it back cannot leak a secret — handy for the smoke assertion. The global
-    // feed id goes with it: a caller that must later prove this row needs the id
-    // it was ACTUALLY allocated, never an ordinal it counted for itself.
-    println!("{}", entry.to_json_line());
-    println!("feedId={}", written.feed_id());
-    // THE RELEASE VERDICT IS PART OF THE ANSWER, always stated (blocker 2). A
-    // scripted certifier that only ever saw `feedId=` could not distinguish a
-    // row written inside a proven section from one whose release nobody can
-    // vouch for; it now has to read past the id to find that out.
-    match &written {
-        casa_feed::ProvenRow::Certified(_) => println!("feedRelease=proven"),
-        casa_feed::ProvenRow::ReleaseUnverified { reason, .. } => {
-            println!("feedRelease=unverified reason={reason}");
-        }
-    }
-    // WHO SAW IT — the same ledger, the same six fields, through the same
-    // `casa_audience` writer the listener's delivery seam now calls (task
-    // audit-does-any). Stated on EVERY run, in one machine-readable word, for
-    // the reason `feedRelease=` is: a certifier that only ever saw the row could
-    // not tell a reply whose audience is on the record from one whose audience
-    // nothing anywhere can name.
-    //
-    //   recorded / duplicate  the audience IS on the record (a duplicate is the
-    //                         ack and the answer of one turn — one audience)
-    //   skipped   no-turn     nothing to join a record to; the honest answer
-    //             inbound     a human's own line is not a reply (see the module
-    //                         header) — recording it would read as a helper
-    //                         answering privately
-    //   refused   <reason>    the row exists and its audience does NOT. The hole
-    //                         this ledger closes, reported rather than swallowed.
-    match (kind, audience) {
-        (_, Some(Ok(outcome))) => println!("audience={}", outcome.as_str()),
-        (_, Some(Err(e))) => {
-            eprintln!("casa audience: the row was written but its audience was NOT: {e}");
-            println!("audience=refused reason={e}");
-        }
-        ("agent", None) => println!(
-            "audience=skipped reason={}",
-            casa_audience::AudienceSkipped::NoTurn.as_str()
-        ),
-        _ => println!("audience=skipped reason=inbound"),
-    }
-    // HOW MANY TIMES THIS PROCESS TOOK THE CONVERSATION LOCK, stated on every run
-    // (docs/42 §9, `feed-lock-section`). The number is the whole finding: every
-    // section is a queue position for every other writer, and six concurrent
-    // writers of this shape were measured at 986 ms of a 1000 ms budget while it
-    // was more than one. A scripted certifier — and the twin gate — can now read
-    // it from the real process instead of inferring it from a comment.
-    println!(
-        "feedLockAcquisitions={}",
-        worksgood::notify::feed_lock::distinct_acquisitions()
-    );
-    if proved {
-        println!("receipt=written");
     }
     Ok(())
 }
@@ -11459,7 +11114,7 @@ domains = ["coordination"]
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
 
-        let err = run_feed_write(
+        let err = crate::casa::feed_write::run_feed_write(
             dir.path(),
             "agent",
             None,
@@ -11491,7 +11146,7 @@ domains = ["coordination"]
         // THE CONTROL. The same call, with the phase declared, writes the row —
         // so the refusal above is about the missing declaration and not about
         // some other thing wrong with this shape.
-        run_feed_write(
+        crate::casa::feed_write::run_feed_write(
             dir.path(),
             "agent",
             None,
@@ -11531,7 +11186,7 @@ domains = ["coordination"]
         for phase in ["ack", "final", "addendum", "watchdog", "failure"] {
             let dir = tempfile::tempdir().unwrap();
             let feed = casa_feed::feed_path_for(dir.path());
-            run_feed_write(
+            crate::casa::feed_write::run_feed_write(
                 dir.path(),
                 "agent",
                 None,
@@ -11565,7 +11220,7 @@ domains = ["coordination"]
         for invented in ["FINAL", "companion", "addendum "] {
             let dir = tempfile::tempdir().unwrap();
             let feed = casa_feed::feed_path_for(dir.path());
-            let outcome = run_feed_write(
+            let outcome = crate::casa::feed_write::run_feed_write(
                 dir.path(),
                 "agent",
                 None,
@@ -11619,7 +11274,7 @@ domains = ["coordination"]
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
 
-        run_feed_write(
+        crate::casa::feed_write::run_feed_write(
             dir.path(),
             "group",
             Some("Wren"),
@@ -12161,7 +11816,7 @@ domains = ["coordination"]
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
         worksgood::notify::feed_lock::reset_acquisition_counters();
-        run_feed_write(
+        crate::casa::feed_write::run_feed_write(
             dir.path(),
             "agent",
             None,
@@ -12203,7 +11858,7 @@ domains = ["coordination"]
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
         worksgood::notify::feed_lock::reset_acquisition_counters();
-        run_feed_write(
+        crate::casa::feed_write::run_feed_write(
             dir.path(),
             "agent",
             None,
@@ -12254,7 +11909,7 @@ domains = ["coordination"]
         let ledger_before = std::fs::read(&ledger).unwrap();
 
         worksgood::notify::feed_lock::reset_acquisition_counters();
-        let outcome = run_feed_write(
+        let outcome = crate::casa::feed_write::run_feed_write(
             dir.path(),
             "agent",
             None,
@@ -12299,7 +11954,7 @@ domains = ["coordination"]
     fn the_same_write_on_a_healthy_ledger_lands_the_row_and_the_receipt_together() {
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
-        run_feed_write(
+        crate::casa::feed_write::run_feed_write(
             dir.path(),
             "agent",
             None,
@@ -12332,7 +11987,7 @@ domains = ["coordination"]
         std::fs::create_dir_all(&casa_audience::audience_path_for(&feed)).unwrap();
 
         worksgood::notify::feed_lock::reset_acquisition_counters();
-        run_feed_write(
+        crate::casa::feed_write::run_feed_write(
             dir.path(),
             "agent",
             None,

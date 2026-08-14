@@ -6,6 +6,7 @@
 pub mod digest;
 pub mod dryruns;
 pub mod elect;
+pub mod feed_write;
 pub mod one_shot_answers;
 pub mod remind;
 pub mod reply_delivery;
