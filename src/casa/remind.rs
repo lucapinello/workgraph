@@ -17,8 +17,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use crate::casa::digest::resolve_dm_target;
 use crate::casa::reply_delivery::{FamilyReplyDelivery, ReplyScope};
-use crate::commands::telegram::{load_telegram_config, project_root, resolve_dm_target};
+use crate::commands::telegram::{load_telegram_config, project_root};
 use worksgood::notify::family_plan;
 use worksgood::notify::ownership;
 use worksgood::notify::telegram::{TelegramBotConfig, TelegramConfig};

@@ -132,12 +132,33 @@ the slices below move ours OUT to `src/casa/`, a path upstream does not have.
 | 2 | `casa/reply_delivery.rs` — family reply delivery | 14,570 → 14,073 | 6 → 5 |
 | 3 | `casa/remind.rs` — the `wg telegram remind` tick | 14,073 → 13,536 | 5 → **6** |
 | 4 | `casa/one_shot_answers.rs` — `owner`, `parity`, `capability` | 13,536 → 13,317 | 6 → 6 |
+| 5 | `casa/digest.rs`, `casa/dryruns.rs`, `casa/elect.rs` | 13,317 → 12,555 | 6 → **5** |
 
 Slice 3 went the wrong way on the marker count, deliberately and once:
 `resolve_dm_target` is ours (absent upstream at the fork point and on `gwwg/main`
 today) but still has one caller and two tests in their file, so it is exposed rather
 than dragged out with its tests. It follows the DM path out when that is extracted.
 The marker is the recorded price of a 537-line reduction, not an oversight.
+
+Slice 5 paid off slice 3's debt. `resolve_dm_target` was exposed there so `casa::remind`
+could reach it, on the promise that it would "follow the DM path out when that path is
+extracted" — `run_digest` was its last non-test caller in that file, so it moved to
+`casa::digest` and the exposure went away. Markers are back to 5, the lowest since the split
+began, while their file has lost 2,986 lines across five slices.
+
+Two things slice 5 taught about the slice test itself:
+
+- **Count test-module callers.** The exclusivity check excluded them on purpose, so
+  `coordination_owner_hint` and `deliver_digest_fire` looked exclusive while having tests in
+  their file. They were repointed to the `casa::` path rather than moved, which is fine — but
+  a "no shared helpers" verdict that ignores tests is not the verdict it claims to be.
+- **Leave a test where its shared dependency is.** `resolve_dm_target`'s two tests also drive
+  `try_register_reminder`, which still has seven callers in their file. Moving them would have
+  meant widening that helper's visibility — re-creating the exact debt this slice paid off. So
+  they stayed and were repointed at the moved function instead.
+
+Also: counting `pub(crate)` occurrences file-wide counts the string in COMMENTS too. A comment
+explaining the marker debt read as a marker and made the metric say 6 when the answer was 5.
 
 Slice 4 is what a clean slice looks like: three commands that drag no private helpers,
 share none, carry no tests in that file's test module, and — the compiler's verdict, not

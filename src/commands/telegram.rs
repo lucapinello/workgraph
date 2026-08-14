@@ -2729,123 +2729,6 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
     Ok(())
 }
 
-/// `wg telegram elect` — show who would respond to a group message in
-/// all-bots-privacy-off mode, without sending anything.
-///
-/// Runs the exact [`elect_responders_with_owner_map`] decision the listener uses on a deduped
-/// message and prints the outcome: `mention` / `name` / `reply-chain` route to
-/// one voice, `collective` fans out to the whole roster, `otto` coordinates a
-/// team-directed ask, and `silence` means the bots stay out. Mentions are
-/// approximated from any `@handle` tokens (the live listener reads Telegram
-/// entities). See docs/09 §natural-group.
-pub fn run_elect(
-    workgraph_dir: &Path,
-    message: &str,
-    reply_to_bot: Option<&str>,
-    chat_type: &str,
-    chat_id: &str,
-    human_count_override: Option<usize>,
-    json: bool,
-) -> Result<()> {
-    let config = load_telegram_config()?;
-
-    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
-
-    // Membership-aware silence: default to the real onboarded-human count so the
-    // diagnostic mirrors the live listener, but let `--humans N` preview either
-    // side of the boundary (a single-human group answers greetings; 2+ humans
-    // keep the conservative silence).
-    let human_count =
-        human_count_override.unwrap_or_else(|| human_agent_id_set(workgraph_dir).len());
-
-    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-    let election = elect_responders_with_owner_map(
-        Some(chat_type),
-        Some(chat_id),
-        message,
-        &mention_usernames,
-        reply_to_bot,
-        // The `wg telegram elect` diagnostic is always run by a human operator,
-        // never a bot — the bot-loop guard is exercised by the unit tests.
-        false,
-        human_count,
-        &config,
-        &owner_map,
-    );
-
-    // (kind, who, addressed_by, body) — `who` is the elected agent for the
-    // single-voice arms, the roster for `collective`, none for silence/private.
-    let (kind, who, addressed_by, body): (&str, Option<String>, Option<String>, String) =
-        match &election {
-            Election::Private => ("private", None, None, message.to_string()),
-            Election::Silence(reason) => (
-                "silence",
-                None,
-                Some(reason.to_string()),
-                message.to_string(),
-            ),
-            Election::All { body, .. } => {
-                let roster = worksgood::notify::telegram_standup::load_project_roster(
-                    &project_root(workgraph_dir),
-                    &config,
-                )?
-                .into_iter()
-                .map(|m| m.bot_id)
-                .collect::<Vec<_>>()
-                .join(", ");
-                ("collective", Some(roster), None, body.clone())
-            }
-            Election::One {
-                bot,
-                body,
-                addressed_by,
-                ..
-            } => {
-                let is_standup = worksgood::notify::telegram_standup::is_standup_command(body);
-                let kind = if is_standup { "standup" } else { "agent" };
-                (
-                    kind,
-                    bot.agent_id.clone().or_else(|| Some(bot.bot_id.clone())),
-                    Some(addressed_by.to_string()),
-                    body.clone(),
-                )
-            }
-        };
-
-    if json {
-        let out = serde_json::json!({
-            "kind": kind,
-            "who": who,
-            "addressed_by": addressed_by,
-            "body": body,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-
-    match kind {
-        "private" => println!("private chat — 1:1 passthrough (not group-routed)"),
-        "silence" => println!(
-            "silence ({}) — no one responds",
-            addressed_by.as_deref().unwrap_or("?")
-        ),
-        "collective" => println!(
-            "collective address — the whole roster answers in order: {}",
-            who.as_deref().unwrap_or("(none configured)")
-        ),
-        "standup" => {
-            println!("/standup — intercepted; posts the configured household roster")
-        }
-        _ => println!(
-            "answered by {} (by {}): {}",
-            who.as_deref().unwrap_or("(unbound)"),
-            addressed_by.as_deref().unwrap_or("?"),
-            body,
-        ),
-    }
-    Ok(())
-}
-
 /// `wg telegram discuss --dry-run` — show whether a group message would run a
 /// DISCUSSION ROUND, and the planned round, without sending anything.
 ///
@@ -6464,214 +6347,6 @@ pub fn run_lifecycle(
     Ok(())
 }
 
-/// `wg telegram digest` — flush each family member's ONE calm morning digest.
-///
-/// This is the missing production caller the daily 12:00 UTC `daily-digest` cron
-/// runs (task `re-arm-the`). The digest ENGINE (`DigestStore`, one-calm-daily)
-/// already accumulates every bundled + overflow proactive item per person, but
-/// nothing ever EMITTED the bundled morning message: `emit_digest` had no
-/// caller, so even when the cron fired it sent nothing (and the cron itself was
-/// registered with an empty description, so a cleanup sweep read it as junk and
-/// abandoned it — the friendly fire this task fixes).
-///
-/// For each known member whose digest is due at `now` — past the digest hour,
-/// out of quiet hours, pending non-empty, not already sent today (see
-/// [`DigestStore::digest_due`]) — compose the calm `Today: …` line, deliver it
-/// through the SAME scoped writer the lifecycle report-backs use
-/// ([`deliver_digest_fire`]: guard, send, verify, and retry once), and — ONLY on a
-/// confirmed delivery — mark the digest sent + clear the queue. A failed send
-/// leaves the queue intact so the next tick retries; at most one per person/day.
-///
-/// `--dry-run` prints what would go to whom and touches no state. `--mock-send`
-/// runs the real tick against a network-free recorder so a smoke/test proves the
-/// guarded private-delivery path without a bot.
-pub fn run_digest(
-    workgraph_dir: &Path,
-    dry_run: bool,
-    now_override: Option<&str>,
-    json: bool,
-    mock_send: bool,
-) -> Result<()> {
-    use worksgood::agency::TelegramBindingMap;
-    use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, compose_digest};
-    use worksgood::notify::telegram_conversation::{BotReplySink, ReplySink};
-
-    let root = project_root(workgraph_dir);
-    let now = match now_override {
-        Some(s) => parse_naive_now(s)
-            .with_context(|| format!("invalid --now '{s}', expected YYYY-MM-DDTHH:MM"))?,
-        None => chrono::Local::now().naive_local(),
-    };
-
-    // Known family members (recipients we can name/DM), from the agency bindings.
-    let agency_dir = workgraph_dir.join("agency");
-    let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
-    let members: Vec<String> = bindings
-        .bindings
-        .iter()
-        .map(|b| b.name.clone())
-        .filter(|n| !n.is_empty())
-        .collect();
-
-    let config = load_telegram_config().unwrap_or_default();
-    let coordination_owner = coordination_owner_hint(&root);
-    let policy = DigestPolicy::default();
-    let store_path = DigestStore::path(&root);
-    let mut store = DigestStore::load(&store_path);
-
-    // Peek (without mutating) each member's due digest so a --dry-run and the
-    // real send agree on exactly what would go out.
-    let due: Vec<(String, String)> = members
-        .iter()
-        .filter(|m| store.digest_due(m, now, &policy))
-        .filter_map(|m| {
-            store
-                .state(m)
-                .map(|st| (m.clone(), compose_digest(st.pending())))
-        })
-        .filter(|(_, text)| !text.trim().is_empty())
-        .collect();
-
-    if dry_run {
-        if json {
-            let rows: Vec<_> = due
-                .iter()
-                .map(|(m, text)| serde_json::json!({ "recipient": m, "text": text }))
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&rows)?);
-        } else if due.is_empty() {
-            println!(
-                "No digest due at {} (nothing pending, already sent, or quiet hours).",
-                now.format("%Y-%m-%d %H:%M")
-            );
-        } else {
-            for (m, text) in &due {
-                println!("WOULD DIGEST to {}: {}", m, text.replace('\n', " · "));
-            }
-        }
-        return Ok(());
-    }
-
-    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
-    // `--mock-send` swaps in a network-free recorder so the private delivery
-    // path is exercised without a live bot.
-    let sink: Box<dyn ReplySink> = if mock_send {
-        Box::new(RecordingSink::default())
-    } else {
-        Box::new(BotReplySink::new(config.clone()))
-    };
-
-    let mut sent = 0usize;
-    let mut undelivered = 0usize;
-    if !due.is_empty() {
-        let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-        rt.block_on(async {
-            for (member, text) in &due {
-                // Resolve the recipient's DM target through the project-authored
-                // coordination owner. Without one, only the recipient's explicit
-                // bot binding may send; roster/map order is never a fallback.
-                let (target, bot_id, _bot) =
-                    match resolve_dm_target(&config, &bindings, member, &coordination_owner) {
-                        Some(t) => t,
-                        None => {
-                            eprintln!(
-                                "[{}] no bound bot/chat for digest recipient '{}' — skipping",
-                                chrono::Utc::now().format("%H:%M:%S"),
-                                member,
-                            );
-                            continue;
-                        }
-                    };
-                match deliver_digest_fire(sink.as_ref(), &family_delivery, &bot_id, &target, text)
-                    .await
-                {
-                    Ok(()) => {
-                        // Confirmed delivery: NOW mark today's digest sent and
-                        // clear the queue (restart-safe — a failed send above
-                        // leaves the queue intact for the next tick to retry).
-                        store.emit_digest(member, now, &policy);
-                        sent += 1;
-                        println!(
-                            "[{}] digest → {} via {}: {}",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                            member,
-                            bot_id,
-                            text.replace('\n', " · "),
-                        );
-                    }
-                    Err(e) => {
-                        undelivered += 1;
-                        eprintln!(
-                            "[{}] UNDELIVERED digest for {} after 2 attempts: {}",
-                            chrono::Utc::now().format("%H:%M:%S"),
-                            member,
-                            worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
-                        );
-                    }
-                }
-            }
-        });
-    }
-
-    // Persist the pacing store after the tick (digest_sent flags + drained queues
-    // for confirmed deliveries; untouched for failed ones).
-    store
-        .save(&store_path)
-        .with_context(|| format!("failed to persist digest state to {}", store_path.display()))?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({ "due": due.len(), "sent": sent, "undelivered": undelivered })
-        );
-    } else if due.is_empty() {
-        println!(
-            "No digest due at {} (nothing pending, already sent, or quiet hours).",
-            now.format("%Y-%m-%d %H:%M")
-        );
-    }
-    Ok(())
-}
-
-/// Deliver one private morning digest through the same scoped writer lifecycle
-/// report-backs use (see [`deliver_lifecycle_fire`]): guard, send, verify, and
-/// retry once.
-///
-/// The digest is delivered to one member's bound 1:1 chat. The shared
-/// conversation feed is the family group's history, so this private text must
-/// never be copied there.
-/// Returns `Ok(())` on confirmed delivery, `Err` when BOTH send attempts failed
-/// (the caller then leaves the pending queue intact for the next tick).
-async fn deliver_digest_fire(
-    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
-    delivery: &FamilyReplyDelivery,
-    bot_id: &str,
-    chat_id: &str,
-    text: &str,
-) -> Result<()> {
-    use worksgood::notify::telegram_conversation::ReplySink as _;
-
-    // DELIVERY VERIFICATION with a single retry (matches the lifecycle path).
-    let sink = delivery.wrap(
-        BorrowedReplySink(sink),
-        ReplyScope::Private,
-        GuardPolicy::Enforce,
-    );
-    let mut result = sink.send(bot_id, chat_id, text).await;
-    if let Err(first) = &result {
-        eprintln!(
-            "[{}] digest send to {} failed (attempt 1/2), retrying: {}",
-            chrono::Utc::now().format("%H:%M:%S"),
-            chat_id,
-            worksgood::notify::telegram::redact_bot_token(&format!("{first:#}")),
-        );
-        result = sink.send(bot_id, chat_id, text).await;
-    }
-    let _message_id = result?.unwrap_or_default();
-
-    Ok(())
-}
-
 /// The persona name(s) doing a task's work, for the "on it" line: the task's
 /// assignee display name when it reads like a plain roster name (not an agent
 /// content-hash), else the origin persona so the line still names a voice.
@@ -6688,454 +6363,6 @@ fn lifecycle_workers(task: &worksgood::graph::Task) -> Vec<String> {
         return vec![a.to_string()];
     }
     Vec::new()
-}
-
-/// Resolve the DM target (chat + bot) for a proactive nudge to `recipient`, sent
-/// in the stable voice `bot`. A resolved Source voice wins; if it has no
-/// configured bot, delivery fails closed. With an empty Source only, the
-/// recipient's explicit bot binding may send. Shared by the reminder and errand
-/// ticks so neither path depends on roster or map iteration order.
-// EXPOSED FOR `casa::remind` (slice 3 of the Casa/upstream split). Temporary: this
-// helper is Casa's, not upstream's, and it follows the DM path out of this file when
-// that path is extracted. Its one caller and two tests are still here.
-pub(crate) fn resolve_dm_target(
-    config: &TelegramConfig,
-    bindings: &worksgood::agency::TelegramBindingMap,
-    recipient: &str,
-    bot: &str,
-) -> Option<(String, String, TelegramBotConfig)> {
-    let binding = bindings.find_by_name_ci(recipient)?;
-    let target = binding.telegram_user.clone();
-    let bots = config.all_bots();
-    if !bot.trim().is_empty() {
-        return bots
-            .iter()
-            .find(|(id, b)| {
-                id.eq_ignore_ascii_case(bot) || {
-                    b.agent_id
-                        .as_deref()
-                        .is_some_and(|agent_id| agent_id.eq_ignore_ascii_case(bot))
-                }
-            })
-            .map(|(id, b)| (target, id.clone(), b.clone()));
-    }
-    binding.bot_id.as_ref().and_then(|bound_id| {
-        bots.iter()
-            .find(|(id, _)| id == bound_id)
-            .map(|(id, b)| (target, id.clone(), b.clone()))
-    })
-}
-
-/// The project-authored voice for proactive coordination messages.
-///
-/// An empty result is intentional: callers then persist no guessed persona and
-/// [`resolve_dm_target`] may use only the recipient's explicit bot binding.
-fn coordination_owner_hint(root: &Path) -> String {
-    ownership::OwnerMap::load(root)
-        .owner_for_domain(ownership::Domain::Coordination)
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// `wg telegram conversation` — dry-run the conversational composer for a plain
-/// message (the 1:1 and group-name-addressed path), without a live bot.
-///
-/// Prints the route decision (which bot answers, in which chat, how it was
-/// addressed, and the plan kind) and the outbound replies the listener WOULD
-/// send — captured by a recording sink, never sent, so it is credential-free.
-///
-/// With `--session-reply <text>` it exercises the legacy persistent-session
-/// round-trip: an ephemeral session is created and bound to the addressed
-/// agent (making the plan `converse`), the human's message is written to that
-/// session's inbox, a fixture responder writes `<text>` to the outbox, and the
-/// relayed reply is captured.
-///
-/// With the hidden `--composed-reply <text>` test seam, the supplied draft is
-/// injected as a [`ReplyComposer`] result and therefore traverses the real
-/// finalize → outbox → delivery path. This is the credential-free scratch proof
-/// for post-composition guards; unlike `--session-reply`, it does not bypass the
-/// finalizer.
-///
-/// With `--compose` it exercises the REAL fix end-to-end: the converse turn is
-/// driven by the production [`OneshotComposer`] (a live one-shot `claude`
-/// spawn), so the captured reply is an actual session-generated answer — no
-/// fixture, no mock. This is the credential-bearing "real turn" validation.
-///
-/// With `--compose-error` a deliberately-failing composer is injected so the
-/// fail-fast + graceful "glitched" follow-up path is provable through the built
-/// binary without a live model (the induced-failure test).
-#[allow(clippy::too_many_arguments)]
-/// Drive the voice-note path end-to-end from a recording FILE: detect →
-/// transcribe → inject (task `telegram-voice-notes`). The credential-free
-/// scripted-test seam behind `wg telegram voice --file`.
-///
-/// `detect`: read the file and build the same [`telegram_voice::VoiceMeta`] the
-/// listener parses from a real update. `transcribe`: POST the bytes to a
-/// gateway — a STUB (when `stub_ok`/`stub_reason` is set) so the whole path runs
-/// with NO live whisper, else the real `/conversation/transcribe`. `inject`: on
-/// a transcript, print it (the body that would be injected) AND how the SAME
-/// fast-lane classifier a typed line hits would route it — proving a spoken line
-/// == a typed line. On failure, print the honest in-persona line the listener
-/// would send.
-pub fn run_voice_dryrun(
-    file: &Path,
-    mime: &str,
-    lang: &str,
-    gateway: Option<&str>,
-    stub_ok: Option<&str>,
-    stub_reason: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    use async_trait::async_trait;
-    use worksgood::notify::fast_lane;
-    use worksgood::notify::telegram_voice as tv;
-
-    // ── detect ────────────────────────────────────────────────────────────
-    let bytes = std::fs::read(file)
-        .with_context(|| format!("failed to read recording file {}", file.display()))?;
-    let meta = tv::VoiceMeta {
-        file_id: format!("local:{}", file.display()),
-        mime_type: Some(mime.to_string()),
-        kind: tv::VoiceKind::Voice,
-        file_size: Some(bytes.len() as u64),
-    };
-
-    // A downloader that just yields the already-read local bytes — the file IS
-    // the "download". The real listener path uses the Telegram getFile impl.
-    struct LocalBytes(Vec<u8>);
-    #[async_trait]
-    impl tv::VoiceDownloader for LocalBytes {
-        async fn download_bytes(&self, _file_id: &str) -> Result<Vec<u8>> {
-            Ok(self.0.clone())
-        }
-    }
-
-    // A stub gateway returning a canned response, so the full detect→transcribe
-    // →inject path is provable with no live whisper engine.
-    struct StubGateway(serde_json::Value);
-    #[async_trait]
-    impl tv::TranscribeGateway for StubGateway {
-        async fn transcribe(
-            &self,
-            _audio: &[u8],
-            _mime_type: &str,
-            _lang: &str,
-        ) -> Result<serde_json::Value> {
-            Ok(self.0.clone())
-        }
-    }
-
-    let downloader = LocalBytes(bytes.clone());
-    let limits = tv::VoiceLimits::default();
-
-    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-    let result: tv::TranscribeResult = rt.block_on(async {
-        if let Some(text) = stub_ok {
-            let gw = StubGateway(serde_json::json!({ "ok": true, "text": text }));
-            tv::transcribe_voice_note(&downloader, &gw, &meta, &limits, lang).await
-        } else if let Some(reason) = stub_reason {
-            let gw = StubGateway(serde_json::json!({ "ok": false, "reason": reason }));
-            tv::transcribe_voice_note(&downloader, &gw, &meta, &limits, lang).await
-        } else {
-            let base = gateway
-                .map(|g| g.to_string())
-                .unwrap_or_else(tv::gateway_base_url);
-            let gw = tv::HttpTranscribeGateway::new(base);
-            tv::transcribe_voice_note(&downloader, &gw, &meta, &limits, lang).await
-        }
-    })?;
-
-    // ── inject ────────────────────────────────────────────────────────────
-    match result {
-        tv::TranscribeResult::Transcript(text) => {
-            // Route the transcript through the SAME classifier a typed line hits.
-            let today = chrono::Local::now().date_naive();
-            let classification = fast_lane::classify(&text, today);
-            let route = match &classification {
-                fast_lane::Classification::FastLane(op) => {
-                    format!("fast-lane:{}", op.kind_label())
-                }
-                fast_lane::Classification::Ask { reason, .. } => {
-                    format!("ask:{}", reason.slug())
-                }
-                fast_lane::Classification::Fallback(_) => "composer".to_string(),
-            };
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": true,
-                        "outcome": "transcript",
-                        "bytes": bytes.len(),
-                        "mime": mime,
-                        "transcript": text,
-                        "injected_body": text,
-                        "route": route,
-                    })
-                );
-            } else {
-                println!("detect: {} bytes, mime {}", bytes.len(), mime);
-                println!("transcribe: ok");
-                println!("inject: message body = {text:?}");
-                println!("route (same path as typed): {route}");
-            }
-        }
-        tv::TranscribeResult::Failed(failure) => {
-            let reason = match failure {
-                tv::TranscribeFailure::Unconfigured => "unconfigured",
-                tv::TranscribeFailure::Silence => "silence",
-                tv::TranscribeFailure::Unclear => "unclear",
-            };
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": false,
-                        "outcome": "failed",
-                        "reason": reason,
-                        "reply": failure.message(),
-                    })
-                );
-            } else {
-                println!("detect: {} bytes, mime {}", bytes.len(), mime);
-                println!("transcribe: failed ({reason})");
-                println!("reply (in-persona): {}", failure.message());
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn run_conversation_dryrun(
-    workgraph_dir: &Path,
-    channel: &str,
-    chat: &str,
-    sender: &str,
-    message: &str,
-    group: bool,
-    session_reply: Option<&str>,
-    composed_reply: Option<&str>,
-    compose: bool,
-    compose_error: bool,
-    json: bool,
-) -> Result<()> {
-    use std::sync::{Arc, Mutex};
-    use worksgood::notify::telegram_conversation as convo;
-
-    let config = if composed_reply.is_some() {
-        load_telegram_config().context(
-            "--composed-reply requires a project-local .wg/notify.toml so the real finalizer is reachable",
-        )?
-    } else {
-        load_telegram_config().unwrap_or_default()
-    };
-    let entry = if group {
-        convo::Entry::GroupElected
-    } else {
-        convo::Entry::Direct
-    };
-
-    // Bind an ephemeral session to the addressed agent so the plan resolves to
-    // `converse` and the turn has somewhere to land — needed for the fixture
-    // round-trip AND both compose modes.
-    if session_reply.is_some() || composed_reply.is_some() || compose || compose_error {
-        let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-        let coordination_owner = owner_map.owner_for_domain(ownership::Domain::Coordination);
-        if let Some(agent_id) =
-            convo::agent_for_channel_with_default(&config, channel, coordination_owner)
-        {
-            let uuid = worksgood::chat_sessions::create_session(
-                workgraph_dir,
-                worksgood::chat_sessions::SessionKind::Interactive,
-                &[],
-                None,
-            )?;
-            worksgood::chat_sessions::bind_agent(workgraph_dir, &agent_id, &uuid)?;
-        }
-    }
-
-    let plan = convo::plan_conversation(workgraph_dir, &config, channel, chat, sender, entry);
-
-    // Recording sink: capture every send AND edit instead of hitting the
-    // network. Sends return a monotonic fake message id so the ack-edit path
-    // works; edits are recorded so the printed output shows the final text.
-    #[derive(Clone, Default)]
-    struct DryRunSink {
-        sent: Arc<Mutex<Vec<(String, String, String)>>>,
-        edited: Arc<Mutex<Vec<(String, String, String, String)>>>,
-        next_id: Arc<Mutex<u64>>,
-    }
-    #[async_trait::async_trait]
-    impl convo::ReplySink for DryRunSink {
-        async fn send(&self, bot_id: &str, chat_id: &str, text: &str) -> Result<Option<String>> {
-            self.sent.lock().unwrap().push((
-                bot_id.to_string(),
-                chat_id.to_string(),
-                text.to_string(),
-            ));
-            let mut n = self.next_id.lock().unwrap();
-            *n += 1;
-            Ok(Some(n.to_string()))
-        }
-        async fn edit(
-            &self,
-            bot_id: &str,
-            chat_id: &str,
-            message_id: &str,
-            text: &str,
-        ) -> Result<()> {
-            self.edited.lock().unwrap().push((
-                bot_id.to_string(),
-                chat_id.to_string(),
-                message_id.to_string(),
-                text.to_string(),
-            ));
-            Ok(())
-        }
-    }
-    let sink = DryRunSink::default();
-
-    // Credential-free composed-turn fixture used only by smoke tests. Unlike
-    // `--session-reply`, this enters through ReplyComposer and therefore drives
-    // every production finalizer before the recording sink sees the reply.
-    struct FixtureComposer(String);
-    #[async_trait::async_trait]
-    impl convo::ReplyComposer for FixtureComposer {
-        async fn compose(
-            &self,
-            _wg: &Path,
-            _session_ref: &str,
-            _agent_id: &str,
-            _message: &str,
-        ) -> Result<String> {
-            Ok(self.0.clone())
-        }
-    }
-
-    // Injected failing composer for `--compose-error`.
-    struct FailingComposer;
-    #[async_trait::async_trait]
-    impl convo::ReplyComposer for FailingComposer {
-        async fn compose(&self, _wg: &Path, _s: &str, _a: &str, _m: &str) -> Result<String> {
-            anyhow::bail!("induced compose failure (--compose-error)")
-        }
-    }
-
-    // Build the composer for whichever mode is active.
-    let real_composer = if compose {
-        Some(convo::OneshotComposer::from_config(
-            worksgood::config::Config::load_merged(workgraph_dir)
-                .context("--compose needs a loadable wg config")?,
-        ))
-    } else {
-        None
-    };
-    let fixture_composer = composed_reply.map(|reply| FixtureComposer(reply.to_string()));
-    let failing_composer = FailingComposer;
-    let composer_ref: Option<&dyn convo::ReplyComposer> =
-        if let Some(fixture) = fixture_composer.as_ref() {
-            Some(fixture)
-        } else if compose_error {
-            Some(&failing_composer)
-        } else {
-            real_composer
-                .as_ref()
-                .map(|c| c as &dyn convo::ReplyComposer)
-        };
-
-    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-    let outcome = rt.block_on(async {
-        // Legacy fixture responder: only when NOT using a composer — echo the
-        // canned reply to the outbox as a live session would.
-        if composer_ref.is_none() {
-            if let (Some(reply), convo::ConversationPlan::Converse { session_ref, .. }) =
-                (session_reply, &plan)
-            {
-                let dir = workgraph_dir.to_path_buf();
-                let session_ref = session_ref.clone();
-                let reply = reply.to_string();
-                tokio::spawn(async move {
-                    for _ in 0..200 {
-                        let inbox =
-                            worksgood::chat::read_inbox_ref(&dir, &session_ref).unwrap_or_default();
-                        if let Some(m) = inbox.iter().find(|m| m.role == "user") {
-                            let _ = worksgood::chat::append_outbox_ref(
-                                &dir,
-                                &session_ref,
-                                &reply,
-                                &m.request_id,
-                            );
-                            return;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                });
-            }
-        }
-        // Timing: in compose modes keep the ack point far out so a normal reply
-        // (or a fast induced failure) lands as a single direct send that the
-        // test can capture; the reply timeout bounds a genuinely hung child. In
-        // the legacy fixture mode, fast timing so the dry-run doesn't stall.
-        let timing = if composer_ref.is_some() {
-            convo::AckTiming {
-                ack_after: std::time::Duration::from_secs(60),
-                reply_timeout: std::time::Duration::from_secs(120),
-                poll: std::time::Duration::from_millis(50),
-            }
-        } else {
-            convo::AckTiming {
-                ack_after: std::time::Duration::from_millis(50),
-                reply_timeout: std::time::Duration::from_secs(5),
-                poll: std::time::Duration::from_millis(15),
-            }
-        };
-        convo::run_conversation_turn(
-            workgraph_dir,
-            &plan,
-            message,
-            &format!("dryrun-{sender}"),
-            timing,
-            composer_ref,
-            &sink,
-        )
-        .await
-    })?;
-
-    // Fold edits into the send list for output so the final text (when the ack
-    // was edited in place) is always visible.
-    let mut sends = sink.sent.lock().unwrap().clone();
-    for (bot, chat, _mid, text) in sink.edited.lock().unwrap().iter() {
-        sends.push((bot.clone(), chat.clone(), text.clone()));
-    }
-    if json {
-        let sends_json: Vec<_> = sends
-            .iter()
-            .map(|(bot, chat, text)| serde_json::json!({ "bot": bot, "chat": chat, "text": text }))
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "entry": entry.label(),
-                "kind": plan.kind_label(),
-                "route": { "bot": plan.route().bot_id, "chat": plan.route().chat_id },
-                "outcome": outcome.label(),
-                "sends": sends_json,
-            }))?
-        );
-    } else {
-        println!(
-            "route: {} via {} in {} [{}] — {}",
-            entry.label(),
-            plan.route().bot_id,
-            plan.route().chat_id,
-            plan.kind_label(),
-            outcome.label(),
-        );
-        for (bot, chat, text) in &sends {
-            println!("  send[{bot} -> {chat}]: {text}");
-        }
-    }
-    Ok(())
 }
 
 /// `wg telegram standup` — run a standup on demand (for the live demo and the
@@ -9598,203 +8825,16 @@ domains = ["coordination"]
     }
 
     #[test]
-    fn proactive_messages_use_the_configured_coordination_owner() {
-        use worksgood::notify::reminder::AdHocStore;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let wg = root.join(".wg");
-        std::fs::create_dir_all(&wg).unwrap();
-        std::fs::write(
-            root.join("household.toml"),
-            r#"
-[[agent]]
-id = "garden-relay"
-name = "Garden Relay"
-domains = ["coordination"]
-
-[[agent]]
-id = "pantry-relay"
-name = "Pantry Relay"
-domains = ["cooking"]
-"#,
-        )
-        .unwrap();
-        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
-
-        let now =
-            chrono::NaiveDateTime::parse_from_str("2026-07-12T10:00", "%Y-%m-%dT%H:%M").unwrap();
-        assert!(
-            try_register_reminder(
-                &wg,
-                "7001001",
-                "household-handle",
-                "remind me tomorrow at 7pm to lock the patio",
-                now,
-            )
-            .is_some()
-        );
-        crate::casa::remind::run_remind(
-            &wg,
-            false,
-            false,
-            Some("remind me Tuesday at 8am to set out the bins"),
-            Some("Household Member"),
-            None,
-            None,
-            Some("2026-07-12T10:00"),
-            false,
-        )
-        .unwrap();
-
-        let store = AdHocStore::load(&AdHocStore::path(root));
-        assert_eq!(store.reminders.len(), 2);
-        assert!(
-            store
-                .reminders
-                .iter()
-                .all(|reminder| reminder.bot == "garden-relay"),
-            "both registration seams must persist only the configured coordination owner: {:?}",
-            store.reminders,
-        );
-
-        let bindings = TelegramBindingMap::load(&wg.join("agency")).unwrap();
-        assert!(
-            bindings
-                .bindings
-                .iter()
-                .all(|binding| binding.bot_id.is_none()),
-            "the fixture must exercise the missing-bot binding path",
-        );
-        let mut bots = HashMap::new();
-        bots.insert(
-            "first-fallback".to_string(),
-            TelegramBotConfig {
-                bot_token: "100:AAA".to_string(),
-                chat_id: "-1001".to_string(),
-                agent_id: Some("pantry-relay".to_string()),
-                username: None,
-            },
-        );
-        bots.insert(
-            "coordination-channel".to_string(),
-            TelegramBotConfig {
-                bot_token: "200:BBB".to_string(),
-                chat_id: "-1002".to_string(),
-                agent_id: Some("garden-relay".to_string()),
-                username: None,
-            },
-        );
-        let config = TelegramConfig {
-            bot_token: String::new(),
-            chat_id: String::new(),
-            bots,
-        };
-        let hint = coordination_owner_hint(root);
-        let (_, bot_id, _) =
-            resolve_dm_target(&config, &bindings, "Household Member", &hint).unwrap();
-        assert_eq!(
-            bot_id, "coordination-channel",
-            "a digest for an unbound member must use the configured coordination voice",
-        );
-    }
-
-    #[test]
     fn proactive_owner_hint_is_empty_without_a_valid_roster() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(coordination_owner_hint(dir.path()), "");
+        assert_eq!(crate::casa::digest::coordination_owner_hint(dir.path()), "");
 
         std::fs::write(dir.path().join("household.toml"), "agent = [").unwrap();
         assert_eq!(
-            coordination_owner_hint(dir.path()),
+            crate::casa::digest::coordination_owner_hint(dir.path()),
             "",
             "malformed configuration must not manufacture a persona id",
         );
-    }
-
-    #[test]
-    fn ambiguous_plan_source_never_selects_first_bot() {
-        use worksgood::notify::family_plan::CalendarEvent;
-        use worksgood::notify::reminder::Reminder;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let wg = root.join(".wg");
-        std::fs::create_dir_all(&wg).unwrap();
-        std::fs::write(
-            root.join("household.toml"),
-            r#"
-[[agent]]
-id = "coordination-anchor-a"
-name = "Shared Lantern"
-domains = ["coordination"]
-
-[[agent]]
-id = "coordination-anchor-b"
-name = "Shared Lantern"
-domains = ["calendar"]
-"#,
-        )
-        .unwrap();
-        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
-        let bindings = TelegramBindingMap::load(&wg.join("agency")).unwrap();
-        let owners = ownership::OwnerMap::load(root);
-        let event = CalendarEvent {
-            weekday: "Tue".into(),
-            date: chrono::NaiveDate::from_ymd_opt(2026, 7, 28),
-            time: "08:00".into(),
-            event: "\u{23f0} Reminder: Household Member set out the bins".into(),
-            source: "Shared Lantern".into(),
-        };
-        assert!(
-            Reminder::from_calendar_event(
-                "2026-W31",
-                &event,
-                &["Household Member".to_string()],
-                &owners,
-            )
-            .is_none(),
-            "duplicate display labels must not become a guessed stable owner",
-        );
-
-        for reverse in [false, true] {
-            let entries = [
-                (
-                    "first-wire",
-                    TelegramBotConfig {
-                        bot_token: "100:AAA".to_string(),
-                        chat_id: "-1001".to_string(),
-                        agent_id: Some("coordination-anchor-a".to_string()),
-                        username: None,
-                    },
-                ),
-                (
-                    "second-wire",
-                    TelegramBotConfig {
-                        bot_token: "200:BBB".to_string(),
-                        chat_id: "-1002".to_string(),
-                        agent_id: Some("coordination-anchor-b".to_string()),
-                        username: None,
-                    },
-                ),
-            ];
-            let mut bots = HashMap::new();
-            let order: &[usize] = if reverse { &[1, 0] } else { &[0, 1] };
-            for index in order {
-                let (id, bot) = &entries[*index];
-                bots.insert((*id).to_string(), bot.clone());
-            }
-            let config = TelegramConfig {
-                bot_token: String::new(),
-                chat_id: String::new(),
-                bots,
-            };
-            assert!(
-                resolve_dm_target(&config, &bindings, "Household Member", "unresolved-source",)
-                    .is_none(),
-                "an unresolved non-empty Source must never fall through to map order",
-            );
-        }
     }
 
     #[test]
@@ -13025,7 +12065,7 @@ domains = ["calendar"]
         let text = "Today: PT check-in at 19:30 · how was last night's salmon?";
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_digest_fire(
+        rt.block_on(crate::casa::digest::deliver_digest_fire(
             &sink,
             &delivery,
             "harbor",
@@ -13058,7 +12098,7 @@ domains = ["calendar"]
         let sink = FlakySink::new(2);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let res = rt.block_on(deliver_digest_fire(
+        let res = rt.block_on(crate::casa::digest::deliver_digest_fire(
             &sink,
             &delivery,
             "harbor",
@@ -13313,5 +12353,203 @@ domains = ["calendar"]
             "the receipt went with it"
         );
         assert_eq!(worksgood::notify::feed_lock::distinct_acquisitions(), 1);
+    }
+    // THESE TWO TESTS STAY HERE ON PURPOSE, while their subject `resolve_dm_target`
+    // moved to `casa::digest` (slice 5). They also drive `try_register_reminder`, which
+    // has seven callers left in this file and is therefore genuinely shared — moving
+    // them would mean widening its visibility here, re-creating exactly the debt slice 5
+    // just paid off. They follow when that helper does.
+
+    #[test]
+    fn proactive_messages_use_the_configured_coordination_owner() {
+        use worksgood::notify::reminder::AdHocStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "garden-relay"
+name = "Garden Relay"
+domains = ["coordination"]
+
+[[agent]]
+id = "pantry-relay"
+name = "Pantry Relay"
+domains = ["cooking"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
+
+        let now =
+            chrono::NaiveDateTime::parse_from_str("2026-07-12T10:00", "%Y-%m-%dT%H:%M").unwrap();
+        assert!(
+            try_register_reminder(
+                &wg,
+                "7001001",
+                "household-handle",
+                "remind me tomorrow at 7pm to lock the patio",
+                now,
+            )
+            .is_some()
+        );
+        crate::casa::remind::run_remind(
+            &wg,
+            false,
+            false,
+            Some("remind me Tuesday at 8am to set out the bins"),
+            Some("Household Member"),
+            None,
+            None,
+            Some("2026-07-12T10:00"),
+            false,
+        )
+        .unwrap();
+
+        let store = AdHocStore::load(&AdHocStore::path(root));
+        assert_eq!(store.reminders.len(), 2);
+        assert!(
+            store
+                .reminders
+                .iter()
+                .all(|reminder| reminder.bot == "garden-relay"),
+            "both registration seams must persist only the configured coordination owner: {:?}",
+            store.reminders,
+        );
+
+        let bindings = TelegramBindingMap::load(&wg.join("agency")).unwrap();
+        assert!(
+            bindings
+                .bindings
+                .iter()
+                .all(|binding| binding.bot_id.is_none()),
+            "the fixture must exercise the missing-bot binding path",
+        );
+        let mut bots = HashMap::new();
+        bots.insert(
+            "first-fallback".to_string(),
+            TelegramBotConfig {
+                bot_token: "100:AAA".to_string(),
+                chat_id: "-1001".to_string(),
+                agent_id: Some("pantry-relay".to_string()),
+                username: None,
+            },
+        );
+        bots.insert(
+            "coordination-channel".to_string(),
+            TelegramBotConfig {
+                bot_token: "200:BBB".to_string(),
+                chat_id: "-1002".to_string(),
+                agent_id: Some("garden-relay".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+        let hint = crate::casa::digest::coordination_owner_hint(root);
+        let (_, bot_id, _) =
+            crate::casa::digest::resolve_dm_target(&config, &bindings, "Household Member", &hint)
+                .unwrap();
+        assert_eq!(
+            bot_id, "coordination-channel",
+            "a digest for an unbound member must use the configured coordination voice",
+        );
+    }
+
+    #[test]
+    fn ambiguous_plan_source_never_selects_first_bot() {
+        use worksgood::notify::family_plan::CalendarEvent;
+        use worksgood::notify::reminder::Reminder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let wg = root.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::write(
+            root.join("household.toml"),
+            r#"
+[[agent]]
+id = "coordination-anchor-a"
+name = "Shared Lantern"
+domains = ["coordination"]
+
+[[agent]]
+id = "coordination-anchor-b"
+name = "Shared Lantern"
+domains = ["calendar"]
+"#,
+        )
+        .unwrap();
+        seed_confirmed_binding(&wg, "7001001", "member-map", "Household Member");
+        let bindings = TelegramBindingMap::load(&wg.join("agency")).unwrap();
+        let owners = ownership::OwnerMap::load(root);
+        let event = CalendarEvent {
+            weekday: "Tue".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 7, 28),
+            time: "08:00".into(),
+            event: "\u{23f0} Reminder: Household Member set out the bins".into(),
+            source: "Shared Lantern".into(),
+        };
+        assert!(
+            Reminder::from_calendar_event(
+                "2026-W31",
+                &event,
+                &["Household Member".to_string()],
+                &owners,
+            )
+            .is_none(),
+            "duplicate display labels must not become a guessed stable owner",
+        );
+
+        for reverse in [false, true] {
+            let entries = [
+                (
+                    "first-wire",
+                    TelegramBotConfig {
+                        bot_token: "100:AAA".to_string(),
+                        chat_id: "-1001".to_string(),
+                        agent_id: Some("coordination-anchor-a".to_string()),
+                        username: None,
+                    },
+                ),
+                (
+                    "second-wire",
+                    TelegramBotConfig {
+                        bot_token: "200:BBB".to_string(),
+                        chat_id: "-1002".to_string(),
+                        agent_id: Some("coordination-anchor-b".to_string()),
+                        username: None,
+                    },
+                ),
+            ];
+            let mut bots = HashMap::new();
+            let order: &[usize] = if reverse { &[1, 0] } else { &[0, 1] };
+            for index in order {
+                let (id, bot) = &entries[*index];
+                bots.insert((*id).to_string(), bot.clone());
+            }
+            let config = TelegramConfig {
+                bot_token: String::new(),
+                chat_id: String::new(),
+                bots,
+            };
+            assert!(
+                crate::casa::digest::resolve_dm_target(
+                    &config,
+                    &bindings,
+                    "Household Member",
+                    "unresolved-source",
+                )
+                .is_none(),
+                "an unresolved non-empty Source must never fall through to map order",
+            );
+        }
     }
 }

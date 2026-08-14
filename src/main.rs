@@ -3875,7 +3875,7 @@ fn main() -> Result<()> {
                 chat_type,
                 chat_id,
                 humans,
-            } => commands::telegram::run_elect(
+            } => casa::elect::run_elect(
                 &workgraph_dir,
                 &message,
                 reply_to_bot.as_deref(),
@@ -3903,7 +3903,7 @@ fn main() -> Result<()> {
                 composed_reply,
                 compose,
                 compose_error,
-            } => commands::telegram::run_conversation_dryrun(
+            } => casa::dryruns::run_conversation_dryrun(
                 &workgraph_dir,
                 &channel,
                 &chat,
@@ -3923,7 +3923,7 @@ fn main() -> Result<()> {
                 gateway,
                 stub_ok,
                 stub_reason,
-            } => commands::telegram::run_voice_dryrun(
+            } => casa::dryruns::run_voice_dryrun(
                 &file,
                 &mime,
                 &lang,
@@ -3968,7 +3968,7 @@ fn main() -> Result<()> {
                 dry_run,
                 now,
                 mock_send,
-            } => commands::telegram::run_digest(
+            } => casa::digest::run_digest(
                 &workgraph_dir,
                 dry_run,
                 now.as_deref(),
