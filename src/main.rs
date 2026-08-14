@@ -3861,7 +3861,7 @@ fn main() -> Result<()> {
                 reply_to_bot,
                 chat_type,
                 chat_id,
-            } => commands::telegram::run_route(
+            } => casa::one_shot_answers::run_route(
                 &workgraph_dir,
                 &message,
                 reply_to_bot.as_deref(),
@@ -3888,11 +3888,14 @@ fn main() -> Result<()> {
                 commands::telegram::run_resolve_sender(&workgraph_dir, &update, cli.json)
             }
             TelegramCommands::RegisterCommands => {
-                commands::telegram::run_register_commands(cli.json)
+                casa::one_shot_answers::run_register_commands(cli.json)
             }
-            TelegramCommands::Command { name, today } => {
-                commands::telegram::run_command(&workgraph_dir, &name, today.as_deref(), cli.json)
-            }
+            TelegramCommands::Command { name, today } => casa::one_shot_answers::run_command(
+                &workgraph_dir,
+                &name,
+                today.as_deref(),
+                cli.json,
+            ),
             TelegramCommands::Conversation {
                 channel,
                 chat,
@@ -4018,7 +4021,7 @@ fn main() -> Result<()> {
                 calendar_owner,
                 apply,
                 dry_run: _,
-            } => commands::telegram::run_shopping_language(
+            } => casa::plan_edits::run_shopping_language(
                 &text,
                 root.as_deref(),
                 today.as_deref(),

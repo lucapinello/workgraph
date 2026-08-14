@@ -160,12 +160,39 @@ the slices below move ours OUT to `src/casa/`, a path upstream does not have.
 | 5 | `casa/digest.rs`, `casa/dryruns.rs`, `casa/elect.rs` | 13,317 → 12,555 | 6 → **5** |
 | 6 | `casa/feed_write.rs`; `run_discuss` → `casa/dryruns.rs` | 12,555 → 12,210 | 5 → 5 |
 | 7a | `casa/group.rs` — collective + discussion rounds | 12,210 → 11,903 | 5 → 5 |
+| 8 | `casa/plan_edits.rs` + 3 more one-shots | 11,903 → 11,507 | 5 → 5 |
 
 Slice 3 went the wrong way on the marker count, deliberately and once:
 `resolve_dm_target` is ours (absent upstream at the fork point and on `gwwg/main`
 today) but still has one caller and two tests in their file, so it is exposed rather
 than dragged out with its tests. It follows the DM path out when that is extracted.
 The marker is the recorded price of a 537-line reduction, not an oversight.
+
+### The slice test, corrected (use this one)
+
+The 7b failure produced a scoping method that actually works. Seed a candidate, then close over
+**all item kinds** (`fn`, `struct`, `enum`, `const`, `static`, `type`, `trait`) using
+**word-boundary references** rather than call sites, and pull in every reachable item that is
+OURS. What remains is the honest cost: items that are genuinely upstream's.
+
+Run against every remaining `pub fn run_*` of ours, that gives:
+
+| seed | lines | items | test refs | needs from upstream |
+|---|---|---|---|---|
+| `run_register_commands` | 73 | 1 | 0 | nothing |
+| `run_route` | 81 | 1 | 0 | nothing |
+| `run_compose_prompt` | 93 | 3 | 5 | nothing |
+| `run_command` | 106 | 2 | 0 | nothing |
+| `run_shopping_language` | 145 | 2 | 0 | nothing |
+| `run_week_start` | 281 | 5 | 22 | nothing |
+| `run_lifecycle` | 703 | 19 | 26 | nothing |
+| `run_decide` | 313 | 7 | 28 | `run_listen`, `try_confirm_binding` |
+| `run_web_inbound` | 1,355 | 25 | 127 | `run_listen` |
+
+Slice 8 took the four zero-test-ref rows. What is left and still clean: `run_compose_prompt`,
+`run_week_start` and `run_lifecycle` — 1,077 lines needing nothing of upstream's, just test
+references to repoint. `run_decide` and `run_web_inbound` are the only ones that genuinely
+touch upstream's listener, and the table is the reason to stop reaching for them.
 
 ### Slice 7b was attempted and reverted — read this before trying again
 

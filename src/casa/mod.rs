@@ -9,6 +9,7 @@ pub mod elect;
 pub mod feed_write;
 pub mod group;
 pub mod one_shot_answers;
+pub mod plan_edits;
 pub mod remind;
 pub mod reply_delivery;
 pub mod telegram_photo;

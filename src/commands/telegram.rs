@@ -2602,89 +2602,6 @@ fn clarify_target(target: &str, config: &TelegramConfig) -> String {
     }
 }
 
-/// `wg telegram route` — show how a group message would be routed to a family
-/// voice, without sending anything.
-///
-/// Runs the exact [`route_natural`] decision the listener uses, so it verifies
-/// natural-group routing (docs/09 §natural-group) end-to-end against the real
-/// `notify.toml` bots. Mentions are approximated from any `@handle` tokens in
-/// the text (the live listener reads them from Telegram entities). Prints the
-/// resolved voice and *how* it was addressed (@mention / name / reply-chain /
-/// concierge), and flags a `/standup` that the listener would intercept for the
-/// whole roster.
-pub fn run_route(
-    workgraph_dir: &Path,
-    message: &str,
-    reply_to_bot: Option<&str>,
-    chat_type: &str,
-    chat_id: &str,
-    json: bool,
-) -> Result<()> {
-    let config = load_telegram_config()?;
-
-    // Approximate the listener's mention extraction: any @handle token.
-    let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
-    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-
-    let route = route_natural_with_owner_map(
-        Some(chat_type),
-        Some(chat_id),
-        message,
-        &mention_usernames,
-        reply_to_bot,
-        &config,
-        &owner_map,
-    );
-
-    // The listener intercepts `/standup` (for the whole roster) on the routed
-    // body before the per-agent handler, so report that specially.
-    let (kind, agent, addressed_by, routed_body) = match &route {
-        NaturalRoute::Private => ("private", None, None, message.to_string()),
-        NaturalRoute::Drop => ("drop", None, None, message.to_string()),
-        NaturalRoute::ToBot {
-            bot,
-            body,
-            addressed_by,
-            ..
-        } => {
-            let is_standup = worksgood::notify::telegram_standup::is_standup_command(body);
-            let kind = if is_standup { "standup" } else { "agent" };
-            (
-                kind,
-                bot.agent_id.clone().or_else(|| Some(bot.bot_id.clone())),
-                Some(addressed_by.to_string()),
-                body.clone(),
-            )
-        }
-    };
-
-    if json {
-        let out = serde_json::json!({
-            "kind": kind,
-            "agent": agent,
-            "addressed_by": addressed_by,
-            "routed_body": routed_body,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-
-    match kind {
-        "private" => println!("private chat — 1:1 passthrough (not group-routed)"),
-        "drop" => println!("dropped — no chat id, or no voice to route to"),
-        "standup" => {
-            println!("/standup — intercepted; posts the configured household roster")
-        }
-        _ => println!(
-            "routed to {} (by {}): {}",
-            agent.as_deref().unwrap_or("(unbound)"),
-            addressed_by.as_deref().unwrap_or("?"),
-            routed_body,
-        ),
-    }
-    Ok(())
-}
-
 /// `wg telegram resolve-sender` — the Fix #5 diagnostic. Resolve the sender of
 /// a raw Telegram update against the binding map through the exact boundary path
 /// the listener uses, and print the result.
@@ -3330,34 +3247,6 @@ fn web_fast_lane_delivery_id(physical_turn_key: &str) -> String {
     )
 }
 
-/// Apply and deliver one web fast-lane occurrence with restart-safe ordering.
-///
-/// Record-before-act is intentional:
-///
-/// 1. reserve the opaque occurrence;
-/// 2. apply the plan edit and graph stamp once;
-/// 3. persist the exact guarded reply + original route;
-/// 4. claim/send through the transport delivery ledger;
-/// 5. mark the occurrence delivered.
-///
-/// A crash in step 2 leaves `reserved` and a replay fails closed because it
-/// cannot know whether the plan edit reached disk. A transport failure in step
-/// 4 leaves `applied`; the replay sends the stored bytes to the stored route
-/// without touching the plan again. The transport ledger itself claims before
-/// send, closing the send-success/journal-mark crash window.
-/// The wall clock to reason about reminders with on the web path, which is handed
-/// a DATE rather than an instant. The live clock when that date is really today;
-/// the start of the named day when a caller pinned `--today` for a test, so a
-/// pinned run sees that whole day's reminders as still ahead of it.
-fn web_fast_lane_now(today: chrono::NaiveDate) -> chrono::NaiveDateTime {
-    let live = chrono::Local::now().naive_local();
-    if live.date() == today {
-        live
-    } else {
-        today.and_hms_opt(0, 0, 0).unwrap_or(live)
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_web_fast_lane_occurrence(
     workgraph_dir: &Path,
@@ -3394,11 +3283,11 @@ async fn run_web_fast_lane_occurrence(
         auth_sender,
         auth_sender,
         message,
-        web_fast_lane_now(today),
+        crate::casa::plan_edits::web_fast_lane_now(today),
     );
     let classified_fast_lane = readback.is_some()
         || matches!(
-            fast_lane::classify_at(message, web_fast_lane_now(today)),
+            fast_lane::classify_at(message, crate::casa::plan_edits::web_fast_lane_now(today)),
             Classification::FastLane(_) | Classification::Ask { .. }
         );
     let opened = if classified_fast_lane {
@@ -3440,7 +3329,7 @@ async fn run_web_fast_lane_occurrence(
                 match fast_lane::run_fast_lane_at(
                     root,
                     message,
-                    web_fast_lane_now(today),
+                    crate::casa::plan_edits::web_fast_lane_now(today),
                     calendar_owner,
                 ) {
                     FastLaneResult::Fallback { .. } => {
@@ -4418,182 +4307,19 @@ pub async fn run_family_command(
 /// Load grounding (plans + graph + human agents) and compose a single family
 /// command's reply. Shared by the live listener and the `wg telegram command`
 /// dry-run so both render identical text. `today`/`now` come from the local
-/// clock (overridable in the dry-run via [`compose_family_reply_on`]).
+/// clock (overridable in the dry-run via [`crate::casa::one_shot_answers::compose_family_reply_on`]).
 fn compose_family_reply(
     workgraph_dir: &Path,
     config: &TelegramConfig,
     cmd: &family_commands::FamilyCommand,
 ) -> Result<String> {
-    compose_family_reply_on(
+    crate::casa::one_shot_answers::compose_family_reply_on(
         workgraph_dir,
         config,
         cmd,
         chrono::Local::now().date_naive(),
         chrono::Utc::now(),
     )
-}
-
-/// [`compose_family_reply`] with an explicit `today`/`now` (for deterministic
-/// tests and the `--today` dry-run flag).
-fn compose_family_reply_on(
-    workgraph_dir: &Path,
-    config: &TelegramConfig,
-    cmd: &family_commands::FamilyCommand,
-    today: chrono::NaiveDate,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<String> {
-    let root = project_root(workgraph_dir);
-    let plans = family_plan::load_plans(&root);
-    let graph = worksgood::parser::load_graph(crate::commands::graph_path(workgraph_dir)).ok();
-    let humans = human_agent_id_set(workgraph_dir);
-    let roster = if cmd.kind == family_commands::CommandKind::Roster {
-        worksgood::notify::telegram_standup::load_project_roster(&root, config)?
-    } else {
-        Vec::new()
-    };
-    let ctx = family_commands::CommandContext {
-        graph: graph.as_ref(),
-        roster: &roster,
-        plans: &plans,
-        today,
-        now,
-        human_agents: &humans,
-    };
-    Ok(family_commands::compose(cmd, &ctx))
-}
-
-/// `wg telegram register-commands` — register the shared family command set with
-/// Telegram (via `setMyCommands`) for EVERY configured bot, so the commands
-/// autocomplete when a user types `/` in the group or a 1:1. Each bot registers
-/// the full set (any bot can receive a `/command`; the listener's election
-/// decides who answers). After each `setMyCommands` we read the menu back with
-/// `getMyCommands` and report the count — verification, no tokens logged.
-pub fn run_register_commands(json: bool) -> Result<()> {
-    let notify = NotifyConfig::load(Some(Path::new(".")))
-        .context("Failed to load notification config")?
-        .context("No notify.toml found. Create one at ~/.config/workgraph/notify.toml")?;
-    let channels = TelegramChannel::all_from_notify_config(&notify)
-        .context("Failed to build Telegram channels")?;
-    if channels.is_empty() {
-        anyhow::bail!("No Telegram bots configured — nothing to register");
-    }
-
-    let cmds: Vec<(String, String)> = family_commands::FAMILY_COMMANDS
-        .iter()
-        .map(|c| (c.name().to_string(), c.description.to_string()))
-        .collect();
-
-    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-    rt.block_on(async {
-        let mut summaries = Vec::new();
-        for ch in &channels {
-            ch.set_my_commands(&cmds)
-                .await
-                .with_context(|| format!("setMyCommands failed for bot {}", ch.bot_id()))?;
-            let got = ch
-                .get_my_commands()
-                .await
-                .with_context(|| format!("getMyCommands failed for bot {}", ch.bot_id()))?;
-            let registered = got
-                .get("result")
-                .and_then(|r| r.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            if !json {
-                println!(
-                    "✓ {} — {} command(s) registered and verified",
-                    ch.bot_id(),
-                    registered
-                );
-            }
-            summaries.push(serde_json::json!({
-                "bot_id": ch.bot_id(),
-                "registered": registered,
-                "commands": got.get("result").cloned().unwrap_or(serde_json::Value::Null),
-            }));
-        }
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "bots": summaries,
-                    "command_set": cmds.iter().map(|(n, _)| n).collect::<Vec<_>>(),
-                }))?
-            );
-        } else {
-            println!(
-                "\nRegistered {} command(s) across {} bot(s): {}",
-                cmds.len(),
-                channels.len(),
-                cmds.iter()
-                    .map(|(n, _)| format!("/{n}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
-}
-
-/// `wg telegram command <name>` — compose a family command's reply against live
-/// data and print it, WITHOUT sending anything. This is the scripted-test and
-/// dry-run entry point: it proves each command returns grounded content (from
-/// the real `plans/` + graph) in the owner's voice. `--today` pins the date so
-/// the "current week" / "tonight's dinner" selection is deterministic.
-pub fn run_command(
-    workgraph_dir: &Path,
-    name: &str,
-    today: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    let cmd = family_commands::match_command(name)
-        .or_else(|| family_commands::match_command(&format!("/{name}")))
-        .with_context(|| {
-            format!(
-                "unknown command '{name}' — known: {}",
-                family_commands::FAMILY_COMMANDS
-                    .iter()
-                    .map(|c| c.keyword)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        })?;
-
-    // Config is only needed for /standup's roster; tolerate its absence so the
-    // plan-grounded commands compose even without a [telegram] section.
-    let config = load_telegram_config().unwrap_or_default();
-
-    let today = match today {
-        Some(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .with_context(|| format!("invalid --today '{s}', expected YYYY-MM-DD"))?,
-        None => chrono::Local::now().date_naive(),
-    };
-    let now = today
-        .and_hms_opt(9, 0, 0)
-        .map(|dt| dt.and_utc())
-        .unwrap_or_else(chrono::Utc::now);
-
-    let text = compose_family_reply_on(workgraph_dir, &config, cmd, today, now)?;
-    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-    let owner = cmd.owner(&owner_map);
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "command": cmd.keyword,
-                "domain": cmd.domain.slug(),
-                "owner": owner,
-                "kind": format!("{:?}", cmd.kind),
-                "data_source": cmd.data_source,
-                "text": text,
-            }))?
-        );
-    } else {
-        println!("{text}");
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4787,7 +4513,7 @@ pub fn run_week_start(
                 match fast_lane::run_fast_lane_at(
                     root,
                     message,
-                    web_fast_lane_now(today),
+                    crate::casa::plan_edits::web_fast_lane_now(today),
                     owner.as_deref(),
                 ) {
                     FastLaneResult::Applied {
@@ -4891,128 +4617,6 @@ pub fn run_week_start(
     println!("turn:    {physical_turn_key}");
     if let Some(a) = &applied {
         println!("apply:   {a}");
-    }
-    Ok(())
-}
-
-/// What does a shopping sentence DO? — the `wg telegram shopping` seam
-/// (see [`crate::cli::TelegramCommands::Shopping`]).
-///
-/// Prints the verdict of the exact shopping lane a family message hits: `add`,
-/// `remove`, `ask` (with the reason — an implausible item, a held ask, or "which
-/// item?"), or `none`. Pure by default. `--apply --root <scratch>` runs the REAL
-/// write so a scratch project can prove a removal removes and an ask writes nothing.
-pub fn run_shopping_language(
-    text: &str,
-    root: Option<&Path>,
-    today: Option<&str>,
-    now: Option<&str>,
-    calendar_owner: Option<&str>,
-    apply: bool,
-    json: bool,
-) -> Result<()> {
-    use worksgood::notify::fast_lane::{self, Classification, FastLaneResult};
-
-    // `--now` is the full wall-clock pin (the reminder lane's elapsed-clock
-    // contract cannot be tested without one); `--today` keeps the older
-    // date-only behaviour for every caller that has no clock to pin.
-    let now = match now {
-        Some(stamp) => Some(
-            chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M")
-                .with_context(|| format!("--now must be YYYY-MM-DDTHH:MM, got {stamp:?}"))?,
-        ),
-        None => None,
-    };
-    let today = match (now, today) {
-        (Some(n), _) => n.date(),
-        (None, Some(d)) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
-            .with_context(|| format!("--today must be YYYY-MM-DD, got {d:?}"))?,
-        (None, None) => chrono::Local::now().date_naive(),
-    };
-    let now = now.unwrap_or_else(|| web_fast_lane_now(today));
-
-    let (lane, item, reply, reason) = match fast_lane::classify_at(text, now) {
-        Classification::FastLane(op) => {
-            let item = match &op {
-                fast_lane::FastLaneOp::ShoppingAdd { item }
-                | fast_lane::FastLaneOp::ShoppingRemove { item } => Some(item.clone()),
-                _ => None,
-            };
-            (
-                op.kind_label().to_string(),
-                item,
-                fast_lane::report_line(&op),
-                None,
-            )
-        }
-        Classification::Ask { reply, reason } => {
-            ("ask".to_string(), None, reply, Some(reason.slug()))
-        }
-        Classification::Fallback(r) => (
-            "none".to_string(),
-            None,
-            String::new(),
-            Some(match r {
-                fast_lane::FallbackReason::Compound => "compound",
-                fast_lane::FallbackReason::NotASimpleEdit => "not-a-simple-edit",
-            }),
-        ),
-    };
-
-    // The real write, against a SCRATCH project — the live proof seam.
-    let applied = if apply {
-        let root = root.ok_or_else(|| anyhow::anyhow!("--apply needs --root <project dir>"))?;
-        match fast_lane::run_fast_lane_at(root, text, now, calendar_owner) {
-            FastLaneResult::Applied {
-                report, week_code, ..
-            } => Some(serde_json::json!({
-                "outcome": "applied",
-                "report": report,
-                "week": week_code,
-            })),
-            FastLaneResult::Answered { reply, lane } => Some(serde_json::json!({
-                "outcome": "answered",
-                "reply": reply,
-                "lane": lane,
-            })),
-            FastLaneResult::Fallback { reason } => Some(serde_json::json!({
-                "outcome": "fallback",
-                "reason": reason,
-            })),
-        }
-    } else {
-        None
-    };
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "text": text,
-                "lane": lane,
-                "item": item,
-                "reply": reply,
-                "reason": reason,
-                "today": today.to_string(),
-                "now": now.format("%Y-%m-%dT%H:%M").to_string(),
-                "applied": applied,
-            }))?
-        );
-        return Ok(());
-    }
-
-    println!("lane:   {lane}");
-    if let Some(i) = &item {
-        println!("item:   {i}");
-    }
-    if let Some(r) = reason {
-        println!("reason: {r}");
-    }
-    if !reply.is_empty() {
-        println!("reply:  {reply}");
-    }
-    if let Some(a) = &applied {
-        println!("apply:  {a}");
     }
     Ok(())
 }
