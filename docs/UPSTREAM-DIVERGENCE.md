@@ -169,6 +169,26 @@ today) but still has one caller and two tests in their file, so it is exposed ra
 than dragged out with its tests. It follows the DM path out when that is extracted.
 The marker is the recorded price of a 537-line reduction, not an oversight.
 
+### Assert your provenance check actually READ something
+
+A provenance check that reads an empty stream reports "absent", which is indistinguishable
+from "not present in upstream" — and "not present upstream" is the verdict that decides whether
+an item may move. This bit once, on 2026-08-14: a one-off shell check used `$MB` set in an
+EARLIER tool call, shell variables do not persist between calls, so it ran
+`git show ":src/commands/telegram.rs"`, got nothing, and pronounced `try_confirm_binding` OURS.
+It is upstream's. The Python scoping pass, which holds the fork text in a variable it just
+filled, said THEIRS and was right.
+
+So: read the fork-point file once, assert it is non-empty (`len(fork) > 10_000` for this file),
+and derive every verdict from that one buffer. Re-checked all eighteen items moved in slices
+7a–9 that way — every one is genuinely ours, so the slices stand — and `try_confirm_binding`
+is the single upstream item in that neighbourhood.
+
+Practical consequence for the last two candidates: `run_listen` is already `pub fn`, so
+importing it costs NOTHING, and `run_decide`'s only real cost is exposing upstream's own
+private `try_confirm_binding`. That is a marker on THEIR function for our convenience, which is
+the one kind of exposure this split should refuse. `run_decide` stays.
+
 ### The slice test, corrected (use this one)
 
 The 7b failure produced a scoping method that actually works. Seed a candidate, then close over
