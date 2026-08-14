@@ -3959,7 +3959,7 @@ fn main() -> Result<()> {
                 dry_run,
                 now,
                 mock_send,
-            } => commands::telegram::run_lifecycle(
+            } => casa::lifecycle::run_lifecycle(
                 &workgraph_dir,
                 task_id.as_deref(),
                 dry_run,
@@ -4002,7 +4002,7 @@ fn main() -> Result<()> {
                         .ok()
                         .filter(|s| !s.trim().is_empty())
                 });
-                commands::telegram::run_week_start(
+                casa::plan_edits::run_week_start(
                     &workgraph_dir,
                     &message,
                     root.as_deref(),
@@ -4100,7 +4100,7 @@ fn main() -> Result<()> {
                 message,
                 agent,
                 session,
-            } => commands::telegram::run_compose_prompt(
+            } => casa::dryruns::run_compose_prompt(
                 &workgraph_dir,
                 &message,
                 agent.as_deref(),

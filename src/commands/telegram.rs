@@ -38,43 +38,6 @@ use worksgood::notify::telegram_voice;
 // resolve a `--now` override with it. See casa/remind.rs.
 use crate::casa::remind::parse_naive_now;
 
-/// Whether an inbound listener message may fire a FAMILY command and/or the
-/// OPERATOR command reference.
-///
-/// This is the single gate that closed `fix-command-leaks`: a bare `?` in the
-/// group was parsed as an operator HELP command and dumped the raw WG
-/// claim/done reference into the family chat, racing the mention election. The
-/// three rules it encodes:
-///
-/// 1. A message is a command **only** when it opens with a genuine Telegram
-///    slash command (`has_bot_command` — a `bot_command` entity at offset 0).
-///    Punctuation, a bare `?`, or ordinary chatter is conversation, never a
-///    command — so it can never race the election.
-/// 2. Because the gate keys off the slash entity (not the text), an addressed
-///    conversational turn like `@nora ?` carries no command entity → the
-///    election owns it and the agent converses.
-/// 3. The OPERATOR reference (claim/done/status/help) is coordinator content
-///    that must NEVER surface in a family group — it runs only in a 1:1
-///    operator DM, and only for a real slash command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommandGate {
-    /// A family-voice command (`/dinner`, `/help`, …) may run in this chat.
-    pub family: bool,
-    /// The operator WG command reference may run in this chat.
-    pub operator: bool,
-}
-
-/// Decide the [`CommandGate`] for an inbound message. Pure and unit-testable
-/// against real `decode_update` output.
-pub fn command_gate(msg: &worksgood::notify::IncomingMessage) -> CommandGate {
-    let is_group = matches!(msg.chat_type.as_deref(), Some("group") | Some("supergroup"));
-    let is_command = msg.has_bot_command;
-    CommandGate {
-        family: is_command,
-        operator: is_command && !is_group,
-    }
-}
-
 /// Loopback gateway endpoint the web-identity `/start login_<nonce>` gate POSTs
 /// the verified telegram id to. One-directional, token-free, loopback-only — the
 /// gateway enforces the loopback guard (`403` for a non-loopback caller) and
@@ -572,9 +535,9 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     // and, worse, swallowed by the pacing cap). Every LIFECYCLE_TICK_SECS this
     // observes the live graph: for any origin-stamped task whose start/done/fail
     // transition is not yet in the FiredLog it delivers the family-voice report
-    // exactly once (see `run_lifecycle`). A cheap `pending_fires` gate keeps an
+    // exactly once (see `crate::casa::lifecycle::run_lifecycle`). A cheap `pending_fires` gate keeps an
     // idle house silent — no per-tick chatter in the log. It runs on a plain OS
-    // thread, NOT a tokio task: `run_lifecycle` builds its own runtime to send,
+    // thread, NOT a tokio task: `crate::casa::lifecycle::run_lifecycle` builds its own runtime to send,
     // which would panic if nested inside this listener's runtime. Read-only
     // against the graph; it never touches the message-routing pipeline below.
     const LIFECYCLE_TICK_SECS: u64 = 15;
@@ -600,7 +563,14 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 // Something transitioned: deliver every pending report-back (same code
                 // path as `wg telegram lifecycle`, real send). Exactly-once + pacing
                 // are enforced inside via the persisted FiredLog.
-                if let Err(e) = run_lifecycle(&lifecycle_dir, None, false, None, false, false) {
+                if let Err(e) = crate::casa::lifecycle::run_lifecycle(
+                    &lifecycle_dir,
+                    None,
+                    false,
+                    None,
+                    false,
+                    false,
+                ) {
                     eprintln!(
                         "[{}] lifecycle report-back tick failed: {}",
                         chrono::Utc::now().format("%H:%M:%S"),
@@ -1072,7 +1042,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // 0). A bare `?`, punctuation, or ordinary chatter carries no such
             // entity and is conversation — it flows to the election below and is
             // never parsed as a command. See `fix-command-leaks`.
-            let gate = command_gate(&msg);
+            let gate = crate::casa::command_gate::command_gate(&msg);
 
             // Web-identity sign-in: a 1:1 `/start login_<nonce>` deep link. The
             // household member scans the kitchen-tablet QR, which opens the bot
@@ -2646,85 +2616,12 @@ pub fn run_resolve_sender(workgraph_dir: &Path, update: &str, json: bool) -> Res
     Ok(())
 }
 
-/// `wg telegram compose-prompt` — print the assembled compose prompt for a
-/// message, WITHOUT spawning a model or sending anything.
-///
-/// The credential-free scripted-test seam for the composer's CONTEXT (sibling of
-/// `run_discuss` / `run_decide`). It runs the real production assembly
-/// (`telegram_conversation::compose_prompt_preview` → `build_compose_prompt`), so
-/// it reads the family's live grounding from disk AND the three gateway-forwarded
-/// env blocks — `WG_THREAD_CONTEXT`, `WG_WEEK_CONTEXT`, `WG_MEMORY_CONTEXT`.
-/// Composition itself is stubbed by stopping at the prompt, which is exactly what
-/// makes this a token-free proof of what the model is handed: a scratch project
-/// plus one env var shows whether durable family memory really reaches the
-/// composer, and whether it is ranked below live state (docs/39 §5.3, §6).
-///
-/// `--json` reports which context blocks landed alongside the prompt, so a script
-/// can assert on the blocks without pattern-matching prose.
-pub fn run_compose_prompt(
-    workgraph_dir: &Path,
-    message: &str,
-    agent: Option<&str>,
-    session: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    use worksgood::notify::telegram_conversation;
-
-    let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-    let agent_id = agent
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .or_else(|| owner_map.owner_for_domain(ownership::Domain::Coordination))
-        .context("--agent is required when household.toml has no configured coordination owner")?;
-    // Default the session ref to the persona id: a bound agent name resolves to
-    // its session, and an unknown ref simply yields no summary/history (the
-    // fresh-session prompt) rather than an error — so a scratch project works.
-    let session_ref = session
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(agent_id);
-
-    let prompt = telegram_conversation::compose_prompt_preview(
-        workgraph_dir,
-        session_ref,
-        agent_id,
-        message,
-    );
-
-    if json {
-        // Which forwarded blocks are present in the ASSEMBLED prompt (not merely
-        // set in the environment) — that distinction is the whole point: an env
-        // var the binary never reads would show `false` here.
-        let out = serde_json::json!({
-            "agent": agent_id,
-            "session": session_ref,
-            "message": message,
-            "blocks": {
-                "thread": prompt.contains("Recent messages in this conversation"),
-                // "MEALS" since task meal-read-lane — the forwarded block carries every
-                // slot the plan knows (dinners, lunches, no-cook nights), not just the
-                // Dinners table. A stale needle here would report `week: false` on a
-                // prompt that DOES carry the week — the exact "green stub over an unread
-                // var" shape this diagnostic exists to prevent.
-                "week": prompt.contains("THIS WEEK'S MEALS"),
-                "memory": prompt.contains("FAMILY MEMORY"),
-                "corrections": prompt.contains("correction"),
-            },
-            "prompt": prompt,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        println!("{prompt}");
-    }
-    Ok(())
-}
-
 /// `wg telegram decide` — run the listener's command-vs-election decision on a
 /// raw Telegram update, without sending anything.
 ///
 /// Feeds the raw `getUpdates` element through the SAME boundary the live
 /// listener uses: [`decode_update`] (which reads the Telegram entities so a
-/// bare `?` is distinguished from a real `/help`), then [`command_gate`] and
+/// bare `?` is distinguished from a real `/help`), then [`crate::casa::command_gate::command_gate`] and
 /// [`elect_responders_with_owner_map`]. Prints the decision — is it a command, and if not, who
 /// the election routes it to. This is the `fix-command-leaks` proof: a bare `?`
 /// or `@mention ?` must decide `conversation` with ZERO commands and never
@@ -2751,7 +2648,7 @@ pub fn run_decide(workgraph_dir: &Path, update: &str, json: bool) -> Result<()> 
         }
     };
 
-    let gate = command_gate(&msg);
+    let gate = crate::casa::command_gate::command_gate(&msg);
 
     // If the message is a genuine slash command, that's the decision — report
     // which command path (family vs operator) and, for a family command, which
@@ -3140,57 +3037,6 @@ fn telegram_physical_turn_key(message: &worksgood::notify::IncomingMessage) -> S
     )
 }
 
-/// Physical-turn key for a gateway-originated group turn.
-///
-/// A supplied opaque occurrence id distinguishes two later turns with identical
-/// words. Missing ids retain the legacy chat + trimmed-body fallback so older
-/// gateways remain compatible. The returned fingerprint never exposes the
-/// occurrence id, the attempt id, or the message body.
-///
-/// `attempt_id` is the gateway's canonical ATTEMPT id for this delivery of that
-/// occurrence, and it is why the key is `(turn, attempt)` rather than `turn`
-/// alone. The two ids answer different questions:
-///
-///   · the same `(turn, attempt)` arriving twice is one physical delivery
-///     redelivered — a dispatcher refire — and the stored outcome must win;
-///   · a NEW attempt on the same turn is the gateway SELF-HEALING a delivery
-///     that died before the family got an answer. Under a turn-only key that
-///     retry matches the dead attempt's ledger entry and is dropped as
-///     "already answered", so the self-heal heals nothing and the household is
-///     left with the silence it was retrying.
-///
-/// An absent or blank attempt id keeps the pre-attempt digest material byte for
-/// byte, so ledger entries an older gateway already wrote keep replaying.
-///
-/// One contract, three layers, all keyed the same way from `WG_ATTEMPT_ID`:
-/// this key (compose dedupe + the fast-lane/week-start mutation journal),
-/// [`worksgood::notify::relay_receipt::attempt_key`] (the delivery receipt
-/// ledger), and — deliberately turn-only — the final-answer reservation in
-/// [`worksgood::notify::telegram_conversation`], where a late original and a
-/// self-heal retry must still produce exactly ONE final message. Admitting the
-/// retry here and holding the line there is the point: the retry gets to answer,
-/// the family does not get answered twice.
-fn web_physical_turn_key(
-    reply_chat: &str,
-    body: &str,
-    turn_id: Option<&str>,
-    attempt_id: Option<&str>,
-) -> String {
-    let (kind, occurrence) = turn_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(|id| ("id", id))
-        .unwrap_or_else(|| ("body", body.trim()));
-    let digest = match attempt_id.map(str::trim).filter(|id| !id.is_empty()) {
-        Some(attempt) => durable_telegram_digest_v1(
-            "web-physical-turn",
-            &[reply_chat, kind, occurrence, "attempt", attempt],
-        ),
-        None => durable_telegram_digest_v1("web-physical-turn", &[reply_chat, kind, occurrence]),
-    };
-    format!("web-turn-{digest}")
-}
-
 /// Pick the `(bot_id, chat)` a fast-lane confirmation should go out as: the
 /// elected single voice when the ask elected one (so a food edit confirms in the
 /// chef's voice, a workout edit in the coach's), else the first configured bot in
@@ -3214,27 +3060,11 @@ fn fast_lane_reply_target(
     (bot_id, target.to_string())
 }
 
-const WEB_FAST_LANE_OCCURRENCE_DOMAIN: &str = "web-fast-lane";
-
-/// Exact restart payload for one web fast-lane mutation.
-///
-/// The mutation's report is guarded before this value is persisted, so an
-/// `applied` replay sends these exact bytes and never re-runs classification,
-/// plan editing, graph stamping, election, or target selection.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WebFastLaneOutcome {
-    op_kind: String,
-    report: String,
-    bot_id: String,
-    chat_id: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WebFastLaneDispatch {
     PassedThrough,
     Handled {
-        outcome: WebFastLaneOutcome,
+        outcome: crate::casa::plan_edits::WebFastLaneOutcome,
         resumed_delivery: bool,
         already_delivered: bool,
     },
@@ -3291,15 +3121,17 @@ async fn run_web_fast_lane_occurrence(
             Classification::FastLane(_) | Classification::Ask { .. }
         );
     let opened = if classified_fast_lane {
-        Some(OccurrenceJournal::<WebFastLaneOutcome>::claim(
+        Some(OccurrenceJournal::<
+            crate::casa::plan_edits::WebFastLaneOutcome,
+        >::claim(
             workgraph_dir,
-            WEB_FAST_LANE_OCCURRENCE_DOMAIN,
+            crate::casa::plan_edits::WEB_FAST_LANE_OCCURRENCE_DOMAIN,
             physical_turn_key,
         )?)
     } else {
-        OccurrenceJournal::<WebFastLaneOutcome>::reopen(
+        OccurrenceJournal::<crate::casa::plan_edits::WebFastLaneOutcome>::reopen(
             workgraph_dir,
-            WEB_FAST_LANE_OCCURRENCE_DOMAIN,
+            crate::casa::plan_edits::WEB_FAST_LANE_OCCURRENCE_DOMAIN,
             physical_turn_key,
         )?
     };
@@ -3312,7 +3144,7 @@ async fn run_web_fast_lane_occurrence(
             // The read-back answer is already family-voice guarded and derived
             // wholly from persisted state; nothing was written to produce it.
             if let Some(reply) = readback {
-                let outcome = WebFastLaneOutcome {
+                let outcome = crate::casa::plan_edits::WebFastLaneOutcome {
                     op_kind: "reminder-read".to_string(),
                     report: reply,
                     bot_id: bot_id.to_string(),
@@ -3348,7 +3180,7 @@ async fn run_web_fast_lane_occurrence(
                             &reply,
                             family_roster,
                         );
-                        let outcome = WebFastLaneOutcome {
+                        let outcome = crate::casa::plan_edits::WebFastLaneOutcome {
                             op_kind: format!("ask-{lane}"),
                             report: guarded,
                             bot_id: bot_id.to_string(),
@@ -3380,7 +3212,7 @@ async fn run_web_fast_lane_occurrence(
                         );
                         fast_lane::stamp_graph_node(workgraph_dir, &origin, &op, &guarded);
 
-                        let outcome = WebFastLaneOutcome {
+                        let outcome = crate::casa::plan_edits::WebFastLaneOutcome {
                             op_kind: op.kind_label().to_string(),
                             report: guarded,
                             bot_id: bot_id.to_string(),
@@ -3890,7 +3722,8 @@ pub fn run_web_inbound(
         Election::All { body, .. } | Election::One { body, .. } => body.as_str(),
         _ => message.trim(),
     };
-    let physical_turn_key = web_physical_turn_key(&target, turn_body, turn_id, attempt_id);
+    let physical_turn_key =
+        crate::casa::plan_edits::web_physical_turn_key(&target, turn_body, turn_id, attempt_id);
 
     let category = match &election {
         Election::Silence(_) => "silence",
@@ -4360,956 +4193,16 @@ fn duplicate_drop_line(
     )
 }
 
-/// The lifecycle report-back's delivery line. The event slug and task id are
-/// work-graph identifiers, not household ones — they stay, and they are what an
-/// operator actually reads this line for.
-fn lifecycle_delivery_line(
-    event: &str,
-    task_id: &str,
-    chat_id: &str,
-    bot_id: &str,
-    message_id: &str,
-    text: &str,
-) -> String {
-    use worksgood::notify::telegram::{redact_body, redact_chat_id, redact_message_id};
-    format!(
-        "lifecycle {} for {} → {} via {} ({}): {}",
-        event,
-        task_id,
-        redact_chat_id(chat_id),
-        bot_id,
-        redact_message_id(message_id),
-        redact_body(text),
-    )
-}
-
-/// Fulfil an accepted week-start offer — the `wg telegram week-start` seam
-/// (see [`crate::cli::TelegramCommands::WeekStart`]).
-///
-/// Runs the exact lane the gateway's dispatched acceptance hits. Without
-/// `--apply` it only reports what the engine RECOGNIZES (is this a week-start
-/// ask, and what requests does it carry). With `--apply --root <scratch>` it
-/// really drafts the week: the plan is assembled, edited with every carried
-/// request and verified IN MEMORY, written only if all of that held, and then
-/// re-read from disk before this command reports success — so a dead pipeline
-/// cannot claim a week it never wrote.
-///
-/// The draft is journaled against `(turn, attempt)` exactly as the live web turn
-/// is, so a dispatcher refire carrying the SAME occurrence AND attempt replays
-/// the stored outcome instead of drafting twice, while a gateway self-heal retry
-/// — same occurrence, NEW attempt — is answered rather than suppressed.
-/// Credential-free throughout.
-pub fn run_week_start(
-    workgraph_dir: &Path,
-    message: &str,
-    root: Option<&Path>,
-    now: Option<&str>,
-    apply: bool,
-    turn_id: Option<&str>,
-    attempt_id: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    use worksgood::notify::fast_lane::{self, FastLaneResult};
-    use worksgood::notify::telegram_occurrence::{OccurrenceJournal, OccurrenceState};
-    use worksgood::notify::week_start;
-
-    let today = match now {
-        Some(d) => {
-            // Accept both a bare date and the `--now` wall-clock form the other
-            // pinned seams take, so a scratch run can pin the same string.
-            let day = d.split(['T', ' ']).next().unwrap_or(d);
-            chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
-                .with_context(|| format!("--now must be YYYY-MM-DD[THH:MM], got {d:?}"))?
-        }
-        None => chrono::Local::now().date_naive(),
-    };
-
-    let ask = week_start::detect(message);
-    let (week_code, monday, sunday) = week_start::iso_week_of(today);
-
-    // The correlation key the live turn builds — the SAME derivation, so what
-    // this seam proves about dedupe is true of the live turn. `--turn-id` (or
-    // WG_TURN_ID) is the gateway's opaque occurrence id; without one the words
-    // are the key, the same legacy fallback `web-inbound` keeps for older
-    // callers. `--attempt-id` (or WG_ATTEMPT_ID) is the canonical attempt id for
-    // this delivery of that occurrence: same (turn, attempt) is a refire and
-    // replays, a new attempt on the same turn is a self-heal and is answered.
-    let physical_turn_key = web_physical_turn_key("web", message, turn_id, attempt_id);
-
-    let mut applied: Option<serde_json::Value> = None;
-    if apply {
-        let root = root.ok_or_else(|| anyhow::anyhow!("--apply needs --root <project dir>"))?;
-        if ask.is_none() {
-            anyhow::bail!("not a week-start ask — nothing to apply");
-        }
-        // The occurrence journal belongs to the PROJECT whose week is being
-        // drafted, not to whatever directory the command was invoked from —
-        // otherwise two scratch projects (or two runs of a test) would share one
-        // turn ledger and the second would replay the first one's outcome.
-        //
-        // THE HOLE THAT WAS IN THAT: the scoping only held for a project that
-        // ALREADY had a `.wg/`, and a scratch project has none — so every scratch
-        // run fell back to the ambient workgraph dir and they all shared one
-        // ledger. Observed: the same ask, run against a FRESH project, replayed a
-        // previous project's outcome and reported "this week's plan is started"
-        // with no plan file anywhere on this disk. Create the journal home under
-        // the root instead; a project's turn ledger is the project's.
-        let journal_dir = root.join(".wg");
-        if !journal_dir.is_dir() {
-            std::fs::create_dir_all(&journal_dir).with_context(|| {
-                format!("create the occurrence journal at {}", journal_dir.display())
-            })?;
-        }
-        let _ = workgraph_dir;
-        let (journal, state) = OccurrenceJournal::<WebFastLaneOutcome>::claim(
-            &journal_dir,
-            WEB_FAST_LANE_OCCURRENCE_DOMAIN,
-            &physical_turn_key,
-        )?;
-        // A replay is only honest if the thing it claims to have done is STILL
-        // THERE. A week-start's whole outcome is one file; if that file is absent,
-        // "already started" is a lie told with a ledger entry as its evidence —
-        // the dead-pipeline-claims-success failure, arriving through the
-        // idempotency guard instead of around it. So a replay whose plan is gone
-        // is not a replay: the week is drafted, which is what the family asked
-        // for and what the ledger says already happened.
-        let plan_path = root
-            .join("plans")
-            .join(format!("{week_code}-family-plan.md"));
-        let replay_is_honest = plan_path.exists();
-        let state = match state {
-            OccurrenceState::Applied(prior) | OccurrenceState::Delivered(prior)
-                if !replay_is_honest =>
-            {
-                let _ = prior;
-                OccurrenceState::New
-            }
-            other => other,
-        };
-        applied = Some(match state {
-            // The SAME accepted turn arriving again (a dispatcher refire): the
-            // durable outcome wins and nothing is drafted a second time.
-            OccurrenceState::Applied(prior) | OccurrenceState::Delivered(prior) => {
-                serde_json::json!({
-                    "outcome": "replayed",
-                    "already_delivered": true,
-                    "op": prior.op_kind,
-                    "report": prior.report,
-                    "plan_exists": true,
-                })
-            }
-            OccurrenceState::Incomplete => serde_json::json!({
-                "outcome": "incomplete",
-                "already_delivered": false,
-            }),
-            OccurrenceState::PassedThrough => serde_json::json!({
-                "outcome": "passed-through",
-                "already_delivered": false,
-            }),
-            OccurrenceState::New => {
-                let owner_map = worksgood::notify::ownership::OwnerMap::load(root);
-                let owner =
-                    owner_map.owner_for_domain(worksgood::notify::ownership::Domain::Calendar);
-                match fast_lane::run_fast_lane_at(
-                    root,
-                    message,
-                    crate::casa::plan_edits::web_fast_lane_now(today),
-                    owner.as_deref(),
-                ) {
-                    FastLaneResult::Applied {
-                        report,
-                        op,
-                        week_code,
-                    } => {
-                        let outcome = WebFastLaneOutcome {
-                            op_kind: op.kind_label().to_string(),
-                            report: report.clone(),
-                            bot_id: String::new(),
-                            chat_id: "web".to_string(),
-                        };
-                        journal.mark_applied(&outcome)?;
-                        // Report the PLAN THAT IS ON DISK, re-read here, rather
-                        // than the lane's own account of what it did.
-                        let path = root
-                            .join("plans")
-                            .join(format!("{week_code}-family-plan.md"));
-                        let written = std::fs::read_to_string(&path).ok();
-                        let doc = written
-                            .as_deref()
-                            .map(|c| worksgood::notify::family_plan::PlanDoc::parse(&week_code, c));
-                        serde_json::json!({
-                            "outcome": "applied",
-                            "already_delivered": false,
-                            "report": report,
-                            "week": week_code,
-                            "plan_path": path.display().to_string(),
-                            "plan_exists": path.exists(),
-                            "day_rows": doc.as_ref().map(|d| d.meals.len()).unwrap_or(0),
-                            "dinners": doc
-                                .as_ref()
-                                .map(|d| d
-                                    .meals
-                                    .iter()
-                                    .map(|m| serde_json::json!({"day": m.weekday, "dish": m.dish}))
-                                    .collect::<Vec<_>>())
-                                .unwrap_or_default(),
-                        })
-                    }
-                    FastLaneResult::Answered { reply, lane } => {
-                        let outcome = WebFastLaneOutcome {
-                            op_kind: format!("ask-{lane}"),
-                            report: reply.clone(),
-                            bot_id: String::new(),
-                            chat_id: "web".to_string(),
-                        };
-                        journal.mark_applied(&outcome)?;
-                        serde_json::json!({
-                            "outcome": "answered",
-                            "already_delivered": false,
-                            "lane": lane,
-                            "reply": reply,
-                        })
-                    }
-                    FastLaneResult::Fallback { reason } => {
-                        journal.mark_passed_through()?;
-                        serde_json::json!({
-                            "outcome": "fallback",
-                            "already_delivered": false,
-                            "reason": reason,
-                        })
-                    }
-                }
-            }
-        });
-    }
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "message": message,
-                "lane": if ask.is_some() { "week-start" } else { "none" },
-                "recognized": ask.is_some(),
-                "carried": ask.as_ref().map(|a| a.carried.clone()).unwrap_or_default(),
-                "today": today.to_string(),
-                "week": week_code,
-                "week_start": monday.to_string(),
-                "week_end": sunday.to_string(),
-                "turn_id": turn_id,
-                "attempt_id": attempt_id,
-                "turn_key": physical_turn_key,
-                "applied": applied,
-            }))?
-        );
-        return Ok(());
-    }
-
-    println!(
-        "lane:    {}",
-        if ask.is_some() { "week-start" } else { "none" }
-    );
-    if let Some(a) = &ask {
-        for c in &a.carried {
-            println!("carried: {c}");
-        }
-    }
-    println!("week:    {week_code} ({monday} – {sunday})");
-    println!("turn:    {physical_turn_key}");
-    if let Some(a) = &applied {
-        println!("apply:   {a}");
-    }
-    Ok(())
-}
-
-/// Deliver ONE lifecycle report-back through the same one-path writer the
-/// conversation replies use — the fix for docs/20 ("every origin writes to the
-/// ledger; Telegram is a mirror") and the "sends must verify delivery" rule.
-///
-/// 1. **Send + verify** — `sink.send` resolves the origin persona's bot, calls
-///    the Telegram API, and returns `Ok(message_id)` ONLY when the API confirmed
-///    `ok:true` (see [`TelegramChannel::api_call`]); any other outcome is `Err`.
-///    On a transport/API failure it retries **once** before giving up.
-/// 2. **Ledger mirror** — on a confirmed send of a GROUP report-back, it appends
-///    an `agent` line to the canonical `.casa/group-feed.jsonl` the constellation
-///    pane reads, via the SAME [`casa_feed`] writer the conversation replies use.
-///    Gated to group origins (the pane is "our end of the family group chat"); a
-///    1:1 DM report-back never leaks into the shared pane. A feed-write failure is
-///    logged and swallowed so a full disk can't lose the Telegram delivery.
-///
-/// Exactly-once is the caller's FiredLog (`notification_id` = the source id,
-/// recorded before the send): a delivered `(task, event)` is never re-sent, so
-/// the line lands in the pane and in Telegram exactly once. Returns `Ok(())` when
-/// delivered, `Err` when BOTH attempts failed — the caller re-arms the FiredLog so
-/// a later tick retries rather than the human silently never hearing back.
-async fn deliver_lifecycle_fire(
-    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
-    delivery: &FamilyReplyDelivery,
-    fire: &worksgood::notify::lifecycle::LifecycleFire,
-) -> Result<()> {
-    use worksgood::graph::OriginChannel;
-    use worksgood::notify::telegram_conversation::ReplySink as _;
-
-    // Send AS the origin persona's bot (bot_id when known, else the persona id):
-    // the reply leaves via the same voice the human addressed, never a wrong face.
-    let bot_id = fire
-        .origin
-        .bot_id
-        .clone()
-        .unwrap_or_else(|| fire.origin.persona.clone());
-    let scope = if matches!(fire.origin.channel, OriginChannel::TelegramGroup) {
-        ReplyScope::Group
-    } else {
-        ReplyScope::Private
-    };
-    let sink = delivery.wrap(BorrowedReplySink(sink), scope, GuardPolicy::Enforce);
-
-    // DELIVERY VERIFICATION with a single retry. `send` bails on a non-`ok`
-    // Telegram response, so `Ok` here means the API accepted the message.
-    let mut result = sink.send(&bot_id, &fire.origin.chat_id, &fire.text).await;
-    if let Err(first) = &result {
-        eprintln!(
-            "[{}] lifecycle {} for {} send failed (attempt 1/2), retrying: {}",
-            chrono::Utc::now().format("%H:%M:%S"),
-            fire.event.slug(),
-            fire.task_id,
-            worksgood::notify::telegram::redact_bot_token(&format!("{first:#}")),
-        );
-        result = sink.send(&bot_id, &fire.origin.chat_id, &fire.text).await;
-    }
-    let message_id = result?.unwrap_or_default();
-
-    println!(
-        "[{}] {}",
-        chrono::Utc::now().format("%H:%M:%S"),
-        lifecycle_delivery_line(
-            fire.event.slug(),
-            &fire.task_id,
-            &fire.origin.chat_id,
-            &bot_id,
-            &message_id.to_string(),
-            &fire.text,
-        ),
-    );
-
-    Ok(())
-}
-
-/// The owner's DM chat for a dead-end escalation, and the bot that speaks it.
-///
-/// Uses only the explicit positive legacy top-level operator chat.
-///
-/// A helper bot's `chat_id` identifies a conversation, not who owns that
-/// conversation. Even when the helper is assigned the coordination domain, a
-/// positive id proves only that the target is a DM; it does not prove that the
-/// DM belongs to the household operator. Owner-facing alerts contain task
-/// details, so every per-helper target fails closed to the loud stderr record.
-/// Group/negative/empty legacy targets fail closed too. `None` means there is no
-/// proven private operator target; no persona or recipient is guessed.
-fn operator_alert_route(
-    config: &TelegramConfig,
-    _coordination_owner: Option<&str>,
-) -> Option<(String, String)> {
-    // Legacy single-bot operator chat, only when it is explicitly a private id.
-    if !config.bot_token.trim().is_empty()
-        && worksgood::notify::telegram::is_dm_chat_id(&config.chat_id)
-    {
-        return Some((String::new(), config.chat_id.clone()));
-    }
-    // A positive id proves only that a chat is private, not that its member is
-    // the coordination owner. Without an owner-bound or legacy operator target,
-    // deliberately fall through to the log-only path.
-    None
-}
-
-/// Deliver ONE dead-end operator alert — a family-origin task that failed with
-/// no retry behind it. The family already heard the honest "I've flagged it"
-/// line; this is the flag being raised, so the ask is never a dead end.
-///
-/// Loud on stderr FIRST (that record survives a missing/broken bot config),
-/// then best-effort DM'd through the explicit legacy operator target. Errors are
-/// reported, never propagated: a failed escalation must not abort the remaining
-/// report-backs.
-async fn deliver_operator_alert(
-    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
-    config: &TelegramConfig,
-    coordination_owner: Option<&str>,
-    alert: &worksgood::notify::lifecycle::OperatorAlert,
-) -> bool {
-    // DELIBERATELY NOT REDACTED, unlike the routing lines below it. This is the
-    // escalation of last resort: it fires precisely when the DM cannot be sent, and
-    // an operator reading it needs to know WHAT the family asked that dead-ended.
-    // Reducing it to a hash would leave the alert with nothing to act on. It
-    // carries no chat id, no sender id and no message id — the requester is a
-    // roster name the operator must be able to read.
-    eprintln!(
-        "[{}] DEAD-END family ask {} ({}): {}",
-        chrono::Utc::now().format("%H:%M:%S"),
-        alert.task_id,
-        if alert.requester.trim().is_empty() {
-            "unknown requester"
-        } else {
-            alert.requester.trim()
-        },
-        alert.text,
-    );
-    let Some((bot_id, chat_id)) = operator_alert_route(config, coordination_owner) else {
-        eprintln!(
-            "[{}] operator alert for {} not DM'd: no telegram bot/chat configured (logged only)",
-            chrono::Utc::now().format("%H:%M:%S"),
-            alert.task_id,
-        );
-        return false;
-    };
-    match sink.send(&bot_id, &chat_id, &alert.text).await {
-        Ok(_) => {
-            // The owner's DM chat id is the most personal identifier in this file.
-            println!(
-                "[{}] operator alert for {} → owner {} via {}",
-                chrono::Utc::now().format("%H:%M:%S"),
-                alert.task_id,
-                worksgood::notify::telegram::redact_chat_id(&chat_id),
-                if bot_id.is_empty() {
-                    "legacy bot"
-                } else {
-                    &bot_id
-                },
-            );
-            true
-        }
-        Err(e) => {
-            eprintln!(
-                "[{}] operator alert for {} FAILED to send: {}",
-                chrono::Utc::now().format("%H:%M:%S"),
-                alert.task_id,
-                worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
-            );
-            false
-        }
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct LifecycleDeliverySummary {
-    sent: usize,
-    undelivered: usize,
-    alerted: usize,
-    rearmed: usize,
-}
-
-/// One exact lifecycle suppressor that must be removed before a notification can
-/// be retried. Operator alerts have no pacing entry; family report-backs carry
-/// the one recipient whose `DigestStore.seen` entry must be reconciled.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-struct LifecycleRearmEntry {
-    notification_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    recipient: Option<String>,
-}
-
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct LifecycleRearmJournal {
-    #[serde(default)]
-    entries: Vec<LifecycleRearmEntry>,
-}
-
-fn lifecycle_rearm_path(log_path: &Path) -> PathBuf {
-    log_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("lifecycle-rearm.json")
-}
-
-fn load_lifecycle_rearm_journal(path: &Path) -> Result<LifecycleRearmJournal> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(body) => body,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LifecycleRearmJournal::default());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to read {}", path.display()));
-        }
-    };
-    let mut journal: LifecycleRearmJournal = serde_json::from_str(&body)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    for entry in &journal.entries {
-        let id = entry.notification_id.trim();
-        if id.is_empty()
-            || (!id.starts_with("lifecycle:") && !id.starts_with("lifecycle-alert:"))
-            || entry
-                .recipient
-                .as_deref()
-                .is_some_and(|recipient| recipient.trim().is_empty())
-            || (entry.recipient.is_some() && !id.starts_with("lifecycle:"))
-        {
-            anyhow::bail!(
-                "refusing invalid lifecycle reconciliation entry in {}",
-                path.display()
-            );
-        }
-    }
-    journal.entries.sort();
-    journal.entries.dedup();
-    Ok(journal)
-}
-
 /// Wake the listener's lifecycle runner when an interrupted update needs
 /// reconciliation, even if the stale FiredLog otherwise hides every transition.
 /// An unreadable journal also wakes the runner so the error is surfaced loudly
 /// instead of turning into permanent silence at the cheap pre-run gate.
 fn lifecycle_reconciliation_needs_tick(log_path: &Path) -> bool {
-    let path = lifecycle_rearm_path(log_path);
-    match load_lifecycle_rearm_journal(&path) {
+    let path = crate::casa::lifecycle::lifecycle_rearm_path(log_path);
+    match crate::casa::lifecycle::load_lifecycle_rearm_journal(&path) {
         Ok(journal) => !journal.entries.is_empty(),
         Err(_) => path.exists(),
     }
-}
-
-fn save_lifecycle_rearm_journal(path: &Path, journal: &LifecycleRearmJournal) -> Result<()> {
-    let body = serde_json::to_vec_pretty(journal)
-        .context("failed to serialize lifecycle reconciliation record")?;
-    worksgood::atomic_file::write_atomic(path, body)
-        .with_context(|| format!("failed to persist {}", path.display()))
-}
-
-/// Stage a new exact reconciliation set before either suppressor store changes.
-///
-/// A non-empty prior journal means startup reconciliation was skipped or failed;
-/// overwriting it could lose an older undelivered id, so fail loudly instead.
-fn stage_lifecycle_rearms(path: &Path, mut entries: Vec<LifecycleRearmEntry>) -> Result<()> {
-    entries.sort();
-    entries.dedup();
-    if entries.is_empty() {
-        return Ok(());
-    }
-    if !load_lifecycle_rearm_journal(path)?.entries.is_empty() {
-        anyhow::bail!(
-            "pending lifecycle reconciliation in {}; retry after it succeeds",
-            path.display()
-        );
-    }
-    save_lifecycle_rearm_journal(path, &LifecycleRearmJournal { entries })
-}
-
-fn clear_lifecycle_rearms(path: &Path) -> Result<()> {
-    // Atomically replace with an empty journal instead of unlinking. A crash can
-    // therefore expose either the complete old set or the complete empty set,
-    // never a torn/partly-cleared record.
-    save_lifecycle_rearm_journal(path, &LifecycleRearmJournal::default())
-}
-
-fn apply_lifecycle_rearms(
-    entries: &[LifecycleRearmEntry],
-    log: &mut worksgood::notify::reminder::FiredLog,
-    store: &mut worksgood::notify::daily_digest::DigestStore,
-) {
-    for entry in entries {
-        log.rearm(&entry.notification_id);
-        if let Some(recipient) = &entry.recipient {
-            store.rearm_lifecycle(recipient, &entry.notification_id);
-        }
-    }
-}
-
-/// Finish an interrupted two-file update before computing the next tick.
-///
-/// The journal contains only exact undelivered notification ids and their one
-/// pacing recipient. Reapplying removals is idempotent. The record remains until
-/// BOTH state files save, so a failure after either save is recoverable on the
-/// following process start without broad replay.
-fn reconcile_lifecycle_rearms(
-    log_path: &Path,
-    store_path: &Path,
-    log: &mut worksgood::notify::reminder::FiredLog,
-    store: &mut worksgood::notify::daily_digest::DigestStore,
-) -> Result<usize> {
-    let journal_path = lifecycle_rearm_path(log_path);
-    let journal = load_lifecycle_rearm_journal(&journal_path)?;
-    if journal.entries.is_empty() {
-        return Ok(0);
-    }
-    apply_lifecycle_rearms(&journal.entries, log, store);
-    log.save(log_path).with_context(|| {
-        format!(
-            "failed to reconcile lifecycle state in {}",
-            log_path.display()
-        )
-    })?;
-    store.save(store_path).with_context(|| {
-        format!(
-            "failed to reconcile lifecycle pacing state in {}",
-            store_path.display()
-        )
-    })?;
-    clear_lifecycle_rearms(&journal_path)?;
-    Ok(journal.entries.len())
-}
-
-fn lifecycle_result_rearms(
-    result: &worksgood::notify::lifecycle::LifecycleTickResult,
-) -> Vec<LifecycleRearmEntry> {
-    let family = result
-        .fired
-        .iter()
-        .chain(result.capped.iter())
-        .map(|fire| LifecycleRearmEntry {
-            notification_id: worksgood::notify::lifecycle::notification_id(
-                &fire.task_id,
-                fire.event,
-            ),
-            recipient: Some(fire.origin.requester.clone()),
-        });
-    let alerts = result
-        .operator_alerts
-        .iter()
-        .map(|alert| LifecycleRearmEntry {
-            notification_id: alert.notification_id.clone(),
-            recipient: None,
-        });
-    family.chain(alerts).collect()
-}
-
-/// Persist the record-before-transport state as a recoverable two-file update.
-///
-/// Nothing has been sent yet, so every result id is safe to re-arm if either
-/// state save fails. The exact journal is cleared before transport only after
-/// both saves succeed.
-fn persist_lifecycle_state_before_transport(
-    result: &worksgood::notify::lifecycle::LifecycleTickResult,
-    log: &worksgood::notify::reminder::FiredLog,
-    log_path: &Path,
-    store: &worksgood::notify::daily_digest::DigestStore,
-    store_path: &Path,
-) -> Result<()> {
-    let journal_path = lifecycle_rearm_path(log_path);
-    let entries = lifecycle_result_rearms(result);
-    stage_lifecycle_rearms(&journal_path, entries.clone())?;
-    log.save(log_path).with_context(|| {
-        format!(
-            "failed to persist lifecycle state to {}",
-            log_path.display()
-        )
-    })?;
-    store
-        .save(store_path)
-        .with_context(|| format!("failed to persist pacing state to {}", store_path.display()))?;
-    if !entries.is_empty() {
-        clear_lifecycle_rearms(&journal_path)?;
-    }
-    Ok(())
-}
-
-/// Deliver one tick's report-backs and alerts, then durably re-arm every
-/// notification whose transport was not confirmed.
-///
-/// `lifecycle_tick` records ids before transport so a process crash cannot
-/// duplicate a message that Telegram accepted. Once the process is still alive
-/// and both attempts have failed, keeping that id would instead turn a transient
-/// failure into permanent silence. Remove only the failed id from the fired log
-/// and lifecycle pacing set, then persist both before returning so the next tick
-/// can try again.
-fn deliver_lifecycle_tick_result(
-    sink: &dyn worksgood::notify::telegram_conversation::ReplySink,
-    family_delivery: &FamilyReplyDelivery,
-    config: &TelegramConfig,
-    coordination_owner: Option<&str>,
-    result: &worksgood::notify::lifecycle::LifecycleTickResult,
-    log: &mut worksgood::notify::reminder::FiredLog,
-    log_path: &Path,
-    store: &mut worksgood::notify::daily_digest::DigestStore,
-    store_path: &Path,
-) -> Result<LifecycleDeliverySummary> {
-    let mut summary = LifecycleDeliverySummary::default();
-    let mut failed_rearms = Vec::new();
-    if result.fired.is_empty() && result.operator_alerts.is_empty() {
-        return Ok(summary);
-    }
-
-    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
-    rt.block_on(async {
-        // DEAD-END ESCALATION FIRST. A family-origin task that failed with no
-        // retry behind it just told the family "I've flagged it so it isn't
-        // forgotten" — raising the flag is what makes that line true, so it
-        // goes out even if a report-back delivery below fails.
-        for alert in &result.operator_alerts {
-            if deliver_operator_alert(sink, config, coordination_owner, alert).await {
-                summary.alerted += 1;
-            } else {
-                failed_rearms.push(LifecycleRearmEntry {
-                    notification_id: alert.notification_id.clone(),
-                    recipient: None,
-                });
-            }
-        }
-        for fire in &result.fired {
-            match deliver_lifecycle_fire(sink, family_delivery, fire).await {
-                Ok(()) => summary.sent += 1,
-                Err(e) => {
-                    // Both attempts failed — surface it LOUDLY (matching the
-                    // web-inbound "make failure visible" rule) so a dropped
-                    // report-back can never masquerade as delivered in the log.
-                    summary.undelivered += 1;
-                    let notification_id =
-                        worksgood::notify::lifecycle::notification_id(&fire.task_id, fire.event);
-                    failed_rearms.push(LifecycleRearmEntry {
-                        notification_id,
-                        recipient: Some(fire.origin.requester.clone()),
-                    });
-                    eprintln!(
-                        "[{}] UNDELIVERED lifecycle {} for {} after 2 attempts; re-armed for the next tick: {}",
-                        chrono::Utc::now().format("%H:%M:%S"),
-                        fire.event.slug(),
-                        fire.task_id,
-                        worksgood::notify::telegram::redact_bot_token(&format!("{e:#}")),
-                    );
-                }
-            }
-        }
-    });
-
-    if !failed_rearms.is_empty() {
-        let journal_path = lifecycle_rearm_path(log_path);
-        stage_lifecycle_rearms(&journal_path, failed_rearms.clone())?;
-        for entry in &failed_rearms {
-            if log.rearm(&entry.notification_id) {
-                summary.rearmed += 1;
-            }
-            if let Some(recipient) = &entry.recipient {
-                store.rearm_lifecycle(recipient, &entry.notification_id);
-            }
-        }
-        log.save(log_path).with_context(|| {
-            format!(
-                "failed to persist re-armed lifecycle state to {}",
-                log_path.display()
-            )
-        })?;
-        store.save(store_path).with_context(|| {
-            format!(
-                "failed to persist re-armed lifecycle pacing state to {}",
-                store_path.display()
-            )
-        })?;
-        clear_lifecycle_rearms(&journal_path)?;
-    }
-    Ok(summary)
-}
-
-/// Report conversational tasks' progress back to the chats they came from — the
-/// `wg telegram lifecycle` seam (see [`crate::cli::TelegramCommands::Lifecycle`]).
-///
-/// Scans origin-stamped tasks (or the single `task_id`), derives each one's
-/// start/done/fail event from live status, renders the family-voice line in the
-/// composing persona's voice, and fires it exactly once — paced through the
-/// daily-digest choke point (time-critical but capped) and delivered to the
-/// origin chat via the origin persona's bot. `--dry-run` prints what would be
-/// sent where and touches no state; the real path persists the FiredLog +
-/// pacing store FIRST (restart-safe), then sends. A delivery that exhausts its
-/// retries is removed from both exactly-once stores and persisted again so the
-/// next tick retries it.
-pub fn run_lifecycle(
-    workgraph_dir: &Path,
-    task_id: Option<&str>,
-    dry_run: bool,
-    now_override: Option<&str>,
-    json: bool,
-    mock_send: bool,
-) -> Result<()> {
-    use worksgood::notify::daily_digest::{DigestPolicy, DigestStore};
-    use worksgood::notify::lifecycle::{self, LifecycleInput};
-    use worksgood::notify::reminder::FiredLog;
-    use worksgood::notify::telegram_conversation::{BotReplySink, ReplySink};
-
-    let root = project_root(workgraph_dir);
-    let now = match now_override {
-        Some(s) => parse_naive_now(s)
-            .with_context(|| format!("invalid --now '{s}', expected YYYY-MM-DDTHH:MM"))?,
-        None => chrono::Local::now().naive_local(),
-    };
-
-    // Live graph: gather origin-stamped tasks that owe a notification. A missing
-    // graph is not an error — there is simply nothing to report yet.
-    let graph_path = crate::commands::graph_path(workgraph_dir);
-    let graph = if graph_path.exists() {
-        worksgood::parser::load_graph(&graph_path).context("failed to load the task graph")?
-    } else {
-        worksgood::WorkGraph::new()
-    };
-    let mut inputs: Vec<LifecycleInput> = Vec::new();
-    for task in graph.tasks() {
-        if let Some(want) = task_id {
-            if task.id != want {
-                continue;
-            }
-        }
-        // Workers doing the work, for the "Nora and Bruno are on it" line: the
-        // assignee display name when it reads as a name, else the origin persona.
-        let workers = lifecycle_workers(task);
-        if let Some(input) = LifecycleInput::from_task(task, workers) {
-            inputs.push(input);
-        }
-    }
-
-    let log_path = FiredLog::path(&root);
-    let store_path = DigestStore::path(&root);
-    let mut log = FiredLog::load(&log_path);
-    let mut store = DigestStore::load(&store_path);
-    if !dry_run {
-        let reconciled = reconcile_lifecycle_rearms(&log_path, &store_path, &mut log, &mut store)?;
-        if reconciled > 0 {
-            eprintln!(
-                "[{}] reconciled {} undelivered lifecycle notification(s) before tick",
-                chrono::Utc::now().format("%H:%M:%S"),
-                reconciled,
-            );
-        }
-    }
-    let policy = DigestPolicy::default();
-    let config = load_telegram_config().unwrap_or_default();
-    let owner_map = ownership::OwnerMap::load(&root);
-    let coordination_owner = owner_map
-        .owner_for_domain(ownership::Domain::Coordination)
-        .map(str::to_string);
-
-    if dry_run {
-        // Compute against throwaway copies so a dry run records nothing.
-        let mut dry_log = log.clone();
-        let mut dry_store = store.clone();
-        let result = lifecycle::lifecycle_tick(&inputs, &mut dry_log, &mut dry_store, now, &policy);
-        if json {
-            let rows: Vec<_> = result
-                .fired
-                .iter()
-                .chain(result.capped.iter())
-                .map(|f| {
-                    serde_json::json!({
-                        "task": f.task_id,
-                        "event": f.event.slug(),
-                        "chat": f.origin.chat_id,
-                        "persona": f.origin.persona,
-                        "bot": f.origin.bot_id,
-                        "text": f.text,
-                        "capped": result.capped.iter().any(|c| c.task_id == f.task_id && c.event == f.event),
-                    })
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&rows)?);
-            let alerts: Vec<_> = result
-                .operator_alerts
-                .iter()
-                .map(|a| {
-                    let route =
-                        operator_alert_route(&config, coordination_owner.as_deref());
-                    serde_json::json!({
-                        "task": a.task_id,
-                        "operator_alert": true,
-                        "requester": a.requester,
-                        "bot": route.as_ref().map(|(bot, _)| if bot.is_empty() { "legacy bot" } else { bot.as_str() }),
-                        "chat": route.as_ref().map(|(_, chat)| chat.as_str()),
-                        "text": a.text,
-                    })
-                })
-                .collect();
-            if !alerts.is_empty() {
-                println!("{}", serde_json::to_string_pretty(&alerts)?);
-            }
-        } else if result.fired.is_empty()
-            && result.capped.is_empty()
-            && result.operator_alerts.is_empty()
-        {
-            println!(
-                "Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).",
-                now.format("%Y-%m-%d %H:%M")
-            );
-        } else {
-            for f in &result.fired {
-                println!("{}", lifecycle::dry_run_line(f));
-            }
-            for f in &result.capped {
-                println!(
-                    "[dry-run] (capped → folds into digest) {}",
-                    lifecycle::dry_run_line(f)
-                );
-            }
-            for a in &result.operator_alerts {
-                let route = operator_alert_route(&config, coordination_owner.as_deref());
-                println!(
-                    "{}",
-                    lifecycle::dry_run_alert_line(a, route.as_ref().map(|(bot, _)| bot.as_str()),)
-                );
-            }
-        }
-        return Ok(());
-    }
-
-    // Real firing: persist exactly-once + pacing state FIRST, then deliver.
-    let result = lifecycle::lifecycle_tick(&inputs, &mut log, &mut store, now, &policy);
-    persist_lifecycle_state_before_transport(&result, &log, &log_path, &store, &store_path)?;
-
-    let config = load_telegram_config().unwrap_or_default();
-    let family_delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
-    // The ONE-PATH writer: lifecycle report-backs leave through the same
-    // `ReplySink` the conversation replies use, so a group report-back both
-    // reaches Telegram AND lands in the canonical `.casa/group-feed.jsonl` the
-    // constellation pane reads — no more sends that bypass the ledger (docs/20).
-    // `--mock-send` swaps in a network-free recorder so the cross-surface smoke
-    // exercises the real tick + real feed mirror without a live bot.
-    let sink: Box<dyn ReplySink> = if mock_send {
-        Box::new(RecordingSink::default())
-    } else {
-        Box::new(BotReplySink::new(config.clone()))
-    };
-    let delivery_summary = deliver_lifecycle_tick_result(
-        sink.as_ref(),
-        &family_delivery,
-        &config,
-        coordination_owner.as_deref(),
-        &result,
-        &mut log,
-        &log_path,
-        &mut store,
-        &store_path,
-    )?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "fired": result.fired.len(),
-                "sent": delivery_summary.sent,
-                "undelivered": delivery_summary.undelivered,
-                "capped": result.capped.len(),
-                "operator_alerts": result.operator_alerts.len(),
-                "operator_alerts_sent": delivery_summary.alerted,
-            })
-        );
-    } else if result.fired.is_empty()
-        && result.capped.is_empty()
-        && result.operator_alerts.is_empty()
-    {
-        println!(
-            "Nothing to report at {} (family-local; the telegram.log delivery lines are UTC).",
-            now.format("%Y-%m-%d %H:%M")
-        );
-    }
-    Ok(())
-}
-
-/// The persona name(s) doing a task's work, for the "on it" line: the task's
-/// assignee display name when it reads like a plain roster name (not an agent
-/// content-hash), else the origin persona so the line still names a voice.
-fn lifecycle_workers(task: &worksgood::graph::Task) -> Vec<String> {
-    // The SAME family-voice gate the composer enforces (morning-taco-bugs): a
-    // raw worker id ("agent-2972"), task id, or content hash is not a speakable
-    // name, so the "on it" line falls back to the owning persona instead of
-    // leaking "Agent-2972 is on it 🍳" into the family group.
-    if let Some(a) = task
-        .assigned
-        .as_deref()
-        .filter(|a| worksgood::notify::lifecycle::is_family_safe_name(a))
-    {
-        return vec![a.to_string()];
-    }
-    Vec::new()
 }
 
 /// `wg telegram standup` — run a standup on demand (for the live demo and the
@@ -6024,7 +4917,7 @@ mod tests {
 
     #[test]
     fn the_lifecycle_delivery_line_carries_no_raw_chat_or_text() {
-        let line = lifecycle_delivery_line(
+        let line = crate::casa::lifecycle::lifecycle_delivery_line(
             "task-done",
             "week-start-engine",
             DM_CHAT,
@@ -6045,7 +4938,9 @@ mod tests {
     fn a_token_shaped_value_never_survives_a_log_line() {
         let dup = duplicate_drop_line(TOKEN_ISH, TOKEN_ISH, 0, TOKEN_ISH, TOKEN_ISH);
         assert_opaque(&dup, &[TOKEN_ISH, "AAH_fakefakefakefakefakefakefake-fake"]);
-        let life = lifecycle_delivery_line("x", "t", TOKEN_ISH, "b", TOKEN_ISH, TOKEN_ISH);
+        let life = crate::casa::lifecycle::lifecycle_delivery_line(
+            "x", "t", TOKEN_ISH, "b", TOKEN_ISH, TOKEN_ISH,
+        );
         assert_opaque(&life, &[TOKEN_ISH, "AAH_fakefakefakefakefakefakefake-fake"]);
     }
 
@@ -6068,7 +4963,7 @@ mod tests {
         "2026-07-10T12:00:00Z".parse().unwrap()
     }
 
-    // --- command_gate (fix-command-leaks) ---------------------------------
+    // --- crate::casa::command_gate::command_gate (fix-command-leaks) ---------------------------------
 
     fn gate_msg(chat_type: &str, has_bot_command: bool) -> worksgood::notify::IncomingMessage {
         worksgood::notify::IncomingMessage {
@@ -6096,9 +4991,9 @@ mod tests {
     #[test]
     fn command_gate_blocks_non_slash_everywhere() {
         // Punctuation / chatter (no bot_command) is never a command — the leak.
-        let g = command_gate(&gate_msg("supergroup", false));
+        let g = crate::casa::command_gate::command_gate(&gate_msg("supergroup", false));
         assert!(!g.family && !g.operator, "no slash entity → no command");
-        let g = command_gate(&gate_msg("private", false));
+        let g = crate::casa::command_gate::command_gate(&gate_msg("private", false));
         assert!(
             !g.family && !g.operator,
             "no slash entity → no command in DM either"
@@ -6109,7 +5004,7 @@ mod tests {
     fn command_gate_operator_reference_never_in_a_group() {
         // Even a genuine slash command in a family GROUP must NOT open the
         // operator claim/done path — that content is coordinator-only.
-        let g = command_gate(&gate_msg("supergroup", true));
+        let g = crate::casa::command_gate::command_gate(&gate_msg("supergroup", true));
         assert!(
             g.family,
             "a real /command still runs the family set in a group"
@@ -6124,7 +5019,7 @@ mod tests {
     fn command_gate_operator_only_in_private_slash() {
         // A 1:1 operator DM with a real slash command is the only place the
         // operator reference may run.
-        let g = command_gate(&gate_msg("private", true));
+        let g = crate::casa::command_gate::command_gate(&gate_msg("private", true));
         assert!(
             g.operator,
             "operator reference is allowed in a 1:1 slash command"
@@ -7831,7 +6726,7 @@ domains = ["coordination"]
         for reverse in [false, true] {
             let config = config_with_order(reverse);
             assert_eq!(
-                operator_alert_route(&config, Some("night-orbit")),
+                crate::casa::lifecycle::operator_alert_route(&config, Some("night-orbit")),
                 None,
                 "coordination ownership does not prove who owns a helper bot's private chat",
             );
@@ -7859,7 +6754,7 @@ domains = ["coordination"]
             let owner = owner_map.owner_for_domain(ownership::Domain::Coordination);
             assert_eq!(owner, None);
             assert_eq!(
-                operator_alert_route(&legacy, owner),
+                crate::casa::lifecycle::operator_alert_route(&legacy, owner),
                 Some((String::new(), "7003".to_string())),
                 "missing or malformed ownership must retain the explicit legacy route",
             );
@@ -7881,12 +6776,15 @@ domains = ["coordination"]
             bots,
         };
         assert_eq!(
-            operator_alert_route(&one_bot, None),
+            crate::casa::lifecycle::operator_alert_route(&one_bot, None),
             None,
             "an arbitrary private member chat is not an owner-alert fallback",
         );
 
-        assert_eq!(operator_alert_route(&TelegramConfig::default(), None), None);
+        assert_eq!(
+            crate::casa::lifecycle::operator_alert_route(&TelegramConfig::default(), None),
+            None
+        );
         let alert = worksgood::notify::lifecycle::OperatorAlert {
             task_id: "stalled-entry-key".to_string(),
             requester: "Household Member".to_string(),
@@ -7930,7 +6828,7 @@ domains = ["coordination"]
         };
 
         assert_eq!(
-            operator_alert_route(&config, Some("configured-owner")),
+            crate::casa::lifecycle::operator_alert_route(&config, Some("configured-owner")),
             None,
             "normal negative family-group ids must never masquerade as an owner DM",
         );
@@ -7944,7 +6842,7 @@ domains = ["coordination"]
         let sink = RecordingSink::default();
         let rt = tokio::runtime::Runtime::new().unwrap();
         assert!(
-            !rt.block_on(deliver_operator_alert(
+            !rt.block_on(crate::casa::lifecycle::deliver_operator_alert(
                 &sink,
                 &config,
                 Some("configured-owner"),
@@ -7971,7 +6869,10 @@ domains = ["coordination"]
             )]),
         };
         assert_eq!(
-            operator_alert_route(&unrelated_private, Some("configured-owner")),
+            crate::casa::lifecycle::operator_alert_route(
+                &unrelated_private,
+                Some("configured-owner")
+            ),
             None,
             "a positive private id is not proof that the chat belongs to the owner",
         );
@@ -8067,11 +6968,15 @@ domains = ["coordination"]
         );
 
         // Web collective callers share the explicit occurrence id across voices.
-        let web_first =
-            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-a"), None);
+        let web_first = crate::casa::plan_edits::web_physical_turn_key(
+            "-100700",
+            "hello household",
+            Some("turn-fixture-a"),
+            None,
+        );
         assert_eq!(
             web_first,
-            web_physical_turn_key(
+            crate::casa::plan_edits::web_physical_turn_key(
                 "-100700",
                 "body changes do not matter on a true refire",
                 Some("turn-fixture-a"),
@@ -8081,7 +6986,12 @@ domains = ["coordination"]
         );
         assert_ne!(
             web_first,
-            web_physical_turn_key("-100700", "hello household", Some("turn-fixture-b"), None),
+            crate::casa::plan_edits::web_physical_turn_key(
+                "-100700",
+                "hello household",
+                Some("turn-fixture-b"),
+                None
+            ),
             "a later web occurrence gets a fresh collective key even with identical words",
         );
     }
@@ -8103,21 +7013,30 @@ domains = ["coordination"]
             "telegram-turn-b3-v1-5c81580a6d5538a35b1233961550e48f16c2f8633615ecb2501491deb9673a83",
         );
 
-        let web_turn =
-            web_physical_turn_key("-100700", "hello household", Some("opaque-turn-a7"), None);
+        let web_turn = crate::casa::plan_edits::web_physical_turn_key(
+            "-100700",
+            "hello household",
+            Some("opaque-turn-a7"),
+            None,
+        );
         assert_eq!(
             web_turn,
             "web-turn-b3-v1-62753b68ec0fbd6e844d7728ecd3ce10560f707a7ef63f394b400dc60eeaa930",
         );
         assert_eq!(
-            web_physical_turn_key("-100700", "hello household", None, None),
+            crate::casa::plan_edits::web_physical_turn_key(
+                "-100700",
+                "hello household",
+                None,
+                None
+            ),
             "web-turn-b3-v1-6debece65596fe4ed96650f648c8ee482b351c65978c3dfd5bb9652ad7168fab",
         );
         // The attempt-bearing key is its own durable vector: the turn ledger it
         // keys lives on disk across restarts and upgrades, so changing this
         // digest silently orphans every entry a running gateway already wrote.
         assert_eq!(
-            web_physical_turn_key(
+            crate::casa::plan_edits::web_physical_turn_key(
                 "-100700",
                 "hello household",
                 Some("opaque-turn-a7"),
@@ -8212,7 +7131,8 @@ domains = ["coordination"]
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 22).unwrap();
         let words = "add oat milk to the shopping list";
-        let first_key = web_physical_turn_key("-100700", words, Some("turn-a"), None);
+        let first_key =
+            crate::casa::plan_edits::web_physical_turn_key("-100700", words, Some("turn-a"), None);
 
         // First invocation applies once and retains canonical bytes when the
         // transport fails.
@@ -8310,7 +7230,8 @@ domains = ["coordination"]
 
         // Identical words with a later occurrence id remain a new household
         // turn and therefore apply + deliver once of their own.
-        let later_key = web_physical_turn_key("-100700", words, Some("turn-b"), None);
+        let later_key =
+            crate::casa::plan_edits::web_physical_turn_key("-100700", words, Some("turn-b"), None);
         run_web_fast_lane_occurrence(
             &workgraph_dir,
             root,
@@ -8664,29 +7585,55 @@ domains = ["coordination"]
         let voice = "voice-3";
         let words = "start the week";
 
-        let first = web_physical_turn_key(chat, words, Some("turn-a7"), Some("attempt-1"));
+        let first = crate::casa::plan_edits::web_physical_turn_key(
+            chat,
+            words,
+            Some("turn-a7"),
+            Some("attempt-1"),
+        );
         assert_eq!(
             first,
-            web_physical_turn_key(chat, words, Some("turn-a7"), Some("attempt-1")),
+            crate::casa::plan_edits::web_physical_turn_key(
+                chat,
+                words,
+                Some("turn-a7"),
+                Some("attempt-1")
+            ),
             "a true refire — same turn, same attempt — must stay one occurrence",
         );
-        let retry = web_physical_turn_key(chat, words, Some("turn-a7"), Some("attempt-2"));
+        let retry = crate::casa::plan_edits::web_physical_turn_key(
+            chat,
+            words,
+            Some("turn-a7"),
+            Some("attempt-2"),
+        );
         assert_ne!(
             first, retry,
             "a new attempt on the same turn must not be suppressed as already-answered",
         );
         assert_ne!(
             first,
-            web_physical_turn_key(chat, words, Some("turn-b9"), Some("attempt-1")),
+            crate::casa::plan_edits::web_physical_turn_key(
+                chat,
+                words,
+                Some("turn-b9"),
+                Some("attempt-1")
+            ),
             "a later turn stays distinct even when the attempt counter repeats",
         );
 
         // An absent — or blank — attempt is the LEGACY key, byte for byte, so an
         // older gateway's live ledger entries keep replaying after this change.
-        let legacy = web_physical_turn_key(chat, words, Some("turn-a7"), None);
+        let legacy =
+            crate::casa::plan_edits::web_physical_turn_key(chat, words, Some("turn-a7"), None);
         assert_eq!(
             legacy,
-            web_physical_turn_key(chat, words, Some("turn-a7"), Some("   ")),
+            crate::casa::plan_edits::web_physical_turn_key(
+                chat,
+                words,
+                Some("turn-a7"),
+                Some("   ")
+            ),
             "a blank attempt id is no attempt id",
         );
         assert_ne!(
@@ -8707,7 +7654,12 @@ domains = ["coordination"]
             web_inbound_request_id(
                 chat,
                 voice,
-                &web_physical_turn_key(chat, words, Some("turn-a7"), Some("attempt-1")),
+                &crate::casa::plan_edits::web_physical_turn_key(
+                    chat,
+                    words,
+                    Some("turn-a7"),
+                    Some("attempt-1")
+                ),
             ),
         );
         assert_ne!(
@@ -8722,9 +7674,24 @@ domains = ["coordination"]
         let chat = "-100777";
         let voice = "voice-3";
         let words = "please help with the weekend";
-        let first_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"), None);
-        let refire_key = web_physical_turn_key(chat, words, Some("opaque-turn-a7"), None);
-        let later_key = web_physical_turn_key(chat, words, Some("opaque-turn-b9"), None);
+        let first_key = crate::casa::plan_edits::web_physical_turn_key(
+            chat,
+            words,
+            Some("opaque-turn-a7"),
+            None,
+        );
+        let refire_key = crate::casa::plan_edits::web_physical_turn_key(
+            chat,
+            words,
+            Some("opaque-turn-a7"),
+            None,
+        );
+        let later_key = crate::casa::plan_edits::web_physical_turn_key(
+            chat,
+            words,
+            Some("opaque-turn-b9"),
+            None,
+        );
 
         let first = web_inbound_request_id(chat, voice, &first_key);
         let refire = web_inbound_request_id(chat, voice, &refire_key);
@@ -8740,14 +7707,24 @@ domains = ["coordination"]
 
         // Missing WG_TURN_ID retains the legacy trimmed-body fallback for an
         // older gateway, including its original refire behavior.
-        let fallback = web_physical_turn_key(chat, words, None, None);
+        let fallback = crate::casa::plan_edits::web_physical_turn_key(chat, words, None, None);
         assert_eq!(
             fallback,
-            web_physical_turn_key(chat, "  please help with the weekend  ", None, None),
+            crate::casa::plan_edits::web_physical_turn_key(
+                chat,
+                "  please help with the weekend  ",
+                None,
+                None
+            ),
         );
         assert_ne!(
             fallback,
-            web_physical_turn_key(chat, "a different legacy message", None, None),
+            crate::casa::plan_edits::web_physical_turn_key(
+                chat,
+                "a different legacy message",
+                None,
+                None
+            ),
         );
         assert_ne!(first, web_inbound_request_id("-100888", voice, &first_key),);
         assert_ne!(first, web_inbound_request_id(chat, "voice-8", &first_key),);
@@ -9709,7 +8686,7 @@ domains = ["coordination"]
         );
     }
 
-    /// ITEM 8, at the ENGINE seam. `web_physical_turn_key()` hashes the turn for
+    /// ITEM 8, at the ENGINE seam. `crate::casa::plan_edits::web_physical_turn_key()` hashes the turn for
     /// the internal delivery digest; that hash must never reach the causal
     /// position. `canonical_turn_id` refuses it, so the row is written UNBOUND
     /// and NO receipt is minted — rather than a receipt carrying an id that can
@@ -10605,8 +9582,10 @@ domains = ["coordination"]
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
-            .unwrap();
+        rt.block_on(crate::casa::lifecycle::deliver_lifecycle_fire(
+            &sink, &delivery, &fire,
+        ))
+        .unwrap();
 
         // Telegram: exactly one send.
         assert_eq!(
@@ -10641,8 +9620,10 @@ domains = ["coordination"]
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
-            .unwrap();
+        rt.block_on(crate::casa::lifecycle::deliver_lifecycle_fire(
+            &sink, &delivery, &fire,
+        ))
+        .unwrap();
 
         assert_eq!(
             sink.sends.lock().unwrap().len(),
@@ -10668,8 +9649,10 @@ domains = ["coordination"]
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire))
-            .unwrap();
+        rt.block_on(crate::casa::lifecycle::deliver_lifecycle_fire(
+            &sink, &delivery, &fire,
+        ))
+        .unwrap();
 
         assert_eq!(
             sink.attempts.lock().unwrap().len(),
@@ -10685,7 +9668,7 @@ domains = ["coordination"]
 
     #[test]
     fn lifecycle_send_that_fails_twice_errors_and_does_not_mirror() {
-        // Both attempts fail → Err (so run_lifecycle re-arms the FiredLog) and the
+        // Both attempts fail → Err (so crate::casa::lifecycle::run_lifecycle re-arms the FiredLog) and the
         // undelivered line must NOT appear in the pane (no phantom "Done!").
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
@@ -10698,7 +9681,9 @@ domains = ["coordination"]
         );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let res = rt.block_on(deliver_lifecycle_fire(&sink, &delivery, &fire));
+        let res = rt.block_on(crate::casa::lifecycle::deliver_lifecycle_fire(
+            &sink, &delivery, &fire,
+        ));
 
         assert!(
             res.is_err(),
@@ -10755,7 +9740,7 @@ domains = ["coordination"]
         assert_eq!(first.fired.len(), 1);
 
         std::fs::create_dir_all(&blocked_store_path).unwrap();
-        let failure = persist_lifecycle_state_before_transport(
+        let failure = crate::casa::lifecycle::persist_lifecycle_state_before_transport(
             &first,
             &log,
             &log_path,
@@ -10774,10 +9759,12 @@ domains = ["coordination"]
             "the first state file was durably written before the injected failure",
         );
         assert_eq!(
-            load_lifecycle_rearm_journal(&lifecycle_rearm_path(&log_path))
-                .unwrap()
-                .entries
-                .len(),
+            crate::casa::lifecycle::load_lifecycle_rearm_journal(
+                &crate::casa::lifecycle::lifecycle_rearm_path(&log_path)
+            )
+            .unwrap()
+            .entries
+            .len(),
             1,
         );
         assert!(
@@ -10788,7 +9775,7 @@ domains = ["coordination"]
 
         let mut reloaded_log = FiredLog::load(&log_path);
         let mut reloaded_store = DigestStore::load(&store_path);
-        reconcile_lifecycle_rearms(
+        crate::casa::lifecycle::reconcile_lifecycle_rearms(
             &log_path,
             &store_path,
             &mut reloaded_log,
@@ -10857,8 +9844,14 @@ domains = ["coordination"]
         assert_eq!(first.operator_alerts.len(), 1);
         assert!(log.contains(&lifecycle_id));
         assert!(log.contains(&alert_id));
-        persist_lifecycle_state_before_transport(&first, &log, &log_path, &store, &store_path)
-            .unwrap();
+        crate::casa::lifecycle::persist_lifecycle_state_before_transport(
+            &first,
+            &log,
+            &log_path,
+            &store,
+            &store_path,
+        )
+        .unwrap();
 
         let mut bots = HashMap::new();
         bots.insert(
@@ -10879,7 +9872,7 @@ domains = ["coordination"]
         let failing_sink = FlakySink::new(3);
         let blocked_store_path = dir.path().join(".casa").join("blocked-store");
         std::fs::create_dir(&blocked_store_path).unwrap();
-        let failure = deliver_lifecycle_tick_result(
+        let failure = crate::casa::lifecycle::deliver_lifecycle_tick_result(
             &failing_sink,
             &delivery,
             &config,
@@ -10902,9 +9895,9 @@ domains = ["coordination"]
             3,
             "one owner-alert attempt plus two family-delivery attempts",
         );
-        let journal_path = lifecycle_rearm_path(&log_path);
+        let journal_path = crate::casa::lifecycle::lifecycle_rearm_path(&log_path);
         assert_eq!(
-            load_lifecycle_rearm_journal(&journal_path)
+            crate::casa::lifecycle::load_lifecycle_rearm_journal(&journal_path)
                 .unwrap()
                 .entries
                 .len(),
@@ -10932,7 +9925,7 @@ domains = ["coordination"]
             "the stale pacing file really would suppress the family retry",
         );
         assert_eq!(
-            reconcile_lifecycle_rearms(
+            crate::casa::lifecycle::reconcile_lifecycle_rearms(
                 &log_path,
                 &store_path,
                 &mut reloaded_log,
@@ -10942,7 +9935,7 @@ domains = ["coordination"]
             2,
         );
         assert!(
-            load_lifecycle_rearm_journal(&journal_path)
+            crate::casa::lifecycle::load_lifecycle_rearm_journal(&journal_path)
                 .unwrap()
                 .entries
                 .is_empty(),
@@ -10969,7 +9962,7 @@ domains = ["coordination"]
         );
 
         // A confirmed second-tick delivery becomes durable exactly once again.
-        persist_lifecycle_state_before_transport(
+        crate::casa::lifecycle::persist_lifecycle_state_before_transport(
             &second,
             &reloaded_log,
             &log_path,
@@ -10978,7 +9971,7 @@ domains = ["coordination"]
         )
         .unwrap();
         let succeeding_sink = RecordingSink::default();
-        let delivered = deliver_lifecycle_tick_result(
+        let delivered = crate::casa::lifecycle::deliver_lifecycle_tick_result(
             &succeeding_sink,
             &delivery,
             &config,

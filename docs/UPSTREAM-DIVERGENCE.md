@@ -161,6 +161,7 @@ the slices below move ours OUT to `src/casa/`, a path upstream does not have.
 | 6 | `casa/feed_write.rs`; `run_discuss` → `casa/dryruns.rs` | 12,555 → 12,210 | 5 → 5 |
 | 7a | `casa/group.rs` — collective + discussion rounds | 12,210 → 11,903 | 5 → 5 |
 | 8 | `casa/plan_edits.rs` + 3 more one-shots | 11,903 → 11,507 | 5 → 5 |
+| 9 | `casa/lifecycle.rs`, `casa/command_gate.rs`, + 2 extended | 11,507 → 10,500 | 5 → 5 |
 
 Slice 3 went the wrong way on the marker count, deliberately and once:
 `resolve_dm_target` is ours (absent upstream at the fork point and on `gwwg/main`
@@ -189,10 +190,20 @@ Run against every remaining `pub fn run_*` of ours, that gives:
 | `run_decide` | 313 | 7 | 28 | `run_listen`, `try_confirm_binding` |
 | `run_web_inbound` | 1,355 | 25 | 127 | `run_listen` |
 
-Slice 8 took the four zero-test-ref rows. What is left and still clean: `run_compose_prompt`,
-`run_week_start` and `run_lifecycle` — 1,077 lines needing nothing of upstream's, just test
-references to repoint. `run_decide` and `run_web_inbound` are the only ones that genuinely
-touch upstream's listener, and the table is the reason to stop reaching for them.
+Slice 8 took the four zero-test-ref rows; slice 9 took the remaining three clean ones
+(`run_lifecycle`, `run_week_start`, `run_compose_prompt` — 1,091 lines, 26 items, still zero
+exposures). **That exhausts the clean list.** `run_decide` and `run_web_inbound` are the only
+candidates left, and both genuinely need upstream's `run_listen`; the table is the reason to
+stop reaching for them rather than a queue.
+
+Slice 9 also cheapened whatever comes next: `command_gate` moved, so `run_decide` now needs
+only `try_confirm_binding` instead of two things.
+
+**One cost worth naming.** Moving a struct out of the file that reads its fields makes those
+fields private across the boundary, so `WebFastLaneOutcome` (4 fields) and
+`LifecycleDeliverySummary`/`LifecycleRearmJournal` (4 more) needed `pub(crate)` FIELDS. That is
+a different and smaller kind of exposure than a `pub(crate) fn` — the function count stayed at
+5 — but it is exposure, and a future slice that moves the readers will take it back.
 
 ### Slice 7b was attempted and reverted — read this before trying again
 
