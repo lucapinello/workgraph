@@ -159,12 +159,25 @@ the slices below move ours OUT to `src/casa/`, a path upstream does not have.
 | 4 | `casa/one_shot_answers.rs` — `owner`, `parity`, `capability` | 13,536 → 13,317 | 6 → 6 |
 | 5 | `casa/digest.rs`, `casa/dryruns.rs`, `casa/elect.rs` | 13,317 → 12,555 | 6 → **5** |
 | 6 | `casa/feed_write.rs`; `run_discuss` → `casa/dryruns.rs` | 12,555 → 12,210 | 5 → 5 |
+| 7a | `casa/group.rs` — collective + discussion rounds | 12,210 → 11,903 | 5 → 5 |
 
 Slice 3 went the wrong way on the marker count, deliberately and once:
 `resolve_dm_target` is ours (absent upstream at the fork point and on `gwwg/main`
 today) but still has one caller and two tests in their file, so it is exposed rather
 than dragged out with its tests. It follows the DM path out when that is extracted.
 The marker is the recorded price of a 537-line reduction, not an oversight.
+
+Slice 7a overturned an earlier verdict of my own. The first pass at `run_web_inbound` said it
+"needs three new `pub(crate)` markers" because `run_group_collective`, `run_group_discussion`
+and `web_physical_turn_key` are also called from upstream's `run_listen`. Checking provenance
+instead of assuming: all three are OURS — absent upstream at the fork point and on `gwwg/main`
+today — and the `run_listen` call sites are our own added lines. So they MOVE and their file
+imports them; exposure would have kept our code there and added a marker. Same for
+`collective_request_id`, shared with `run_listen` but ours.
+
+The lesson generalises: "shared with a function that stays" is not the same as "must be
+exposed". Ask who owns it first. Exposure is only forced when the helper is genuinely
+upstream's.
 
 Slice 6 tripped a guard, correctly. `notify/casa_audience.rs` pins the EXACT set of engine
 feed-writer files, and moving `run_feed_write` changed it — so the lib suite went

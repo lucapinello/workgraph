@@ -731,6 +731,11 @@ fn git_head_sha(dir: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+// TEST-ONLY since the call sites moved to `worktree_preserve_reason`, which needs the
+// classification and not just a bool. Kept because two fixtures assert on dirtiness
+// directly, and `#[cfg(test)]` is honest about that rather than leaving a dead-code
+// warning for the next reader to wonder about.
+#[cfg(test)]
 fn worktree_dirty(path: &Path) -> bool {
     !matches!(
         worktree_dirt(path),
