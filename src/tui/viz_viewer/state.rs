@@ -33393,7 +33393,17 @@ mod chat_pty_executor_resolution_tests {
         // discovery the production path uses, so a host WITH pi still runs
         // every assertion below.
         if !worksgood::executor_discovery::pi_route_availability().satisfiable() {
-            eprintln!(
+            // STDOUT, not stderr. Upstream's `tui_runtime_never_writes_process_stderr` guard
+            // forbids the stderr-printing macro anywhere in these files, because ratatui may
+            // own the alternate screen. These three notices are OURS and test-only, but the
+            // guard reads each file whole and had been RED long enough to get waved past as
+            // "pre-existing". cargo captures both streams per test identically, so the notice
+            // is exactly as loud as before.
+            //
+            // This comment deliberately does not NAME that macro: the guard is a substring
+            // sweep, so a comment mentioning it trips the very check it explains — which is how
+            // the first attempt at this fix stayed red.
+            println!(
                 "SKIP {}: no pi route on this host",
                 "pi_pane_uses_uuid_session_dir_after_legacy_transcript_migration"
             );
@@ -33901,7 +33911,17 @@ mod prioritized_chat_startup_tests {
         // discovery the production path uses, so a host WITH pi still runs
         // every assertion below.
         if !worksgood::executor_discovery::pi_route_availability().satisfiable() {
-            eprintln!(
+            // STDOUT, not stderr. Upstream's `tui_runtime_never_writes_process_stderr` guard
+            // forbids the stderr-printing macro anywhere in these files, because ratatui may
+            // own the alternate screen. These three notices are OURS and test-only, but the
+            // guard reads each file whole and had been RED long enough to get waved past as
+            // "pre-existing". cargo captures both streams per test identically, so the notice
+            // is exactly as loud as before.
+            //
+            // This comment deliberately does not NAME that macro: the guard is a substring
+            // sweep, so a comment mentioning it trips the very check it explains — which is how
+            // the first attempt at this fix stayed red.
+            println!(
                 "SKIP {}: no pi route on this host",
                 "new_pi_chat_plan_keeps_exact_atomic_pi_route"
             );
@@ -33963,7 +33983,17 @@ mod prioritized_chat_startup_tests {
         // discovery the production path uses, so a host WITH pi still runs
         // every assertion below.
         if !worksgood::executor_discovery::pi_route_availability().satisfiable() {
-            eprintln!(
+            // STDOUT, not stderr. Upstream's `tui_runtime_never_writes_process_stderr` guard
+            // forbids the stderr-printing macro anywhere in these files, because ratatui may
+            // own the alternate screen. These three notices are OURS and test-only, but the
+            // guard reads each file whole and had been RED long enough to get waved past as
+            // "pre-existing". cargo captures both streams per test identically, so the notice
+            // is exactly as loud as before.
+            //
+            // This comment deliberately does not NAME that macro: the guard is a substring
+            // sweep, so a comment mentioning it trips the very check it explains — which is how
+            // the first attempt at this fix stayed red.
+            println!(
                 "SKIP {}: no pi route on this host",
                 "selecting_dead_live_chat_resurrects_saved_route"
             );
