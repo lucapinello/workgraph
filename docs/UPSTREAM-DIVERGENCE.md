@@ -167,6 +167,36 @@ today) but still has one caller and two tests in their file, so it is exposed ra
 than dragged out with its tests. It follows the DM path out when that is extracted.
 The marker is the recorded price of a 537-line reduction, not an oversight.
 
+### Slice 7b was attempted and reverted — read this before trying again
+
+The `run_web_inbound` cluster is NOT a clean slice, and the first two scopings of it were both
+wrong. Recorded so the third does not repeat them.
+
+**Scoping error 1: only `fn` was scanned.** The moving set came out as 19 functions / 1,548
+lines / 0 exposures, the cut was applied, and the compiler produced 77 errors for items that
+were never in the set at all — `WebFastLaneOutcome`, `WebFastLaneDispatch`, `WebDefaultOwner`,
+`WebDefaultOwnerResolution`, `NeedsContactReason`, `WEB_FAST_LANE_OCCURRENCE_DOMAIN`. Structs,
+enums and consts belong to a cluster exactly as much as its functions do. Same class of
+omission as slice 5's test-module callers: the analysis answered a narrower question than the
+one that mattered.
+
+**Scoping error 2: call sites, not references.** Matching `name(` finds callers of a function
+and misses every other mention — a type in a signature, a const in a match arm. Re-run over
+all item kinds with word-boundary references, the honest picture is 17 items that upstream's
+`run_listen` also touches, `run_listen` itself among the names.
+
+**What that means.** Unlike slices 1–7a, this cluster is genuinely interleaved with upstream's
+listener rather than merely called from it. By the slice-7a rule most of those items are ours
+and could still move with imports back, but the result is a ~1,500-line move touching the
+family's live inbound path, and the value per unit of risk is much lower than any slice so far.
+Reverted rather than forced: `git checkout` of `commands/telegram.rs`, `main.rs`, `casa/mod.rs`
+plus deleting the two new modules, verified back to 0 dirty files, 0 build errors, lib 3926/0
+and bin 4049/0.
+
+**If you take this on:** scope it over ALL item kinds with reference matching, expect the
+`WebFastLane*` types to come along, do it on its own branch, and prove it with the human-flow
+suite plus a real message through the web pane — not with a build.
+
 Slice 7a overturned an earlier verdict of my own. The first pass at `run_web_inbound` said it
 "needs three new `pub(crate)` markers" because `run_group_collective`, `run_group_discussion`
 and `web_physical_turn_key` are also called from upstream's `run_listen`. Checking provenance
