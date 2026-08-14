@@ -23,6 +23,27 @@
 use anyhow::Result;
 use std::path::Path;
 
+/// How to describe an owner lookup, keeping "nobody owns this" apart from "there was
+/// nothing to look in".
+///
+/// Without `--root` there is no `household.toml` to read, so the map is empty BY
+/// CONSTRUCTION — and this used to print the authoritative-sounding "no persona lists this
+/// domain" for every ask, from a lookup that never happened. On the live house that reads
+/// as a routing failure: `telegram owner "should we move Thursday's dinner?"` said
+/// unresolved, while the same ask WITH `--root` resolves to `nora` off a roster that was
+/// correct all along. It is the distinction the human-flow pre-flights already refuse to
+/// blur between "could not sweep" and "clean": a lookup with no corpus is not a verdict
+/// about the corpus.
+fn owner_line(roster_loaded: bool, owner: Option<&str>) -> String {
+    match (roster_loaded, owner) {
+        (_, Some(o)) => o.to_string(),
+        (true, None) => "(unresolved — no persona lists this domain)".to_string(),
+        (false, None) => {
+            "(no roster read — pass --root <project dir> to resolve owners)".to_string()
+        }
+    }
+}
+
 pub fn run_owner(
     ask: &str,
     persona: Option<&str>,
@@ -33,9 +54,9 @@ pub fn run_owner(
     use worksgood::notify::ownership::{self, OwnerDecision, OwnerMap};
 
     let domain = ownership::classify_domain(ask);
-    let map = match root {
-        Some(r) => OwnerMap::load(r),
-        None => OwnerMap::default(),
+    let (map, roster_loaded) = match root {
+        Some(r) => (OwnerMap::load(r), true),
+        None => (OwnerMap::default(), false),
     };
     let owner = map.owner_for_ask(ask).map(str::to_string);
     let decision = persona.map(|p| map.decide_owner(p, ask));
@@ -62,10 +83,7 @@ pub fn run_owner(
 
     println!("ask:     \"{ask}\"");
     println!("domain:  {}", domain.slug());
-    match &owner {
-        Some(o) => println!("owner:   {o}"),
-        None => println!("owner:   (unresolved — no persona lists this domain)"),
-    }
+    println!("owner:   {}", owner_line(roster_loaded, owner.as_deref()));
     match (persona, &decision) {
         (Some(p), Some(OwnerDecision::Owner)) => {
             println!("verdict: {p} OWNS this ask → it creates the task");
@@ -197,9 +215,9 @@ pub fn run_capability(text: &str, root: Option<&Path>, _dry_run: bool, json: boo
     use worksgood::notify::parity;
 
     let is_ask = capability::is_capability_ask(text);
-    let map = match root {
-        Some(r) => OwnerMap::load(r),
-        None => OwnerMap::default(),
+    let (map, roster_loaded) = match root {
+        Some(r) => (OwnerMap::load(r), true),
+        None => (OwnerMap::default(), false),
     };
     let answer = if is_ask {
         capability::capability_answer(&map)
@@ -234,10 +252,61 @@ pub fn run_capability(text: &str, root: Option<&Path>, _dry_run: bool, json: boo
             println!("answer:  {a}");
             println!("promised: {}", promised.as_deref().unwrap_or("none"));
         }
-        None if is_ask => {
-            println!("answer:  none — this household declares no domain ownership");
-        }
-        None => println!("answer:  none — not a capability ask, the normal path owns it"),
+        None => println!(
+            "answer:  none — {}",
+            capability_none_reason(roster_loaded, is_ask)
+        ),
     }
     Ok(())
+}
+
+/// Why a capability ask produced no answer — same distinction as [`owner_line`]. The
+/// "this household declares no domain ownership" wording is a claim ABOUT a household, so
+/// it may only be used when a household was actually read. Without `--root` nothing was.
+fn capability_none_reason(roster_loaded: bool, is_ask: bool) -> &'static str {
+    match (is_ask, roster_loaded) {
+        (false, _) => "not a capability ask, the normal path owns it",
+        (true, true) => "this household declares no domain ownership",
+        (true, false) => "no roster read — pass --root <project dir>",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this pins: an empty-by-construction map reported as a verdict about the
+    /// roster. `owner_line(false, None)` and `owner_line(true, None)` must not be the same
+    /// sentence, or the caller cannot tell "nobody owns this" from "I read nothing".
+    #[test]
+    fn owner_line_keeps_no_roster_apart_from_no_owner() {
+        assert_eq!(owner_line(true, Some("nora")), "nora");
+        assert_eq!(owner_line(false, Some("nora")), "nora");
+        let no_owner = owner_line(true, None);
+        let no_roster = owner_line(false, None);
+        assert!(
+            no_owner.contains("no persona lists this domain"),
+            "{no_owner}"
+        );
+        assert!(no_roster.contains("--root"), "{no_roster}");
+        assert_ne!(
+            no_owner, no_roster,
+            "a lookup that loaded no roster must not read as a verdict about the roster"
+        );
+    }
+
+    /// Same property on the capability side, where the misleading wording made a claim
+    /// about the household ("declares no domain ownership") from an unread file.
+    #[test]
+    fn capability_reason_never_claims_a_household_it_did_not_read() {
+        assert!(capability_none_reason(true, true).contains("this household"));
+        let unread = capability_none_reason(false, true);
+        assert!(!unread.contains("this household"), "{unread}");
+        assert!(unread.contains("--root"), "{unread}");
+        // Not-an-ask outranks both: there is nothing to resolve either way.
+        assert_eq!(
+            capability_none_reason(true, false),
+            capability_none_reason(false, false)
+        );
+    }
 }
