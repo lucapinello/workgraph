@@ -705,13 +705,170 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+#[cfg(test)]
+fn git_init_commit(dir: &Path) {
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "t"],
+        vec!["commit", "-q", "--allow-empty", "-m", "base"],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+fn git_head_sha(dir: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 fn worktree_dirty(path: &Path) -> bool {
-    std::process::Command::new("git")
+    !matches!(
+        worktree_dirt(path),
+        WorktreeDirt::Clean | WorktreeDirt::Missing
+    )
+}
+
+/// What is actually dirty in a worktree — because "uncommitted source" and "untracked
+/// build evidence" carry completely different risk and were being reported as the same
+/// thing.
+///
+/// Measured on the live box 2026-08-14: seven worktrees pinned 11 GB with the reason
+/// `owning worktree has uncommitted source`, and every one of them had ZERO tracked-dirty
+/// files and 13 untracked entries, all of them directories under `disposables/` — a
+/// directory named for being disposable. The reason was not merely unhelpful, it was
+/// false: there was no uncommitted source anywhere. An operator reading it cannot tell a
+/// worktree holding real unsaved work from one holding screenshots.
+#[derive(Debug, PartialEq, Eq)]
+enum WorktreeDirt {
+    Clean,
+    /// The worktree path is NOT THERE. Nothing to protect: this guard exists to save
+    /// uncommitted source inside a worktree, and there is no worktree. Observed on the live
+    /// box holding cargo build caches for agents whose worktrees were removed long ago —
+    /// reported, wrongly, as "owning worktree has uncommitted source".
+    Missing,
+    /// TRACKED files differ from HEAD — genuinely unsaved work, preserve.
+    TrackedDirty,
+    /// Only untracked paths. Still preserved (an untracked file can be new source), but
+    /// named for what it is so the operator can judge it.
+    UntrackedOnly(usize),
+    /// git could not answer. Fails closed, as before.
+    Unknown,
+}
+
+fn worktree_dirt(path: &Path) -> WorktreeDirt {
+    // Absent is not unknown. `git status` in a directory that does not exist fails, which
+    // would otherwise fail closed forever on a cache whose owner was reaped ages ago.
+    if !path.exists() {
+        return WorktreeDirt::Missing;
+    }
+    let out = std::process::Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=normal"])
         .current_dir(path)
+        .output();
+    let Ok(out) = out else {
+        return WorktreeDirt::Unknown;
+    };
+    if !out.status.success() {
+        return WorktreeDirt::Unknown;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let mut untracked = 0usize;
+    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+        if line.starts_with("??") {
+            untracked += 1;
+        } else {
+            return WorktreeDirt::TrackedDirty;
+        }
+    }
+    if untracked == 0 {
+        WorktreeDirt::Clean
+    } else {
+        WorktreeDirt::UntrackedOnly(untracked)
+    }
+}
+
+/// The preservation verdict for a worktree, as the reason string the report will print, or
+/// `None` when it is expendable.
+fn worktree_preserve_reason(path: &Path) -> Option<String> {
+    if reaped_wip_preserved(path) {
+        return None;
+    }
+    match worktree_dirt(path) {
+        WorktreeDirt::Clean | WorktreeDirt::Missing => None,
+        WorktreeDirt::TrackedDirty => {
+            Some("owning worktree has uncommitted tracked source".to_string())
+        }
+        WorktreeDirt::UntrackedOnly(n) => Some(format!(
+            "owning worktree has {n} untracked path(s) and no tracked-dirty file"
+        )),
+        WorktreeDirt::Unknown => {
+            Some("owning worktree status could not be read (failing closed)".to_string())
+        }
+    }
+}
+
+/// Has the reap path ALREADY preserved this worktree's work somewhere `worktree_dirty`
+/// cannot see?
+///
+/// `worktree_dirty` counts untracked files, so any build or test byproduct that is neither
+/// committed nor gitignored pins its worktree forever. Measured on the live box
+/// 2026-08-13: 58 agent worktrees / 26 GB, `wg disk cleanup` reaped 0 of them on every
+/// run, 44 were clean AND already merged into `main`, and across all 58 the only
+/// uncommitted content was untracked screenshot evidence under `disposables/` plus four
+/// `.wg-reaped-wip.json` sidecars. The guard was protecting screenshots while the one
+/// thing that WAS real work had already been preserved somewhere it never looks.
+///
+/// So this asks the stronger question. The reap path writes a sidecar naming a WIP commit
+/// and an out-of-tree patch (`wg_preserve_reaped_wip`, `commands/spawn/execution.rs`); if
+/// that sidecar is present AND both halves it promises really exist, the worktree is
+/// expendable. Every check is positive evidence — a sidecar that is unparseable, names a
+/// commit this repo cannot resolve, or points at a patch that is gone means NOT preserved,
+/// and the conservative path keeps the worktree.
+///
+/// Deliberately NOT `--untracked-files=no`: an untracked file can be genuinely new source,
+/// and silently dropping it is the one failure this guard exists to prevent. Deliberately
+/// not a path allowlist (`disposables/`, `spikes/`) either — that encodes today's directory
+/// names into a safety check, and the next evidence directory leaks straight through.
+fn reaped_wip_preserved(path: &Path) -> bool {
+    let Ok(body) = fs::read_to_string(path.join(".wg-reaped-wip.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    if v.get("schema").and_then(|x| x.as_str()) != Some("wg-reap-preserved-wip/1") {
+        return false;
+    }
+    let commit = match v.get("commit").and_then(|x| x.as_str()) {
+        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        _ => return false,
+    };
+    let patch = match v.get("patch").and_then(|x| x.as_str()) {
+        Some(x) if !x.trim().is_empty() => x.trim().to_string(),
+        _ => return false,
+    };
+    // The patch it promises must be on disk...
+    if !Path::new(&patch).is_file() {
+        return false;
+    }
+    // ...and the commit it names must resolve HERE. A sha from another repo, or one lost to
+    // a prune, preserves nothing.
+    std::process::Command::new("git")
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .current_dir(path)
         .output()
-        .map(|o| !o.stdout.is_empty() || !o.status.success())
-        .unwrap_or(true)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -840,12 +997,12 @@ fn safe_remove_owned_path(
     {
         return Err("owned-cache path contains a worktree".into());
     }
-    if cache
+    if let Some(reason) = cache
         .worktree_path
         .as_deref()
-        .is_some_and(|w| worktree_dirty(Path::new(w)))
+        .and_then(|w| worktree_preserve_reason(Path::new(w)))
     {
-        return Err("owning worktree has uncommitted source".into());
+        return Err(reason.into());
     }
     if path_contains_registered_artifact(cache, graph, project_root) {
         return Err("path contains a registered artifact".into());
@@ -1093,11 +1250,11 @@ pub fn cleanup_owned(
                 // for entries execute would simply drop.
                 None
             } else if representative.mount_id != mount_id(p) {
-                Some("mount identity changed since registration")
+                Some("mount identity changed since registration".to_string())
             } else if absolute == Path::new("/")
                 || absolute_lexical(project_root).starts_with(&absolute)
             {
-                Some("owned-cache path contains the project/source root")
+                Some("owned-cache path contains the project/source root".to_string())
             } else if representative
                 .worktree_path
                 .as_deref()
@@ -1105,17 +1262,17 @@ pub fn cleanup_owned(
                     absolute_lexical(Path::new(worktree)).starts_with(&absolute)
                 })
             {
-                Some("owned-cache path contains a worktree")
-            } else if representative
+                Some("owned-cache path contains a worktree".to_string())
+            } else if let Some(reason) = representative
                 .worktree_path
                 .as_deref()
-                .is_some_and(|w| worktree_dirty(Path::new(w)))
+                .and_then(|w| worktree_preserve_reason(Path::new(w)))
             {
-                Some("owning worktree has uncommitted source")
+                Some(reason)
             } else if path_contains_registered_artifact(representative, &graph, project_root) {
-                Some("path contains a registered artifact")
+                Some("path contains a registered artifact".to_string())
             } else if has_open_files(p) {
-                Some("path has open files")
+                Some("path has open files".to_string())
             } else {
                 None
             };
@@ -1479,12 +1636,25 @@ mod tests {
         let dirty_root = TempDir::new().unwrap();
         let worktree = dirty_root.path().join("source");
         fs::create_dir_all(&worktree).unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&worktree)
-            .status()
-            .unwrap();
-        fs::write(worktree.join("dirty.rs"), "uncommitted").unwrap();
+        // TRACKED-dirty, which is what this guard is named for. The fixture used to
+        // `git init` and drop an uncommitted file, which in a repo with no commits is
+        // merely UNTRACKED — so it exercised the weakest arm while asserting the
+        // strongest wording. Commit the file first, then modify it.
+        git_init_commit(&worktree);
+        fs::write(worktree.join("dirty.rs"), "committed\n").unwrap();
+        for args in [vec!["add", "dirty.rs"], vec!["commit", "-q", "-m", "add"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&worktree)
+                .status()
+                .unwrap();
+        }
+        fs::write(worktree.join("dirty.rs"), "uncommitted edit\n").unwrap();
+        assert_eq!(
+            worktree_dirt(&worktree),
+            WorktreeDirt::TrackedDirty,
+            "the dirty-worktree fixture must be TRACKED-dirty, not merely untracked"
+        );
         let dirty_target = dirty_root.path().join("wg-target-dirty");
         fs::create_dir_all(&dirty_target).unwrap();
         let (dir, cfg) = terminal_fixture(dirty_root.path(), &dirty_target, Some(&worktree));
@@ -1495,6 +1665,150 @@ mod tests {
                 .preserved
                 .iter()
                 .any(|p| p.reason.contains("uncommitted"))
+        );
+
+        // A WORKTREE WHOSE WORK IS ALREADY PRESERVED IS EXPENDABLE (the case that failed
+        // on the live box: 58 worktrees / 26 GB, 0 ever reaped, because untracked
+        // screenshot evidence read as "uncommitted source"). Untracked evidence PLUS a
+        // complete reap sidecar — a resolvable commit and a patch that is really on disk —
+        // must reap.
+        let kept_root = TempDir::new().unwrap();
+        let kept_wt = kept_root.path().join("source");
+        fs::create_dir_all(kept_wt.join("disposables")).unwrap();
+        git_init_commit(&kept_wt);
+        fs::write(kept_wt.join("disposables/shot.png"), "untracked evidence").unwrap();
+        let head = git_head_sha(&kept_wt);
+        let patch = kept_root.path().join("reaped-wip.patch");
+        fs::write(&patch, "diff --git a/x b/x\n").unwrap();
+        fs::write(
+            kept_wt.join(".wg-reaped-wip.json"),
+            format!(
+                r#"{{"schema":"wg-reap-preserved-wip/1","agent":"agent-1","task":"t","reason":"exit-1","branch":"b","commit":"{head}","patch":"{}","file_count":1}}"#,
+                patch.display()
+            ),
+        )
+        .unwrap();
+        assert!(
+            worktree_dirty(&kept_wt),
+            "fixture must be dirty, or the reap below proves nothing about the sidecar"
+        );
+        assert!(
+            reaped_wip_preserved(&kept_wt),
+            "a complete sidecar (resolvable commit + patch on disk) must read as preserved"
+        );
+        let kept_target = kept_root.path().join("wg-target-preserved");
+        fs::create_dir_all(&kept_target).unwrap();
+        let (dir, cfg) = terminal_fixture(kept_root.path(), &kept_target, Some(&kept_wt));
+        let report = cleanup_owned(&dir, &cfg, true).unwrap();
+        assert!(
+            !kept_target.exists(),
+            "a worktree whose WIP is already preserved must not pin its target: {:?}",
+            report.preserved
+        );
+
+        // AND THE OTHER DIRECTION: a sidecar that PROMISES a patch which is not there
+        // preserves nothing, so the conservative path must still hold the worktree. This is
+        // the half that stops the fix above from becoming "any sidecar means delete".
+        let broken_root = TempDir::new().unwrap();
+        let broken_wt = broken_root.path().join("source");
+        fs::create_dir_all(&broken_wt).unwrap();
+        git_init_commit(&broken_wt);
+        // TRACKED-dirty on purpose: this is the case that matters — REAL unsaved work
+        // plus a sidecar that promises a patch which is not there. An untracked file
+        // would exercise the weaker arm and prove less.
+        fs::write(broken_wt.join("dirty.rs"), "committed\n").unwrap();
+        for args in [vec!["add", "dirty.rs"], vec!["commit", "-q", "-m", "add"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&broken_wt)
+                .status()
+                .unwrap();
+        }
+        fs::write(broken_wt.join("dirty.rs"), "uncommitted real source\n").unwrap();
+        let broken_head = git_head_sha(&broken_wt);
+        fs::write(
+            broken_wt.join(".wg-reaped-wip.json"),
+            format!(
+                r#"{{"schema":"wg-reap-preserved-wip/1","agent":"agent-2","task":"t","reason":"exit-1","branch":"b","commit":"{broken_head}","patch":"{}/gone.patch","file_count":1}}"#,
+                broken_root.path().display()
+            ),
+        )
+        .unwrap();
+        assert!(
+            !reaped_wip_preserved(&broken_wt),
+            "a sidecar whose patch is MISSING must not read as preserved"
+        );
+        let broken_target = broken_root.path().join("wg-target-broken");
+        fs::create_dir_all(&broken_target).unwrap();
+        let (dir, cfg) = terminal_fixture(broken_root.path(), &broken_target, Some(&broken_wt));
+        let report = cleanup_owned(&dir, &cfg, true).unwrap();
+        assert!(
+            broken_target.exists(),
+            "an incomplete sidecar must leave the conservative guard in force"
+        );
+        assert!(
+            report
+                .preserved
+                .iter()
+                .any(|p| p.reason.contains("uncommitted"))
+        );
+
+        // THE REASON MUST NAME WHAT IS ACTUALLY DIRTY. On the live box seven worktrees
+        // pinned 11 GB reporting "uncommitted source" while having ZERO tracked-dirty
+        // files and 13 untracked `disposables/` directories. Both still preserve — an
+        // untracked file can be new source — but an operator must be able to tell them
+        // apart, and "uncommitted source" for a tree with none was simply false.
+        // TWO untracked entries, not one: the `disposables/` directory AND the sidecar
+        // itself, which the reap path writes into the worktree and never commits. Worth
+        // pinning — it means a preserved worktree is ALWAYS at least untracked-dirty, so
+        // the sidecar rule is the only thing that can ever release it.
+        assert_eq!(worktree_dirt(&kept_wt), WorktreeDirt::UntrackedOnly(2));
+        assert_eq!(worktree_dirt(&broken_wt), WorktreeDirt::TrackedDirty);
+        let evidence_root = TempDir::new().unwrap();
+        let evidence_wt = evidence_root.path().join("source");
+        fs::create_dir_all(evidence_wt.join("disposables")).unwrap();
+        git_init_commit(&evidence_wt);
+        fs::write(evidence_wt.join("disposables/a.png"), "shot").unwrap();
+        fs::write(evidence_wt.join("disposables/b.png"), "shot").unwrap();
+        let reason =
+            worktree_preserve_reason(&evidence_wt).expect("untracked-only still preserves");
+        assert!(
+            reason.contains("untracked") && reason.contains("no tracked-dirty"),
+            "reason must say what is dirty, got: {reason}"
+        );
+        assert!(
+            !reason.contains("uncommitted tracked source"),
+            "an untracked-only tree must not be reported as uncommitted source: {reason}"
+        );
+        // And the real-risk case keeps the strong wording.
+        let tracked_reason =
+            worktree_preserve_reason(&broken_wt).expect("tracked-dirty still preserves");
+        assert!(
+            tracked_reason.contains("uncommitted tracked source"),
+            "got: {tracked_reason}"
+        );
+
+        // A CACHE WHOSE OWNING WORKTREE IS GONE has no uncommitted source to lose. This
+        // held 7.2 GB of cargo build caches on the live box, every one of them reported as
+        // "owning worktree has uncommitted source" for a worktree that had not existed for
+        // days.
+        let gone_root = TempDir::new().unwrap();
+        let gone_wt = gone_root.path().join("worktree-that-was-removed");
+        assert!(!gone_wt.exists());
+        assert_eq!(worktree_dirt(&gone_wt), WorktreeDirt::Missing);
+        assert_eq!(
+            worktree_preserve_reason(&gone_wt),
+            None,
+            "a cache whose owning worktree is absent must be expendable"
+        );
+        let gone_target = gone_root.path().join("wg-target-gone");
+        fs::create_dir_all(&gone_target).unwrap();
+        let (dir, cfg) = terminal_fixture(gone_root.path(), &gone_target, Some(&gone_wt));
+        let report = cleanup_owned(&dir, &cfg, true).unwrap();
+        assert!(
+            !gone_target.exists(),
+            "cache with an absent owning worktree must reap: {:?}",
+            report.preserved
         );
 
         // Registered artifact guard.

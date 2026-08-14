@@ -8,69 +8,51 @@ session starts from a diagnosis rather than a symptom.
 
 ---
 
-## 1. `worktree_dirty` treats disposable evidence as uncommitted source
+## 1. SHIPPED (partly) — `worktree_dirty` no longer lies, but disk is still pinned
 
-**Where:** `src/disk_sentinel.rs:708`, called at `:846` (the `safe_remove_owned_path`
-guard) and `:1112` (the dry-run branch). Fork-only — upstream has no such function.
+**Where:** `src/disk_sentinel.rs`. Fork-only — upstream has no such function.
 
-```rust
-fn worktree_dirty(path: &Path) -> bool {
-    std::process::Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=normal"])
-        // …
-        .map(|o| !o.stdout.is_empty() || !o.status.success())
-        .unwrap_or(true)
-}
-```
+### What shipped (2026-08-14)
 
-**The defect.** `--untracked-files=normal` counts UNTRACKED files as dirty, so any
-build or test byproduct that is neither committed nor gitignored pins its worktree
-forever. On a long-running family box disk therefore grows without bound and the
-cleanup that exists to stop it never fires. `unwrap_or(true)` also means a git
-invocation that fails for any reason preserves — correct as a default, but it
-compounds the same direction.
+Three changes, each with a mutation-proven test:
 
-**Measured on the live box, 2026-08-13:**
+1. **The reap contract releases a worktree.** If `.wg-reaped-wip.json` is present AND its
+   `commit` resolves in that repo AND its `patch` is on disk, the worktree is expendable.
+   Every check is positive evidence; anything unparseable, unresolvable or missing means
+   NOT preserved, and the conservative path holds.
+2. **The reason names what is actually dirty.** `WorktreeDirt` splits `TrackedDirty` from
+   `UntrackedOnly(n)`. Seven worktrees were pinning 11 GB while reporting "owning worktree
+   has uncommitted source" with **zero** tracked-dirty files and 13 untracked
+   `disposables/` directories. The reason was not merely unhelpful, it was false.
+3. **Absent is not unknown.** A cache whose owning worktree no longer exists is expendable
+   — this guard protects uncommitted source inside a worktree, and there is no worktree.
+   That mislabel covered cargo caches for agents reaped days earlier.
 
-- 58 agent worktrees, **26 GB**; `wg disk cleanup` reaped 0 of them every run.
-- 44 are clean AND their branch is already merged into `main` — 15 GB with nothing
-  to lose.
-- Across ALL 58, the only uncommitted content is untracked output under
-  `disposables/` (UI screenshot evidence — the directory is named for being
-  disposable) plus, in four worktrees, `.wg-reaped-wip.json`.
-- Those four sidecars each name a WIP **commit** and an out-of-tree **patch**.
-  All four commits are present in the repo and all four patch files exist
-  (17 MB, 17 MB, 10 KB, 17 MB; 34 files each). The work provably survives
-  `git worktree remove`.
+Deliberately NOT done, as reasoned before: `--untracked-files=no` (an untracked file can be
+new source) and a path allowlist (`disposables/`, `spikes/`) which would encode today's
+directory names into a safety check.
 
-So the guard was protecting screenshots, while the one thing that *was* real work
-had already been preserved somewhere the guard does not look.
+### What did NOT happen: the disk is still 11 GB
 
-**Proposed fix — use the preservation contract, not a path allowlist.**
+`wg disk cleanup` still reports **reaped=0**. The false verdict is gone — "uncommitted
+source" now appears zero times — but the remaining holders are:
 
-The reap path already writes `.wg-reaped-wip.json` + a named WIP commit + an
-out-of-tree patch whenever there is work worth keeping (`wg_preserve_reaped_wip`,
-`src/commands/spawn/execution.rs`). That is a stronger signal than dirtiness:
+| preserved reason | count |
+|---|---|
+| one or more recorded owners are active/inconclusive | 28 |
+| N untracked path(s) and no tracked-dirty file | 14 |
+| path has open files | 1 |
 
-- if a valid sidecar exists and BOTH its `commit` resolves and its `patch` file is
-  present, the worktree is expendable — say so, and let the reap proceed;
-- otherwise keep the current conservative behaviour.
+So the next step is a DIFFERENT gate: **owner liveness**, not worktree dirt. 28 paths are
+held because their recorded owners resolve as active or inconclusive. Whether those agents
+are really alive is the question to answer next — start by resolving each recorded owner id
+against the graph and the process table, and expect the same shape as everything else here:
+an inconclusive lookup being reported as an active owner.
 
-Deliberately NOT proposed: switching to `--untracked-files=no`. An untracked file
-can be genuinely new source, and silently dropping it is the one failure this
-guard exists to prevent. A path allowlist (`disposables/`, `spikes/`) is also
-rejected — it encodes today's directory names into a safety check, and the next
-evidence directory would leak straight through.
-
-**Guard it with teeth.** Two cases, both mutation-checkable: a worktree whose
-sidecar's patch is MISSING must still be preserved; a worktree with untracked
-evidence and a complete sidecar must be reaped. The second is the one that fails
-today.
-
-**Not urgent, but it does not shrink on its own** — every reaped agent adds a
-worktree, and none are ever reclaimed.
-
----
+The 14 untracked-only entries are preserved BY DESIGN and need a policy decision, not a
+bug fix: reaping a worktree whose only dirt is untracked evidence means accepting that an
+untracked file might have been new source. That is the owner's call to make, and it is now
+visible in the report rather than hidden behind the wrong words.
 
 ## 2. RETRACTED — there is no week-lock bypass (the gate certified its own mutant)
 
