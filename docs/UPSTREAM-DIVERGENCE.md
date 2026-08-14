@@ -195,6 +195,22 @@ the slice is real, just not yet.
 Also worth recording: `run_ask` looks like a peer of the three moved here and is NOT a
 candidate — it is upstream's. Check provenance before assuming a neighbour is ours.
 
+**Before cutting, grep for guards that NAME what you are moving.** Two separate guards have
+now gone red at 0s purely because a file changed address — `notify/casa_audience.rs` (an exact
+list of feed-writer paths) and `tests/smoke/scenarios/feed_lock_section_length.sh` (a corpus
+of named source files, widened twice before being made discovery-based). Neither was wrong;
+both were doing their job. The check costs one command:
+
+```
+grep -rln '<fn or path you are moving>' tests/smoke/scenarios/ src/ | grep -v '<the file itself>'
+```
+
+Still live in this shape, and fine only because the symbols they name stay with upstream's
+`run_listen`: `engine_capability_no_invented_work.sh` (greps `try_capability_answer` in
+`commands/telegram.rs`) and `reminder_classifier_fails_closed.sh` (greps `try_cancel_reminder`
+and `try_register_reminder` there). If a future slice moves any of those three, expect a 0s
+red from those two scenarios, and prefer widening them to discovery over renaming a path.
+
 **Choosing a slice.** Prefer a cluster whose helpers are used ONLY by it — then nothing
 has to be exposed. Check provenance first (`git show <merge-base>:<path>`): a helper
 that exists upstream must stay, and one that does not is ours to move. `run_remind`
