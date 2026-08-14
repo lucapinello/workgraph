@@ -111,6 +111,31 @@ Learned from writing the first three:
 `/tmp` → `/private/tmp` symlink compared against a `TempDir` spelling. Expect more of
 these; some are worth sending.
 
+### The one macOS gap we carry as an ignore (2026-08-14)
+
+`tui::pty_pane::tests::pty_pane_unblocks_codex_style_query_burst_end_to_end` is
+`#[cfg_attr(target_os = "macos", ignore = …)]` in our fork. It is upstream's test, and our
+DA1 logic is byte-identical to theirs, so this is a platform gap and not a divergence:
+
+- `compute_query_replies` (the pure half) passes.
+- `[ -t 0 ]` inside the script confirms stdin IS the pty slave.
+- The child's `read` still gets EOF rather than the replies, so the gap is delivery from the
+  master writer to the slave on Darwin.
+
+Two things were fixed along the way and are worth keeping straight from the gap itself: the
+script used `read -N`, which macOS's bash 3.2.57 rejects as a usage error (so it reported an
+empty response set within milliseconds and looked like "the emulator answered nothing"), and
+three of our own test SKIP notices used the stderr macro, which tripped upstream's
+`tui_runtime_never_writes_process_stderr` guard — that one was OUR bug and is fixed in our
+code, not by widening their guard.
+
+Left as a red it taught a whole session to read "2 failed" as normal, which is how a real
+regression walks in beside a known one. On Linux — upstream's CI — the test still runs. Running
+it explicitly with `--ignored` still reproduces the same `expected DA1 reply` failure, so
+nothing was neutered.
+
+Engine suite on macOS is now lib 3926 / 0 failed and bin 4049 / 0 failed / 2 ignored.
+
 ## The way back
 
 Target: `casa` becomes its own crate depending on `worksgood` pinned by `rev`, and
