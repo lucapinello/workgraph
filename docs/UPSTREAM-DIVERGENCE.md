@@ -131,12 +131,28 @@ the slices below move ours OUT to `src/casa/`, a path upstream does not have.
 | 1 | `casa/telegram_photo.rs` — photo → shopping pipeline | 15,541 → 14,570 | 9 → 6 |
 | 2 | `casa/reply_delivery.rs` — family reply delivery | 14,570 → 14,073 | 6 → 5 |
 | 3 | `casa/remind.rs` — the `wg telegram remind` tick | 14,073 → 13,536 | 5 → **6** |
+| 4 | `casa/one_shot_answers.rs` — `owner`, `parity`, `capability` | 13,536 → 13,317 | 6 → 6 |
 
 Slice 3 went the wrong way on the marker count, deliberately and once:
 `resolve_dm_target` is ours (absent upstream at the fork point and on `gwwg/main`
 today) but still has one caller and two tests in their file, so it is exposed rather
 than dragged out with its tests. It follows the DM path out when that is extracted.
 The marker is the recorded price of a 537-line reduction, not an oversight.
+
+Slice 4 is what a clean slice looks like: three commands that drag no private helpers,
+share none, carry no tests in that file's test module, and — the compiler's verdict, not
+mine — import nothing back from it either. Both helpers I added on the strength of a regex
+match were flagged unused. Nothing exposed, nothing repointed, no marker change.
+
+It was picked over the bigger candidate on purpose. `run_web_inbound` is 512 lines but
+needs three new `pub(crate)` markers (`web_physical_turn_key`, shared with
+`run_week_start`; `run_group_collective` and `run_group_discussion`, shared with
+`run_listen`) and ~69 test references moved — and it gets cheaper once `run_listen` goes,
+since that takes both group handlers with it. Eight of its helpers ARE exclusive to it, so
+the slice is real, just not yet.
+
+Also worth recording: `run_ask` looks like a peer of the three moved here and is NOT a
+candidate — it is upstream's. Check provenance before assuming a neighbour is ours.
 
 **Choosing a slice.** Prefer a cluster whose helpers are used ONLY by it — then nothing
 has to be exposed. Check provenance first (`git show <merge-base>:<path>`): a helper

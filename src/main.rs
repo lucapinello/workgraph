@@ -4031,18 +4031,20 @@ fn main() -> Result<()> {
                 reply_text,
                 human,
                 dry_run,
-            } => commands::telegram::run_parity(&reply_text, human.as_deref(), dry_run, cli.json),
+            } => {
+                casa::one_shot_answers::run_parity(&reply_text, human.as_deref(), dry_run, cli.json)
+            }
             TelegramCommands::Capability {
                 text,
                 root,
                 dry_run,
-            } => commands::telegram::run_capability(&text, root.as_deref(), dry_run, cli.json),
+            } => casa::one_shot_answers::run_capability(&text, root.as_deref(), dry_run, cli.json),
             TelegramCommands::Owner {
                 ask,
                 persona,
                 root,
                 dry_run,
-            } => commands::telegram::run_owner(
+            } => casa::one_shot_answers::run_owner(
                 &ask,
                 persona.as_deref(),
                 root.as_deref(),
