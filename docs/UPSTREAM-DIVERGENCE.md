@@ -406,14 +406,34 @@ The plan's rule — "would wg users want this with no Casa?" — is necessary bu
 second question is whether upstream is still broken, and that has to be checked against
 `gwwg/main`, not assumed from our commit message.
 
+Swept 2026-08-15. Four candidates checked against `gwwg/main` at `29459696`; **two survive, two do
+not** — and neither of the two that died was distinguishable from a real candidate by its commit
+subject.
+
 | candidate | status |
 |---|---|
-| 400-classification split (`1d556fca`) | **verified live** — `gwwg/main` has `http_status == Some(400) => ApiError400Document` with no document check at all, blunter than the version we just fixed. Ready to PR |
-| one unverifiable verdict starves the graph (`2db5230c`) | recorded as live upstream (`load_durable_verdicts` bails on the first bad verdict). Re-verify before sending |
-| transport-exhausted → per-task quarantine (`bfed378c`) | unverified against current `gwwg/main` |
-| self-healing spawn circuit breaker (`9b823397`) | unverified |
-| cron-fanout orphaning / poison-task stall (`691965eb`) | unverified |
-| macOS `pipe2` build fix | **PR #62, open, zero reviews since 2026-08-13** |
+| macOS `pipe2` build fix | **PR #62** — open, MERGEABLE, zero reviews since 2026-08-13. Also a hard prerequisite: `cargo test` on their `main` does not compile on macOS without it, so no macOS contributor can verify anything upstream today |
+| 400-classification split (`1d556fca`) | **PR #63, sent 2026-08-15.** Verified live: `Hard if http_status == Some(400) => ApiError400Document` with no document check. Their shape needed a different patch than ours — see the note below |
+| one unverifiable verdict starves the graph (`2db5230c`) | **VERIFIED LIVE — ready to send.** `load_durable_verdicts` (their line 917) still aborts the entire store on the first bad file: `?` on load, `bail!` twice, `?` on `verify_evaluation_digest`. One unverifiable verdict file makes every verdict unreadable. Minimal upstream form is skip-and-warn inside the loop, not our richer store split |
+| zombie session lock, from `691965eb` | **VERIFIED LIVE — ready to send.** They handle a RECYCLED pid (`holder.alive && pid_reused_by_foreign` → recover) but a genuinely live handler from a previous daemon generation hits `Some(holder) if holder.alive => Err("session lock held by live handler")` and every later coordinator exits as a cooperative handoff, forever. Since `wg service stop` leaves handlers running BY THEIR OWN DESIGN, this is reachable upstream exactly as it was for us on 2026-07-19. Their comment even anticipates the shape while fixing only the recycled case |
+| transport-exhausted → per-task quarantine (`bfed378c`) | **NOT APPLICABLE.** No transport-exhausted concept exists upstream at all (`git grep` finds nothing). Ours is bucket B, not a fix to send |
+| self-healing spawn circuit breaker (`9b823397`) | **NOT A FIX — a PARALLEL IMPLEMENTATION.** Upstream has its own per-task spawn breaker (`spawn_breaker_tripped_tasks` in their coordinator, with `test_record_dispatch_clears_breaker_on_success` and `test_spawn_circuit_breaker_reset_on_edit`), plus a provider breaker in `triage.rs`. They have no `spawn_breaker.rs`; we built the same idea in a file they lack. This is a Phase 3 **adopt-theirs** candidate: dropping ours in favour of theirs would delete ~900 of our lines and remove a guaranteed conflict |
+| cron-fanout orphaning / poison-task stall (`691965eb`) | still unverified — the commit is a bundle, and only its session-lock half has been checked |
+
+### What the sweep says about method
+
+Two of four candidates evaporated, and in both cases the commit subject read exactly like a
+portable bug fix. `bfed378c` describes a quarantine for a failure mode upstream has never modelled;
+`9b823397` describes a breaker they already have. Add `ee9c45d1` from the first pass and that is
+**three of five** named candidates that do not survive contact with their tree.
+
+The `1d556fca` PR makes the same point from the other side. Our fix added enum variants and a
+policy mapping; their tree needed neither, because their parser already carries the vocabulary and
+the right patch was to make one match arm ask for evidence. Porting our diff would have been
+wrong even though the bug was real.
+
+So: verify against their code before writing anything, and expect the patch to be a different
+shape than ours.
 
 ### Correction to the plan: `ee9c45d1` is not a bucket-A candidate
 
