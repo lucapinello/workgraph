@@ -366,7 +366,16 @@ pub(crate) fn compose_family_reply_on(
 pub fn run_register_commands(json: bool) -> Result<()> {
     let notify = NotifyConfig::load(Some(Path::new(".")))
         .context("Failed to load notification config")?
-        .context("No notify.toml found. Create one at ~/.config/workgraph/notify.toml")?;
+        .with_context(|| {
+            format!(
+                "No notify.toml found. Create one at .wg/notify.toml in this project (that is \
+                 what is checked first, and what `casa` and the /setup wizard write), or \
+                 globally at {}",
+                worksgood::notify::config::default_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<config dir>/worksgood/notify.toml".to_string()),
+            )
+        })?;
     let channels = TelegramChannel::all_from_notify_config(&notify)
         .context("Failed to build Telegram channels")?;
     if channels.is_empty() {

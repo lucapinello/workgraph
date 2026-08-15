@@ -453,7 +453,16 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
     // channel per configured bot for the poll loop below.
     let notify_config = NotifyConfig::load(Some(Path::new(".")))
         .context("Failed to load notification config")?
-        .context("No notify.toml found. Create one at ~/.config/workgraph/notify.toml")?;
+        .with_context(|| {
+            format!(
+                "No notify.toml found. Create one at .wg/notify.toml in this project (that is \
+                 what is checked first, and what `casa` and the /setup wizard write), or \
+                 globally at {}",
+                worksgood::notify::config::default_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<config dir>/worksgood/notify.toml".to_string()),
+            )
+        })?;
     let config = TelegramConfig::from_notify_config(&notify_config)?;
     let effective_chat_id = chat_id
         .map(|s| s.to_string())
@@ -4259,8 +4268,9 @@ pub fn run_standup(workgraph_dir: &Path, chat_id: Option<&str>, dry_run: bool) -
 /// bot.
 pub fn run_list_bots(json: bool) -> Result<()> {
     // Match the project-local-then-global lookup the other telegram subcommands
-    // use (see `load_telegram_config`): try `.workgraph/notify.toml` from CWD
-    // first, then fall back to `~/.config/workgraph/notify.toml`.
+    // use (see `load_telegram_config`): try `.wg/notify.toml` from CWD first, then
+    // fall back to the global `worksgood/notify.toml` under the user's config dir.
+    // (The old `workgraph/` global is read for back-compat only and warns.)
     let notify = match NotifyConfig::load(Some(Path::new(".")))? {
         Some(c) => c,
         None => {
@@ -4298,7 +4308,8 @@ pub fn run_list_bots(json: bool) -> Result<()> {
     } else if channels.is_empty() {
         println!("Telegram: no bots configured");
         println!(
-            "\nAdd a [telegram] block to ~/.config/workgraph/notify.toml or .workgraph/notify.toml."
+            "\nAdd a [telegram] block to .wg/notify.toml in this project, or to the global \
+             worksgood/notify.toml in your config dir."
         );
         println!(
             "Single-bot (legacy):\n  [telegram]\n  bot_token = \"...\"\n  chat_id = \"...\"\n"
@@ -4348,8 +4359,13 @@ pub fn run_status(json: bool) -> Result<()> {
             } else {
                 println!("Telegram: not configured");
                 println!("\nAdd a [telegram] section to your notify.toml:");
-                println!("  ~/.config/workgraph/notify.toml");
-                println!("  or .wg/notify.toml");
+                println!("  .wg/notify.toml   (in this project — checked first)");
+                println!(
+                    "  or {}",
+                    worksgood::notify::config::default_config_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<config dir>/worksgood/notify.toml".to_string()),
+                );
                 println!();
                 println!("  [telegram]");
                 println!("  bot_token = \"123456:ABC-DEF...\"");
@@ -4853,7 +4869,16 @@ fn bot_banner(config: &TelegramConfig) -> String {
 pub(crate) fn load_telegram_config() -> Result<TelegramConfig> {
     let notify_config = NotifyConfig::load(Some(Path::new(".")))
         .context("Failed to load notification config")?
-        .context("No notify.toml found. Create one at ~/.config/workgraph/notify.toml")?;
+        .with_context(|| {
+            format!(
+                "No notify.toml found. Create one at .wg/notify.toml in this project (that is \
+                 what is checked first, and what `casa` and the /setup wizard write), or \
+                 globally at {}",
+                worksgood::notify::config::default_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<config dir>/worksgood/notify.toml".to_string()),
+            )
+        })?;
     TelegramConfig::from_notify_config(&notify_config)
 }
 
