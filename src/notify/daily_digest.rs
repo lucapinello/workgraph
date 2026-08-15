@@ -400,6 +400,24 @@ impl DigestStore {
         self.people.get(recipient)
     }
 
+    /// Every recipient key that currently holds queued items, whatever wrote it.
+    ///
+    /// Readers MUST union this with their own roster. [`Self::offer`] keys the
+    /// queue by `nudge.recipient` verbatim — whatever string the sender happened
+    /// to hold — but a flush that builds its recipient list from telegram binding
+    /// NAMES alone never visits a bucket keyed anything else. Two such keys exist
+    /// in the wild: a raw telegram user id, and the literal role `operator` that
+    /// `spawn_breaker` queues under. Items in those buckets are told
+    /// "folded into the next digest" and then never delivered — the queue grows,
+    /// nothing reads it, and the promise is silently broken forever.
+    pub fn queued_recipients(&self) -> Vec<String> {
+        self.people
+            .iter()
+            .filter(|(_, st)| !st.pending.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// Forget one lifecycle pacing decision after its standalone transport was
     /// not confirmed, allowing the next scheduler tick to offer it again.
     ///
@@ -1094,6 +1112,57 @@ mod tests {
         assert_eq!(
             store.offer(&other_kind, now, &DigestPolicy::new()),
             Offer::Duplicate
+        );
+    }
+
+    #[test]
+    fn queued_recipients_lists_every_bucket_a_name_only_roster_would_miss() {
+        // `offer` keys the queue by `nudge.recipient` VERBATIM, but the flush builds
+        // its roster from telegram binding names. Any bucket keyed otherwise — the
+        // role `operator` that `spawn_breaker` queues under, or a raw telegram id —
+        // is told "folded into the next digest" and then never read. This accessor
+        // is what makes those buckets reachable.
+        let now = dt(2026, 7, 13, 9, 0);
+        let policy = DigestPolicy::new();
+        let mut store = DigestStore::default();
+
+        // POSITIVE CONTROL: an ordinary binding-named bucket. If the accessor were
+        // simply broken this fails first, so `operator` below cannot pass vacuously.
+        let named = Nudge::bundled(
+            "n1",
+            "Teo",
+            NudgeKind::FeedbackAsk,
+            now,
+            "how was the salmon?",
+        );
+        assert!(matches!(
+            store.offer(&named, now, &policy),
+            Offer::Queued { .. }
+        ));
+
+        // The live bug: a role key that is not, and never will be, a binding name.
+        let role = Nudge::bundled(
+            "n2",
+            "operator",
+            NudgeKind::Proactive,
+            now,
+            "spawn breaker tripped",
+        );
+        assert!(matches!(
+            store.offer(&role, now, &policy),
+            Offer::Queued { .. }
+        ));
+
+        // A known recipient holding NOTHING must not be listed — otherwise the flush
+        // would compose an empty digest for them.
+        let _ = store.state_mut("Ada");
+
+        let mut queued = store.queued_recipients();
+        queued.sort();
+        assert_eq!(
+            queued,
+            vec!["Teo".to_string(), "operator".to_string()],
+            "every bucket with items must be reachable, whatever key its sender used",
         );
     }
 

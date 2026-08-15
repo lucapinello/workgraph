@@ -46,7 +46,12 @@ pub(crate) fn resolve_dm_target(
     recipient: &str,
     bot: &str,
 ) -> Option<(String, String, TelegramBotConfig)> {
-    let binding = bindings.find_by_name_ci(recipient)?;
+    // A queue key is whatever the sender held: usually a binding name, sometimes
+    // the raw telegram user id. Both name the same human, so both must resolve —
+    // a name-only lookup turns an id-keyed bucket into an undeliverable orphan.
+    let binding = bindings
+        .find_by_name_ci(recipient)
+        .or_else(|| bindings.find_by_user(recipient))?;
     let target = binding.telegram_user.clone();
     let bots = config.all_bots();
     if !bot.trim().is_empty() {
@@ -136,8 +141,21 @@ pub fn run_digest(
     mock_send: bool,
 ) -> Result<()> {
     use worksgood::agency::TelegramBindingMap;
-    use worksgood::notify::daily_digest::{DigestPolicy, DigestStore, compose_digest};
+    use worksgood::notify::daily_digest::{DigestItem, DigestPolicy, DigestStore, compose_digest};
     use worksgood::notify::telegram_conversation::{BotReplySink, ReplySink};
+
+    /// One morning message and every queue bucket that feeds it. Usually one
+    /// bucket, but a person keyed two ways (name and raw telegram id) collapses
+    /// into a single group so they still receive ONE calm digest.
+    struct DueGroup {
+        /// Identity of the chat this reaches — the grouping key.
+        route: String,
+        /// The name shown in logs and `--dry-run`.
+        label: String,
+        /// Every store key folded in; ALL are marked sent on a confirmed delivery.
+        keys: Vec<String>,
+        items: Vec<DigestItem>,
+    }
 
     let root = project_root(workgraph_dir);
     let now = match now_override {
@@ -149,7 +167,7 @@ pub fn run_digest(
     // Known family members (recipients we can name/DM), from the agency bindings.
     let agency_dir = workgraph_dir.join("agency");
     let bindings = TelegramBindingMap::load(&agency_dir).unwrap_or_default();
-    let members: Vec<String> = bindings
+    let mut members: Vec<String> = bindings
         .bindings
         .iter()
         .map(|b| b.name.clone())
@@ -162,15 +180,54 @@ pub fn run_digest(
     let store_path = DigestStore::path(&root);
     let mut store = DigestStore::load(&store_path);
 
+    // The roster above names only bindings, but `DigestStore::offer` keys the queue
+    // by whatever string the SENDER held — a binding name, a raw telegram id, or the
+    // literal role `operator` that `spawn_breaker` queues under. A name-only reader
+    // never visits those buckets, so their items are told "folded into the next
+    // digest" and then dropped forever. Union in every key that actually holds
+    // something: a key that still cannot be routed now fails LOUDLY below (one
+    // "no bound bot/chat" line per tick) instead of silently.
+    for key in store.queued_recipients() {
+        if !members.iter().any(|m| m.eq_ignore_ascii_case(&key)) {
+            members.push(key);
+        }
+    }
+
     // Peek (without mutating) each member's due digest so a --dry-run and the
-    // real send agree on exactly what would go out.
-    let due: Vec<(String, String)> = members
-        .iter()
-        .filter(|m| store.digest_due(m, now, &policy))
-        .filter_map(|m| {
-            store
-                .state(m)
-                .map(|st| (m.clone(), compose_digest(st.pending())))
+    // real send agree on exactly what would go out. Buckets are grouped by the
+    // chat they actually reach, so one person keyed two ways still gets ONE
+    // message rather than a duplicate pair.
+    let mut groups: Vec<DueGroup> = Vec::new();
+    for m in &members {
+        if !store.digest_due(m, now, &policy) {
+            continue;
+        }
+        let Some(items) = store.state(m).map(|st| st.pending().to_vec()) else {
+            continue;
+        };
+        // Unroutable keys group under themselves so they never merge with a real
+        // recipient's message.
+        let route = resolve_dm_target(&config, &bindings, m, &coordination_owner)
+            .map(|(chat, bot_id, _)| format!("{bot_id}/{chat}"))
+            .unwrap_or_else(|| format!("unrouted:{m}"));
+        match groups.iter_mut().find(|g| g.route == route) {
+            Some(g) => {
+                g.keys.push(m.clone());
+                g.items.extend(items);
+            }
+            None => groups.push(DueGroup {
+                route,
+                label: m.clone(),
+                keys: vec![m.clone()],
+                items,
+            }),
+        }
+    }
+    let due: Vec<(DueGroup, String)> = groups
+        .into_iter()
+        .map(|g| {
+            let text = compose_digest(&g.items);
+            (g, text)
         })
         .filter(|(_, text)| !text.trim().is_empty())
         .collect();
@@ -179,7 +236,7 @@ pub fn run_digest(
         if json {
             let rows: Vec<_> = due
                 .iter()
-                .map(|(m, text)| serde_json::json!({ "recipient": m, "text": text }))
+                .map(|(g, text)| serde_json::json!({ "recipient": g.label, "text": text }))
                 .collect();
             println!("{}", serde_json::to_string_pretty(&rows)?);
         } else if due.is_empty() {
@@ -188,8 +245,8 @@ pub fn run_digest(
                 now.format("%Y-%m-%d %H:%M")
             );
         } else {
-            for (m, text) in &due {
-                println!("WOULD DIGEST to {}: {}", m, text.replace('\n', " · "));
+            for (g, text) in &due {
+                println!("WOULD DIGEST to {}: {}", g.label, text.replace('\n', " · "));
             }
         }
         return Ok(());
@@ -209,7 +266,8 @@ pub fn run_digest(
     if !due.is_empty() {
         let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
         rt.block_on(async {
-            for (member, text) in &due {
+            for (group, text) in &due {
+                let member = &group.label;
                 // Resolve the recipient's DM target through the project-authored
                 // coordination owner. Without one, only the recipient's explicit
                 // bot binding may send; roster/map order is never a fallback.
@@ -218,10 +276,12 @@ pub fn run_digest(
                         Some(t) => t,
                         None => {
                             eprintln!(
-                                "[{}] no bound bot/chat for digest recipient '{}' — skipping",
+                                "[{}] no bound bot/chat for digest recipient '{}' — {} item(s) STAY QUEUED for the next tick",
                                 chrono::Utc::now().format("%H:%M:%S"),
                                 member,
+                                group.items.len(),
                             );
+                            undelivered += 1;
                             continue;
                         }
                     };
@@ -232,7 +292,11 @@ pub fn run_digest(
                         // Confirmed delivery: NOW mark today's digest sent and
                         // clear the queue (restart-safe — a failed send above
                         // leaves the queue intact for the next tick to retry).
-                        store.emit_digest(member, now, &policy);
+                        // EVERY bucket folded into this one message is drained,
+                        // or a merged-in key would re-send its items tomorrow.
+                        for key in &group.keys {
+                            store.emit_digest(key, now, &policy);
+                        }
                         sent += 1;
                         println!(
                             "[{}] digest → {} via {}: {}",
@@ -274,4 +338,75 @@ pub fn run_digest(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use worksgood::agency::{TelegramBinding, TelegramBindingMap};
+
+    /// One confirmed human, fronted by one configured bot.
+    fn fixture() -> (TelegramConfig, TelegramBindingMap) {
+        let bindings = TelegramBindingMap {
+            bindings: vec![TelegramBinding::new(
+                "8905220378",
+                "human-one",
+                "Household Member",
+                Some("casa".to_string()),
+                chrono::Utc::now(),
+            )],
+        };
+        let mut bots = HashMap::new();
+        bots.insert(
+            "casa".to_string(),
+            TelegramBotConfig {
+                bot_token: "100:AAA".to_string(),
+                chat_id: "-1001".to_string(),
+                agent_id: Some("coordination-relay".to_string()),
+                username: None,
+            },
+        );
+        let config = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            bots,
+        };
+        (config, bindings)
+    }
+
+    #[test]
+    fn a_bucket_keyed_by_raw_telegram_id_reaches_the_same_human() {
+        // The live store carries TWO keys for one person — the binding name and the
+        // raw telegram id — because writers key by whatever string they hold. A
+        // name-only lookup makes the id-keyed bucket an undeliverable orphan whose
+        // items are queued forever and read by nobody.
+        let (config, bindings) = fixture();
+
+        // POSITIVE CONTROL: the name key resolves. If this fails the fixture is
+        // wrong, so the id assertion below cannot pass for the wrong reason.
+        let by_name = resolve_dm_target(&config, &bindings, "Household Member", "")
+            .expect("the binding name must resolve");
+        let by_id = resolve_dm_target(&config, &bindings, "8905220378", "")
+            .expect("an id-keyed bucket must resolve to the human it names");
+
+        assert_eq!(
+            (by_name.0, by_name.1),
+            (by_id.0, by_id.1),
+            "both keys name one person, so both must reach one chat via one bot",
+        );
+    }
+
+    #[test]
+    fn a_role_key_names_nobody_and_still_fails_closed() {
+        // Widening the lookup must not turn `operator` into "whichever binding is
+        // first". An unroutable key stays unroutable — the caller then leaves its
+        // items queued and says so, rather than DMing a family member an alert
+        // meant for whoever runs the house.
+        let (config, bindings) = fixture();
+        assert!(
+            resolve_dm_target(&config, &bindings, "operator", "").is_none(),
+            "a role key must never be delivered to an arbitrary human",
+        );
+    }
 }
