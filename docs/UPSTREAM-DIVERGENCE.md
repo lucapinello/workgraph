@@ -345,3 +345,95 @@ two `pub` group handlers, so it wants its own slice.
 
 **Pin by `rev`, never a branch.** Bump monthly while the gap is small — the cost of a bump
 grows superlinearly with the gap, which is precisely how this fork got here.
+
+---
+
+## Phase 1 — the triage table (2026-08-15)
+
+**Method.** Merge base with `gwwg/main` is `29740403` (2026-07-20). Since then: 342 commits ours,
+459 theirs. Files WE touched under `src/`: 122. Files THEY touched: 351. The intersection — the
+only files where a rev bump can actually collide — is **48**.
+
+**The number that reframes the problem.** Our `src/` churn is 95,363 lines, and only **11,033 of
+them (11%) sit in those 48 files**. The other 84,330 lines live in files upstream has never
+touched, so they merge without a conflict at all. The fork is not "100k lines of divergence to
+reconcile"; it is 11k lines across 48 files, and the top ten of those hold most of it. `src/casa/`
+(5,722 lines) is already immune by construction — upstream has no such path.
+
+**Buckets.** `A` = an upstream bug fix (a plain `wg` user would want it, no Casa involved) → PR it,
+and the file leaves our diff for good. `B` = Casa behaviour → moves into the Casa crate at Phase 3.
+`C` = wiring or noise (CLI declarations, dispatch arms, `cargo fmt`, merge commits) → disappears
+when Casa declares its own CLI, or is a trivial re-apply.
+
+**This is a first pass from commit subjects and file-level reading, not a per-hunk audit.** Every
+row marked `A+B` is genuinely mixed and needs a hunk-level split before it can be sent or moved.
+Rows are ordered by our churn, because that is the sync cost.
+
+| lines | file | bucket | why |
+|---:|---|:---:|---|
+| 1397 | `commands/service/coordinator.rs` | A+B | A: spawn circuit breaker, transport-exhausted quarantine, verdict starvation, dispatcher resilience. B: family-first lane (reserve headroom, family turns first), R18 button→task routing |
+| 1150 | `commands/service/mod.rs` | A+B | A: breaker + operator alert. B: the human-task dispatch tail (Casa's human asks) |
+| 1003 | `cli.rs` | C | Casa subcommand declarations; 565 of 1003 added lines are comments. Gone when Casa owns its CLI |
+| 871 | `eval_lifecycle.rs` | A | PendingEval unwedge, verdict-link transitions, coordinator perf — general lifecycle, no Casa concept |
+| 794 | `cron.rs` | A+B | A: cron-fanout orphaning, a distinct instance per firing, protected crons surviving a cleanup sweep. B: origin stamping / report-back |
+| 678 | `main.rs` | C | dispatch arms for Casa subcommands |
+| 596 | `disk_sentinel.rs` | A | double cache walk per interval, a guard reporting an untrue reason, macOS inertness |
+| 485 | `commands/service/human_dispatch.rs` | B | Casa's human-ask dispatch + button routing |
+| 479 | `service/provider_health.rs` | A | `classify_error` done-spoof suppressing real provider errors |
+| 390 | `session_lock.rs` | A | lock-test flakiness + dispatcher resilience |
+| 383 | `commands/done.rs` | A | disposable artifact/log enforcement and result ingestion — engine guardrails (docs/14) |
+| 357 | `commands/func_apply.rs` | A+C | fixes plus R18 wiring |
+| 308 | `config.rs` | A+B | A: breaker knobs. B: Casa-only settings |
+| 291 | `graph.rs` | A | `FailureClass` (incl. today's 400 split), disposable contract — engine vocabulary |
+| 208 | `commands/service/ipc.rs` | C | R18 routing surface |
+| 204 | `service/mod.rs` | A | inherited test failures |
+| 154 | `commands/setup.rs` | C | merge noise |
+| 151 | `tui/viz_viewer/state.rs` | A | dev TUI test fixes |
+| 149 | `commands/abandon.rs` | A | general |
+| 142 | `commands/spawn/execution.rs` | B | the heartbeat guard is OURS, not theirs — see the correction below |
+| 128 | `commands/publish.rs` | A+B | R18 routing (B) + an inherited test failure (A) |
+| 123 | `profile/named.rs` | A | tests |
+| 89 + 50 | `commands/service/worktree.rs`, `commands/spawn/worktree.rs` | A | worktree lifecycle / macOS path resolution |
+| 80 + 33 | `commands/spawn/raw_stream_classifier.rs`, `commands/service/triage.rs` | A | the 400 classification split (`1d556fca`) — **verified live upstream** |
+| 48 | `service/llm.rs` | C | merge |
+| 41 | `commands/chat_cmd.rs` | A+B | mixed |
+| 35 + 34 | `tui/pty_pane.rs`, `commands/spawn/mod.rs` | A | inherited test failures |
+| ≤28 each | `function.rs`, `commands/add.rs`, `claude_handler.rs`, `commands/mod.rs`, `coordinator_agent.rs`, `query.rs`, `commands/show.rs`, `func_cmd.rs`, `func_extract.rs`, `func_bootstrap.rs`, `commands/edit.rs`, `service/executor.rs`, `commands/notify.rs`, `evolve/deferred.rs`, `critical_path.rs`, `func_make_adaptive.rs`, `plan_validator.rs`, `lib.rs` | C mostly | 18 files, 175 lines between them: CLI/dispatch wiring with a few one-line fixes. Cheap either way |
+
+### The PR queue, with verification status
+
+The plan's rule — "would wg users want this with no Casa?" — is necessary but not sufficient. The
+second question is whether upstream is still broken, and that has to be checked against
+`gwwg/main`, not assumed from our commit message.
+
+| candidate | status |
+|---|---|
+| 400-classification split (`1d556fca`) | **verified live** — `gwwg/main` has `http_status == Some(400) => ApiError400Document` with no document check at all, blunter than the version we just fixed. Ready to PR |
+| one unverifiable verdict starves the graph (`2db5230c`) | recorded as live upstream (`load_durable_verdicts` bails on the first bad verdict). Re-verify before sending |
+| transport-exhausted → per-task quarantine (`bfed378c`) | unverified against current `gwwg/main` |
+| self-healing spawn circuit breaker (`9b823397`) | unverified |
+| cron-fanout orphaning / poison-task stall (`691965eb`) | unverified |
+| macOS `pipe2` build fix | **PR #62, open, zero reviews since 2026-08-13** |
+
+### Correction to the plan: `ee9c45d1` is not a bucket-A candidate
+
+The plan lists "heartbeat guard uses fd 9, not a bash-4 named fd" as a known upstream fix to send.
+It is not. Upstream does not have the feature: `gwwg/main`'s `commands/spawn/execution.rs` carries
+tests asserting its ABSENCE —
+
+```rust
+!script.contains("heartbeat-watch") && !script.contains("HEARTBEAT_GUARD_FD")
+```
+
+— so there is nothing there to fix, and the fix belongs to a Casa-carried feature (bucket B). One
+of the five named candidates evaporates on contact with their tree, which is the whole reason this
+table records verification status per row instead of trusting a subject line.
+
+### What this changes about the plan
+
+- **Phase 3 gets a priority order.** The top ten of these 48 files hold most of the 11k conflict
+  surface; the 18-file tail holds 175 lines. Extracting or upstreaming the top ten is where the
+  sync cost actually falls.
+- **Phase 2 is smaller than advertised and needs verification per patch**, not per commit subject.
+- **A monthly rev bump is already viable** for the 89% of our churn upstream never touches. The
+  thing that makes a bump expensive is those ten files, not the fork's total size.
