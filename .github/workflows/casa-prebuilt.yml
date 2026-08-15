@@ -56,7 +56,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install rust
         run: |
@@ -81,7 +81,7 @@ jobs:
           echo "$out"
           case "$out" in wg\ *) ;; *) echo "unexpected --version output" >&2; exit 1;; esac
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: wg-${{ matrix.target }}
           path: |
@@ -95,7 +95,7 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # THIS REPO CARRIES THE PACKAGING SCRIPT, so the workflow needs no repository variable and
       # no cross-repo token. The first version fetched it from the (private) gateway repo, which
@@ -107,7 +107,7 @@ jobs:
           test -x scripts/release-wg.sh || { echo "scripts/release-wg.sh missing from this repo" >&2; exit 1; }
           head -3 scripts/release-wg.sh
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -205,7 +205,7 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[] | "\(.name)  \(.size)"'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: casa-prebuilt-dist
           path: dist
