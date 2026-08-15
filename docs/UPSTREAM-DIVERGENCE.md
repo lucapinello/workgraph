@@ -414,18 +414,35 @@ subject.
 |---|---|
 | macOS `pipe2` build fix | **PR #62** — open, MERGEABLE, zero reviews since 2026-08-13. Also a hard prerequisite: `cargo test` on their `main` does not compile on macOS without it, so no macOS contributor can verify anything upstream today |
 | 400-classification split (`1d556fca`) | **PR #63, sent 2026-08-15.** Verified live: `Hard if http_status == Some(400) => ApiError400Document` with no document check. Their shape needed a different patch than ours — see the note below |
-| one unverifiable verdict starves the graph (`2db5230c`) | **VERIFIED LIVE — ready to send.** `load_durable_verdicts` (their line 917) still aborts the entire store on the first bad file: `?` on load, `bail!` twice, `?` on `verify_evaluation_digest`. One unverifiable verdict file makes every verdict unreadable. Minimal upstream form is skip-and-warn inside the loop, not our richer store split |
-| zombie session lock, from `691965eb` | **VERIFIED LIVE — ready to send.** They handle a RECYCLED pid (`holder.alive && pid_reused_by_foreign` → recover) but a genuinely live handler from a previous daemon generation hits `Some(holder) if holder.alive => Err("session lock held by live handler")` and every later coordinator exits as a cooperative handoff, forever. Since `wg service stop` leaves handlers running BY THEIR OWN DESIGN, this is reachable upstream exactly as it was for us on 2026-07-19. Their comment even anticipates the shape while fixing only the recycled case |
+| one unverifiable verdict starves the graph (`2db5230c`) | **LIVE BUT NOT SENDABLE — their fail-closed is deliberate.** The code path is exactly as described (`?` on load, `bail!` twice, `?` on `verify_evaluation_digest` — one bad file makes every verdict unreadable), but two of their tests REQUIRE it: a tampered score must produce an `unwrap_err()` containing `INTEGRITY`, and an evaluation tampered after its verdict must produce one containing `EVIDENCE`. Fail-closed on evidence tampering is a defensible choice, and skip-and-warn would break both tests. This is a design disagreement, not a bug: raise the operational consequence as an ISSUE (one unusable file starves the whole graph) and let them decide. Our per-file quarantine stays a carried policy difference |
+| zombie session lock, from `691965eb` | **NOT ESTABLISHED — needs deeper analysis, do not send.** The refusal path is real (`Some(holder) if holder.alive => Err("session lock held by live handler")`, with only a recycled-pid escape), but it is deliberately tested too (`second_acquire_fails_while_first_held`), and they have machinery we may simply have duplicated: `request_release_embeds_live_holder_pid`, `release_request_targets_only_its_generation`, `legacy_untargeted_marker_is_treated_as_stale`. A targeted release request to the previous generation's holder may already be their intended answer to the cross-generation case. Establishing whether that path actually resolves it needs a read of the release protocol, not a grep — and until that is done, "live" is a claim about a code path, not about a defect |
 | transport-exhausted → per-task quarantine (`bfed378c`) | **NOT APPLICABLE.** No transport-exhausted concept exists upstream at all (`git grep` finds nothing). Ours is bucket B, not a fix to send |
 | self-healing spawn circuit breaker (`9b823397`) | **NOT A FIX — a PARALLEL IMPLEMENTATION.** Upstream has its own per-task spawn breaker (`spawn_breaker_tripped_tasks` in their coordinator, with `test_record_dispatch_clears_breaker_on_success` and `test_spawn_circuit_breaker_reset_on_edit`), plus a provider breaker in `triage.rs`. They have no `spawn_breaker.rs`; we built the same idea in a file they lack. This is a Phase 3 **adopt-theirs** candidate: dropping ours in favour of theirs would delete ~900 of our lines and remove a guaranteed conflict |
 | cron-fanout orphaning / poison-task stall (`691965eb`) | still unverified — the commit is a bundle, and only its session-lock half has been checked |
 
+### Correction, same day: "the path is live" is not "the behaviour is a bug"
+
+The two rows above first read **VERIFIED LIVE — ready to send**, on the strength of the code path
+alone. That was wrong in the way that costs a maintainer's goodwill: in both cases the current
+behaviour is pinned by their own tests, so a patch would have arrived breaking them and arguing
+against an intent nobody had asked about. Fail-closed on a tampered verdict store and refusing a
+lock held by a live process are both defensible, and they are tested as such.
+
+The check that was missing: after finding the path, grep the tests for assertions that REQUIRE it.
+`unwrap_err()`, `assert!(… .is_err())`, and a test named for the refusal are the tells. Only then is
+the difference a defect rather than a disagreement — and a disagreement belongs in an issue, where
+they can say no cheaply, not in a PR.
+
 ### What the sweep says about method
 
-Two of four candidates evaporated, and in both cases the commit subject read exactly like a
-portable bug fix. `bfed378c` describes a quarantine for a failure mode upstream has never modelled;
-`9b823397` describes a breaker they already have. Add `ee9c45d1` from the first pass and that is
-**three of five** named candidates that do not survive contact with their tree.
+All four candidates evaporated, for three different reasons, and every one of them read like a
+portable bug fix in its commit subject. `bfed378c` quarantines a failure mode upstream has never
+modelled. `9b823397` reimplements a breaker they already have. `2db5230c` and the session-lock half
+of `691965eb` both describe behaviour their tests deliberately pin. Add `ee9c45d1` from the first
+pass and that is **five of five** named bucket-A candidates that are not sendable as patches.
+
+The one PR that did go out this session (#63) was not in the plan at all — it came from
+investigating a failed household task.
 
 The `1d556fca` PR makes the same point from the other side. Our fix added enum variants and a
 policy mapping; their tree needed neither, because their parser already carries the vocabulary and
