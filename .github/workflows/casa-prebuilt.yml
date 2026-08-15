@@ -63,8 +63,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add ${{ matrix.target }}
 
+      # BOTH binaries. release-wg.sh includes `nex` when it sits next to `wg`
+      # ("nex ships alongside wg in CI"), which is how the published macOS archive got it. Build
+      # only `wg` here and the Linux archives would quietly differ in contents from the macOS one.
       - name: build the engine
-        run: cargo build --release --locked --bin wg --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked --bin wg --target ${{ matrix.target }}
+          cargo build --release --locked --bin nex --target ${{ matrix.target }}
 
       # A binary that cannot answer `--version` is not a release candidate. Native runner, so
       # this actually executes rather than merely linking.
@@ -79,7 +84,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wg-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/wg
+          path: |
+            target/${{ matrix.target }}/release/wg
+            target/${{ matrix.target }}/release/nex
           if-no-files-found: error
           retention-days: 1
 
@@ -90,21 +97,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # scripts/release-wg.sh lives in the GATEWAY repo, not this one. Fetch just that script
-      # from the deploy repo rather than vendoring a second copy that can drift.
-      - name: fetch the packaging script
-        env:
-          GH_TOKEN: ${{ secrets.CASA_GATEWAY_TOKEN || secrets.GITHUB_TOKEN }}
-          GATEWAY_REPO: ${{ vars.CASA_GATEWAY_REPO }}
+      # THIS REPO CARRIES THE PACKAGING SCRIPT, so the workflow needs no repository variable and
+      # no cross-repo token. The first version fetched it from the (private) gateway repo, which
+      # meant two pieces of configuration that sit unset — turning the whole workflow into a
+      # fail-fast error message instead of a release. The gateway remains the source of truth and
+      # claw3d-bridge/test/releaseScriptTwin.test.mjs fails if the two copies drift.
+      - name: check the packaging script is present
         run: |
-          if [ -z "${GATEWAY_REPO:-}" ]; then
-            echo "set repository variable CASA_GATEWAY_REPO to the gateway repo (owner/name)" >&2
-            exit 1
-          fi
-          mkdir -p scripts
-          gh api "repos/${GATEWAY_REPO}/contents/scripts/release-wg.sh" \
-            --jq '.content' | base64 -d > scripts/release-wg.sh
-          chmod +x scripts/release-wg.sh
+          test -x scripts/release-wg.sh || { echo "scripts/release-wg.sh missing from this repo" >&2; exit 1; }
           head -3 scripts/release-wg.sh
 
       - uses: actions/download-artifact@v4
@@ -141,6 +141,9 @@ jobs:
           for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             bin="artifacts/wg-$t/wg"
             test -x "$bin" || chmod +x "$bin"
+            # nex must sit NEXT TO wg for release-wg.sh to include it, matching the macOS archive.
+            [ -f "artifacts/wg-$t/nex" ] && chmod +x "artifacts/wg-$t/nex"
+            test -f "artifacts/wg-$t/nex" || { echo "nex missing for $t — the archive would differ from the macOS one" >&2; exit 1; }
             WG_PREBUILT_BIN="$bin" OUT_DIR="$PWD/dist" \
               scripts/release-wg.sh --target "$t"
           done
