@@ -151,8 +151,15 @@ jobs:
           echo "--- combined SHA256SUMS (must still list the macOS archive if it was published) ---"
           cat dist/SHA256SUMS
 
-      # The guard that makes the seeding above meaningful rather than decorative: if the release
-      # already had a macOS archive, the file we are about to upload must still name it.
+      # Two guards, because NAMING an asset is not the same as naming it CORRECTLY.
+      #
+      # (1) orphaning: if the release already had an archive, the SHA256SUMS we upload must still
+      #     list it, or an installer that looks its own archive up by name fails.
+      # (2) STALENESS: the seed is a snapshot. If someone publishes another target between our
+      #     seed and our upload — which nearly happened here, the macOS asset was refreshed three
+      #     minutes into this workflow — we would carry that target's OLD digest and every install
+      #     of it would fail checksum verification. So compare each already-published archive's
+      #     digest against its published .sha256 and refuse on any mismatch.
       - name: refuse to orphan an existing asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -169,6 +176,22 @@ jobs:
             fi
           done
           echo "every published archive is still listed"
+
+          # (2) the digests we carry for OTHER targets must match what is published right now.
+          for a in $published; do
+            case "$a" in *linux-gnu*) continue;; esac   # we just built these
+            ours="$(awk -v n="$a" '$2 == n {print $1}' dist/SHA256SUMS)"
+            theirs="$(gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$a.sha256" --output - 2>/dev/null | awk '{print $1}')"
+            if [ -n "$theirs" ] && [ "$ours" != "$theirs" ]; then
+              echo "STALE seed for $a" >&2
+              echo "  ours:   $ours" >&2
+              echo "  theirs: $theirs" >&2
+              echo "that asset was re-published after this run seeded SHA256SUMS; re-run this workflow." >&2
+              exit 1
+            fi
+          done
+          echo "carried digests match what is published"
 
       - name: publish
         if: ${{ inputs.publish == 'true' }}
