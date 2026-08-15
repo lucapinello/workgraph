@@ -868,6 +868,14 @@ fn print_human_readable(details: &TaskDetails) {
             ApiError400Document => {
                 "fix the input (malformed/encrypted PDF or document) before retry — do not auto-retry"
             }
+            ApiError400UsageLimit => {
+                "the API budget is exhausted, not this task's input — the agent's output names when \
+                 access returns. Nothing to fix here: restore budget (or switch route) and re-run"
+            }
+            ApiError400Other => {
+                "the API rejected the request itself (a 400 that is neither a document nor a usage \
+                 limit) — read the agent output before retrying"
+            }
             ApiError429RateLimit => "rate limit — back off and retry",
             ApiError5xxTransient => "transient upstream error — retry is safe",
             AgentHardTimeout => "agent exceeded hard timeout — split task or raise timeout",

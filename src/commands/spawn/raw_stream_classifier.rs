@@ -39,15 +39,29 @@ pub fn classify_from_raw_stream(raw_stream: &Path, exit_code: i32) -> FailureCla
     if let Some(status_code) = extract_api_error_status(&tail) {
         match status_code {
             400 => {
-                // Confirm it's a document-processing error, not an unrelated 400.
+                // A 400 is not one thing, and this used to pretend it was: the guard below
+                // "confirmed" a document error and then the fall-through returned the SAME class
+                // anyway, so every 400 became api-error-400-document. On 2026-08-11 that turned
+                // an exhausted API budget into "fix the malformed PDF" on task verify-next-week —
+                // a document that does not exist — and, because the document class maps to
+                // ProviderErrorKind::FatalTask, it marked the task permanently failed for
+                // something that was not its fault. With the budget gone, every queued task would
+                // have been destroyed the same way.
+                //
+                // Usage limit first: it is the only 400 whose right answer is "stop the run", not
+                // "fix this task".
+                if is_usage_limit(&tail) {
+                    return FailureClass::ApiError400UsageLimit;
+                }
                 if tail.contains("Could not process PDF")
                     || tail.contains("Could not process document")
                     || tail.contains("Could not process image")
                 {
                     return FailureClass::ApiError400Document;
                 }
-                // Generic 400 — treat as document error conservatively.
-                return FailureClass::ApiError400Document;
+                // Neither — the request itself was rejected. Same conservative no-auto-retry
+                // policy as a document error, but named for what we actually know.
+                return FailureClass::ApiError400Other;
             }
             429 => return FailureClass::ApiError429RateLimit,
             500..=599 => return FailureClass::ApiError5xxTransient,
@@ -165,6 +179,17 @@ fn extract_api_error_status(text: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// Does this stream tail carry the API's "you are out of budget" 400?
+///
+/// The message is prose, not a code: `"You have reached your specified API usage limits. You will
+/// regain access on 2026-09-01 at 00:00 UTC."` Both halves are matched independently because the
+/// wording around them has changed before and the two phrases have never appeared in a
+/// document-processing error.
+fn is_usage_limit(tail: &str) -> bool {
+    let t = tail.to_ascii_lowercase();
+    t.contains("usage limit") || t.contains("regain access on")
+}
+
 fn looks_like_executor_tool_model_config_failure(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("param: tools")
@@ -206,6 +231,48 @@ mod tests {
             classify_from_raw_stream(f.path(), 1),
             FailureClass::ApiError400Document
         );
+    }
+
+    #[test]
+    fn test_classifier_400_usage_limit_is_not_a_document_error() {
+        // The REAL payload from agent-8349 (task verify-next-week, 2026-08-11), trimmed to the
+        // fields the classifier reads. It used to come back ApiError400Document, whose operator
+        // hint sends you to fix a malformed PDF and whose triage kind is FatalTask — so a house
+        // with no API budget left destroyed the task instead of parking the run.
+        let f = write_stream(
+            r#"{"type":"result","terminal_reason":"api_error","subtype":"success","api_error_status":400,"result":"API Error: 400 You have reached your specified API usage limits. You will regain access on 2026-09-01 at 00:00 UTC."}"#,
+        );
+        assert_eq!(
+            classify_from_raw_stream(f.path(), 1),
+            FailureClass::ApiError400UsageLimit
+        );
+    }
+
+    #[test]
+    fn test_classifier_400_with_no_known_cause_is_not_called_a_document_error() {
+        // Behaviour CHANGE, deliberately pinned: the old code ran a "confirm it's a document
+        // error" check and then returned the document class either way, so this case asserted a
+        // diagnosis nobody had made.
+        let f = write_stream(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":400,"message":"messages.1: all messages must have non-empty content"}"#,
+        );
+        assert_eq!(
+            classify_from_raw_stream(f.path(), 1),
+            FailureClass::ApiError400Other
+        );
+    }
+
+    #[test]
+    fn test_usage_limit_detector_does_not_fire_on_a_document_error() {
+        // The two 400s must stay distinguishable in both directions, or the fix just moves the
+        // misclassification to the other side.
+        assert!(!is_usage_limit(
+            r#"{"api_error_status":400,"message":"Could not process PDF: encrypted"}"#
+        ));
+        assert!(is_usage_limit(
+            "You have reached your specified API usage limits."
+        ));
+        assert!(is_usage_limit("you will regain access on 2026-09-01"));
     }
 
     #[test]
@@ -282,10 +349,13 @@ mod tests {
     fn test_classifier_truncated_jsonl() {
         // Last line is partial JSON — should fall back, not panic
         let f = write_stream(r#"{"type":"result","api_error_status":400,"mes"#);
-        // Still extracts the status code from partial JSON
+        // Still extracts the status code from partial JSON. The CLASS changed with the 400 split
+        // (2026-08-15): a stream that stops mid-key cannot tell you why the request was rejected,
+        // so calling it a document error was the same unearned diagnosis this test used to pin.
+        // "Other" is what is actually known — a 400 whose cause the stream does not contain.
         assert_eq!(
             classify_from_raw_stream(f.path(), 1),
-            FailureClass::ApiError400Document
+            FailureClass::ApiError400Other
         );
     }
 

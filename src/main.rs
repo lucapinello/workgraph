@@ -4986,6 +4986,8 @@ fn parse_failure_class(s: &str) -> Option<worksgood::graph::FailureClass> {
     use worksgood::graph::FailureClass;
     match s.trim() {
         "api-error-400-document" => Some(FailureClass::ApiError400Document),
+        "api-error-400-usage-limit" => Some(FailureClass::ApiError400UsageLimit),
+        "api-error-400-other" => Some(FailureClass::ApiError400Other),
         "api-error-429-rate-limit" => Some(FailureClass::ApiError429RateLimit),
         "api-error-5xx-transient" => Some(FailureClass::ApiError5xxTransient),
         "agent-hard-timeout" => Some(FailureClass::AgentHardTimeout),

@@ -764,6 +764,7 @@ fn classify_typed_or_legacy_failure(
 ) -> Option<ProviderErrorKind> {
     let kind = match failure_class {
         Some(FailureClass::ApiError400Document)
+        | Some(FailureClass::ApiError400Other)
         | Some(FailureClass::AgentHardTimeout)
         | Some(FailureClass::DeliverableMissing)
         | Some(FailureClass::NoOperationalOutput)
@@ -771,7 +772,11 @@ fn classify_typed_or_legacy_failure(
         Some(FailureClass::ApiError429RateLimit)
         | Some(FailureClass::ApiError5xxTransient)
         | Some(FailureClass::WrapperInternal) => ProviderErrorKind::Transient,
-        Some(FailureClass::ExecutorConfig) => ProviderErrorKind::FatalProvider,
+        // A usage-limit 400 is the PROVIDER being out of budget, not this task being broken:
+        // FatalProvider parks the run instead of burning every queued task on the same wall.
+        Some(FailureClass::ExecutorConfig) | Some(FailureClass::ApiError400UsageLimit) => {
+            ProviderErrorKind::FatalProvider
+        }
         Some(FailureClass::AgentExitNonzero) | None => classify_error(exit_code, stderr),
     };
     Some(kind)
@@ -1235,6 +1240,29 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use worksgood::graph::Task;
+
+    #[test]
+    fn usage_limit_is_a_provider_problem_not_a_broken_task() {
+        // THE 2026-08-11 LOSS. An exhausted API budget arrives as a 400. Every 400 used to be
+        // classified api-error-400-document, which maps to FatalTask — so `verify-next-week` was
+        // marked permanently failed for a malformed document it never had, and with no budget left
+        // every other queued task was headed for the same fate. The budget is a PROVIDER
+        // condition: FatalProvider parks the run instead of consuming the graph.
+        assert_eq!(
+            classify_typed_or_legacy_failure(Some(FailureClass::ApiError400UsageLimit), Some(1), ""),
+            Some(ProviderErrorKind::FatalProvider),
+        );
+        // A real document error is still the task's own input problem.
+        assert_eq!(
+            classify_typed_or_legacy_failure(Some(FailureClass::ApiError400Document), Some(1), ""),
+            Some(ProviderErrorKind::FatalTask),
+        );
+        // An unexplained 400 keeps the conservative no-auto-retry policy it always had.
+        assert_eq!(
+            classify_typed_or_legacy_failure(Some(FailureClass::ApiError400Other), Some(1), ""),
+            Some(ProviderErrorKind::FatalTask),
+        );
+    }
 
     /// Helper: call apply_triage_verdict with a dummy dir and default config
     /// (no profile set → no escalation).

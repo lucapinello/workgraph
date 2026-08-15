@@ -130,6 +130,20 @@ pub enum FailureClass {
     /// HTTP 400 from the Anthropic API on a document attachment (e.g. malformed/
     /// encrypted PDF). Action: fix the input before retry — do not auto-retry.
     ApiError400Document,
+    /// HTTP 400 whose body says the API USAGE LIMIT is reached ("You have reached
+    /// your specified API usage limits. You will regain access on <date>").
+    /// Nothing is wrong with the task or its input: the whole provider is out of
+    /// budget until the stated time, so this is a FatalProvider condition, not a
+    /// FatalTask one. Classifying it as a document error (which is what every 400
+    /// used to become) marks the task permanently failed for a reason that is not
+    /// its fault, and tells the operator to go and fix a PDF that does not exist —
+    /// while every other task in flight fails the same way.
+    ApiError400UsageLimit,
+    /// HTTP 400 that is neither a document error nor a usage limit — the API
+    /// rejected the request itself. Same conservative do-not-auto-retry policy as
+    /// the document case, but named honestly so `wg show` stops asserting a
+    /// diagnosis nobody checked.
+    ApiError400Other,
     /// HTTP 429 — rate limit. Auto-retriable after backoff.
     ApiError429RateLimit,
     /// HTTP 5xx — transient upstream error. Auto-retriable.
@@ -172,6 +186,8 @@ impl std::fmt::Display for FailureClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             FailureClass::ApiError400Document => "api-error-400-document",
+            FailureClass::ApiError400UsageLimit => "api-error-400-usage-limit",
+            FailureClass::ApiError400Other => "api-error-400-other",
             FailureClass::ApiError429RateLimit => "api-error-429-rate-limit",
             FailureClass::ApiError5xxTransient => "api-error-5xx-transient",
             FailureClass::AgentHardTimeout => "agent-hard-timeout",
