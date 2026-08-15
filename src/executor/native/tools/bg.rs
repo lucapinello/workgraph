@@ -393,14 +393,35 @@ mod tests {
         });
         tool.execute(&run_input).await;
 
-        // Small delay to let output flush
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Get output
+        // Wait for the job's OWN output rather than sleeping a fixed guess.
+        //
+        // This test used to sleep 200ms and assert only `!is_error`, which asserts almost
+        // nothing: `JobStore::output` returns Ok("(no output yet — …)") when the log file does
+        // not exist yet and Ok("(log file exists but is empty …)") when it is empty, so the old
+        // version passed without the job ever having produced anything. Its only real failure
+        // mode is "Job not found", i.e. `run` never registered the job.
+        //
+        // KNOWN-GAPS item 2 records this test failing ~1 full run in 3 while passing 5/5 in
+        // isolation; that was NOT reproduced here (a 0ms delay still passes on an idle box), so
+        // this is not a claimed fix. It is a stronger assertion and a bounded wait: the deadline
+        // cannot mask a break — if the output never arrives, or "Job not found" comes back, this
+        // fails and the panic message carries the tool's own words.
         let output_input = json!({ "action": "output", "job": "output-test" });
-        let result = tool.execute(&output_input).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut result = tool.execute(&output_input).await;
+        while std::time::Instant::now() < deadline
+            && (result.is_error || !result.content.contains("hello world"))
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            result = tool.execute(&output_input).await;
+        }
 
         assert!(!result.is_error, "Error: {}", result.content);
+        assert!(
+            result.content.contains("hello world"),
+            "the job printed nothing this test could see within 10s: {}",
+            result.content
+        );
 
         // Cleanup
         let delete_input = json!({ "action": "delete", "job": "output-test" });
