@@ -1,0 +1,186 @@
+# Publish the Linux `wg` prebuilts that `casa install-wg` downloads.
+#
+# WHY THIS FILE EXISTS, AND WHY IT IS NOT AN EDIT TO release.yml. Upstream's
+# .github/workflows/release.yml already builds a five-target matrix and names assets exactly
+# `wg-v<version>-<target>.tar.gz` + `SHA256SUMS` — the convention `casa install-wg` reads. But
+# it is UPSTREAM'S file, and it publishes to the tag that triggered it. Casa's deploy path reads
+# a FIXED release tag (`casa-prebuilt`, see docs/reference-fork.txt), so it needs its own
+# publisher. A new file cannot conflict on the next upstream sync; an edit to theirs would.
+#
+# THE GAP THIS CLOSES (measured 2026-08-14). docs/05 told deployers a Linux prebuilt "is now
+# published" for both linux triples so a container could get the listener with no compiler. The
+# `casa-prebuilt` release actually held THREE assets: SHA256SUMS, the aarch64-apple-darwin
+# tarball, and its .sha256. Zero Linux. The claim outran the release because those targets build
+# natively — an Apple-silicon Mac cannot produce them alone, which is exactly what CI is for.
+#
+# SEEDING SHA256SUMS IS LOAD-BEARING. scripts/release-wg.sh merges per target: it drops this
+# archive's line and keeps every other line already in $OUT_DIR/SHA256SUMS. On a fresh CI
+# checkout that file does not exist, so publishing Linux from an empty out-dir would upload a
+# SHA256SUMS containing ONLY the Linux archives — and `casa install-wg` on a Mac, which fetches
+# SHA256SUMS and looks up its own archive, would then fail on a release that still HAS the macOS
+# tarball. So the publish job downloads the existing SHA256SUMS first and packages on top of it.
+#
+# Runners are upstream's proven pairing: x86_64 on ubuntu-22.04, aarch64 on ubuntu-22.04-arm.
+# No cross-compilation, no `cross` container.
+#
+# workflow_dispatch ONLY. Publishing replaces a public artifact that families download; that is
+# a deliberate act, never a side effect of a push.
+
+name: casa-prebuilt (linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish into (must already exist)"
+        required: true
+        default: casa-prebuilt
+      publish:
+        description: "Upload to the release? 'false' builds and packages only."
+        required: true
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: build the engine
+        run: cargo build --release --locked --bin wg --target ${{ matrix.target }}
+
+      # A binary that cannot answer `--version` is not a release candidate. Native runner, so
+      # this actually executes rather than merely linking.
+      - name: prove the binary runs
+        run: |
+          BIN=target/${{ matrix.target }}/release/wg
+          test -x "$BIN"
+          out="$("$BIN" --version)"
+          echo "$out"
+          case "$out" in wg\ *) ;; *) echo "unexpected --version output" >&2; exit 1;; esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wg-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/wg
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: package + publish
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # scripts/release-wg.sh lives in the GATEWAY repo, not this one. Fetch just that script
+      # from the deploy repo rather than vendoring a second copy that can drift.
+      - name: fetch the packaging script
+        env:
+          GH_TOKEN: ${{ secrets.CASA_GATEWAY_TOKEN || secrets.GITHUB_TOKEN }}
+          GATEWAY_REPO: ${{ vars.CASA_GATEWAY_REPO }}
+        run: |
+          if [ -z "${GATEWAY_REPO:-}" ]; then
+            echo "set repository variable CASA_GATEWAY_REPO to the gateway repo (owner/name)" >&2
+            exit 1
+          fi
+          mkdir -p scripts
+          gh api "repos/${GATEWAY_REPO}/contents/scripts/release-wg.sh" \
+            --jq '.content' | base64 -d > scripts/release-wg.sh
+          chmod +x scripts/release-wg.sh
+          head -3 scripts/release-wg.sh
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # SEED the combined checksum file from the release as it stands, so the merge in
+      # release-wg.sh preserves every asset already published (notably the macOS tarball).
+      # Absent on a first-ever publish, which is fine — the merge then simply starts empty.
+      - name: seed SHA256SUMS from the existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir -p dist
+          if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir dist; then
+            echo "seeded from $TAG:"; cat dist/SHA256SUMS
+          else
+            echo "no existing SHA256SUMS on $TAG — first publish for this tag"
+          fi
+
+      # WG_SOURCE_DIR is REQUIRED, not optional: release-wg.sh dies if it is missing and reads
+      # the release version from $WG_SOURCE_DIR/Cargo.toml. Its default is a developer's local
+      # ~/Projects/workgraph, which does not exist on a runner — omitting it here made the job
+      # fail before packaging anything. This workflow runs inside the engine checkout, so the
+      # workspace IS the source dir.
+      - name: package each target
+        env:
+          WG_RELEASE_TAG: ${{ inputs.release_tag }}
+          WG_RELEASE_REPO: ${{ github.repository }}
+          WG_SOURCE_DIR: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            bin="artifacts/wg-$t/wg"
+            test -x "$bin" || chmod +x "$bin"
+            WG_PREBUILT_BIN="$bin" OUT_DIR="$PWD/dist" \
+              scripts/release-wg.sh --target "$t"
+          done
+          ls -l dist
+          echo "--- combined SHA256SUMS (must still list the macOS archive if it was published) ---"
+          cat dist/SHA256SUMS
+
+      # The guard that makes the seeding above meaningful rather than decorative: if the release
+      # already had a macOS archive, the file we are about to upload must still name it.
+      - name: refuse to orphan an existing asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          published="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | grep '\.tar\.gz$' || true)"
+          for a in $published; do
+            if ! grep -q "  $a\$" dist/SHA256SUMS; then
+              echo "SHA256SUMS would drop already-published asset: $a" >&2
+              echo "installers that fetch SHA256SUMS and look up their own archive would break." >&2
+              exit 1
+            fi
+          done
+          echo "every published archive is still listed"
+
+      - name: publish
+        if: ${{ inputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/wg-*-linux-gnu.tar.gz dist/wg-*-linux-gnu.tar.gz.sha256 dist/SHA256SUMS
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size)"'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: casa-prebuilt-dist
+          path: dist
+          if-no-files-found: error
