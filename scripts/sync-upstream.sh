@@ -46,7 +46,10 @@ say "  theirs          $REMOTE/$BRANCH, $THEIRS_N commits since"
 
 # ── the conflict surface: files BOTH sides touched ────────────────────────────
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"; [ -n "${wt:-}" ] && git worktree remove --force "$wt" >/dev/null 2>&1' EXIT
+# `worktree remove` can leave the ADMIN entry behind when the run dies hard (observed: a stale
+# /private/var/.../trial entry surviving in `git worktree list` after a failed trial merge), so
+# prune unconditionally afterwards — otherwise every run leaves a registration nobody expects.
+trap 'rm -rf "$tmp"; [ -n "${wt:-}" ] && git worktree remove --force "$wt" >/dev/null 2>&1; git worktree prune >/dev/null 2>&1' EXIT
 git diff --name-only "$BASE"..HEAD -- src/ > "$tmp/ours"
 git diff --name-only "$BASE".."$REMOTE/$BRANCH" -- src/ > "$tmp/theirs"
 comm -12 <(sort "$tmp/ours") <(sort "$tmp/theirs") > "$tmp/both"
