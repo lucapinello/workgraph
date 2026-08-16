@@ -39,7 +39,7 @@
 #
 # ENV OVERRIDES:
 #   WG_SOURCE_DIR   fork checkout to build from   (default: ~/Projects/workgraph)
-#   WG_FORK_BRANCH  branch to build               (default: integration/casa-pinello)
+#   WG_FORK_BRANCH  branch to build               (default: casa-integration-synced)
 #   WG_RELEASE_REPO GitHub repo to publish to      (default: lucapinello/workgraph)
 #   WG_RELEASE_TAG  release tag to publish under   (default: casa-prebuilt, a rolling tag)
 #   OUT_DIR         where archives are staged       (default: <repo>/dist)
@@ -66,7 +66,11 @@ set -euo pipefail
 # ── config ───────────────────────────────────────────────────────────────────
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WG_SOURCE_DIR="${WG_SOURCE_DIR:-$HOME/Projects/workgraph}"
-WG_FORK_BRANCH="${WG_FORK_BRANCH:-integration/casa-pinello}"
+# The branch Casa's engine actually lives on. This defaulted to `integration/casa-pinello`, which
+# stopped moving on 2026-07-22 while every engine fix since landed on `casa-integration-synced` —
+# so a `--publish` run without WG_PREBUILT_BIN would have built a month-old engine and shipped it
+# as "the prebuilt". The published release WAS a month stale when this was found (2026-08-16).
+WG_FORK_BRANCH="${WG_FORK_BRANCH:-casa-integration-synced}"
 WG_RELEASE_REPO="${WG_RELEASE_REPO:-lucapinello/workgraph}"
 WG_RELEASE_TAG="${WG_RELEASE_TAG:-casa-prebuilt}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"
