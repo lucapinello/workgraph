@@ -474,3 +474,62 @@ table records verification status per row instead of trusting a subject line.
 - **Phase 2 is smaller than advertised and needs verification per patch**, not per commit subject.
 - **A monthly rev bump is already viable** for the 89% of our churn upstream never touches. The
   thing that makes a bump expensive is those ten files, not the fork's total size.
+
+---
+
+## Phase 2/3, measured properly (2026-08-15, later)
+
+`scripts/sync-upstream.sh` does the trial merge, so the work list is no longer a guess. Conflicts
+today: **23 files**, and they are wildly lopsided.
+
+| hunks | our-side lines | file |
+|---:|---:|---|
+| 22 | 3948 | `commands/service/coordinator.rs` |
+| 7 | 139 | `config.rs` |
+| 6 | 158 | `disk_sentinel.rs` |
+| 5 | 368 | `eval_lifecycle.rs` |
+| 5 | 164 | `commands/service/ipc.rs` |
+| 5 | 146 | `commands/service/mod.rs` |
+| 5 | 131 | `commands/spawn/execution.rs` |
+| 3 | 78 | `commands/spawn/raw_stream_classifier.rs` |
+| ≤2 each | ~700 total | 15 more files, incl. 2 integration tests and `tests/smoke/manifest.toml` |
+
+**One file is ~60% of the sync cost.** The other 22 hold ~1,900 lines across 55 hunks, and 13 of
+them have two hunks or fewer — those are minutes each, not the problem.
+
+### The coordinator conflict does NOT dissolve by extracting Casa
+
+This was the assumption behind giving Phase 3 a priority order, and reading the hunks kills it. The
+22 conflicted hunks in `coordinator.rs` are not family behaviour. They are general dispatcher
+observability and resilience we added:
+
+- **quarantined-verdict reporting**, once per distinct quarantine set — the old reader "printed its
+  fail-closed line 16,764 times on the live instance, which trained every reader to scroll past it";
+- **a starve detector** for the `tasks_ready == 0` case with work still open, which our own comment
+  records as the pre-existing dispatch watchdog's exact blind spot: "that starve ticked quietly 1102
+  times and cost a family a whole week";
+- cohort naming, so a starve with a big single-status cohort is reportable rather than silent.
+
+None of that is Casa-specific, so none of it can move into a Casa crate. It is bucket **A** in
+character. Which means `coordinator.rs` has exactly two futures: upstream takes these improvements
+and the conflict disappears, or we carry them and pay the merge cost in this one file forever.
+
+### New bucket-A candidates, not in the plan's list
+
+The starve detector and the quarantine reporting are stronger candidates than anything in the
+original five, because both address gaps upstream's own code acknowledges. Neither has been checked
+against the test-intent rule yet — that check comes first, every time.
+
+### Correction: the spawn breaker is NOT an adopt-theirs opportunity
+
+Recorded earlier today as "~900 lines we could delete by adopting theirs". Wrong, and the answer was
+in our own module header the whole time: upstream's breaker is the PER-TASK one, which our module
+describes as "a final give-up" that "does nothing about a systemic spawn outage". Ours is a
+dispatcher-wide layer on top of it — consecutive dispatcher-wide spawn failures, a cooldown, a
+half-open probe, an exponential backoff, and a loud operator alert, with state persisted across
+daemon restarts. Their `provider_health.rs` pauses a PROVIDER on auth/quota/CLI-missing, which does
+not cover a crash window or a bad binary.
+
+Two complementary layers, not a duplicate. There are no 900 lines to delete, and deleting ours would
+remove a layer that exists because of an outage. Third time today that matching on a concept name
+instead of reading the code produced a wrong claim.
