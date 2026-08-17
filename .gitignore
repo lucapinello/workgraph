@@ -87,3 +87,7 @@ terminal-bench/results/
 # Agent issue directories (per-run)
 /issues-*/
 .workgraph
+
+# Release staging: scripts/release-wg.sh packages archives here (124 MB per run).
+# Build output, never source — and an accidental commit would put a binary in git.
+dist/
