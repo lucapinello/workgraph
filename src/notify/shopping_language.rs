@@ -738,10 +738,25 @@ const GENERIC_GOODS: &[&str] = &[
     "pods",
 ];
 
+/// Packaging / measure nouns, in the ONLY shapes that evidence a purchase.
+///
+/// This used to be a bare word-boundary match on the vocabulary. Half of these words are also
+/// ordinary verbs, and one of them — `can` — is the commonest modal in English, so ANY sentence
+/// containing it read as groceries. On 2026-08-18 a family answered a wrong calendar with
+/// "…I have to pick up the kids can you tell this to the developer of casa" and the house replied
+/// "Done — kids can you tell this to the developer of casa on the shopping list 🛒": a correction
+/// became a row, because "can you" tripped this.
+///
+/// A packaging noun is now evidence only in a UNIT construction — followed by "of"
+/// ("a can of tomatoes", "bottles of water") or preceded by a quantity ("2 cans", "a bottle",
+/// "another pack"). Bare "can/box/roll/pack" is left to the verb reading it usually has.
+/// `\b(?:…)\b` alternation only: the regex crate has no lookaround.
 static PACKAGING_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(?:bag|bags|box|boxes|can|cans|tin|tins|jar|jars|bottle|bottles|pack|packs|packet|packets|carton|cartons|tub|tubs|roll|rolls|loaf|loaves|bunch|bunches|dozen|punnet|punnets|sachet|sachets|refill|refills)\b",
-    )
+    const PKG: &str = "bag|bags|box|boxes|can|cans|tin|tins|jar|jars|bottle|bottles|pack|packs|packet|packets|carton|cartons|tub|tubs|roll|rolls|loaf|loaves|bunch|bunches|dozen|punnet|punnets|sachet|sachets|refill|refills";
+    const QTY: &str = r"\d+|a|an|another|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|couple|few|some|half";
+    Regex::new(&format!(
+        r"(?i)(?:\b(?:{PKG})\s+of\b)|(?:\b(?:{QTY})\s+(?:{PKG})\b)"
+    ))
     .expect("valid packaging regex")
 });
 

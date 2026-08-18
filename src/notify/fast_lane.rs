@@ -4900,3 +4900,67 @@ Keep what I just asked for: \"Set Tuesday's dinner to homemade pizza.\"";
         );
     }
 }
+
+#[cfg(test)]
+mod packaging_word_is_not_a_purchase_on_its_own {
+    use super::*;
+    use crate::notify::shopping_language as lang;
+
+    fn day() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()
+    }
+
+    /// THE TURN THAT BROKE IT (2026-08-18). The house had said the calendar was clear; the family
+    /// corrected it and asked for the feedback to be passed on. The answer was
+    /// "Done — kids can you tell this to the developer of casa on the shopping list 🛒".
+    ///
+    /// Nothing here names the list, so it had to clear the unscoped gate, and it did: the bare
+    /// `\bcan\b` in the packaging vocabulary made "can you tell this…" read as a purchase.
+    #[test]
+    fn a_correction_containing_can_you_is_not_a_shopping_row() {
+        let msg = "It is not true actually I have to pick up the kids can you tell this to the developer of casa";
+        match classify(msg, day()) {
+            Classification::FastLane(op) => {
+                panic!("a correction was applied as a fast-lane edit: {op:?}")
+            }
+            other => {
+                // The composer must get it — that is where a complaint can be answered.
+                assert!(
+                    matches!(other, Classification::Fallback(_)),
+                    "expected the composer to handle it, got {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modal_can_is_not_grocery_evidence_but_a_can_of_something_is() {
+        // The false positive, at the predicate.
+        assert!(!lang::plausible_grocery("can you tell this to the developer"));
+        assert!(!lang::plausible_grocery("can we talk later"));
+        assert!(!lang::plausible_grocery("box him in"));
+        // …and the true positives a unit construction must keep.
+        assert!(lang::plausible_grocery("a can of chopped tomatoes"));
+        assert!(lang::plausible_grocery("2 cans of chickpeas"));
+        assert!(lang::plausible_grocery("bottle of olive oil"));
+        assert!(lang::plausible_grocery("another pack of batteries"));
+        assert!(lang::plausible_grocery("half a dozen eggs"));
+    }
+
+    #[test]
+    fn the_ordinary_shopping_adds_still_land() {
+        // Regression net: the shapes families actually use must be untouched by the fix.
+        for msg in [
+            "add milk to the shopping list",
+            "add a can of tomatoes to the shopping list",
+            "we are out of olive oil - add olive oil",
+        ] {
+            match classify(msg, day()) {
+                Classification::FastLane(FastLaneOp::ShoppingAdd { item }) => {
+                    assert!(!item.is_empty(), "{msg:?} produced an empty item");
+                }
+                other => panic!("{msg:?} should still be a shopping add, got {other:?}"),
+            }
+        }
+    }
+}
