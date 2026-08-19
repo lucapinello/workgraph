@@ -2113,6 +2113,17 @@ pub fn fetch_schedule_grounding(
 /// states plainly that the day is clear) and forbids inventing any other
 /// meeting/appointment/birthday or calling the day packed/back-to-back. Pure.
 pub fn schedule_context_line(doc: Option<&PlanDoc>, now: NaiveDateTime) -> String {
+    // Callers that cannot know about an external feed keep the historical behaviour.
+    schedule_context_line_scoped(doc, now, false)
+}
+
+/// [`schedule_context_line`], told whether an EXTERNAL calendar feed exists whose events never
+/// reach the plan document. When one does, an empty plan is not evidence of a free day.
+pub fn schedule_context_line_scoped(
+    doc: Option<&PlanDoc>,
+    now: NaiveDateTime,
+    external_feed_configured: bool,
+) -> String {
     let today = now.date();
     let label = format!(
         "{} {}",
@@ -2122,11 +2133,29 @@ pub fn schedule_context_line(doc: Option<&PlanDoc>, now: NaiveDateTime) -> Strin
     let titles = doc
         .map(|d| upcoming_titles_on(d, today, now))
         .unwrap_or_default();
-    if titles.is_empty() {
+    if titles.is_empty() && !external_feed_configured {
         format!(
             "CALENDAR ({label}) — there is NOTHING on the calendar today. Do NOT invent a \
              meeting, appointment, birthday, or any event, and do NOT say the day is \
              busy/packed/back-to-back. If asked, say the calendar is clear.\n"
+        )
+    } else if titles.is_empty() {
+        // The plan carries no rows for today AND this house syncs an external calendar whose
+        // events never reach the plan document. "Clear" would then be a confident claim about
+        // something we cannot see — which is exactly the failure this house already fixed once on
+        // the gateway (task safety-critical-fast, 2026-07-20) and shipped again here: on
+        // 2026-08-18 the family was told "Calendar's clear — nothing on the books" while a real
+        // school pickup sat in the linked Google calendar.
+        //
+        // The recorded principle: an empty result from a source that is not authoritative is
+        // answered by a HEDGE, never by "you are free".
+        format!(
+            "CALENDAR ({label}) — the week plan lists no events for today, but this household \
+             syncs an EXTERNAL calendar that is NOT visible to you here. You therefore do NOT \
+             know whether the day is free. Never describe the day as clear, empty or free, and do \
+             NOT invent an event either. If asked what is on, say plainly that you can see \
+             nothing on the plan for today and that anything in the linked calendar would not \
+             show up here.\n"
         )
     } else {
         format!(
@@ -2138,13 +2167,41 @@ pub fn schedule_context_line(doc: Option<&PlanDoc>, now: NaiveDateTime) -> Strin
     }
 }
 
+/// Does this household sync an EXTERNAL calendar (a Google/iCal feed) whose events do not land in
+/// the week plan?
+///
+/// The gateway keeps the secret feed URL in `.casa/calendar.toml` and merges its occurrences into
+/// `/calendar.json` and the Week view. None of that reaches a `PlanDoc`, so from here the plan is
+/// an incomplete view of the family's day whenever this returns true. Presence of a non-empty
+/// The key is `ics_url` — the name the gateway itself writes
+/// (`claw3d-bridge/src/calendarSource.mjs writeCalendarConfig`: `[calendar]\nics_url = "…"`). I
+/// first wrote this probe against a guessed `url` and it silently reported "no feed" on the live
+/// house, which would have left the hedge below dormant and shipped the same bug again; a test
+/// against the real config caught it. `url` is still accepted, so a hand-written config using the
+/// shorter key is not ignored. The URL itself never enters a prompt or a log.
+pub fn external_calendar_configured(root: &Path) -> bool {
+    let path = root.join(".casa").join("calendar.toml");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .any(|(key, value)| {
+            let key = key.trim();
+            (key.eq_ignore_ascii_case("ics_url") || key.eq_ignore_ascii_case("url"))
+                && value.trim().trim_matches('"').len() > 8
+        })
+}
+
 /// Load the current week model under `root` and render [`schedule_context_line`]
 /// for it as of `now`. Best-effort; a missing plan yields the empty-calendar
 /// (strict) truth line so the model is still told the day is clear.
 pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
     let plans = family_plan::load_plans(root);
     let doc = family_plan::current_plan(&plans, now.date());
-    schedule_context_line(doc, now)
+    schedule_context_line_scoped(doc, now, external_calendar_configured(root))
 }
 
 // ---------------------------------------------------------------------------
@@ -4669,6 +4726,89 @@ mod tests {
     // and always forbids inventing. This is the root-cause fix: the calendar is
     // now in the compose context even for non-read-shaped chatter.
     #[test]
+    /// THE LIVE FAILURE (2026-08-18). Asked "What's in for today?", the house answered
+    /// "Calendar's clear — nothing on the books" while a school pickup sat in the family's linked
+    /// Google calendar. The grounding line is where that came from: it reads the PLAN document,
+    /// and on an empty plan it instructed the model to "say the calendar is clear".
+    ///
+    /// The plan is not the whole calendar when an external feed is configured — its events reach
+    /// /calendar.json and the Week view, never a PlanDoc. This is the same class of bug the
+    /// gateway fixed on 2026-07-20 (task safety-critical-fast), whose recorded principle is that
+    /// an empty result from a non-authoritative source must HEDGE, never say "you are free".
+    #[test]
+    fn an_external_feed_forbids_claiming_the_day_is_clear() {
+        let now = at(2026, 7, 14, 15, 0);
+
+        // No feed: the plan IS the calendar, so "clear" is honest and stays.
+        let authoritative = schedule_context_line_scoped(None, now, false);
+        assert!(
+            authoritative.contains("NOTHING on the calendar"),
+            "without a feed the strict truth line must stay: {authoritative}"
+        );
+        assert!(authoritative.contains("say the calendar is clear"));
+
+        // A feed exists and the plan is empty: we cannot see the family's day.
+        let hedged = schedule_context_line_scoped(None, now, true);
+        assert!(
+            !hedged.contains("say the calendar is clear"),
+            "the model was still licensed to claim a clear day: {hedged}"
+        );
+        assert!(
+            !hedged.contains("NOTHING on the calendar"),
+            "the absence was still asserted as fact: {hedged}"
+        );
+        assert!(
+            hedged.contains("NOT visible to you here"),
+            "the hedge must say WHY it cannot know: {hedged}"
+        );
+        assert!(
+            hedged.contains("do NOT invent") || hedged.contains("NOT invent an event"),
+            "hedging must not license invention either: {hedged}"
+        );
+    }
+
+    #[test]
+    fn the_feed_probe_reads_a_real_calendar_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let casa = dir.path().join(".casa");
+        std::fs::create_dir_all(&casa).unwrap();
+
+        // No file at all.
+        assert!(!external_calendar_configured(dir.path()));
+
+        // A config with only comments and an empty url is NOT a feed.
+        std::fs::write(
+            casa.join("calendar.toml"),
+            "# Family calendar\n# url = \"https://example.invalid/commented-out.ics\"\n[calendar]\nurl = \"\"\n",
+        )
+        .unwrap();
+        assert!(
+            !external_calendar_configured(dir.path()),
+            "a commented-out or empty url must not count as a configured feed"
+        );
+
+        // The key the GATEWAY writes is `ics_url` (calendarSource.mjs writeCalendarConfig). Pinning
+        // it here because the first version of this probe guessed `url`, reported "no feed" on the
+        // live house, and would have left the hedge dormant.
+        std::fs::write(
+            casa.join("calendar.toml"),
+            "[calendar]\nics_url = \"https://calendar.google.com/calendar/ical/EXAMPLE/basic.ics\"\n",
+        )
+        .unwrap();
+        assert!(
+            external_calendar_configured(dir.path()),
+            "the gateway's own ics_url key must be recognised"
+        );
+
+        // A hand-written short key still counts.
+        std::fs::write(
+            casa.join("calendar.toml"),
+            "[calendar]\nurl = \"https://calendar.google.com/calendar/ical/EXAMPLE/basic.ics\"\n",
+        )
+        .unwrap();
+        assert!(external_calendar_configured(dir.path()));
+    }
+
     fn ground_schedule_context_line_states_the_truth() {
         let doc = PlanDoc::parse("2026-W29", PLAN);
         // Tue at 15:00 → names the real upcoming event, forbids invention.
@@ -6505,4 +6645,23 @@ label = "Fallback Member"
     }
 
     // -----------------------------------------------------------------------
+}
+
+#[cfg(test)]
+mod live_house_probe {
+    /// Does the probe recognise THIS household's real configuration? Skips loudly rather than
+    /// passing vacuously when the live tree is not present (CI, a fresh clone, another machine).
+    #[test]
+    fn the_live_house_is_recognised_as_having_an_external_feed() {
+        let root = std::path::Path::new("/Users/lp698/Projects/weekly_planner");
+        if !root.join(".casa/calendar.toml").exists() {
+            eprintln!("SKIP: no live .casa/calendar.toml here — nothing to recognise");
+            return;
+        }
+        assert!(
+            super::external_calendar_configured(root),
+            "the live house syncs a Google calendar but the probe did not see it — the hedge would \
+             not engage and 'the calendar is clear' would ship again"
+        );
+    }
 }
