@@ -49,7 +49,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Weekday};
 use regex::{Captures, Regex};
 
 use super::family_plan::{self, PlanDoc};
@@ -2195,13 +2195,199 @@ pub fn external_calendar_configured(root: &Path) -> bool {
         })
 }
 
+/// How stale the gateway's calendar snapshot may be before this process stops trusting it.
+///
+/// The gateway confirms the feed every 5 minutes ([`DEFAULT_POLL_MS`] in
+/// `calendarSource.mjs`), so a live house is always minutes old. An hour is twelve missed
+/// polls: by then the gateway is down or the feed is unreachable, the family may well have
+/// added something since, and the honest answer goes back to the hedge.
+const CALENDAR_SNAPSHOT_MAX_AGE_SECS: i64 = 60 * 60;
+
+/// What this process can see of the household's real calendar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarView {
+    /// No snapshot on disk, or one too old to trust — the feed is configured but invisible
+    /// from here, so an empty plan is NOT evidence of a free day.
+    Blind,
+    /// A snapshot this process trusts. `titles` are today's remaining events, in order.
+    /// Empty means the day genuinely is clear on BOTH the plan and the calendar.
+    Visible { titles: Vec<String> },
+}
+
+/// Read the gateway's merged calendar snapshot (`.casa/calendar/synced-events.json`) and
+/// return what it says about `now`'s day.
+///
+/// WHY A FILE AND NOT A FETCH. The Google feed is fetched by the GATEWAY and kept in memory;
+/// this process never saw it, which is why Otto could only ever answer "anything in the
+/// linked calendar would not show up here" — true, and useless to a family whose whole reason
+/// for linking a calendar is that the house should know what is on it. The gateway now writes
+/// the merged, already-family-voiced list beside the family quick-add store, and this reads
+/// it. Deliberately NOT the raw ICS: a second recurrence expander here would be a twin of
+/// `icsParser.mjs`, and the two would drift on exactly the RRULE shapes that matter — an
+/// expired repeating "pickup the kids" entry is how this was found.
+///
+/// Freshness is judged on `fetchedAt` (when the FEED was last confirmed), never on the file's
+/// own mtime or `writtenAt`: a failed poll leaves the previous snapshot in place, and reading
+/// the write time would make an unreachable calendar look live. `feed: "none"` needs no
+/// freshness at all — with no external feed the family's own entries ARE the whole calendar,
+/// and they are complete the moment they are written.
+pub fn calendar_snapshot_view(root: &Path, now: NaiveDateTime) -> CalendarView {
+    let path = root
+        .join(".casa")
+        .join("calendar")
+        .join("synced-events.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return CalendarView::Blind;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return CalendarView::Blind;
+    };
+    let feed_configured = json.get("feed").and_then(|v| v.as_str()) != Some("none");
+    if feed_configured {
+        // A configured feed must have been CONFIRMED recently for this snapshot to speak for it.
+        let Some(fetched_ms) = json.get("fetchedAt").and_then(|v| v.as_i64()) else {
+            return CalendarView::Blind;
+        };
+        let Some(fetched) = chrono::DateTime::from_timestamp_millis(fetched_ms) else {
+            return CalendarView::Blind;
+        };
+        // `now` is household LOCAL civil time; `fetched` is an absolute instant. Interpreting
+        // the first as UTC (`now.and_utc()`) compares two different clocks and is wrong by the
+        // zone offset — on this box, -4h, which read as a snapshot from the future and blinded
+        // a calendar that had just been written. The unit tests could not see it: they built
+        // `fetchedAt` with the same mistaken conversion, so the error cancelled on both sides.
+        // The live-house probe is what caught it.
+        let Some(now_abs) = Local
+            .from_local_datetime(&now)
+            .earliest()
+            .map(|t| t.to_utc())
+        else {
+            return CalendarView::Blind;
+        };
+        let age = now_abs.signed_duration_since(fetched).num_seconds();
+        // A stamp from the FUTURE is a clock disagreement between the two processes, not
+        // freshness; treat it as trustworthy only within the same window.
+        if age > CALENDAR_SNAPSHOT_MAX_AGE_SECS || age < -CALENDAR_SNAPSHOT_MAX_AGE_SECS {
+            return CalendarView::Blind;
+        }
+    }
+    let today = now.date();
+    let mut titles = Vec::new();
+    for e in json
+        .get("events")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+    {
+        let Some(start) = e.get("start").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(when) = chrono::DateTime::parse_from_rfc3339(start) else {
+            continue;
+        };
+        // TO HOUSEHOLD LOCAL TIME, not to the offset the string happened to carry. The gateway
+        // writes `new Date(...).toISOString()`, which is always UTC with a `Z`, while `now`
+        // here is `chrono::Local` civil time (the same clock the plan's own dates are in). A
+        // bare `naive_local()` on the parsed value keeps the +00:00 offset, so a 5pm pickup in
+        // a UTC-4 house would read as 9pm — the "has it passed?" test and the day boundary
+        // would both be wrong by the offset, silently.
+        let local = when.with_timezone(&chrono::Local).naive_local();
+        if local.date() != today {
+            continue;
+        }
+        // An all-day entry has no clock to have passed; a timed one that is over is not
+        // "what's on today" any more, matching how the plan's own rows are filtered.
+        let all_day = e.get("allDay").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !all_day && local < now {
+            continue;
+        }
+        let title = e
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let stamped = if all_day {
+            title
+        } else {
+            format!("{} ({})", title, local.format("%-I:%M%P"))
+        };
+        if !titles.contains(&stamped) {
+            titles.push(stamped);
+        }
+    }
+    CalendarView::Visible { titles }
+}
+
 /// Load the current week model under `root` and render [`schedule_context_line`]
 /// for it as of `now`. Best-effort; a missing plan yields the empty-calendar
 /// (strict) truth line so the model is still told the day is clear.
+///
+/// The household's REAL calendar is folded in here (see [`calendar_snapshot_view`]): when the
+/// gateway's snapshot is fresh, its events are named alongside the plan's and the hedge is
+/// dropped, because there is no longer anything this process cannot see. When it is missing or
+/// stale the hedge stands, which is the same honest answer as before.
 pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
     let plans = family_plan::load_plans(root);
     let doc = family_plan::current_plan(&plans, now.date());
-    schedule_context_line_scoped(doc, now, external_calendar_configured(root))
+    match calendar_snapshot_view(root, now) {
+        CalendarView::Visible { titles } => {
+            schedule_context_line_with_calendar(doc, now, &titles)
+        }
+        CalendarView::Blind => {
+            schedule_context_line_scoped(doc, now, external_calendar_configured(root))
+        }
+    }
+}
+
+/// [`schedule_context_line`] for a house whose real calendar IS readable here: the plan's rows
+/// and the calendar's are one list, and an empty list means the day is genuinely clear rather
+/// than merely unseen. No hedge — hedging while holding the answer is its own small dishonesty.
+pub fn schedule_context_line_with_calendar(
+    doc: Option<&PlanDoc>,
+    now: NaiveDateTime,
+    calendar_titles: &[String],
+) -> String {
+    let today = now.date();
+    let label = format!(
+        "{} {}",
+        family_plan::long_weekday(today),
+        today.format("%b %-d")
+    );
+    let mut titles = doc
+        .map(|d| upcoming_titles_on(d, today, now))
+        .unwrap_or_default();
+    for t in calendar_titles {
+        // The plan and the calendar can carry the same commitment; say it once.
+        let already = titles.iter().any(|existing| {
+            let a = existing.to_lowercase();
+            let b = t.to_lowercase();
+            a.contains(&b) || b.contains(&a)
+        });
+        if !already {
+            titles.push(t.clone());
+        }
+    }
+    if titles.is_empty() {
+        format!(
+            "CALENDAR ({label}) — there is NOTHING on the calendar today, and this includes \
+             the household's linked calendar, which IS visible to you here. Do NOT invent a \
+             meeting, appointment, birthday, or any event, and do NOT say the day is \
+             busy/packed/back-to-back. If asked, say the calendar is clear.\n"
+        )
+    } else {
+        format!(
+            "CALENDAR ({label}) — the ONLY real events today are: {}. This list already \
+             includes the household's linked calendar, so it is COMPLETE: mention ONLY these, \
+             do NOT invent any other meeting, appointment, or birthday, do NOT tell the family \
+             you cannot see their calendar, and only call the day busy/packed if there are \
+             genuinely several.\n",
+            titles.join("; ")
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4767,6 +4953,214 @@ mod tests {
         );
     }
 
+    /// THE FOLLOW-ON FAILURE (2026-08-20). With the hedge in place the house stopped lying —
+    /// and started saying "Can't see your linked calendar from here, so anything there will not
+    /// show up." Honest, and useless: the family linked a calendar precisely so the house would
+    /// know what is on it. The Google feed is fetched by the GATEWAY and kept in memory, so this
+    /// process genuinely could not see an event. It can now: the gateway writes the merged list
+    /// to `.casa/calendar/synced-events.json` and this reads it.
+    #[test]
+    fn a_fresh_snapshot_replaces_the_hedge_with_the_real_calendar() {
+        let dir = tempfile::tempdir().unwrap();
+        let cal = dir.path().join(".casa").join("calendar");
+        std::fs::create_dir_all(&cal).unwrap();
+        // The feed IS configured — this is the exact house that got the hedge.
+        std::fs::write(
+            dir.path().join(".casa").join("calendar.toml"),
+            "[calendar]\nics_url = \"https://example.invalid/private-feed.ics\"\n",
+        )
+        .unwrap();
+        let now = at(2026, 7, 14, 15, 0);
+        // A TRUE local->absolute conversion, which is what the gateway's `Date.now()` is.
+        // Writing `now.and_utc().timestamp_millis()` here instead would reproduce the exact
+        // confusion this file had in production and CANCEL IT OUT on both sides — the test
+        // would pass while a live house was blinded by its own zone offset. That is what
+        // happened, and only the live-house probe caught it.
+        let local_ms = |t: NaiveDateTime| {
+            Local
+                .from_local_datetime(&t)
+                .earliest()
+                .expect("unambiguous local instant")
+                .timestamp_millis()
+        };
+        let confirmed = local_ms(now);
+        // Rendered exactly as the gateway renders them — `new Date(x).toISOString()`, i.e. UTC
+        // with a `Z` — from LOCAL instants, so this fixture cannot drift into a shape
+        // production never writes (and so it passes in any timezone the suite runs in).
+        let iso = |t: NaiveDateTime| {
+            Local
+                .from_local_datetime(&t)
+                .single()
+                .expect("unambiguous local instant")
+                .to_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let later = iso(at(2026, 7, 14, 17, 0));
+        let earlier = iso(at(2026, 7, 14, 9, 0));
+        let tomorrow = iso(at(2026, 7, 15, 9, 0));
+
+        // Nothing on disk yet → still blind, still hedging. This is the control: without it,
+        // the assertions below could pass on a reader that always claims to see.
+        assert_eq!(calendar_snapshot_view(dir.path(), now), CalendarView::Blind);
+        assert!(fetch_schedule_context_line(dir.path(), now).contains("NOT visible to you here"));
+
+        // The gateway's snapshot: a school pickup later today, one already past, one tomorrow.
+        std::fs::write(
+            cal.join("synced-events.json"),
+            format!(
+                r#"{{"version":1,"writtenAt":{confirmed},"feed":"configured","fetchedAt":{confirmed},
+                    "status":"ok","windowDays":14,"events":[
+                    {{"title":"Pick up the kids","start":"{later}","end":"{later}","allDay":false,"source":"google"}},
+                    {{"title":"Dentist","start":"{earlier}","end":"{earlier}","allDay":false,"source":"google"}},
+                    {{"title":"Sports day","start":"{tomorrow}","end":"{tomorrow}","allDay":true,"source":"family"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let view = calendar_snapshot_view(dir.path(), now);
+        let CalendarView::Visible { titles } = view else {
+            panic!("a fresh snapshot was not trusted: {view:?}");
+        };
+        // Today's REMAINING event only: the 9am dentist has passed, sports day is tomorrow.
+        assert_eq!(titles, vec!["Pick up the kids (5:00pm)".to_string()]);
+
+        let line = fetch_schedule_context_line(dir.path(), now);
+        assert!(line.contains("Pick up the kids"), "{line}");
+        assert!(
+            !line.contains("NOT visible to you here"),
+            "still hedging while holding the answer: {line}"
+        );
+        assert!(
+            line.contains("COMPLETE"),
+            "the model was not told the list is the whole calendar: {line}"
+        );
+        assert!(
+            line.contains("do NOT tell the family you cannot see their calendar"),
+            "nothing stops the old sentence being said anyway: {line}"
+        );
+    }
+
+    #[test]
+    fn a_stale_or_unreadable_snapshot_goes_back_to_hedging() {
+        let dir = tempfile::tempdir().unwrap();
+        let cal = dir.path().join(".casa").join("calendar");
+        std::fs::create_dir_all(&cal).unwrap();
+        std::fs::write(
+            dir.path().join(".casa").join("calendar.toml"),
+            "[calendar]\nics_url = \"https://example.invalid/private-feed.ics\"\n",
+        )
+        .unwrap();
+        let now = at(2026, 7, 14, 15, 0);
+
+        // Confirmed two hours ago: the gateway has missed ~24 polls, so the family may well
+        // have added something since. Trusting it would be the same overconfidence in a new
+        // place — an empty list from a source that has stopped reporting is not evidence.
+        let local_ms = |t: NaiveDateTime| {
+            Local
+                .from_local_datetime(&t)
+                .earliest()
+                .expect("unambiguous local instant")
+                .timestamp_millis()
+        };
+        let stale = local_ms(now - chrono::Duration::hours(2));
+        let pickup = {
+            Local
+                .from_local_datetime(&at(2026, 7, 14, 17, 0))
+                .single()
+                .expect("unambiguous local instant")
+                .to_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let write = |fetched: String| {
+            std::fs::write(
+                cal.join("synced-events.json"),
+                format!(
+                    r#"{{"version":1,"feed":"configured","fetchedAt":{fetched},"events":[
+                       {{"title":"Pick up the kids","start":"{pickup}","allDay":false,"source":"google"}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write(stale.to_string());
+        assert_eq!(calendar_snapshot_view(dir.path(), now), CalendarView::Blind);
+        assert!(fetch_schedule_context_line(dir.path(), now).contains("NOT visible to you here"));
+
+        // No stamp at all, and a corrupt file: both blind, neither a panic.
+        write("null".to_string());
+        assert_eq!(calendar_snapshot_view(dir.path(), now), CalendarView::Blind);
+        std::fs::write(cal.join("synced-events.json"), "{ not json").unwrap();
+        assert_eq!(calendar_snapshot_view(dir.path(), now), CalendarView::Blind);
+
+        // FRESH is the control on all of the above — same file, current stamp, and the event
+        // comes through. Otherwise these could pass on a reader that is simply always blind.
+        write(local_ms(now).to_string());
+        assert!(matches!(
+            calendar_snapshot_view(dir.path(), now),
+            CalendarView::Visible { ref titles } if titles.len() == 1
+        ));
+    }
+
+    #[test]
+    fn with_no_feed_the_family_own_entries_need_no_freshness() {
+        // The other half of the invisibility: with no Google feed, the family's quick-adds ARE
+        // the whole calendar — and were equally unreadable here. They are complete when written,
+        // so an old stamp must not blind us to them.
+        let dir = tempfile::tempdir().unwrap();
+        let cal = dir.path().join(".casa").join("calendar");
+        std::fs::create_dir_all(&cal).unwrap();
+        let now = at(2026, 7, 14, 15, 0);
+        let swim = {
+            Local
+                .from_local_datetime(&at(2026, 7, 14, 18, 0))
+                .single()
+                .expect("unambiguous local instant")
+                .to_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        std::fs::write(
+            cal.join("synced-events.json"),
+            format!(
+                r#"{{"version":1,"feed":"none","fetchedAt":null,"events":[
+                   {{"title":"Swimming","start":"{swim}","allDay":false,"source":"family"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let CalendarView::Visible { titles } = calendar_snapshot_view(dir.path(), now) else {
+            panic!("a feed-less snapshot was treated as blind");
+        };
+        assert_eq!(titles, vec!["Swimming (6:00pm)".to_string()]);
+        let line = fetch_schedule_context_line(dir.path(), now);
+        assert!(line.contains("Swimming"), "{line}");
+        assert!(!line.contains("NOT visible to you here"), "{line}");
+    }
+
+    #[test]
+    fn a_commitment_in_both_the_plan_and_the_calendar_is_said_once() {
+        const PLAN_PICKUP: &str = "\
+# 2026-W29 Family Plan
+
+**Week of Monday 2026-07-13 to Sunday 2026-07-19**
+
+## 3. Calendar
+
+| Day | Time | Event | Source |
+|-----|------|-------|--------|
+| Tue 07-14 | 17:00 | Pick up the kids | Otto |
+";
+        let now = at(2026, 7, 14, 15, 0);
+        let doc = PlanDoc::parse("2026-W29", PLAN_PICKUP);
+        let line = schedule_context_line_with_calendar(
+            Some(&doc),
+            now,
+            &["Pick up the kids (5:00pm)".to_string()],
+        );
+        assert_eq!(
+            line.matches("Pick up the kids").count(),
+            1,
+            "the same commitment was listed twice: {line}"
+        );
+    }
+
     #[test]
     fn the_feed_probe_reads_a_real_calendar_toml() {
         let dir = tempfile::tempdir().unwrap();
@@ -6662,6 +7056,35 @@ mod live_house_probe {
             super::external_calendar_configured(root),
             "the live house syncs a Google calendar but the probe did not see it — the hedge would \
              not engage and 'the calendar is clear' would ship again"
+        );
+    }
+
+    /// The other half of the same live check: this house's calendar must be READABLE from here,
+    /// not merely known to exist. Same skip rule, so it is inert anywhere but this box.
+    ///
+    /// Recognising the feed is what turned the lie into a hedge; reading it is what turns the
+    /// hedge into an answer. On 2026-08-20 the family asked "tell me what's in for today" and got
+    /// "Can't see your linked calendar from here" while `Luca pickup Oliver/Elliot` sat in that
+    /// calendar for 5pm the same day.
+    #[test]
+    fn the_live_house_can_actually_read_its_calendar() {
+        let root = std::path::Path::new("/Users/lp698/Projects/weekly_planner");
+        if !root.join(".casa/calendar/synced-events.json").exists() {
+            eprintln!("SKIP: no live calendar snapshot here — the gateway writes it on sync");
+            return;
+        }
+        let now = chrono::Local::now().naive_local();
+        let view = super::calendar_snapshot_view(root, now);
+        assert!(
+            matches!(view, super::CalendarView::Visible { .. }),
+            "the live snapshot exists but is not trusted ({view:?}) — the family would still be \
+             told the calendar cannot be seen from here"
+        );
+        // And the always-on context line must NOT carry the sentence the family read.
+        let line = super::fetch_schedule_context_line(root, now);
+        assert!(
+            !line.contains("NOT visible to you here"),
+            "the compose prompt still tells the model it cannot see the calendar: {line}"
         );
     }
 }
