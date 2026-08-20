@@ -2206,12 +2206,21 @@ const CALENDAR_SNAPSHOT_MAX_AGE_SECS: i64 = 60 * 60;
 /// What this process can see of the household's real calendar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CalendarView {
-    /// No snapshot on disk, or one too old to trust — the feed is configured but invisible
-    /// from here, so an empty plan is NOT evidence of a free day.
+    /// No snapshot at all, or an unreadable one. Nothing is known from here.
     Blind,
-    /// A snapshot this process trusts. `titles` are today's remaining events, in order.
-    /// Empty means the day genuinely is clear on BOTH the plan and the calendar.
-    Visible { titles: Vec<String> },
+    /// A snapshot was read. `titles` are today's remaining events, in order.
+    ///
+    /// `confirmed` says whether the FEED was verified recently. The distinction is not about
+    /// how much to trust the events — an event that was on the calendar an hour ago was really
+    /// on it — but about what an EMPTY list is allowed to mean. Naming what we hold is safe at
+    /// any age; concluding "your day is free" from a source that has stopped reporting is the
+    /// original bug wearing a different hat.
+    ///
+    /// This matches what the gateway does for its own rendering: `_lastGoodBody` is kept
+    /// regardless of age and the Week view keeps showing it, because "a blip never empties".
+    /// An engine that went blind after an hour would have the kiosk naming a 5pm pickup while
+    /// Otto said he could not see the calendar — one house, two answers.
+    Visible { titles: Vec<String>, confirmed: bool },
 }
 
 /// Read the gateway's merged calendar snapshot (`.casa/calendar/synced-events.json`) and
@@ -2243,14 +2252,14 @@ pub fn calendar_snapshot_view(root: &Path, now: NaiveDateTime) -> CalendarView {
         return CalendarView::Blind;
     };
     let feed_configured = json.get("feed").and_then(|v| v.as_str()) != Some("none");
+    // With no external feed the family's own quick-adds ARE the whole calendar: complete the
+    // moment they are written, with nothing to have gone stale.
+    let mut confirmed = !feed_configured;
     if feed_configured {
-        // A configured feed must have been CONFIRMED recently for this snapshot to speak for it.
-        let Some(fetched_ms) = json.get("fetchedAt").and_then(|v| v.as_i64()) else {
-            return CalendarView::Blind;
-        };
-        let Some(fetched) = chrono::DateTime::from_timestamp_millis(fetched_ms) else {
-            return CalendarView::Blind;
-        };
+        let fetched = json
+            .get("fetchedAt")
+            .and_then(|v| v.as_i64())
+            .and_then(chrono::DateTime::from_timestamp_millis);
         // `now` is household LOCAL civil time; `fetched` is an absolute instant. Interpreting
         // the first as UTC (`now.and_utc()`) compares two different clocks and is wrong by the
         // zone offset — on this box, -4h, which read as a snapshot from the future and blinded
@@ -2264,12 +2273,12 @@ pub fn calendar_snapshot_view(root: &Path, now: NaiveDateTime) -> CalendarView {
         else {
             return CalendarView::Blind;
         };
-        let age = now_abs.signed_duration_since(fetched).num_seconds();
         // A stamp from the FUTURE is a clock disagreement between the two processes, not
-        // freshness; treat it as trustworthy only within the same window.
-        if age > CALENDAR_SNAPSHOT_MAX_AGE_SECS || age < -CALENDAR_SNAPSHOT_MAX_AGE_SECS {
-            return CalendarView::Blind;
-        }
+        // freshness; it counts as unconfirmed rather than as trustworthy.
+        confirmed = fetched.is_some_and(|f| {
+            let age = now_abs.signed_duration_since(f).num_seconds();
+            age.abs() <= CALENDAR_SNAPSHOT_MAX_AGE_SECS
+        });
     }
     let today = now.date();
     let mut titles = Vec::new();
@@ -2319,7 +2328,7 @@ pub fn calendar_snapshot_view(root: &Path, now: NaiveDateTime) -> CalendarView {
             titles.push(stamped);
         }
     }
-    CalendarView::Visible { titles }
+    CalendarView::Visible { titles, confirmed }
 }
 
 /// Load the current week model under `root` and render [`schedule_context_line`]
@@ -2334,12 +2343,17 @@ pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
     let plans = family_plan::load_plans(root);
     let doc = family_plan::current_plan(&plans, now.date());
     match calendar_snapshot_view(root, now) {
-        CalendarView::Visible { titles } => {
+        // Events in hand: say them, whether or not the feed answered its last poll.
+        CalendarView::Visible { titles, .. } if !titles.is_empty() => {
             schedule_context_line_with_calendar(doc, now, &titles)
         }
-        CalendarView::Blind => {
-            schedule_context_line_scoped(doc, now, external_calendar_configured(root))
+        // Nothing today, from a calendar we just confirmed: the day really is clear.
+        CalendarView::Visible { confirmed: true, .. } => {
+            schedule_context_line_with_calendar(doc, now, &[])
         }
+        // Nothing today from a source that has stopped reporting — or no snapshot at all. An
+        // empty answer is then not evidence, and the hedge is the honest one.
+        _ => schedule_context_line_scoped(doc, now, external_calendar_configured(root)),
     }
 }
 
@@ -5018,9 +5032,10 @@ mod tests {
         .unwrap();
 
         let view = calendar_snapshot_view(dir.path(), now);
-        let CalendarView::Visible { titles } = view else {
+        let CalendarView::Visible { titles, confirmed } = view else {
             panic!("a fresh snapshot was not trusted: {view:?}");
         };
+        assert!(confirmed, "a snapshot stamped just now did not read as confirmed");
         // Today's REMAINING event only: the 9am dentist has passed, sports day is tomorrow.
         assert_eq!(titles, vec!["Pick up the kids (5:00pm)".to_string()]);
 
@@ -5081,22 +5096,46 @@ mod tests {
             )
             .unwrap();
         };
+        // STALE BUT HOLDING AN EVENT. The kiosk keeps showing a last-good calendar of any age
+        // ("a blip never empties"), so an engine that went silent here would have the Week view
+        // naming this pickup while Otto said he could not see the calendar. An event that was on
+        // the calendar an hour ago was really on it: say it, and mark the feed unconfirmed.
         write(stale.to_string());
-        assert_eq!(calendar_snapshot_view(dir.path(), now), CalendarView::Blind);
-        assert!(fetch_schedule_context_line(dir.path(), now).contains("NOT visible to you here"));
+        let view = calendar_snapshot_view(dir.path(), now);
+        assert!(
+            matches!(&view, CalendarView::Visible { titles, confirmed: false } if titles.len() == 1),
+            "a stale snapshot dropped an event the kiosk is still showing: {view:?}"
+        );
+        let line = fetch_schedule_context_line(dir.path(), now);
+        assert!(line.contains("Pick up the kids"), "{line}");
+        assert!(!line.contains("NOT visible to you here"), "{line}");
 
-        // No stamp at all, and a corrupt file: both blind, neither a panic.
+        // STALE AND EMPTY is the case that must still hedge: an empty answer from a source that
+        // has stopped reporting is not evidence of a free day. That is the original bug.
+        std::fs::write(
+            cal.join("synced-events.json"),
+            format!(r#"{{"version":1,"feed":"configured","fetchedAt":{stale},"events":[]}}"#),
+        )
+        .unwrap();
+        assert!(
+            fetch_schedule_context_line(dir.path(), now).contains("NOT visible to you here"),
+            "an empty stale calendar was reported as a clear day"
+        );
+
+        // No stamp at all, and a corrupt file: unconfirmed and blind respectively, no panic.
         write("null".to_string());
-        assert_eq!(calendar_snapshot_view(dir.path(), now), CalendarView::Blind);
+        assert!(matches!(
+            calendar_snapshot_view(dir.path(), now),
+            CalendarView::Visible { confirmed: false, .. }
+        ));
         std::fs::write(cal.join("synced-events.json"), "{ not json").unwrap();
         assert_eq!(calendar_snapshot_view(dir.path(), now), CalendarView::Blind);
 
-        // FRESH is the control on all of the above — same file, current stamp, and the event
-        // comes through. Otherwise these could pass on a reader that is simply always blind.
+        // FRESH is the control — same file, current stamp, and the feed reads as confirmed.
         write(local_ms(now).to_string());
         assert!(matches!(
             calendar_snapshot_view(dir.path(), now),
-            CalendarView::Visible { ref titles } if titles.len() == 1
+            CalendarView::Visible { ref titles, confirmed: true } if titles.len() == 1
         ));
     }
 
@@ -5125,9 +5164,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let CalendarView::Visible { titles } = calendar_snapshot_view(dir.path(), now) else {
+        let CalendarView::Visible { titles, confirmed } = calendar_snapshot_view(dir.path(), now) else {
             panic!("a feed-less snapshot was treated as blind");
         };
+        assert!(confirmed, "with no feed there is nothing to have gone stale");
         assert_eq!(titles, vec!["Swimming (6:00pm)".to_string()]);
         let line = fetch_schedule_context_line(dir.path(), now);
         assert!(line.contains("Swimming"), "{line}");
