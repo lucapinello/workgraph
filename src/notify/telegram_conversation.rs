@@ -250,8 +250,10 @@ pub fn onboarding_line(inviter: Option<&str>) -> String {
 /// THIS IS A FAILURE NOTICE, NOT AN ANSWER, AND THE WORDS NOW SAY SO (live
 /// incident 2026-08-10 22:25). It used to read
 ///
-///     "I'm here! 🙂 Give me a little while to get settled and I'll be able to
-///      help properly."
+/// ```text
+/// "I'm here! 🙂 Give me a little while to get settled and I'll be able to
+///  help properly."
+/// ```
 ///
 /// and it was delivered — over Telegram, mirrored into the family feed with
 /// `replyPhase: final` — as the ANSWER to "one about singers". The family asked

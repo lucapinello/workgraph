@@ -64,12 +64,14 @@
 //!    from the POST-VERIFICATION window, 4/4 (reviewer seq 195, task
 //!    `receipt-s1c-atomic`):
 //!
-//!        A verifies the pathname against a descriptor — it IS our inode, then.
-//!        A closes the descriptor.
-//!        A human clears the lock file (§5's documented cure); B legitimately acquires.
-//!        A's already-approved decision fires and RENAMES: B's live authority path is
-//!          moved away and the pathname is empty for the length of an inspection.
-//!        C creates there and acquires. B and C are both inside the section.
+//!    ```text
+//!    A verifies the pathname against a descriptor — it IS our inode, then.
+//!    A closes the descriptor.
+//!    A human clears the lock file (§5's documented cure); B legitimately acquires.
+//!    A's already-approved decision fires and RENAMES: B's live authority path is
+//!      moved away and the pathname is empty for the length of an inspection.
+//!    C creates there and acquires. B and C are both inside the section.
+//!    ```
 //!
 //!    A check on a closed descriptor and an action on a pathname are two decisions
 //!    with a gap between them, so judging harder or checking sooner cannot close

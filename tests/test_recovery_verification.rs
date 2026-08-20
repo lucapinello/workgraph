@@ -51,7 +51,12 @@ fn find_branch_for_worktree(project_root: &Path, worktree_path: &Path) -> Option
         .ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let worktree_str = worktree_path.to_string_lossy();
+    // `git worktree list` prints the CANONICAL path. On macOS the temp dir sits behind the
+    // /var -> /private/var symlink, so comparing it against the raw TempDir spelling never
+    // matches and the branch is reported missing — on that platform only. Canonicalize both
+    // sides so the comparison is about the directory, not about how it is spelled.
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let worktree_canon: PathBuf = canon(worktree_path);
 
     // Porcelain output is blocks separated by blank lines.
     // Each block has: worktree <path>\nHEAD <sha>\nbranch refs/heads/<name>\n
@@ -61,7 +66,7 @@ fn find_branch_for_worktree(project_root: &Path, worktree_path: &Path) -> Option
             current_path = Some(path);
         } else if let Some(branch_ref) = line.strip_prefix("branch ") {
             if let Some(cp) = current_path
-                && cp == worktree_str.as_ref()
+                && canon(Path::new(cp)) == worktree_canon
             {
                 // Convert refs/heads/wg/agent-X/task-Y to wg/agent-X/task-Y
                 return Some(

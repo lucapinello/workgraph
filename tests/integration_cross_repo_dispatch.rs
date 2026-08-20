@@ -118,7 +118,14 @@ fn resolve_named_peer() {
     );
 
     let resolved = resolve_peer("remote", &local_wg).unwrap();
-    assert_eq!(resolved.workgraph_dir, remote.join(".wg"));
+    // Canonicalized on BOTH sides, exactly as the project_path line below already does:
+    // `resolve_peer` returns a canonical path, and on macOS the temp dir sits behind the
+    // /var -> /private/var symlink, so the raw TempDir spelling is a different string for
+    // the same directory. This line was the one that got missed.
+    assert_eq!(
+        resolved.workgraph_dir,
+        remote.canonicalize().unwrap().join(".wg")
+    );
     assert_eq!(resolved.project_path, remote.canonicalize().unwrap());
 }
 

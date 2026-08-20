@@ -338,13 +338,21 @@ fn looks_like_homebrew(path: &Path) -> bool {
 }
 
 fn looks_like_cargo_install(path: &Path) -> bool {
+    // BOTH SIDES CANONICAL. `current_exe()` resolves symlinks; `CARGO_HOME` and `HOME`
+    // generally do not. On any box whose home sits behind a link — macOS `/var` ->
+    // `/private/var`, a home on a linked volume, a bind mount — the same directory then has
+    // two spellings and this prefix test silently answers "no". The binary is classified
+    // `Unknown` and the upgrade plan it prints is the wrong one, with nothing to indicate
+    // why. Canonicalizing keeps the question about the directory, not its spelling.
+    let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+    let exe = canon(path.to_path_buf());
     if let Some(cargo_home) = env::var_os("CARGO_HOME")
-        && path.starts_with(PathBuf::from(cargo_home).join("bin"))
+        && exe.starts_with(canon(PathBuf::from(cargo_home).join("bin")))
     {
         return true;
     }
     dirs::home_dir()
-        .map(|home| path.starts_with(home.join(".cargo").join("bin")))
+        .map(|home| exe.starts_with(canon(home.join(".cargo").join("bin"))))
         .unwrap_or(false)
 }
 

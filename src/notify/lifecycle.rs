@@ -45,7 +45,10 @@
 //!   asks can't flood the chat. [`lifecycle_tick`] wires exactly-once firing (a
 //!   [`FiredLog`], keyed on `(task, event)`) to that pacing.
 
+use std::sync::LazyLock;
+
 use chrono::NaiveDateTime;
+use regex::Regex;
 
 use crate::graph::{Status, Task, TaskOrigin};
 use crate::notify::daily_digest::{DigestPolicy, DigestStore, Nudge, NudgeKind, Offer};
@@ -767,7 +770,53 @@ pub fn fallback_summary_from_title(title: &str) -> Option<String> {
     if human.is_empty() {
         return None;
     }
+    // FAMILY-VOICE GATE ON THE TITLE (see DEV_TICKET_SIGNALS). A title that reads like a
+    // ticket is not an echo of anything the family asked for, so the Done line falls back
+    // to the warm generic rather than reading engineering prose back to them.
+    if reads_like_a_dev_ticket(human) || crate::notify::grounding::has_ops_jargon(human) {
+        return None;
+    }
     Some(cap_summary(&cap_first(human)))
+}
+
+/// Machine prose in a TITLE — the shapes that mean "a developer filed this", not
+/// "the house did this for you".
+///
+/// A worker-recorded `LIFECYCLE_SUMMARY:` is composed FOR the family. A title is
+/// whatever filed the task, and on 2026-08-19 that was a bug report: the family said
+/// "I have to pick up the kids, can you tell this to the developer", a task was filed
+/// as *"Report Casa calendar sync issue — user has standing kids pickup obligation not
+/// reflected in system"*, and the Done ping read that sentence back to them on Telegram,
+/// verbatim, as though it were news about their week.
+///
+/// Note what does NOT catch it, which is why this list exists at all:
+/// [`crate::notify::grounding::has_ops_jargon`] has no signal in that sentence, and
+/// `has_infra_narration` requires an article before "system". So the shape is named
+/// directly: the third-person "user" (a family member is *you*, or a name — never a
+/// user), a bare "in system", ticket vocabulary, and the "not reflected/wired/surfaced"
+/// complaint form. Deliberately narrow: a false positive costs one specific echo and
+/// still says something true, while a false negative speaks engineering to the family.
+static DEV_TICKET_SIGNALS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"(?i)\busers?\b",
+        r"(?i)\b(?:in|to|from|by)\s+system\b",
+        r"(?i)\b(?:the|our|this|that)\s+system\b",
+        r"(?i)\b(?:bug|regression|repro|traceback|stack\s*trace|codebase|refactor|endpoint|payload|schema|parser|classifier|API|CLI|SDK)\b",
+        r"(?i)\bunit\s+test|\btest\s+suite\b|\bpull\s+request\b|\bcommit\b|\brollback\b",
+        r"(?i)\b(?:sync|integration|parsing|classification|routing|rendering)\s+(?:issue|bug|error|failure|problem)\b",
+        r"(?i)\breport\s+\S+\s+(?:issue|bug|problem|failure)\b",
+        r"(?i)\bnot\s+(?:reflected|surfaced|wired|propagated|persisted|honou?red\s+by)\b",
+        r"(?i)\bdevelopers?\b|\bdev\s+(?:task|ticket|lane)\b",
+        r"(?i)\bP[0-4]\b",
+    ]
+    .into_iter()
+    .map(|pattern| Regex::new(pattern).expect("valid dev-ticket regex"))
+    .collect()
+});
+
+/// True when `title` reads like an engineering ticket rather than a family request.
+pub fn reads_like_a_dev_ticket(title: &str) -> bool {
+    DEV_TICKET_SIGNALS.iter().any(|re| re.is_match(title))
 }
 
 /// The "what changed" summary to attach to a Done payoff: a worker-recorded
@@ -1624,6 +1673,59 @@ mod tests {
         assert!(line.starts_with("Done!"), "{line}");
         assert!(line.contains("trout"), "must say what changed: {line}");
         assert_ne!(line, "All done — that's sorted ✅");
+    }
+
+    #[test]
+    fn lifecycle_done_never_reads_a_dev_ticket_title_back_to_the_family() {
+        // THE LIVE LEAK (2026-08-19, Telegram). The family said "I have to pick up the
+        // kids, can you tell this to the developer"; a task was filed under an
+        // engineering title; and the Done ping spoke it to them word for word.
+        let leaked =
+            "Report Casa calendar sync issue — user has standing kids pickup obligation \
+             not reflected in system";
+        assert!(
+            reads_like_a_dev_ticket(leaked),
+            "the exact leaked title must be caught"
+        );
+        let mut t = task_with("report-casa-calendar-sync-issue", Status::Done);
+        t.title = leaked.into();
+        let line = LifecycleInput::from_task(&t, vec![])
+            .unwrap()
+            .render()
+            .unwrap();
+        // Degrades to the warm generic — the family still hears that it is done.
+        assert_eq!(line, "All done — that's sorted ✅");
+        for machine in ["user", "system", "sync issue", "Report Casa"] {
+            assert!(
+                !line.contains(machine),
+                "engineering prose reached the family: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dev_ticket_gate_still_lets_ordinary_family_titles_through() {
+        // The gate's whole cost is a lost specific echo, so it must not eat the echoes
+        // that made it worth having. These are the shapes the family actually asks for.
+        for title in [
+            "replace friday dinner chicken with trout",
+            "add Thursday dinner: grilled tofu",
+            "put milk and eggs on the shopping list",
+            "move Mira's swimming to Saturday morning",
+            "book the dentist for Bruno",
+            "remind me to pay the school trip",
+        ] {
+            assert!(
+                !reads_like_a_dev_ticket(title),
+                "family title wrongly gated: {title}"
+            );
+            assert!(
+                fallback_summary_from_title(title).is_some(),
+                "family title lost its echo: {title}"
+            );
+        }
+        // …and the ops-jargon gate is wired in on this path too, not just the new list.
+        assert_eq!(fallback_summary_from_title("restart the dispatcher"), None);
     }
 
     #[test]

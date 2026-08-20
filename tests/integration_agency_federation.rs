@@ -22,6 +22,24 @@ use worksgood::graph::TrustLevel;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Assert two store paths name the SAME directory, on a box where the temp dir sits
+/// behind a symlink.
+///
+/// `resolve_store` canonicalizes the path it returns; `TempDir` hands back the symlinked
+/// spelling. On Linux those agree (`/tmp/.tmpXXXX`), so a bare `assert_eq!` passes. On
+/// macOS `/var` is a symlink to `/private/var`, so the same directory has two spellings
+/// and five of these tests fail there and only there — an assertion about spelling
+/// masquerading as one about resolution. Canonicalizing both sides keeps it about the
+/// directory.
+fn assert_same_dir(left: &Path, right: &Path) {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    assert_eq!(
+        canon(left),
+        canon(right),
+        "different directories: {left:?} vs {right:?}"
+    );
+}
+
 fn setup_store(tmp: &TempDir, name: &str) -> LocalStore {
     let path = tmp.path().join(name).join("agency");
     agency::init(&path).unwrap();
@@ -203,7 +221,7 @@ fn resolve_store_finds_project() {
     create_project_store_dirs(tmp.path());
 
     let store = federation::resolve_store(tmp.path().to_str().unwrap()).unwrap();
-    assert_eq!(store.store_path(), tmp.path().join(".wg").join("agency"));
+    assert_same_dir(store.store_path(), &tmp.path().join(".wg").join("agency"));
     assert!(store.is_valid());
 }
 
@@ -214,7 +232,7 @@ fn resolve_store_finds_bare() {
     create_bare_store_dirs(tmp.path());
 
     let store = federation::resolve_store(tmp.path().to_str().unwrap()).unwrap();
-    assert_eq!(store.store_path(), tmp.path().join("agency"));
+    assert_same_dir(store.store_path(), &tmp.path().join("agency"));
     assert!(store.is_valid());
 }
 
@@ -682,7 +700,7 @@ fn remote_name_resolves_for_pull_push() {
 
     // resolve_store_with_remotes should find it by name
     let resolved = federation::resolve_store_with_remotes("upstream", &wg_dir).unwrap();
-    assert_eq!(resolved.store_path(), remote_store.store_path());
+    assert_same_dir(resolved.store_path(), remote_store.store_path());
     assert!(resolved.is_valid());
 
     // Fallback: unknown name resolves as filesystem path
@@ -691,7 +709,7 @@ fn remote_name_resolves_for_pull_push() {
         &wg_dir,
     )
     .unwrap();
-    assert_eq!(resolved2.store_path(), remote_store.store_path());
+    assert_same_dir(resolved2.store_path(), remote_store.store_path());
 }
 
 /// Show remote displays entity summary.
@@ -1604,8 +1622,8 @@ fn multiple_remotes_coexist() {
     // Both resolve independently
     let resolved_a = federation::resolve_store_with_remotes("team-a", &wg_dir).unwrap();
     let resolved_b = federation::resolve_store_with_remotes("team-b", &wg_dir).unwrap();
-    assert_eq!(resolved_a.store_path(), store_a.store_path());
-    assert_eq!(resolved_b.store_path(), store_b.store_path());
+    assert_same_dir(resolved_a.store_path(), store_a.store_path());
+    assert_same_dir(resolved_b.store_path(), store_b.store_path());
 
     // Each has its own entities
     assert!(resolved_a.exists_role("r-a"));
@@ -2476,7 +2494,7 @@ fn resolve_store_direct_agency_path() {
 
     // Point directly at the agency dir
     let store = federation::resolve_store(agency_dir.to_str().unwrap()).unwrap();
-    assert_eq!(store.store_path(), agency_dir);
+    assert_same_dir(store.store_path(), &agency_dir);
     assert!(store.is_valid());
 }
 
