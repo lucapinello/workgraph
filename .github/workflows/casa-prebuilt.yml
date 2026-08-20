@@ -205,6 +205,30 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[] | "\(.name)  \(.size)"'
 
+      # A SKIPPED PUBLISH MUST SAY SO. `publish` defaults to "false" on purpose (see the header:
+      # replacing a public artifact is never a side effect), and `gh workflow run` with no inputs
+      # takes that default. The run then builds, packages, guards, skips step "publish" — and
+      # reports SUCCESS, because a skipped step is not a failure. On 2026-08-20 that read as
+      # "Linux published" while the release still held the archives from four days earlier, and
+      # the only trace was one word buried in the third job's step list.
+      #
+      # So the outcome is stated in the run summary either way. Nothing is enforced here: build-
+      # only is a legitimate mode. What changes is that a green run can no longer be mistaken for
+      # a published one at a glance.
+      - name: say what this run actually did
+        if: ${{ always() }}
+        run: |
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            echo "### Published to \`${{ inputs.release_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "Linux archives + merged SHA256SUMS uploaded." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### PACKAGED ONLY — nothing was uploaded" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`publish\` was \`${{ inputs.publish }}\` (the default is \`false\`)." >> "$GITHUB_STEP_SUMMARY"
+            echo "The release still holds whatever it held before this run." >> "$GITHUB_STEP_SUMMARY"
+            echo "Re-run with \`-f publish=true\` to actually publish." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Nothing published::publish=${{ inputs.publish }} — packaged only; the release is unchanged"
+          fi
+
       - uses: actions/upload-artifact@v5
         with:
           name: casa-prebuilt-dist
