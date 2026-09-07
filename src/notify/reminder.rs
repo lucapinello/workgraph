@@ -6,7 +6,7 @@
 //! Two sources feed one scheduler:
 //!
 //! * **Plan reminders** — rows in a plan's `## 3. Calendar` table shaped like a
-//!   reminder, e.g. `| Tue 07-14 | 19:30 | ⏰ Reminder: Luca PT check-in | Otto |`.
+//!   reminder, e.g. `| Tue 07-14 | 19:30 | ⏰ Reminder: Alex PT check-in | Otto |`.
 //!   [`Reminder::from_calendar_event`] recognises the `⏰` / `Reminder:` shape,
 //!   pulls out the recipient (first known family member named in the row), the
 //!   owning voice (the Source column), the due wall-clock time, and a clean body.
@@ -68,13 +68,13 @@ pub struct Reminder {
     pub id: String,
     /// Wall-clock instant the reminder is due (family-local time).
     pub due: NaiveDateTime,
-    /// Display name of the human to DM, e.g. `"Luca"`. Empty when the row named
+    /// Display name of the human to DM, e.g. `"Alex"`. Empty when the row named
     /// no known member (the caller then falls back to the group).
     pub recipient: String,
     /// The voice/bot that owns and sends the reminder, e.g. `"otto"`.
     pub bot: String,
     /// The clean reminder body (no leading emoji, no `Reminder:` label), e.g.
-    /// `"Luca PT check-in (if unanswered)"` or `"Defrost the trout"`.
+    /// `"Alex PT check-in (if unanswered)"` or `"Defrost the trout"`.
     pub text: String,
     /// Where it came from.
     pub source: ReminderSource,
@@ -147,7 +147,7 @@ pub fn is_reminder_event(event: &str) -> bool {
 }
 
 /// Strip the leading `⏰` emoji and any `Reminder:` label from a plan event so the
-/// DM body reads cleanly. `"⏰ Reminder: Luca PT check-in"` → `"Luca PT check-in"`.
+/// DM body reads cleanly. `"⏰ Reminder: Alex PT check-in"` → `"Alex PT check-in"`.
 fn clean_reminder_body(event: &str) -> String {
     let mut s = event.trim();
     // Drop a leading alarm emoji (and stray whitespace).
@@ -183,7 +183,7 @@ pub(crate) fn normalize_bot(source: &str) -> String {
 /// case-insensitively on a word boundary-ish basis.
 ///
 /// `pub(crate)` so the errand engine reuses the identical person-resolution rule
-/// to pull the runner out of a `🛒 Market run (Luca)` row.
+/// to pull the runner out of a `🛒 Market run (Alex)` row.
 pub(crate) fn first_member(text: &str, members: &[String]) -> Option<String> {
     let low = text.to_ascii_lowercase();
     members
@@ -194,7 +194,7 @@ pub(crate) fn first_member(text: &str, members: &[String]) -> Option<String> {
 }
 
 /// Whole-word-ish containment: `name` occurs in `hay` not flanked by other
-/// alphanumerics (so `"luca"` matches `"Luca PT"` but not `"lucas"`).
+/// alphanumerics (so `"alex"` matches `"Alex PT"` but not `"alexa"`).
 fn contains_word(hay: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;

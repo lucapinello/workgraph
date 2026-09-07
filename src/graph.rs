@@ -451,7 +451,7 @@ impl TaskChoice {
         Self { key, label }
     }
 
-    /// The default confirmation pair Luca asked for: `[Looks good]` /
+    /// The default confirmation pair for plan-review prompts: `[Looks good]` /
     /// `[Change something]`. Any task can opt into it (e.g. a plan-review DM).
     pub fn confirmation_pair() -> Vec<TaskChoice> {
         vec![
@@ -868,7 +868,7 @@ pub struct TaskOrigin {
     /// The chat to reply in — a Telegram chat id (1:1 or group), or a web
     /// session id. The lifecycle notification is delivered *here*.
     pub chat_id: String,
-    /// Display name of the human who asked, e.g. `"Luca"`. Used to answer their
+    /// Display name of the human who asked, e.g. `"Alex"`. Used to answer their
     /// "are they done yet?" and to address the payoff line. Empty when unknown.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requester: String,

@@ -367,7 +367,7 @@ fn compose_help(_ctx: &CommandContext<'_>) -> String {
 // Grounding helpers
 // ---------------------------------------------------------------------------
 
-/// Sessions-per-person summary, e.g. `"Luca 4 sessions, Nadin 3"`.
+/// Sessions-per-person summary, e.g. `"Alex 4 sessions, Sam 3"`.
 fn workout_summary(plan: &PlanDoc) -> String {
     // Preserve first-seen person order.
     let mut order: Vec<String> = Vec::new();
