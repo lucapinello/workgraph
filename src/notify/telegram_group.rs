@@ -1942,7 +1942,43 @@ pub fn addressed_name_bot(text: &str, config: &TelegramConfig) -> Option<Resolve
 /// The second-person guard (`you`/`your`/`u`) suppresses the domain-question
 /// branch so human-to-human questions ("you free this weekend?") stay silent —
 /// unless an indefinite agent or explicit group lead overrides it.
+/// Conversation state the ENTRY decision may use.
+///
+/// THE REFRAME (2026-09-30, Luca): *"the main goal is to have a system that is natural in
+/// dealing with N:N conversation and can infer what is happening and the right person will
+/// reply."* This is not a message classifier — it is TURN-TAKING in a multi-party room, and
+/// the entry decision cannot be made from the message alone.
+///
+/// The measurement that forces it: **66 of this household's 201 real human turns are three
+/// words or fewer**, and the SAME word is an answer or a sign-off depending only on what came
+/// before it.
+///
+/// ```text
+///   "yes" / "red" / "carbonara" / "just mozzarella" / "Another one"
+///       -> answers to a question the HOUSE asked   (currently dropped: no domain word)
+///   "Night" / "thanks" / "hey" / "Good morning!"
+///       -> sign-offs, still not the house's business
+/// ```
+///
+/// A per-message view cannot separate those two rows; a single bit of state can.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnContext {
+    /// The house's most recent turn in this chat was addressed to the family and could expect
+    /// an answer — a question, a confirmation card, or an offer.
+    pub awaiting_reply: bool,
+}
+
+/// [`is_team_directed_ask_in`] with no conversation state — the per-message view.
 pub fn is_team_directed_ask(text: &str) -> bool {
+    is_team_directed_ask_in(text, TurnContext::default())
+}
+
+/// The entry decision, given what the conversation is doing.
+///
+/// Every branch below is still the per-message ladder; the state only ADDS one case that a
+/// message alone cannot express. Keeping the old entry point as a wrapper means every existing
+/// call site and test is unchanged, and the new behaviour is opt-in by supplying context.
+pub fn is_team_directed_ask_in(text: &str, ctx: TurnContext) -> bool {
     let lower = text.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return false;
@@ -2023,6 +2059,29 @@ pub fn is_team_directed_ask(text: &str) -> bool {
     // A stated household need touching a household domain. Last, so every stronger
     // signal above keeps its precedence.
     if (states_a_need || states_consumption) && has_domain && !human_directed {
+        return true;
+    }
+    // ── A SHORT ANSWER TO A QUESTION WE ASKED ────────────────────────────────────────────
+    // The largest class in the real corpus, and invisible to a per-message view: when the
+    // house's last turn could expect an answer, a brief turn IS that answer — even though it
+    // carries no domain word, no `?`, no imperative and no pronoun (which is exactly why
+    // every branch above misses it: "red", "carbonara", "just mozzarella", "Another one").
+    //
+    // Four guards keep it from becoming a net that answers everything:
+    //   * the state bit must be set — with no open question the behaviour is UNCHANGED;
+    //   * short only (<=4 tokens): a long turn has content of its own and the ladder judges it;
+    //   * not courtesy ("Night", "thanks", "hey" stay silent) and not second-person
+    //     ("you" keeps one human's instruction to another out, as everywhere else);
+    //   * not transcription noise — "[BLANK_AUDIO]", "*sigh* *pop*" are not answers.
+    if ctx.awaiting_reply
+        && tokens.len() <= 4
+        && !human_directed
+        && !is_social_courtesy(text)
+        && !text.trim_start().starts_with(['[', '*'])
+        && tokens
+            .iter()
+            .any(|w| w.len() >= 2 && w.chars().all(|c| c.is_ascii_alphabetic()))
+    {
         return true;
     }
     false
@@ -4830,6 +4889,66 @@ domains = ["coordination", "calendar"]
         assert!(!is_team_directed_ask("what time is it"));
         assert!(!is_team_directed_ask("the train ran late"));
         assert!(!is_team_directed_ask("coffee was expensive today"));
+    }
+
+    /// TURN-TAKING, NOT CLASSIFICATION (2026-09-30). 66 of this household's 201 real human
+    /// turns are three words or fewer, and the SAME word is an answer or a sign-off depending
+    /// only on what came before it. Every string in the first loop is verbatim from the real
+    /// transcript and was dropped by the per-message ladder.
+    #[test]
+    fn a_short_answer_to_our_own_question_is_ours() {
+        let awaiting = TurnContext {
+            awaiting_reply: true,
+        };
+        let none = TurnContext::default();
+
+        // With an open question these are answers to US, even though each carries no domain
+        // word, no `?`, no imperative and no pronoun.
+        for t in [
+            "yes",
+            "pestp",
+            "carbonara",
+            "red",
+            "just mozzarella",
+            "Another one.",
+            "What about tomorrow?",
+            "tomororw/",
+        ] {
+            assert!(
+                is_team_directed_ask_in(t, awaiting),
+                "{t:?} is an answer to a question we asked"
+            );
+            assert!(
+                !is_team_directed_ask_in(t, none),
+                "{t:?} must be UNCHANGED when no question is open — the state is the only new input"
+            );
+        }
+
+        // Courtesy stays silent EVEN while we are owed an answer: "Night" after a question is
+        // still a sign-off, and answering it is the interjection the family does not want.
+        for t in ["Night", "thanks", "hey", "Good morning!"] {
+            assert!(
+                !is_team_directed_ask_in(t, awaiting),
+                "{t:?} is courtesy, not an answer"
+            );
+        }
+        // Transcription noise is not an answer either (the family types into a mic).
+        for t in ["[BLANK_AUDIO]", "*sigh* *pop*"] {
+            assert!(
+                !is_team_directed_ask_in(t, awaiting),
+                "{t:?} is noise, not an answer"
+            );
+        }
+        // The second-person guard holds on this branch too.
+        assert!(!is_team_directed_ask_in(
+            "put your dishes in the sink",
+            awaiting
+        ));
+        // A LONG turn is judged on its own content, never promoted by the state bit.
+        assert!(!is_team_directed_ask_in(
+            "the neighbours dog is adorable and I am exhausted today",
+            awaiting
+        ));
     }
 
     #[test]
