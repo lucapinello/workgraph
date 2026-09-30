@@ -138,6 +138,10 @@ impl PlanDoc {
             ..Default::default()
         };
         let year = parse_year(week_code);
+        // The plan's Monday, from the filename's ISO week. Anchors day-cell dates so
+        // a plan whose week crosses New Year (a `2026-W53` file naming `January 2`)
+        // resolves to the right year, and backs the range fallback below.
+        let anchor = iso_week_monday(week_code);
 
         let mut section = Section::None;
         // Current workout person (set by the `### <Person> — …` heading inside
@@ -153,6 +157,17 @@ impl PlanDoc {
                 if dates.len() >= 2 {
                     doc.start = Some(dates[0]);
                     doc.end = Some(dates[1]);
+                } else {
+                    // The live plans head with a MONTH-NAME range, not an ISO one:
+                    //   `**Week of Monday October 5 → Sunday October 11**`
+                    // `find_iso_dates` sees no `YYYY-MM-DD` token there, so before
+                    // this the range was never read and `covers()` answered false
+                    // for every plan this household writes.
+                    let named = find_month_name_dates(line, anchor, year);
+                    if named.len() >= 2 {
+                        doc.start = Some(named[0]);
+                        doc.end = Some(named[1]);
+                    }
                 }
             }
             if doc.status.is_empty() {
@@ -208,7 +223,7 @@ impl PlanDoc {
                     if let Some(cells) = table_row(line) {
                         // Columns: Day | Slot | Dish | Prep | …
                         if cells.len() >= 3 && !is_header_or_rule(&cells) {
-                            let (weekday, date) = parse_day_cell(&cells[0], year);
+                            let (weekday, date) = parse_day_cell(&cells[0], anchor, year);
                             if !weekday.is_empty() {
                                 doc.meals.push(Meal {
                                     weekday,
@@ -232,7 +247,7 @@ impl PlanDoc {
                     if let Some(cells) = table_row(line) {
                         // Columns: Day | Time | Event | Source
                         if cells.len() >= 3 && !is_header_or_rule(&cells) {
-                            let (weekday, date) = parse_day_cell(&cells[0], year);
+                            let (weekday, date) = parse_day_cell(&cells[0], anchor, year);
                             if !weekday.is_empty() {
                                 doc.calendar.push(CalendarEvent {
                                     weekday,
@@ -252,7 +267,7 @@ impl PlanDoc {
                     {
                         // Columns: Day | Session | Structure
                         if cells.len() >= 2 && !is_header_or_rule(&cells) {
-                            let (weekday, _date) = parse_day_cell(&cells[0], year);
+                            let (weekday, _date) = parse_day_cell(&cells[0], anchor, year);
                             if !weekday.is_empty() {
                                 doc.workouts.push(WorkoutDay {
                                     person: person.clone(),
@@ -264,6 +279,19 @@ impl PlanDoc {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // `covers()` is the gate every plan reader asks ("is this the week we are
+        // in?"). If the header named no range we could read, fall back to the ISO
+        // week code in the filename — the one part of a plan's identity that is
+        // always present and always machine-derived (`NEXT_WEEK="$(date … +%G-W%V)"`).
+        // Kept as a FALLBACK rather than the primary so a header that disagrees with
+        // its own filename still wins, as it did before.
+        if doc.start.is_none() || doc.end.is_none() {
+            if let Some((start, end)) = iso_week_range(week_code) {
+                doc.start = Some(start);
+                doc.end = Some(end);
             }
         }
 
@@ -285,10 +313,7 @@ impl PlanDoc {
         if let Some(m) = self.meals.iter().find(|m| m.date == Some(day)) {
             return Some(m);
         }
-        let want = short_weekday(day);
-        self.meals
-            .iter()
-            .find(|m| m.weekday.eq_ignore_ascii_case(want))
+        self.meals.iter().find(|m| weekday_matches(&m.weekday, day))
     }
 }
 
@@ -417,7 +442,9 @@ pub fn expand_weekday(short: &str) -> String {
     }
 }
 
-/// Three-letter weekday for a date, matching how the plan writes day cells.
+/// Three-letter weekday code for a date. NOT the shape the plan writes — plans
+/// write the full name (`"Monday"`) — so this is only ever the *prefix* to compare
+/// against. See [`weekday_matches`].
 fn short_weekday(day: NaiveDate) -> &'static str {
     match day.weekday() {
         Weekday::Mon => "Mon",
@@ -462,13 +489,113 @@ fn is_header_or_rule(cells: &[String]) -> bool {
             .any(|c| c.chars().all(|ch| ch == '-') && !c.is_empty())
 }
 
-/// Parse a day cell like `"Mon 07-13"` into (`"Mon"`, date). The date is
-/// resolved against `year`; `None` if the `MM-DD` part is missing/unparseable.
-fn parse_day_cell(cell: &str, year: Option<i32>) -> (String, Option<NaiveDate>) {
+/// True when a plan day cell's weekday token names `day`'s weekday.
+///
+/// The cell may carry either the full name the live plans write (`"Monday"`) or
+/// the three-letter code the older fixtures use (`"Mon"`); both must match. The
+/// first three letters are the shared prefix, so that is what we compare —
+/// comparing a three-letter abbreviation for EQUALITY against a full name could
+/// never succeed, which is why `meal_on` returned `None` for every dinner in
+/// every plan this household writes.
+fn weekday_matches(cell_weekday: &str, day: NaiveDate) -> bool {
+    match cell_weekday.trim().get(..3) {
+        Some(prefix) => prefix.eq_ignore_ascii_case(short_weekday(day)),
+        None => false,
+    }
+}
+
+/// Parse a day cell into (`weekday`, date). Two shapes are live:
+///
+/// * `"Mon 07-13"` — the older fixture form (numeric month-day), and
+/// * `"Monday October 5"` — what the current plans actually write.
+///
+/// The date is `None` when neither shape resolves; callers then fall back to
+/// matching on the weekday name ([`weekday_matches`]).
+fn parse_day_cell(
+    cell: &str,
+    anchor: Option<NaiveDate>,
+    year: Option<i32>,
+) -> (String, Option<NaiveDate>) {
     let mut parts = cell.split_whitespace();
     let weekday = parts.next().unwrap_or("").to_string();
-    let date = parts.next().and_then(|md| parse_month_day(md, year));
+    let rest: Vec<&str> = parts.collect();
+    let date = rest
+        .first()
+        .and_then(|md| parse_month_day(md, year))
+        .or_else(|| parse_named_month_day(&rest, anchor, year));
     (weekday, date)
+}
+
+/// Resolve a month/day pair to a concrete date, choosing among the plan's ISO year
+/// and its neighbours by which lands NEAREST the plan's Monday.
+///
+/// Needed at both ends of a year-crossing week: a plan filed as `2026-W53` runs
+/// Mon 2026-12-28 → Sun 2027-01-03, so its "December 28" cell belongs to 2026
+/// while its "January 3" cell belongs to 2027 — and the filename's own year is
+/// the only hint we have.
+fn resolve_named_date(
+    month: u32,
+    day: u32,
+    anchor: Option<NaiveDate>,
+    year_hint: Option<i32>,
+) -> Option<NaiveDate> {
+    let year_hint = year_hint.or_else(|| anchor.map(|a| a.year()))?;
+    let mut best: Option<(i64, NaiveDate)> = None;
+    // The hint first, so that with no anchor to compare against a tie keeps it.
+    for y in [year_hint, year_hint + 1, year_hint - 1] {
+        if let Some(d) = NaiveDate::from_ymd_opt(y, month, day) {
+            let dist = anchor.map_or(0, |a| (d - a).num_days().abs());
+            if best.is_none_or(|(best_dist, _)| dist < best_dist) {
+                best = Some((dist, d));
+            }
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
+/// Resolve a `["October", "5,", …]` tail against the plan's week.
+fn parse_named_month_day(
+    tokens: &[&str],
+    anchor: Option<NaiveDate>,
+    year: Option<i32>,
+) -> Option<NaiveDate> {
+    let month = tokens.first().and_then(|t| month_number(t))?;
+    let day = tokens.get(1).and_then(|t| leading_number(t))?;
+    resolve_named_date(month, day, anchor, year)
+}
+
+/// Month number for an English month name, full or three-letter (case-insensitive).
+fn month_number(name: &str) -> Option<u32> {
+    let low = name.trim().to_ascii_lowercase();
+    let head = low.get(..3)?;
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    MONTHS
+        .iter()
+        .position(|m| m.starts_with(head))
+        .map(|i| i as u32 + 1)
+}
+
+/// The leading run of digits in a token (`"5,"` → `5`).
+fn leading_number(token: &str) -> Option<u32> {
+    let digits: String = token.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 /// Parse `"07-13"` against a year into a `NaiveDate`.
@@ -496,6 +623,61 @@ fn find_iso_dates(line: &str) -> Vec<NaiveDate> {
         }
     }
     out
+}
+
+/// Find `October 5`-style dates in a line, in order, resolved against `year`.
+///
+/// The live plans head with
+/// `**Week of Monday October 5 → Sunday October 11**`, which carries no
+/// `YYYY-MM-DD` token at all — so [`find_iso_dates`] returns nothing for it and
+/// the plan's range went unread.
+fn find_month_name_dates(
+    line: &str,
+    anchor: Option<NaiveDate>,
+    year: Option<i32>,
+) -> Vec<NaiveDate> {
+    let toks: Vec<&str> = line
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < toks.len() {
+        if let (Some(month), Some(day)) = (month_number(toks[i]), leading_number(toks[i + 1])) {
+            if let Some(d) = resolve_named_date(month, day, anchor, year) {
+                out.push(d);
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parse an ISO week code like `"2026-W41"` into `(iso_year, iso_week)`.
+fn parse_iso_week(week_code: &str) -> Option<(i32, u32)> {
+    let (y, w) = week_code.split_once('-')?;
+    let year: i32 = y.trim().parse().ok()?;
+    let week: u32 = w.trim().trim_start_matches(['W', 'w']).parse().ok()?;
+    if week == 0 || week > 53 {
+        return None;
+    }
+    Some((year, week))
+}
+
+/// The Monday of the ISO week named by a code like `"2026-W41"`.
+fn iso_week_monday(week_code: &str) -> Option<NaiveDate> {
+    let (year, week) = parse_iso_week(week_code)?;
+    NaiveDate::from_isoywd_opt(year, week, Weekday::Mon)
+}
+
+/// The Monday..Sunday range named by an ISO week code.
+fn iso_week_range(week_code: &str) -> Option<(NaiveDate, NaiveDate)> {
+    let (year, week) = parse_iso_week(week_code)?;
+    let mon = NaiveDate::from_isoywd_opt(year, week, Weekday::Mon)?;
+    let sun = NaiveDate::from_isoywd_opt(year, week, Weekday::Sun)?;
+    Some((mon, sun))
 }
 
 /// A `plans/<week>-dinner-suggestions.md` note is a SIDE-CHANNEL, never a plan of
@@ -653,6 +835,124 @@ mod tests {
         assert_eq!(doc.start, Some(date(2026, 7, 13)));
         assert_eq!(doc.end, Some(date(2026, 7, 19)));
         assert_eq!(doc.status, "DRAFT");
+    }
+
+    /// The LIVE plan shape, byte-for-byte in its two load-bearing details: a
+    /// MONTH-NAME range in the header, and full-weekday day cells.
+    ///
+    /// Both defeated the reader (2026-09-30). `find_iso_dates` wants a
+    /// `YYYY-MM-DD` token, so `start`/`end` stayed `None` and `covers()` — the gate
+    /// every plan reader asks — answered false for every plan this household has
+    /// ever written; and `meal_on`'s dateless fallback compared a three-letter
+    /// abbreviation against `"Monday"`, which can never be equal.
+    const LIVE_SHAPE: &str = "# Casa Pinello — Weekly Plan\n\n\
+**Week of Monday October 5 → Sunday October 11**\n\
+**Status:** Draft\n\n\
+## 1. Dinners (Nora → Bruno)\n\n\
+| Day | Slot | Dish | Prep |\n|---|---|---|---|\n\
+| Monday October 5 | Fish | Cod baked from frozen in tomato, olives and capers | ~30 min |\n\
+| Wednesday October 7 | Red meat | Slow beef ragù with rigatoni | ~60 min |\n\
+| Sunday October 11 | Fish — fresh | Miso-glazed salmon with sesame broccoli | ~30 min |\n";
+
+    #[test]
+    fn month_name_header_yields_the_week_range() {
+        let doc = PlanDoc::parse("2026-W41", LIVE_SHAPE);
+        assert_eq!(
+            doc.start,
+            Some(date(2026, 10, 5)),
+            "Monday, from the header"
+        );
+        assert_eq!(doc.end, Some(date(2026, 10, 11)), "Sunday, from the header");
+        assert!(doc.covers(date(2026, 10, 7)), "a Wednesday inside the week");
+        assert!(!doc.covers(date(2026, 10, 12)), "the Monday after it");
+        assert!(!doc.covers(date(2026, 10, 4)), "the Sunday before it");
+    }
+
+    /// The header parse needs its own teeth: with the ISO-week fallback in place, a
+    /// test whose header range happens to EQUAL the filename's week passes even if the
+    /// header branch never runs. Here the file is mis-named (`W40`, Mon 2026-09-28) and
+    /// the header says Oct 5–11 (`W41`), so only a real header parse can produce the
+    /// asserted dates — and the header must win, as it did before this change.
+    #[test]
+    fn month_name_header_wins_over_the_filename_week_code() {
+        let doc = PlanDoc::parse("2026-W40", LIVE_SHAPE);
+        assert_eq!(
+            doc.start,
+            Some(date(2026, 10, 5)),
+            "header range, not W40's"
+        );
+        assert_eq!(doc.end, Some(date(2026, 10, 11)), "header range, not W40's");
+    }
+
+    #[test]
+    fn month_name_day_cells_resolve_to_dates() {
+        let doc = PlanDoc::parse("2026-W41", LIVE_SHAPE);
+        assert_eq!(doc.meals.len(), 3);
+        assert_eq!(doc.meals[0].weekday, "Monday");
+        assert_eq!(doc.meals[0].date, Some(date(2026, 10, 5)));
+        assert_eq!(doc.meals[2].date, Some(date(2026, 10, 11)));
+    }
+
+    /// The family-visible claim: "what's for dinner tonight" must name the dish the
+    /// plan names, for a real date in the plan's week.
+    #[test]
+    fn meal_on_names_the_live_plan_dinner() {
+        let doc = PlanDoc::parse("2026-W41", LIVE_SHAPE);
+        assert_eq!(
+            doc.meal_on(date(2026, 10, 7)).map(|m| m.dish.as_str()),
+            Some("Slow beef ragù with rigatoni")
+        );
+        assert_eq!(
+            doc.meal_on(date(2026, 10, 5)).map(|m| m.dish.as_str()),
+            Some("Cod baked from frozen in tomato, olives and capers")
+        );
+        assert!(doc.meal_on(date(2026, 10, 8)).is_none(), "no Thursday row");
+    }
+
+    /// The weekday FALLBACK, isolated: a cell whose date will not resolve still has
+    /// to match by name. This is the path that compared `"Mon"` for EQUALITY
+    /// against `"Wednesday"`-style cells and so matched nothing, ever.
+    #[test]
+    fn meal_on_falls_back_to_the_full_weekday_name() {
+        let body = "# Casa Pinello — Weekly Plan\n\n\
+**Week of Monday October 5 → Sunday October 11**\n\n\
+## 1. Dinners\n\n| Day | Slot | Dish | Prep |\n|---|---|---|---|\n\
+| Wednesday | Fish | Weekday-only cell | ~20 min |\n";
+        let doc = PlanDoc::parse("2026-W41", body);
+        assert_eq!(
+            doc.meals[0].date, None,
+            "dateless by design, to force the fallback"
+        );
+        assert_eq!(doc.meals[0].weekday, "Wednesday");
+        assert_eq!(
+            doc.meal_on(date(2026, 10, 7)).map(|m| m.dish.as_str()),
+            Some("Weekday-only cell"),
+            "a full weekday name must match the three-letter code for the same day"
+        );
+    }
+
+    /// The filename's ISO week is the fallback when the header names no range at all.
+    #[test]
+    fn header_less_plan_takes_its_range_from_the_week_code() {
+        let doc = PlanDoc::parse("2026-W41", "# Casa Pinello\n\n**Status:** Draft\n");
+        assert_eq!(doc.start, Some(date(2026, 10, 5)));
+        assert_eq!(doc.end, Some(date(2026, 10, 11)));
+    }
+
+    /// A year-crossing week: `2026-W53` runs Mon 2026-12-28 → Sun 2027-01-03, so its
+    /// December cell is 2026 and its January cell is 2027.
+    #[test]
+    fn a_year_boundary_week_resolves_into_the_next_year() {
+        let body = "# Plan\n\n\
+**Week of Monday December 28 → Sunday January 3**\n\n\
+## 1. Dinners\n\n| Day | Slot | Dish | Prep |\n|---|---|---|---|\n\
+| Monday December 28 | Fish | December fish | ~20 min |\n\
+| Sunday January 3 | Fish | New-year fish | ~20 min |\n";
+        let doc = PlanDoc::parse("2026-W53", body);
+        assert_eq!(doc.start, Some(date(2026, 12, 28)));
+        assert_eq!(doc.end, Some(date(2027, 1, 3)), "January belongs to 2027");
+        assert_eq!(doc.meals[0].date, Some(date(2026, 12, 28)));
+        assert_eq!(doc.meals[1].date, Some(date(2027, 1, 3)));
     }
 
     #[test]
