@@ -906,6 +906,36 @@ pub const ADDRESS_FOLLOWERS: &[&str] = &[
 /// person — a strong signal a request is team-directed ("can *someone* …").
 pub const INDEFINITE_AGENTS: &[&str] = &["someone", "somebody", "anyone", "anybody"];
 
+/// Verbs that, in the FIRST position of a message, open an imperative *command*
+/// to the household rather than a remark ("**add** banana to the shopping list",
+/// "**remind** me about the dentist"). Deliberately excludes chore verbs that are
+/// far more often one human instructing another ("clean your room") — see the
+/// second-person guard in [`is_team_directed_ask`]. Tunable.
+pub const IMPERATIVE_LEADS: &[&str] = &[
+    "add",
+    "put",
+    "buy",
+    "order",
+    "get",
+    "grab",
+    "pick",
+    "remind",
+    "book",
+    "schedule",
+    "reschedule",
+    "cancel",
+    "move",
+    "swap",
+    "plan",
+    "cook",
+    "make",
+    "note",
+    "log",
+    "remove",
+    "delete",
+    "drop",
+];
+
 /// Household/planning domain keywords. A question or request touching one of
 /// these is plausibly *for the team* (the concierge) rather than idle chatter.
 /// Tunable — this is the heart of the e-vs-f (ask-vs-small-talk) boundary.
@@ -1819,7 +1849,10 @@ pub fn addressed_name_bot(text: &str, config: &TelegramConfig) -> Option<Resolve
 /// * a group request lead ("can we …", "let's …") touches a [`DOMAIN_KEYWORDS`]
 ///   topic;
 /// * a `?`-question touches a domain topic and is NOT aimed at a specific person
-///   ("what's the plan for dinner?" fires; "did you eat?" does not).
+///   ("what's the plan for dinner?" fires; "did you eat?" does not);
+/// * an [`IMPERATIVE_LEADS`] verb OPENS the message on a domain topic and it is
+///   not aimed at a specific person ("add banana to the shopping list" fires;
+///   "put your dishes in the sink" does not).
 ///
 /// The second-person guard (`you`/`your`/`u`) suppresses the domain-question
 /// branch so human-to-human questions ("you free this weekend?") stay silent —
@@ -1834,6 +1867,10 @@ pub fn is_team_directed_ask(text: &str) -> bool {
     let has_indefinite = INDEFINITE_AGENTS.iter().any(|w| words.contains(*w));
     let has_domain = DOMAIN_KEYWORDS.iter().any(|w| words.contains(*w));
     let request_lead = REQUEST_LEADS.iter().any(|p| lower.starts_with(p));
+    let imperative_lead = word_list(text)
+        .first()
+        .map(|w| IMPERATIVE_LEADS.contains(&w.as_str()))
+        .unwrap_or(false);
     let human_directed = words.contains("you") || words.contains("your") || words.contains("u");
 
     // Strongest signal: explicitly asking "someone/anyone" in the group.
@@ -1846,6 +1883,25 @@ pub fn is_team_directed_ask(text: &str) -> bool {
     }
     // A domain question not aimed at a specific person.
     if is_question && has_domain && !human_directed {
+        return true;
+    }
+    // A bare imperative COMMAND about a household domain ("add banana to the
+    // shopping list", "remind me about the dentist"). Every branch above needs a
+    // `?`, an indefinite agent, or a "can we …"-shaped lead, so until this one a
+    // plain instruction to the house matched nothing and fell through to
+    // silence(small-talk) — no reply, no task, nothing written.
+    //
+    // That was INVISIBLE while the group held a single human, because
+    // `elect_responder`'s `human_count <= 1` path answers every unaddressed
+    // message anyway. It surfaced the instant a second human joined and the
+    // conservative silence came back: Luca's "Add banana to shopping list" was
+    // dropped 62s after Erik entered the group (2026-09-29).
+    //
+    // The second-person guard is what stops this eating family chatter: "put your
+    // dishes in the sink" is one human instructing another, not the house. It
+    // costs "add milk to your list", which stays silent — the same conservative
+    // trade the domain-question branch above already makes.
+    if imperative_lead && has_domain && !human_directed {
         return true;
     }
     false
@@ -4564,6 +4620,30 @@ domains = ["coordination", "calendar"]
         assert!(!is_team_directed_ask("did you eat yet?"));
         assert!(!is_team_directed_ask("how are you?"));
         assert!(!is_team_directed_ask("that movie was great"));
+    }
+
+    /// A plain instruction to the house is an ask. Before the imperative branch
+    /// every case in the first group returned false and the message was elected
+    /// `silence(small-talk)` — no reply, no task (Luca's "Add banana to shopping
+    /// list", dropped 62s after a second human joined the group, 2026-09-29).
+    #[test]
+    fn bare_imperative_command_is_a_team_ask() {
+        // The exact line the house dropped, verbatim, and its natural variants.
+        assert!(is_team_directed_ask("Add banana to shopping list"));
+        assert!(is_team_directed_ask("add banana to the shopping list"));
+        assert!(is_team_directed_ask("remind me about the dentist appointment"));
+        assert!(is_team_directed_ask("move thursday's training session"));
+        assert!(is_team_directed_ask("buy groceries for the weekend"));
+
+        // NEGATIVE CONTROLS. The second-person guard keeps one human instructing
+        // another out of the house's business — this is the boundary that stops
+        // the branch from eating family chatter wholesale.
+        assert!(!is_team_directed_ask("put your dishes in the sink"));
+        assert!(!is_team_directed_ask("add your kit to the laundry pile"));
+        // An imperative with no household domain is not the house's business.
+        assert!(!is_team_directed_ask("add a comment to the pull request"));
+        // A domain word without an imperative opener is still chatter.
+        assert!(!is_team_directed_ask("bananas were expensive today"));
     }
 
     #[test]
