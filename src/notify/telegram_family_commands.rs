@@ -256,10 +256,16 @@ fn compose_dinner(ctx: &CommandContext<'_>) -> String {
     }
 }
 
-/// `/shopping` — Otto. The current week's shopping list, phone-friendly, one
-/// block per store section.
+/// `/shopping` — Otto. THIS week's shopping list, phone-friendly, one block per
+/// store section.
+///
+/// "This week" means the plan that COVERS today, not the newest plan on file. A
+/// week with no plan of its own must decline, never borrow the next week's list and
+/// present it as this week's (`current_plan` falls back to the nearest upcoming
+/// week, which is how `/shopping` came to answer with the following week's list while
+/// `/dinner` — which does gate on `covers` — honestly said there was no plan).
 fn compose_shopping(ctx: &CommandContext<'_>) -> String {
-    let plan = family_plan::current_plan(ctx.plans, ctx.today);
+    let plan = ctx.plans.iter().find(|p| p.covers(ctx.today));
     let sections = plan.map(|p| p.shopping.as_slice()).unwrap_or(&[]);
     if sections.is_empty() {
         return "\u{1f6d2} No shopping list yet for this week — I'll put one \
@@ -283,7 +289,13 @@ fn compose_shopping(ctx: &CommandContext<'_>) -> String {
 /// `/week` — Otto. Meals by day + a workouts line + pending confirmations.
 /// Dates render as weekday names; the block stays compact.
 fn compose_week(ctx: &CommandContext<'_>) -> String {
-    let plan = family_plan::current_plan(ctx.plans, ctx.today);
+    // The plan that COVERS today — not `current_plan`, which falls back to the nearest
+    // upcoming week. That fallback made this command answer
+    // "This week at a glance: Monday — <next week's Monday dish>" on a week with no
+    // plan: next week's meals labelled as this week, with no dates on the lines to give
+    // it away, while `/dinner` (which gates on `covers`) declined honestly. Three
+    // surfaces, two answers, and the family had no way to tell.
+    let plan = ctx.plans.iter().find(|p| p.covers(ctx.today));
     let mut out = String::from("\u{1f4c5} This week at a glance:\n");
 
     match plan {
@@ -702,6 +714,48 @@ mod tests {
         );
         assert!(out.contains("Workouts:"), "workouts line: {out}");
         assert!(out.contains("Luca"), "workout person: {out}");
+    }
+
+    /// THE BORROWED-WEEK BUG (2026-09-30). With only a plan for ANOTHER week on file,
+    /// `/week` and `/shopping` answered with that plan's content while presenting it as
+    /// "This week" — the following week's meals labelled as this week, with no dates on
+    /// the lines to give it away. `/dinner` gates on `covers(today)` and declined
+    /// honestly, so the three surfaces contradicted one another. `current_plan`'s
+    /// nearest-upcoming fallback is right for "show me the next plan we have"; it is
+    /// wrong for "what is this week".
+    #[test]
+    fn week_and_shopping_never_borrow_a_neighbouring_week() {
+        // The only plan on file covers Mon 2026-07-13 … Sun 2026-07-19 (W29).
+        let plans = w29();
+        let humans = HashSet::new();
+
+        // A date in the FOLLOWING week, which has no plan of its own.
+        let outside = ctx(&plans, None, &humans, &[], date(2026, 7, 27));
+        let week = compose_week(&outside);
+        assert!(
+            !week.contains("Chickpea & spinach curry"),
+            "next week's dinner must not be served as this week's: {week}"
+        );
+        assert!(
+            week.contains("No meals planned yet."),
+            "an unplanned week is stated, not filled in: {week}"
+        );
+
+        let shopping = compose_shopping(&outside);
+        assert!(
+            !shopping.contains("Salmon fillets"),
+            "next week's list must not be served as this week's: {shopping}"
+        );
+        assert!(
+            shopping.contains("No shopping list yet for this week"),
+            "an unplanned week is stated, not filled in: {shopping}"
+        );
+
+        // POSITIVE CONTROL: inside the plan's own week both still render, so the
+        // assertions above mean "does not reach for a neighbour", not "is broken".
+        let inside = ctx(&plans, None, &humans, &[], date(2026, 7, 15));
+        assert!(compose_week(&inside).contains("Chickpea & spinach curry"));
+        assert!(compose_shopping(&inside).contains("Salmon fillets"));
     }
 
     #[test]
