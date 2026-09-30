@@ -906,6 +906,34 @@ pub const ADDRESS_FOLLOWERS: &[&str] = &[
 /// person — a strong signal a request is team-directed ("can *someone* …").
 pub const INDEFINITE_AGENTS: &[&str] = &["someone", "somebody", "anyone", "anybody"];
 
+/// Words that OPEN a question even when the family did not type the `?`.
+///
+/// "what's for dinner" and "What's for dinner?" are the same ask, and the trailing
+/// mark is the only thing the old test used to tell them apart — so half of a
+/// household's questions were classified as small talk. Asking is not the same as
+/// being *shaped* like a question: every branch below still requires a household
+/// domain, which is what keeps "how are you" and "who is that" silent.
+pub const INTERROGATIVE_LEADS: &[&str] = &[
+    "what", "what's", "whats", "which", "when", "where", "why", "how", "who", "whose", "are", "is",
+    "do", "does", "did", "can", "could", "would", "will", "should", "any", "have", "has",
+];
+
+/// Filler that may PRECEDE the commanding verb without changing the message.
+///
+/// `imperative_lead` once required the verb to be the very first token, so the
+/// politeness a family actually uses defeated it: "Please add milk to the shopping
+/// list" and "Hi, add milk to the shopping list" were both dropped while the terse
+/// "add milk to the shopping list" was answered. Skipped only as a bounded LEADING
+/// run — the verb still has to arrive before the sentence gets going.
+///
+/// Deliberately excludes "we"/"i" beyond the need-phrases: "i need to add …" is
+/// covered because `need` is itself in this list and is skipped like filler.
+pub const POLITE_PREFIX: &[&str] = &[
+    "please", "pls", "plz", "hi", "hey", "hello", "ok", "okay", "so", "just", "can", "could",
+    "would", "you", "u", "i", "i'm", "im", "we", "need", "needs", "to", "want", "wants", "quick",
+    "quickly", "also", "and", "then", "now",
+];
+
 /// Verbs that, in the FIRST position of a message, open an imperative *command*
 /// to the household rather than a remark ("**add** banana to the shopping list",
 /// "**remind** me about the dentist"). Deliberately excludes chore verbs that are
@@ -988,6 +1016,63 @@ pub const DOMAIN_KEYWORDS: &[&str] = &[
     "errands",
     "dishes",
     "laundry",
+];
+
+/// The NOUNS a family actually names when it asks the house for something:
+/// consumables they stock and run out of.
+///
+/// Kept separate from [`DOMAIN_KEYWORDS`] because the two do different work.
+/// `DOMAIN_KEYWORDS` is PLANNING vocabulary — the language the house writes
+/// ("shopping", "grocery", "meal", "calendar") — and every branch gates on it. But a
+/// person does not type the house's vocabulary; they type the thing they are out of
+/// ("we're out of coffee", "add bananas to the list", "I'm out of eggs"), and the
+/// OBJECT of a request carried no planning word at all. Measured before this list
+/// existed: 17 of 29 realistic family turns fell through to silence(small-talk).
+///
+/// The separation is also a safety property: "X is finished" is a consumption signal
+/// only for a staple, so "I finished the book" is not an ask just because "book"
+/// happens to be a household domain word (to book a table).
+///
+/// Curated and bounded on purpose. A general noun list would swallow the negative
+/// controls — "add a comment to the pull request", "put your dishes in the sink" —
+/// that keep one human's instruction to another out of the house's business. Tunable.
+pub const PANTRY_KEYWORDS: &[&str] = &[
+    // "add X to the list" is the canonical phrasing, and "list" appeared nowhere in
+    // the vocabulary before this.
+    "list",
+    "milk",
+    "bread",
+    "eggs",
+    "egg",
+    "butter",
+    "cheese",
+    "coffee",
+    "tea",
+    "juice",
+    "yoghurt",
+    "yogurt",
+    "fruit",
+    "vegetables",
+    "veggies",
+    "pasta",
+    "rice",
+    "flour",
+    "sugar",
+    "onions",
+    "garlic",
+    "tomatoes",
+    "potatoes",
+    "chicken",
+    "fish",
+    "meat",
+    "bananas",
+    "apples",
+    "toilet",
+    "detergent",
+    "tablets",
+    "soap",
+    "shampoo",
+    "batteries",
 ];
 
 /// Sentence-lead phrases that mark a request aimed at the group ("can we …",
@@ -1863,15 +1948,46 @@ pub fn is_team_directed_ask(text: &str) -> bool {
         return false;
     }
     let words = word_set(text);
-    let is_question = lower.ends_with('?');
+    let tokens = word_list(text);
+    // A question may arrive without its `?` — "what's for dinner" is the same ask as
+    // "What's for dinner?". An interrogative opener is the signal that survives the
+    // missing mark. Deliberately NOT "is the sentence shaped like a question": the
+    // domain gate below still applies, so "how are you" stays silent.
+    let is_question = lower.ends_with('?')
+        || tokens
+            .first()
+            .map(|w| INTERROGATIVE_LEADS.contains(&w.as_str()))
+            .unwrap_or(false);
     let has_indefinite = INDEFINITE_AGENTS.iter().any(|w| words.contains(*w));
-    let has_domain = DOMAIN_KEYWORDS.iter().any(|w| words.contains(*w));
+    let has_staple = PANTRY_KEYWORDS.iter().any(|w| words.contains(*w));
+    let has_domain = has_staple || DOMAIN_KEYWORDS.iter().any(|w| words.contains(*w));
     let request_lead = REQUEST_LEADS.iter().any(|p| lower.starts_with(p));
-    let imperative_lead = word_list(text)
-        .first()
+    // The commanding verb does not have to be the very first token: a family says
+    // "Please add milk…", "Hi, add milk…", "I need to add…". Skip a bounded run of
+    // politeness/pronoun filler and judge the first real word. Bounded on purpose —
+    // an unbounded scan would find "add" anywhere in a sentence ABOUT adding.
+    let imperative_lead = tokens
+        .iter()
+        .skip_while(|w| POLITE_PREFIX.contains(&w.as_str()))
+        .next()
         .map(|w| IMPERATIVE_LEADS.contains(&w.as_str()))
         .unwrap_or(false);
     let human_directed = words.contains("you") || words.contains("your") || words.contains("u");
+    // A STATED NEED, not a command — the dominant real-world phrasing, and until now
+    // the one with no branch at all: "we are out of coffee", "I'm out of eggs",
+    // "the fridge is empty", "we need more toilet paper". Gated on the same domain
+    // vocabulary as every other branch, so "I need a holiday" and "I'm out of
+    // patience" stay silent.
+    let states_a_need = words.contains("need")
+        || words.contains("needs")
+        || words.contains("needed")
+        || words.contains("empty")
+        || lower.contains("out of");
+    // "X is finished/gone" counts ONLY for a staple we actually stock. "Finished" is
+    // also how you end a book, a meeting or a film, and the first cut of this branch
+    // answered "I finished the book" — because "book" is a household domain word (to
+    // book a table). A consumption signal needs a consumable, not a domain.
+    let states_consumption = (words.contains("finished") || words.contains("gone")) && has_staple;
 
     // Strongest signal: explicitly asking "someone/anyone" in the group.
     if has_indefinite && (is_question || has_domain || request_lead) {
@@ -1902,6 +2018,11 @@ pub fn is_team_directed_ask(text: &str) -> bool {
     // costs "add milk to your list", which stays silent — the same conservative
     // trade the domain-question branch above already makes.
     if imperative_lead && has_domain && !human_directed {
+        return true;
+    }
+    // A stated household need touching a household domain. Last, so every stronger
+    // signal above keeps its precedence.
+    if (states_a_need || states_consumption) && has_domain && !human_directed {
         return true;
     }
     false
@@ -4631,7 +4752,9 @@ domains = ["coordination", "calendar"]
         // The exact line the house dropped, verbatim, and its natural variants.
         assert!(is_team_directed_ask("Add banana to shopping list"));
         assert!(is_team_directed_ask("add banana to the shopping list"));
-        assert!(is_team_directed_ask("remind me about the dentist appointment"));
+        assert!(is_team_directed_ask(
+            "remind me about the dentist appointment"
+        ));
         assert!(is_team_directed_ask("move thursday's training session"));
         assert!(is_team_directed_ask("buy groceries for the weekend"));
 
@@ -4644,6 +4767,69 @@ domains = ["coordination", "calendar"]
         assert!(!is_team_directed_ask("add a comment to the pull request"));
         // A domain word without an imperative opener is still chatter.
         assert!(!is_team_directed_ask("bananas were expensive today"));
+    }
+
+    /// THE FAMILY'S VOCABULARY (2026-09-30). The imperative branch above required a
+    /// household domain word and the verb in position 0 — so a family typing its own
+    /// language still vanished. Measured on a 29-turn corpus of realistic turns: 17
+    /// were elected `silence(small-talk)`. Three independent causes, each with its
+    /// controls below. After this, 7.
+    #[test]
+    fn the_family_vocabulary_is_an_ask_not_small_talk() {
+        // (1) THE OBJECT-WORD GAP. Every branch gates on `has_domain`, and the
+        // vocabulary was the language the HOUSE writes ("shopping", "grocery") —
+        // never the thing a person names. "add X to the list" is the canonical
+        // phrasing and "list" appeared nowhere.
+        assert!(is_team_directed_ask("Add bananas to the list"));
+        assert!(is_team_directed_ask("add bread"));
+        assert!(is_team_directed_ask("Order more dishwasher tablets"));
+        assert!(is_team_directed_ask("buy a bottle of milk"));
+
+        // (2) THE POLITE PREFIX. The verb had to be the FIRST token, so the
+        // politeness a family actually uses defeated it.
+        assert!(is_team_directed_ask("Please add milk to the shopping list"));
+        assert!(is_team_directed_ask("Hi, add milk to the shopping list"));
+        assert!(is_team_directed_ask("I need to add a dentist appointment"));
+        assert!(is_team_directed_ask(
+            "can we please book a table for Friday"
+        ));
+
+        // (3) THE MISSING `?`. Asking is not the same as being SHAPED like a
+        // question, and the trailing mark was the only thing distinguishing
+        // "what's for dinner" from "What's for dinner?".
+        assert!(is_team_directed_ask("what's for dinner"));
+        assert!(is_team_directed_ask("when is the shopping coming"));
+
+        // (4) A STATED NEED had no branch at all — the dominant real-world phrasing.
+        assert!(is_team_directed_ask("we are out of coffee"));
+        assert!(is_team_directed_ask("I'm out of eggs"));
+        assert!(is_team_directed_ask("the fridge is empty"));
+        assert!(is_team_directed_ask("we need more toilet paper"));
+        assert!(is_team_directed_ask("coffee is finished"));
+
+        // NEGATIVE CONTROLS — every one of these was checked against the LIVE
+        // classifier in a 23-turn sweep and none is answered.
+        // The second-person guard still keeps one human instructing another out.
+        assert!(!is_team_directed_ask("put your dishes in the sink"));
+        assert!(!is_team_directed_ask("add milk to your list"));
+        // A request about something that is not the household's business.
+        assert!(!is_team_directed_ask("add a comment to the pull request"));
+        assert!(!is_team_directed_ask("can you pass the salt"));
+        // "Finished" is how you end a book, a film or a meeting. The FIRST cut of
+        // the need-branch answered "I finished the book", because "book" is a
+        // household domain word (to book a table) — so a consumption signal now
+        // requires a staple, not merely a domain.
+        assert!(!is_team_directed_ask("I finished the book"));
+        assert!(!is_team_directed_ask("the film is finished"));
+        assert!(!is_team_directed_ask("finished the meeting"));
+        // A need for something the house does not stock.
+        assert!(!is_team_directed_ask("I need a holiday"));
+        assert!(!is_team_directed_ask("I'm out of patience"));
+        // Interrogatives and need-words that carry no household object stay chatter.
+        assert!(!is_team_directed_ask("how are you"));
+        assert!(!is_team_directed_ask("what time is it"));
+        assert!(!is_team_directed_ask("the train ran late"));
+        assert!(!is_team_directed_ask("coffee was expensive today"));
     }
 
     #[test]
