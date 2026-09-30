@@ -33,7 +33,7 @@ use worksgood::notify::ownership;
 use worksgood::notify::telegram::{TelegramChannel, TelegramConfig};
 use worksgood::notify::telegram_family_commands as family_commands;
 use worksgood::notify::telegram_group::{
-    NaturalRoute, parse_at_mention_tokens, route_natural_with_owner_map,
+    Election, elect_responders_with_owner_map, parse_at_mention_tokens,
 };
 
 /// How to describe an owner lookup, keeping "nobody owns this" apart from "there was
@@ -443,13 +443,23 @@ pub fn run_register_commands(json: bool) -> Result<()> {
 /// `wg telegram route` — show how a group message would be routed to a family
 /// voice, without sending anything.
 ///
-/// Runs the exact [`route_natural`] decision the listener uses, so it verifies
-/// natural-group routing (docs/09 §natural-group) end-to-end against the real
-/// `notify.toml` bots. Mentions are approximated from any `@handle` tokens in
-/// the text (the live listener reads them from Telegram entities). Prints the
-/// resolved voice and *how* it was addressed (@mention / name / reply-chain /
-/// concierge), and flags a `/standup` that the listener would intercept for the
-/// whole roster.
+/// Runs the SAME [`elect_responders_with_owner_map`] decision the listener uses — the
+/// one `wg telegram elect` reports — so the two diagnostics can no longer disagree.
+/// (Until 2026-09-30 this called `route_natural`, a PARALLEL implementation with no
+/// domain-voice step and no silence rule, so it answered `routed to otto (by
+/// concierge)` for "what's for dinner?" while the live listener answered
+/// `nora (by domain:meal-planning)` — same message, two answers, and the doc comment
+/// and the `--help` both claimed this command ran "the exact decision the listener
+/// uses". An operator debugging a misroute with the lying one got the wrong answer.)
+///
+/// Mentions are approximated from any `@handle` tokens in the text (the live listener
+/// reads them from Telegram entities). `--humans N` is NOT offered here on purpose:
+/// this must reflect the live membership, and `wg telegram elect --humans N` already
+/// exists for previewing the other side of the boundary.
+///
+/// Prints the resolved voice and *how* it was addressed (@mention / name / reply-chain /
+/// domain / concierge), reports a SILENCE with its reason rather than routing it to the
+/// concierge, and flags a `/standup` that the listener would intercept.
 pub fn run_route(
     workgraph_dir: &Path,
     message: &str,
@@ -463,23 +473,47 @@ pub fn run_route(
     // Approximate the listener's mention extraction: any @handle token.
     let mention_usernames: Vec<String> = parse_at_mention_tokens(message);
     let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
+    let human_count = human_agent_id_set(workgraph_dir).len();
 
-    let route = route_natural_with_owner_map(
+    let election = elect_responders_with_owner_map(
         Some(chat_type),
         Some(chat_id),
         message,
         &mention_usernames,
         reply_to_bot,
+        false,
+        human_count,
         &config,
         &owner_map,
     );
 
     // The listener intercepts `/standup` (for the whole roster) on the routed
     // body before the per-agent handler, so report that specially.
-    let (kind, agent, addressed_by, routed_body) = match &route {
-        NaturalRoute::Private => ("private", None, None, message.to_string()),
-        NaturalRoute::Drop => ("drop", None, None, message.to_string()),
-        NaturalRoute::ToBot {
+    let (kind, agent, addressed_by, routed_body) = match &election {
+        Election::Private => ("private", None, None, message.to_string()),
+        Election::Silence(reason) => (
+            "silence",
+            None,
+            Some(reason.to_string()),
+            message.to_string(),
+        ),
+        Election::All { body, .. } => {
+            let roster = worksgood::notify::telegram_standup::load_project_roster(
+                &project_root(workgraph_dir),
+                &config,
+            )?
+            .into_iter()
+            .map(|m| m.bot_id)
+            .collect::<Vec<_>>()
+            .join(", ");
+            let kind = if worksgood::notify::telegram_standup::is_standup_command(body) {
+                "standup"
+            } else {
+                "collective"
+            };
+            (kind, Some(roster), None, body.clone())
+        }
+        Election::One {
             bot,
             body,
             addressed_by,
@@ -509,10 +543,17 @@ pub fn run_route(
 
     match kind {
         "private" => println!("private chat — 1:1 passthrough (not group-routed)"),
-        "drop" => println!("dropped — no chat id, or no voice to route to"),
+        "silence" => println!(
+            "no voice answers ({}) — the listener stays out of this one",
+            addressed_by.as_deref().unwrap_or("?")
+        ),
         "standup" => {
             println!("/standup — intercepted; posts the configured household roster")
         }
+        "collective" => println!(
+            "collective address — the whole roster answers in order: {}",
+            agent.as_deref().unwrap_or("(no roster)")
+        ),
         _ => println!(
             "routed to {} (by {}): {}",
             agent.as_deref().unwrap_or("(unbound)"),
