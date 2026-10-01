@@ -1287,19 +1287,30 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             let human_count = human_agent_id_set(&workgraph_dir).len();
 
             let owner_map = ownership::OwnerMap::load(&project_root(&workgraph_dir));
-            let election = elect_responders_with_owner_map(
-                msg.chat_type.as_deref(),
-                msg.chat_id.as_deref(),
-                &msg.body,
-                &msg.mention_usernames,
-                msg.reply_to_bot.as_deref(),
+            // ── THE ROUTER SEAM (task router-modular) ────────────────────────────────────
+            // `Router::shipped()` holds the SAME deterministic ladder behind a strategy trait,
+            // so an alternative approach (a JEV-style model readout, an embedding classifier)
+            // can be added by composing strategies — with no edit to this call site. The five
+            // tests in `casa::router` pin the one thing that matters here: adopting the seam
+            // moves NO decision, so this line is behaviour-identical to the direct call it
+            // replaced.
+            let routing = crate::casa::router::RoutingRequest {
+                chat_type: msg.chat_type.as_deref(),
+                chat_id: msg.chat_id.as_deref(),
+                text: &msg.body,
+                mention_usernames: &msg.mention_usernames,
+                reply_to_bot: msg.reply_to_bot.as_deref(),
                 // Defense in depth behind the boundary guard above — a bot-sent
                 // message never reaches here, but the election refuses it too.
-                msg.sender_is_bot,
+                sender_is_bot: msg.sender_is_bot,
                 human_count,
-                &route_config,
-                &owner_map,
-            );
+                config: &route_config,
+                owner_map: &owner_map,
+                turn: worksgood::notify::telegram_group::TurnContext::default(),
+                context: None,
+            };
+            let routed = crate::casa::router::Router::shipped().decide(&routing);
+            let election = routed.election;
 
             // Observability: exactly ONE decision line per consumed message —
             // which election rule fired and where it landed — emitted for EVERY

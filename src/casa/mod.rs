@@ -14,4 +14,5 @@ pub mod one_shot_answers;
 pub mod plan_edits;
 pub mod remind;
 pub mod reply_delivery;
+pub mod router;
 pub mod telegram_photo;
