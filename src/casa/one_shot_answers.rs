@@ -475,17 +475,25 @@ pub fn run_route(
     let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
     let human_count = human_agent_id_set(workgraph_dir).len();
 
-    let election = elect_responders_with_owner_map(
-        Some(chat_type),
-        Some(chat_id),
-        message,
-        &mention_usernames,
-        reply_to_bot,
-        false,
-        human_count,
-        &config,
-        &owner_map,
-    );
+    // THE SAME ROUTER AS THE LISTENER AND `wg telegram elect`. Wiring only some of the three call
+    // sites is how `route` and `elect` came to disagree on 2026-09-30, and it happened again on
+    // 2026-10-02 (caught by tests/smoke/scenarios/engine_route_matches_elect.sh: `route` said
+    // silence for "the sink is leaking" while `elect` said otto). One decision, one code path.
+    let election = crate::casa::router::router_from_config(workgraph_dir)
+        .decide(&crate::casa::router::RoutingRequest {
+            chat_type: Some(chat_type),
+            chat_id: Some(chat_id),
+            text: message,
+            mention_usernames: &mention_usernames,
+            reply_to_bot,
+            sender_is_bot: false,
+            human_count,
+            config: &config,
+            owner_map: &owner_map,
+            turn: worksgood::notify::telegram_group::TurnContext::default(),
+            context: None,
+        })
+        .election;
 
     // The listener intercepts `/standup` (for the whole roster) on the routed
     // body before the per-agent handler, so report that specially.
