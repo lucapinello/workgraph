@@ -52,6 +52,10 @@ pub struct ContextBlock {
     pub memory: Option<String>,
     /// Recent turns of this chat, oldest first, `"<speaker>: <text>"`.
     pub history: Option<String>,
+    /// THIS WEEK'S PLAN — dinners by day plus its "Waiting on the family" section. Absent when
+    /// this week has no plan file. Sent to the model because "what's for dinner?" and "I'd rather
+    /// not do fish twice" cannot be judged without it.
+    pub plan: Option<String>,
     /// Local clock + week state, already formatted for a prompt.
     pub clock: Option<String>,
 }
@@ -67,10 +71,13 @@ impl ContextBlock {
                 "0"
             }
         };
+        // The presence string is what makes "everything reached the router" a LOG LINE rather
+        // than an assurance, so it must name every block that is actually sent.
         format!(
-            "roles={} memory={} history={} clock={}",
+            "roles={} memory={} plan={} history={} clock={}",
             f(&self.roles),
             f(&self.memory),
+            f(&self.plan),
             f(&self.history),
             f(&self.clock)
         )
@@ -405,13 +412,14 @@ mod tests {
         let c = ContextBlock {
             roles: Some("nora".into()),
             memory: None,
+            plan: Some("Mon: fish".into()),
             history: Some("Luca: hi".into()),
             clock: Some("Mon".into()),
         };
-        assert_eq!(c.present(), "roles=1 memory=0 history=1 clock=1");
+        assert_eq!(c.present(), "roles=1 memory=0 plan=1 history=1 clock=1");
         assert_eq!(
             ContextBlock::default().present(),
-            "roles=0 memory=0 history=0 clock=0"
+            "roles=0 memory=0 plan=0 history=0 clock=0"
         );
     }
 }

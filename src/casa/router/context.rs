@@ -39,6 +39,7 @@ pub fn build(root: &Path, history: Option<String>) -> ContextBlock {
     ContextBlock {
         roles: roles_block(root),
         memory: memory_block(root),
+        plan: plan_block(root),
         history: history.map(|h| clip(h, HISTORY_MAX)),
         clock: Some(clock_block(root)),
     }
@@ -166,7 +167,11 @@ fn plan_block(root: &Path) -> Option<String> {
                 && !cells[1].starts_with('-')
                 && !cells[1].eq_ignore_ascii_case("day")
             {
-                out.push_str(&format!("- {}: {}\n", cells[1], cells[2]));
+                // The live table is `Day | Slot | Dish | Prep`, so the DISH is the 4th cell.
+                // Using the 3rd sent the slot type ("Fish", "Vegetarian") instead of the dinner,
+                // which is worse than useless for "what's for dinner?" — caught by the test below.
+                let dish = cells.get(3).copied().unwrap_or(cells[2]);
+                out.push_str(&format!("- {}: {}\n", cells[1], dish));
                 rows += 1;
             }
         }
@@ -302,7 +307,7 @@ mod tests {
         assert!(h.contains("which night?"));
 
         // and the presence string makes it all observable
-        assert_eq!(c.present(), "roles=1 memory=1 history=1 clock=1");
+        assert_eq!(c.present(), "roles=1 memory=1 plan=1 history=1 clock=1");
     }
 
     /// A house with nothing to read must produce ABSENT blocks, not empty ones — otherwise the
@@ -316,6 +321,27 @@ mod tests {
         assert!(c.history.is_none());
         assert!(c.clock.is_some(), "the clock is always known");
         assert!(c.clock.unwrap().contains("NOT planned yet"));
+    }
+
+    /// The PLAN must actually reach the model — it was assembled but never carried, which is a
+    /// shortcut of exactly the kind this file exists to prevent.
+    #[test]
+    fn the_plan_reaches_the_block() {
+        let d = tempfile::tempdir().unwrap();
+        fixture(d.path());
+        let c = build(d.path(), None);
+        let plan = c
+            .plan
+            .clone()
+            .expect("the plan must be carried, not merely consulted");
+        assert!(
+            plan.contains("Cod baked from frozen"),
+            "dinners by day: {plan}"
+        );
+        assert!(
+            plan.contains("WAITING ON THE FAMILY"),
+            "and what is owed back: {plan}"
+        );
     }
 
     #[test]

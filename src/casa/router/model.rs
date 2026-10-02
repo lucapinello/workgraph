@@ -27,6 +27,10 @@ pub enum ModelKind {
     Jev,
     /// A capable autoregressive model (vllm-metal) via guided_choice + logprobs + order swap.
     Gemma4,
+    /// **`djev` over LunaRoute** — the same Jev mechanism served remotely at POST /v1/systemone.
+    /// No weights, no RAM floor, no GPU: a new machine needs network access only. The network
+    /// dependency is covered by `on_unavailable`, which degrades to the ladder rather than silence.
+    LunaRoute,
 }
 
 impl ModelKind {
@@ -34,6 +38,7 @@ impl ModelKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "jev" | "diffgemma" => Some(Self::Jev),
             "gemma4" | "gemma" => Some(Self::Gemma4),
+            "lunaroute" | "djev" => Some(Self::LunaRoute),
             _ => None,
         }
     }
@@ -42,6 +47,7 @@ impl ModelKind {
         match self {
             Self::Jev => "jev",
             Self::Gemma4 => "gemma4",
+            Self::LunaRoute => "lunaroute",
         }
     }
 }
@@ -112,6 +118,8 @@ pub struct RouterConfig {
     /// What to do when the endpoint cannot answer. `Pattern` is the ONLY safe value and is what
     /// "unavailable" maps to; the field exists so the intent is written down rather than implied.
     pub on_unavailable: Unavailable,
+    /// Bearer token for a remote endpoint. Empty for a local server (which needs none).
+    pub api_key: String,
     /// Below this probability the model abstains and the ladder's silence stands.
     pub min_confidence: f32,
     pub timeout: Duration,
@@ -130,6 +138,7 @@ impl Default for RouterConfig {
         Self {
             kind: ModelKind::Jev, // THE STANDARD (2026-10-02)
             endpoint: "http://127.0.0.1:8080".to_string(),
+            api_key: std::env::var("WG_ROUTER_API_KEY").unwrap_or_default(),
             on_unavailable: Unavailable::Pattern,
             min_confidence: 0.60,
             timeout: Duration::from_secs(8),
@@ -193,6 +202,7 @@ impl RouterConfig {
                     }
                 }
                 "endpoint" => cfg.endpoint = v.to_string(),
+                "api_key" => cfg.api_key = v.to_string(),
                 "enabled" => {
                     cfg.enabled = !matches!(v.to_ascii_lowercase().as_str(), "false" | "no" | "0")
                 }
@@ -246,6 +256,7 @@ impl ModelClient {
         match self.cfg.kind {
             ModelKind::Jev => self.classify_jev(text, context),
             ModelKind::Gemma4 => self.classify_gemma4(text, context),
+            ModelKind::LunaRoute => self.classify_lunaroute(text, context),
         }
     }
 
@@ -266,7 +277,7 @@ impl ModelClient {
         instructions.push_str("\n\n");
         instructions.push_str(EXAMPLES);
         if let Some(c) = context {
-            for block in [&c.roles, &c.memory, &c.history, &c.clock]
+            for block in [&c.roles, &c.memory, &c.plan, &c.history, &c.clock]
                 .into_iter()
                 .flatten()
             {
@@ -309,6 +320,55 @@ impl ModelClient {
         Some((p >= 0.5, decided))
     }
 
+    /// **`djev` over LunaRoute** — the Jev interface, verified against the live API.
+    ///
+    /// The shape was discovered from the endpoint's own validation (it names the field it
+    /// rejects): `questions` is an OBJECT keyed by id, a question needs `type`, `noul` is the
+    /// yes/no arm and returns P(yes) directly, and the policy/context belongs in `instructions`.
+    /// Same policy text and same ContextBlock as the local engines — only the transport differs.
+    fn classify_lunaroute(
+        &self,
+        text: &str,
+        context: Option<&super::ContextBlock>,
+    ) -> Option<(bool, f32)> {
+        let mut instructions = String::from(POLICY);
+        instructions.push_str("\n\n");
+        instructions.push_str(EXAMPLES);
+        if let Some(c) = context {
+            for block in [&c.roles, &c.memory, &c.plan, &c.history, &c.clock]
+                .into_iter()
+                .flatten()
+            {
+                if !block.trim().is_empty() {
+                    instructions.push('\n');
+                    instructions.push_str(block);
+                }
+            }
+        }
+        let body = serde_json::json!({
+            "model": "djev",
+            "state": text,
+            "questions": { "house": { "type": "noul", "instructions": instructions } }
+        });
+        let mut req = self
+            .http
+            .post(format!(
+                "{}/v1/systemone",
+                self.cfg.endpoint.trim_end_matches('/')
+            ))
+            .json(&body);
+        if !self.cfg.api_key.is_empty() {
+            req = req.bearer_auth(&self.cfg.api_key);
+        }
+        let v: serde_json::Value = req.send().ok()?.json().ok()?;
+        let p = v["answers"]["house"]["noul"].as_f64()? as f32;
+        let conf = if p >= 0.5 { p } else { 1.0 - p };
+        if conf < self.cfg.min_confidence {
+            return None;
+        }
+        Some((p >= 0.5, conf))
+    }
+
     /// The autoregressive path. Two reads with the options swapped, averaged — without that the
     /// readout measures the model's preference between `A` and `B` rather than the message
     /// (measured: 1.5B answered B to everything, 7B answered A to everything).
@@ -327,7 +387,7 @@ impl ModelClient {
                 order.0, order.1
             );
             if let Some(c) = context {
-                for block in [&c.roles, &c.memory, &c.history, &c.clock]
+                for block in [&c.roles, &c.memory, &c.plan, &c.history, &c.clock]
                     .into_iter()
                     .flatten()
                 {
