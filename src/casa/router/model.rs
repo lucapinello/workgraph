@@ -47,45 +47,62 @@ impl ModelKind {
 }
 
 /// What counts as an ask — stated, because an undefined question gets a confidently wrong answer.
-const POLICY: &str = "HOW TO DECIDE. The house speaks when it is ASKED, not when it overhears.\n\
+const POLICY: &str = "HOW TO DECIDE. You are the household's front desk. Decide whether the\n\
+family should hear from the house about this message.\n\
 \n\
-Answer ASK only when the message is a REQUEST TO THE HOUSE or a stated need the house can act on:\n\
+Answer ASK when the house has something to do — act on it, log it, or answer it:\n\
   * a request, question or instruction addressed to the assistants, however terse ('rundown',\n\
-    'plans for tomorrow?', 'change wed to pesto');\n\
+    'plans for tomorrow?', 'change wed to pesto', 'can you add wine');\n\
+  * a request to REMEMBER something ('my sister's birthday is the 12th, don't let me forget',\n\
+    'remind me about the bins');\n\
   * a stated household need ('we're out of coffee', 'the fridge is empty', \"I'm out of eggs\");\n\
+  * a question about the household's own state or supplies ('what's for dinner?', 'what's in my\n\
+    calendar?', 'what's the best way to use up the sour cream');\n\
   * a constraint the house must hold ('I'm away wednesday to friday', 'keep sunday free');\n\
-  * a question about the household's own state ('what's for dinner?', 'what's in my calendar?').\n\
+  * a FAULT or planned upkeep IN THE HOUSE, even stated as a plain observation, because the house\n\
+    can at least flag it or arrange it ('the boiler is making a weird noise', 'the wifi keeps\n\
+    dropping upstairs', 'the dishwasher isn't draining properly', 'we should get the gutters\n\
+    cleaned before winter').\n\
 \n\
-Answer STAY_OUT for everything else, INCLUDING messages that mention household things but are not\n\
-requests. A remark is not an ask just because the house could think of something to do about it:\n\
-  * thinking aloud, venting, feelings ('my back is killing me', 'work has been mad lately',\n\
-    'I've got a headache coming on');\n\
-  * an observation with no request in it ('the garden looks a mess', \"I keep meaning to sort the\n\
-    shed out', 'the coffee machine at work is broken', 'the supermarket was packed');\n\
-  * one family member addressing another ('can you pick up the kids', 'put your dishes in the sink');\n\
-  * social noise ('night', 'thanks', 'hey', '[BLANK_AUDIO]');\n\
-  * things outside the house's business (weather, opening hours, school term dates, the car, a\n\
-    broken router) unless the family member is ASKING the house to do something about it.\n\
+Answer STAY_OUT for everything else:\n\
+  * PERSONAL feeling or venting, even when the house could think of something to do about it\n\
+    ('my back is killing me', \"I've got a headache coming on', 'I'm exhausted today', 'work has\n\
+    been mad lately');\n\
+  * a bare observation with no fault and no intent ('the garden looks a mess', 'the supermarket\n\
+    was packed', 'it's meant to be warmer next week');\n\
+  * one family member addressing another ('can you pick up the kids', 'put your dishes in the\n\
+    sink');\n\
+  * a remark ABOUT other people — reporting what someone said or will do — unless it asks the\n\
+    house to do something ('Erik says he'll bring the wine', \"she's starting her new job monday',\n\
+    'he never listens', 'my sister is so annoying sometimes');\n\
+  * social noise ('night', 'thanks', 'hey', 'good night everyone', '[BLANK_AUDIO]');\n\
+  * matters OUTSIDE the house with no request attached — weather, opening hours, school term\n\
+    dates, the car, a machine at someone's WORK ('the coffee machine at work is broken').\n\
 \n\
-If a family member is answering a question the house asked, that is ASK — the answer belongs to us.\n\
-When in doubt, STAY_OUT: a dropped request is recoverable, an interruption is not.";
+If a family member is answering a question the house asked, that is ASK — the answer is ours.\n\
+The dividing line is simple: does the house have something TO DO? A fault in the home or a request,\n\
+however casually worded, is yes. A feeling, a bare remark, or the world outside is no.";
 
 /// Worked examples. Nine of them, taken from the harness that measured the win.
 const EXAMPLES: &str = "WORKED EXAMPLES:\n\
-  add bananas to the list                    -> ASK\n\
-  rundown                                    -> ASK\n\
-  we're out of coffee                        -> ASK\n\
-  change wed to pesto                        -> ASK\n\
-  what's for dinner?                         -> ASK\n\
-  I'm travelling wednesday to friday         -> ASK\n\
-  can you keep sunday free                   -> ASK\n\
-  my back is killing me                      -> STAY_OUT\n\
-  the garden looks a mess                    -> STAY_OUT\n\
-  work has been mad lately                   -> STAY_OUT\n\
-  the coffee machine at work is broken       -> STAY_OUT\n\
-  can you pick up the kids                   -> STAY_OUT\n\
-  good night everyone                        -> STAY_OUT\n\
-  [BLANK_AUDIO]                              -> STAY_OUT";
+  add bananas to the list                       -> ASK\n\
+  change wed to pesto                           -> ASK\n\
+  what's for dinner?                            -> ASK\n\
+  what's the best way to use up the sour cream  -> ASK\n\
+  my sister's birthday is the 12th, don't let me forget -> ASK\n\
+  remind me about the bins                      -> ASK\n\
+  the boiler is making a weird noise            -> ASK   (a fault in the house)\n\
+  the wifi keeps dropping upstairs              -> ASK   (a fault in the house)\n\
+  the dishwasher isn't draining properly        -> ASK   (a fault in the house)\n\
+  we should get the gutters cleaned             -> ASK   (planned upkeep)\n\
+  I'm travelling wednesday to friday            -> ASK   (a constraint)\n\
+  my back is killing me                         -> STAY_OUT   (personal venting)\n\
+  the garden looks a mess                       -> STAY_OUT   (a bare observation, no fault)\n\
+  the coffee machine at work is broken          -> STAY_OUT   (outside the house)\n\
+  can you pick up the kids                      -> STAY_OUT   (to another family member)\n\
+  good night everyone                           -> STAY_OUT   (social noise)\n\
+  Erik says he'll bring the wine                -> STAY_OUT   (about someone else)\n\
+  she's starting her new job monday             -> STAY_OUT   (about someone else)";
 
 /// `[router]` from `.wg/config.toml`. Every field has a default, so an absent block is the standard.
 #[derive(Clone, Debug)]
