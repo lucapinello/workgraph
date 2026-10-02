@@ -1294,6 +1294,13 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // tests in `casa::router` pin the one thing that matters here: adopting the seam
             // moves NO decision, so this line is behaviour-identical to the direct call it
             // replaced.
+            // NO SHORTCUTS: the model gets the house's own state, not just the message. Assembled
+            // from household.toml (roles + full remit), the memory store, this week's plan, the
+            // clock, and the recent turns of THIS chat. Measured worth: 9/40 -> 1/40 dropped asks.
+            let routing_ctx = crate::casa::router::Router::request_context(
+                &project_root(&workgraph_dir),
+                Some(&casa_feed::feed_path_for(&project_root(&workgraph_dir))),
+            );
             let routing = crate::casa::router::RoutingRequest {
                 chat_type: msg.chat_type.as_deref(),
                 chat_id: msg.chat_id.as_deref(),
@@ -1307,7 +1314,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                 config: &route_config,
                 owner_map: &owner_map,
                 turn: worksgood::notify::telegram_group::TurnContext::default(),
-                context: None,
+                context: Some(&routing_ctx),
             };
             // THE LIVE ROUTER. `router_from_config` reads `[router]` (JEV is the standard) and
             // composes the hybrid with the deterministic ladder. The hybrid consults the model

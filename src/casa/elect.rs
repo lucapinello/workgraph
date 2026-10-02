@@ -45,6 +45,9 @@ pub fn run_elect(
     // THE SAME ROUTER THE LISTENER USES. Routing this diagnostic through the direct election
     // while the listener ran the router would make the diagnostic lie about the live decision —
     // the exact defect fixed in `wg telegram route` (2026-09-30). One decision, one code path.
+    // The same context the listener sends, minus the chat history: a single-message diagnostic has
+    // no conversation to draw on, and pretending otherwise would be a shortcut of its own.
+    let routing_ctx = crate::casa::router::Router::request_context(&project_root(workgraph_dir), None);
     let routed = crate::casa::router::router_from_config(&project_root(workgraph_dir)).decide(
         &crate::casa::router::RoutingRequest {
             chat_type: Some(chat_type),
@@ -59,7 +62,7 @@ pub fn run_elect(
             config: &config,
             owner_map: &owner_map,
             turn: worksgood::notify::telegram_group::TurnContext::default(),
-            context: None,
+            context: Some(&routing_ctx),
         },
     );
     let election = routed.election;

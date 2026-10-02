@@ -46,6 +46,47 @@ impl ModelKind {
     }
 }
 
+/// What counts as an ask — stated, because an undefined question gets a confidently wrong answer.
+const POLICY: &str = "HOW TO DECIDE. The house speaks when it is ASKED, not when it overhears.\n\
+\n\
+Answer ASK only when the message is a REQUEST TO THE HOUSE or a stated need the house can act on:\n\
+  * a request, question or instruction addressed to the assistants, however terse ('rundown',\n\
+    'plans for tomorrow?', 'change wed to pesto');\n\
+  * a stated household need ('we're out of coffee', 'the fridge is empty', \"I'm out of eggs\");\n\
+  * a constraint the house must hold ('I'm away wednesday to friday', 'keep sunday free');\n\
+  * a question about the household's own state ('what's for dinner?', 'what's in my calendar?').\n\
+\n\
+Answer STAY_OUT for everything else, INCLUDING messages that mention household things but are not\n\
+requests. A remark is not an ask just because the house could think of something to do about it:\n\
+  * thinking aloud, venting, feelings ('my back is killing me', 'work has been mad lately',\n\
+    'I've got a headache coming on');\n\
+  * an observation with no request in it ('the garden looks a mess', \"I keep meaning to sort the\n\
+    shed out', 'the coffee machine at work is broken', 'the supermarket was packed');\n\
+  * one family member addressing another ('can you pick up the kids', 'put your dishes in the sink');\n\
+  * social noise ('night', 'thanks', 'hey', '[BLANK_AUDIO]');\n\
+  * things outside the house's business (weather, opening hours, school term dates, the car, a\n\
+    broken router) unless the family member is ASKING the house to do something about it.\n\
+\n\
+If a family member is answering a question the house asked, that is ASK — the answer belongs to us.\n\
+When in doubt, STAY_OUT: a dropped request is recoverable, an interruption is not.";
+
+/// Worked examples. Nine of them, taken from the harness that measured the win.
+const EXAMPLES: &str = "WORKED EXAMPLES:\n\
+  add bananas to the list                    -> ASK\n\
+  rundown                                    -> ASK\n\
+  we're out of coffee                        -> ASK\n\
+  change wed to pesto                        -> ASK\n\
+  what's for dinner?                         -> ASK\n\
+  I'm travelling wednesday to friday         -> ASK\n\
+  can you keep sunday free                   -> ASK\n\
+  my back is killing me                      -> STAY_OUT\n\
+  the garden looks a mess                    -> STAY_OUT\n\
+  work has been mad lately                   -> STAY_OUT\n\
+  the coffee machine at work is broken       -> STAY_OUT\n\
+  can you pick up the kids                   -> STAY_OUT\n\
+  good night everyone                        -> STAY_OUT\n\
+  [BLANK_AUDIO]                              -> STAY_OUT";
+
 /// `[router]` from `.wg/config.toml`. Every field has a default, so an absent block is the standard.
 #[derive(Clone, Debug)]
 pub struct RouterConfig {
@@ -199,11 +240,14 @@ impl ModelClient {
         text: &str,
         context: Option<&super::ContextBlock>,
     ) -> Option<(bool, f32)> {
-        let mut instructions = String::from(
-            "Decide whether the message is addressed to the household's assistants, who should \
-             respond, or whether it is one family member talking to another / social noise, where \
-             the assistants stay out.",
-        );
+        // THE POLICY AND THE EXAMPLES ARE LOAD-BEARING, not decoration. Without them the model is
+        // asked an undefined question and answers with high confidence in the wrong direction —
+        // measured: "my mother is visiting thursday, can we do something nice" came back p=0.009
+        // (silent) at 0.99 confidence, i.e. confidently wrong. These are the exact strings the
+        // harness used to reach 0/40 dropped; omitting them was a shortcut.
+        let mut instructions = String::from(POLICY);
+        instructions.push_str("\n\n");
+        instructions.push_str(EXAMPLES);
         if let Some(c) = context {
             for block in [&c.roles, &c.memory, &c.history, &c.clock]
                 .into_iter()

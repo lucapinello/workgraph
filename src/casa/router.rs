@@ -27,7 +27,9 @@
 //! context reaches ~97% — but the *wiring* is where a household's behaviour changes, so it lands
 //! as its own change with its own eval, behind this trait, not bolted on here.
 
+mod context;
 mod model;
+pub use context::{build as build_context, recent_history};
 pub use model::{
     HybridStrategy, ModelClient, ModelKind, RouterConfig, Unavailable, router_from_config,
 };
@@ -175,6 +177,13 @@ impl Router {
     pub fn with(mut self, s: Box<dyn RouterStrategy>) -> Self {
         self.strategies.push(s);
         self
+    }
+
+    /// Build the routing request's context for a project root. ONE place, so every call site sends
+    /// the same thing — the discipline the three-way `route`/`elect`/listener divergence taught.
+    pub fn request_context(root: &std::path::Path, feed: Option<&std::path::Path>) -> ContextBlock {
+        let history = feed.and_then(|f| recent_history(f, 12));
+        build_context(root, history)
     }
 
     pub fn strategies(&self) -> Vec<&'static str> {

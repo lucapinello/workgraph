@@ -479,6 +479,9 @@ pub fn run_route(
     // sites is how `route` and `elect` came to disagree on 2026-09-30, and it happened again on
     // 2026-10-02 (caught by tests/smoke/scenarios/engine_route_matches_elect.sh: `route` said
     // silence for "the sink is leaking" while `elect` said otto). One decision, one code path.
+    // The same context the listener sends, minus the chat history: a single-message diagnostic has
+    // no conversation to draw on, and pretending otherwise would be a shortcut of its own.
+    let routing_ctx = crate::casa::router::Router::request_context(&project_root(workgraph_dir), None);
     let election = crate::casa::router::router_from_config(&project_root(workgraph_dir))
         .decide(&crate::casa::router::RoutingRequest {
             chat_type: Some(chat_type),
@@ -491,7 +494,7 @@ pub fn run_route(
             config: &config,
             owner_map: &owner_map,
             turn: worksgood::notify::telegram_group::TurnContext::default(),
-            context: None,
+            context: Some(&routing_ctx),
         })
         .election;
 
