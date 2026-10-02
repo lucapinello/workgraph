@@ -27,9 +27,16 @@
 //! context reaches ~97% — but the *wiring* is where a household's behaviour changes, so it lands
 //! as its own change with its own eval, behind this trait, not bolted on here.
 
+mod model;
+pub use model::{
+    HybridStrategy, ModelClient, ModelKind, RouterConfig, Unavailable, router_from_config,
+};
+
 use worksgood::notify::ownership::OwnerMap;
 use worksgood::notify::telegram::TelegramConfig;
-use worksgood::notify::telegram_group::{Election, TurnContext, elect_responders_with_owner_map};
+use worksgood::notify::telegram_group::{
+    Election, ResolvedBot, TurnContext, elect_responders_with_owner_map,
+};
 
 /// The assembled context a strategy MAY read. Every field is optional on purpose: a strategy that
 /// ignores context still works, and a strategy that wants more can arrive without changing the
@@ -135,6 +142,17 @@ impl RouterStrategy for PatternStrategy {
             confidence: None,
         })
     }
+}
+
+/// The project's coordination owner resolved to a configured bot — the documented home of an
+/// unaddressed ask, and therefore where a model-justified answer is delivered. Returns `None` when
+/// no concierge is configured, in which case the caller keeps the ladder's silence rather than
+/// inventing a voice.
+pub fn concierge_for(req: &RoutingRequest<'_>) -> Option<ResolvedBot> {
+    let owner = req
+        .owner_map
+        .owner_for_domain(worksgood::notify::ownership::Domain::Coordination)?;
+    worksgood::notify::telegram_group::resolve_mentioned_bot(owner, req.config)
 }
 
 /// An ordered set of strategies. First definite answer wins.
