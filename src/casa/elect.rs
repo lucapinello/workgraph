@@ -42,19 +42,27 @@ pub fn run_elect(
         human_count_override.unwrap_or_else(|| human_agent_id_set(workgraph_dir).len());
 
     let owner_map = ownership::OwnerMap::load(&project_root(workgraph_dir));
-    let election = elect_responders_with_owner_map(
-        Some(chat_type),
-        Some(chat_id),
-        message,
-        &mention_usernames,
-        reply_to_bot,
-        // The `wg telegram elect` diagnostic is always run by a human operator,
-        // never a bot — the bot-loop guard is exercised by the unit tests.
-        false,
-        human_count,
-        &config,
-        &owner_map,
+    // THE SAME ROUTER THE LISTENER USES. Routing this diagnostic through the direct election
+    // while the listener ran the router would make the diagnostic lie about the live decision —
+    // the exact defect fixed in `wg telegram route` (2026-09-30). One decision, one code path.
+    let routed = crate::casa::router::router_from_config(workgraph_dir).decide(
+        &crate::casa::router::RoutingRequest {
+            chat_type: Some(chat_type),
+            chat_id: Some(chat_id),
+            text: message,
+            mention_usernames: &mention_usernames,
+            reply_to_bot,
+            // The diagnostic is always run by a human operator, never a bot — the bot-loop
+            // guard is exercised by the unit tests.
+            sender_is_bot: false,
+            human_count,
+            config: &config,
+            owner_map: &owner_map,
+            turn: worksgood::notify::telegram_group::TurnContext::default(),
+            context: None,
+        },
     );
+    let election = routed.election;
 
     // (kind, who, addressed_by, body) — `who` is the elected agent for the
     // single-voice arms, the roster for `collective`, none for silence/private.
