@@ -479,7 +479,7 @@ pub fn run_route(
     // sites is how `route` and `elect` came to disagree on 2026-09-30, and it happened again on
     // 2026-10-02 (caught by tests/smoke/scenarios/engine_route_matches_elect.sh: `route` said
     // silence for "the sink is leaking" while `elect` said otto). One decision, one code path.
-    let election = crate::casa::router::router_from_config(workgraph_dir)
+    let election = crate::casa::router::router_from_config(&project_root(workgraph_dir))
         .decide(&crate::casa::router::RoutingRequest {
             chat_type: Some(chat_type),
             chat_id: Some(chat_id),

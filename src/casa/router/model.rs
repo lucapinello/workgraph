@@ -81,14 +81,32 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
-    /// Read `<root>/.wg/config.toml`'s `[router]` table. Absent keys take the defaults above, so a
-    /// household that has never heard of this feature gets the standard.
+    /// Read `<root>/.wg/config.toml`'s `[router]` table.
+    ///
+    /// **NO `[router]` BLOCK => DISABLED.** This matters for two reasons and both are load-bearing:
+    ///
+    /// 1. **Hermeticity.** A scratch project root (every smoke scenario and every human flow) has no
+    ///    `[router]` block, so it must not reach a model server. Before this default the router
+    ///    silently pointed at `127.0.0.1:8080` from a scratch root, which stalled the human-flows
+    ///    scenario for 21 minutes and made the suite depend on whether a server was up
+    ///    (see `DEPLOY-ROUTERS-AND-NEXT-PASS.md` §6).
+    /// 2. **Honesty.** "JEV is the standard" is then a line a household writes, not an implicit
+    ///    default nobody can see. The kind still defaults to JEV; enabling is explicit.
     pub fn load(root: &Path) -> Self {
         let path = root.join(".wg").join("config.toml");
         let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
+            return Self::default().disabled();
         };
+        if !text.lines().any(|l| l.trim() == "[router]") {
+            return Self::default().disabled();
+        }
         Self::from_toml(&text)
+    }
+
+    /// The same configuration, switched off — used when no `[router]` block is present.
+    fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
     }
 
     /// Parse the `[router]` table out of a config document. Deliberately minimal: the engine has no
@@ -434,8 +452,21 @@ mod tests {
         assert_eq!(d.endpoint, "http://127.0.0.1:8080");
         assert_eq!(d.on_unavailable, Unavailable::Pattern);
         // no file on disk -> defaults, not an error
+        // NO CONFIG => DISABLED: a scratch root must never reach a live model server.
         let from_missing = RouterConfig::load(Path::new("/nonexistent-root"));
-        assert_eq!(from_missing.kind, ModelKind::Jev);
+        assert_eq!(
+            from_missing.kind,
+            ModelKind::Jev,
+            "the standard is still JEV"
+        );
+        assert!(
+            !from_missing.enabled,
+            "and it is OFF until a household enables it explicitly"
+        );
+        assert!(
+            ModelClient::new(from_missing).is_none(),
+            "so no client can be built"
+        );
     }
 
     #[test]

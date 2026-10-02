@@ -1313,7 +1313,7 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
             // composes the hybrid with the deterministic ladder. The hybrid consults the model
             // ONLY where the ladder would have been silent, so this cannot take away an answer the
             // house already gives; an unreachable model degrades to the ladder, never to silence.
-            let routed = crate::casa::router::router_from_config(&workgraph_dir).decide(&routing);
+            let routed = crate::casa::router::router_from_config(&project_root(&workgraph_dir)).decide(&routing);
             let election = routed.election;
 
             // Observability: exactly ONE decision line per consumed message —

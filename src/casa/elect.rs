@@ -45,7 +45,7 @@ pub fn run_elect(
     // THE SAME ROUTER THE LISTENER USES. Routing this diagnostic through the direct election
     // while the listener ran the router would make the diagnostic lie about the live decision —
     // the exact defect fixed in `wg telegram route` (2026-09-30). One decision, one code path.
-    let routed = crate::casa::router::router_from_config(workgraph_dir).decide(
+    let routed = crate::casa::router::router_from_config(&project_root(workgraph_dir)).decide(
         &crate::casa::router::RoutingRequest {
             chat_type: Some(chat_type),
             chat_id: Some(chat_id),
