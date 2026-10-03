@@ -486,11 +486,29 @@ pub fn gate(asks: &[AskRecord], now_ms: i64) -> AskDecision {
     recent.sort_by_key(|a| a.ts);
     let n = recent.len();
     if n >= 2 && !recent[n - 1].responded && !recent[n - 2].responded {
-        return AskDecision::Skip("two silent asks in a row — backing off".to_string());
+        // Rule 3: THE BACK-OFF EXPIRES ON A CLOCK, NOT ON A HUMAN.
+        //
+        // Before this, the *only* documented road out of the back-off was a recorded rating
+        // flipping an ask to answered — so a household that had genuinely stopped replying was
+        // never asked again until someone happened to answer, and the one path out was the flip
+        // that falsified the ledger (see `ask_a_rating_may_answer`). A quiet family is not
+        // necessarily a family that wants to be asked never again.
+        //
+        // So: while silent, ask at most once per BACKOFF_QUIET_DAYS. That is a light, self-healing
+        // retry — it cannot nag (Rule 1 still caps it at one ask per day, and this caps the silent
+        // case far below that), and it means the loop can resume on its own.
+        let since_last = now_ms.saturating_sub(recent[n - 1].ts);
+        if since_last < BACKOFF_QUIET_MS {
+            return AskDecision::Skip("two silent asks in a row — backing off".to_string());
+        }
     }
 
     AskDecision::Send
 }
+
+/// How long the two-silent-asks back-off holds before the clock reopens the gate, so the loop can
+/// resume without a family member having to reply first. See Rule 3 in [`gate`].
+pub const BACKOFF_QUIET_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 
 /// UTC day index (days since epoch) for an epoch-ms timestamp. Two timestamps in
 /// the same UTC day share a bucket. Used only for the "one ask per day" rule.
@@ -1117,4 +1135,76 @@ mod tests {
         assert!(!note.contains('\n'));
         assert!(render_session_note(&[]).is_empty());
     }
+    /// THE CLOCK (KNOWN-GAPS #9). Before this the ONLY road out of the back-off was a recorded
+    /// rating flipping an ask — so a household that had stopped replying was never asked again,
+    /// and the single path out was the flip that falsified the ledger. The back-off must expire
+    /// on time by itself.
+    #[test]
+    fn the_backoff_expires_on_a_clock_not_on_a_reply() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("asks.jsonl");
+        for ts in [1 * DAY, 2 * DAY] {
+            append_ask(
+                &path,
+                &AskRecord {
+                    ts,
+                    dish: "Sardines".into(),
+                    responded: false,
+                },
+            )
+            .unwrap();
+        }
+        let asks = load_asks(&path);
+
+        // well inside the quiet period, and on its last day -> still backed off
+        assert!(
+            !gate(&asks, 3 * DAY).should_send(),
+            "one day after the second silence, the house stays quiet"
+        );
+        assert!(
+            !gate(&asks, 2 * DAY + BACKOFF_QUIET_MS - 1).should_send(),
+            "the last millisecond of the quiet period is still quiet"
+        );
+
+        // the clock passes -> the loop resumes with nobody having replied
+        assert!(
+            gate(&asks, 2 * DAY + BACKOFF_QUIET_MS).should_send(),
+            "when the quiet period expires the gate reopens without a reply"
+        );
+    }
+
+    /// The clock does not defeat "one ask per day": a recent ask still suppresses today's.
+    #[test]
+    fn the_clock_does_not_nag_within_a_day() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("asks.jsonl");
+        for ts in [1 * DAY, 2 * DAY] {
+            append_ask(
+                &path,
+                &AskRecord {
+                    ts,
+                    dish: "Cod".into(),
+                    responded: false,
+                },
+            )
+            .unwrap();
+        }
+        // An ask TODAY, older silent ones behind it, and the clock long expired.
+        append_ask(
+            &path,
+            &AskRecord {
+                ts: 5 * DAY,
+                dish: "Sardines".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        let asks = load_asks(&path);
+        // Rule 1 is checked first and outranks the clock: never two asks in one day.
+        assert!(
+            !gate(&asks, 5 * DAY).should_send(),
+            "an ask already sent today still suppresses a second one, clock or no clock"
+        );
+    }
+
 }
