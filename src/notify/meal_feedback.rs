@@ -500,34 +500,79 @@ fn day_bucket(ts_ms: i64) -> i64 {
     ts_ms.div_euclid(86_400_000)
 }
 
-/// Mark the most recent ask in `path` as answered, if it isn't already. Called
-/// when a rating is recorded so the gate knows the family engaged. Rewrites the
-/// file (it is tiny — a handful of lines per week). No-op if the file is missing
-/// or empty.
-pub fn mark_latest_ask_answered(path: &Path) -> std::io::Result<()> {
+/// Which ask a recorded rating is allowed to mark answered, if any.
+///
+/// THE BUG THIS REPLACES. The old rule flipped the ask with the newest `ts`, whatever it was
+/// about. On a household that had gone quiet, the newest ask is not the one being rated: a
+/// genuine "loved it" about *tonight's* sardines marked the ask for a **different dish ten days
+/// stale** answered, and added no row for the night that actually produced the rating. The ratings
+/// file and the ask ledger then disagreed about which evenings the house had asked about, and the
+/// back-off gate — whose *only* documented road out is this flip — counted from a falsehood.
+///
+/// THE RULE. A rating may answer an ask about the SAME EVENING, and nothing else: the ask from the
+/// rating's own day, or from the previous day (a family often rates this morning what they ate last
+/// night). Never older than that, because an older ask cannot have produced this rating. Among the
+/// eligible asks an exact dish match wins; failing that, the evening has only one ask in practice.
+///
+/// Returns the index of the ask to flip. `None` means nothing is eligible and the ledger must be
+/// left alone — which is a correct outcome, not a failure: a rating for a night the house never
+/// asked about is not evidence that it did.
+pub fn ask_a_rating_may_answer(
+    asks: &[AskRecord],
+    rating_dish: &str,
+    rating_ts: i64,
+) -> Option<usize> {
+    let want = rating_dish.trim();
+    let newest_in = |day: i64| -> Option<usize> {
+        let mut dish_match: Option<usize> = None;
+        let mut any: Option<usize> = None;
+        for (i, a) in asks.iter().enumerate() {
+            if day_bucket(a.ts) != day {
+                continue;
+            }
+            if !want.is_empty() && a.dish.trim().eq_ignore_ascii_case(want) {
+                if dish_match.is_none_or(|j| a.ts > asks[j].ts) {
+                    dish_match = Some(i);
+                }
+            }
+            if any.is_none_or(|j| a.ts > asks[j].ts) {
+                any = Some(i);
+            }
+        }
+        dish_match.or(any)
+    };
+    let rating_day = day_bucket(rating_ts);
+    newest_in(rating_day).or_else(|| newest_in(rating_day - 1))
+}
+
+/// Mark the ask that `rating_dish`/`rating_ts` may answer as answered, so the gate knows the
+/// family engaged. Rewrites the file (it is tiny — a handful of lines per week). No-op if the file
+/// is missing or empty, if nothing is eligible, or if the eligible ask is already answered.
+///
+/// Returns whether a flip actually happened, so a caller can report it rather than assume it.
+pub fn mark_ask_answered(
+    path: &Path,
+    rating_dish: &str,
+    rating_ts: i64,
+) -> std::io::Result<bool> {
     let mut asks = load_asks(path);
     if asks.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
-    // Find the index of the newest ask by ts.
-    let idx = asks
+    let Some(i) = ask_a_rating_may_answer(&asks, rating_dish, rating_ts) else {
+        return Ok(false);
+    };
+    if asks[i].responded {
+        return Ok(false);
+    }
+    asks[i].responded = true;
+    let body: String = asks
         .iter()
-        .enumerate()
-        .max_by_key(|(_, a)| a.ts)
-        .map(|(i, _)| i);
-    if let Some(i) = idx {
-        if asks[i].responded {
-            return Ok(()); // already answered — nothing to rewrite
-        }
-        asks[i].responded = true;
-        let body: String = asks
-            .iter()
-            .map(|a| a.to_json_line())
-            .collect::<Vec<_>>()
-            .join("\n");
-        crate::atomic_file::write_atomic(path, format!("{body}\n").as_bytes())?;
-    }
-    Ok(())
+        .map(|a| a.to_json_line())
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::atomic_file::write_atomic(path, format!("{body}\n").as_bytes())?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -926,12 +971,86 @@ mod tests {
         .unwrap();
         // Before answering: gate backs off.
         assert!(!gate(&load_asks(&path), 5 * DAY).should_send());
-        // A rating arrives -> mark the latest ask answered.
-        mark_latest_ask_answered(&path).unwrap();
+        // A rating for Thursday's "Cod" arrives on Friday -> it may answer Thursday's ask (the
+        // ask from the rating's own day, or the previous day; a family often rates this morning
+        // what they ate last night).
+        assert!(mark_ask_answered(&path, "Cod", 5 * DAY).unwrap());
         let asks = load_asks(&path);
         assert!(asks.iter().max_by_key(|a| a.ts).unwrap().responded);
         // Gate now reopens (most recent is answered).
         assert!(gate(&asks, 5 * DAY).should_send());
+    }
+
+    /// THE BUG (KNOWN-GAPS #9, recorded 2026-08-24). A genuine "loved it" about *tonight's*
+    /// sardines marked the ask for a **different dish ten days stale** as answered, and added no
+    /// row for the night that actually produced the rating — so the ratings file and the ask
+    /// ledger disagreed about which evenings the house had asked about, and the back-off gate,
+    /// whose only documented road out is this flip, counted from a falsehood.
+    #[test]
+    fn a_rating_never_answers_an_ask_from_another_evening() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("asks.jsonl");
+        append_ask(
+            &path,
+            &AskRecord {
+                ts: 1 * DAY,
+                dish: "Spiced lentils and rice".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        append_ask(
+            &path,
+            &AskRecord {
+                ts: 11 * DAY,
+                dish: "Sardines".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+
+        assert!(mark_ask_answered(&path, "Sardines", 11 * DAY).unwrap());
+
+        let asks = load_asks(&path);
+        let stale = asks
+            .iter()
+            .find(|a| a.dish.starts_with("Spiced"))
+            .unwrap();
+        assert!(
+            !stale.responded,
+            "the ten-day-stale ask for another dish must NOT be marked answered"
+        );
+        assert!(
+            asks.iter().find(|a| a.dish == "Sardines").unwrap().responded,
+            "tonight's ask is the one the rating answers"
+        );
+    }
+
+    /// The other half of the same rule: a rating for a night the house never asked about is not
+    /// evidence that it did. Leave the ledger alone rather than manufacture engagement.
+    #[test]
+    fn a_rating_for_a_night_never_asked_leaves_the_ledger_untouched() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("asks.jsonl");
+        append_ask(
+            &path,
+            &AskRecord {
+                ts: 11 * DAY,
+                dish: "Sardines".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+
+        // A rating nine days later, for a dish no ask ever carried.
+        assert!(
+            !mark_ask_answered(&path, "Roast chicken", 20 * DAY).unwrap(),
+            "nothing is eligible, so nothing flips"
+        );
+        assert!(
+            load_asks(&path).iter().all(|a| !a.responded),
+            "a rating must not fake engagement on an ask it cannot answer"
+        );
     }
 
     // ---- summarisation: the memory + the loop ----

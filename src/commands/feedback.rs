@@ -179,7 +179,10 @@ pub fn run_record(
 
     // The family engaged — flip the latest ask to answered so the gate reopens.
     let ask_log = meal_feedback::ask_log_path_for(&root);
-    let _ = meal_feedback::mark_latest_ask_answered(&ask_log);
+    // Only an ask about THIS evening may be marked answered — see ask_a_rating_may_answer.
+    // A rating for a night the house never asked about must leave the ledger alone rather than
+    // falsify it, which is what the old newest-ts flip did.
+    let _ = meal_feedback::mark_ask_answered(&ask_log, &rating.dish, rating.ts);
 
     if json {
         println!(
