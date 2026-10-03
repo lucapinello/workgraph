@@ -54,10 +54,15 @@ impl ModelKind {
 
 /// The COMPRESSED policy for the remote route.
 ///
-/// The LunaRoute System One backend REJECTS an `instructions` block past ~350 words with
-/// `systemone_invalid_request: the System One backend rejected the request as invalid` (measured:
-/// 346 words -> 200, 412 words -> 400). The full local policy does not fit, so the remote route
-/// carries this shorter one. Measured on the same 80 novel probes: **0/40 dropped, 0/40 false
+/// The LunaRoute System One backend REJECTS an `instructions` block **past 2000 characters**, with
+/// `systemone_invalid_request: the System One backend rejected the request as invalid` — an opaque
+/// 400 that never names the limit or the field. Measured by bisection: 2000 chars accepted, 2001
+/// rejected, a hard cut. It is CHARACTERS, not words and not tokens -- a 2000-char one-word filler
+/// is accepted while a 1102-token block is accepted and a 500-token long-worded one is refused.
+/// `state` is NOT capped (8000 chars accepted), so the family's message never competes for budget.
+///
+/// The local POLICY alone is 2480 chars -- over the cap before its examples (1328) or any context
+/// block. So this shorter policy is not a preference, it is forced. Measured on the same 80 novel probes: **0/40 dropped, 0/40 false
 /// alarms, accuracy 1.000** at 0.30 s per decision.
 const POLICY_LUNAROUTE: &str = r#"You are the household's front desk. Decide ONE thing: does the house have something TO DO about this message?
 
@@ -359,9 +364,9 @@ impl ModelClient {
         text: &str,
         context: Option<&super::ContextBlock>,
     ) -> Option<(bool, f32)> {
-        // The COMPRESSED policy ONLY. This backend rejects an `instructions` block past ~350 words
-        // (346 -> 200, 412 -> 400), so the local policy, its examples and the context block all
-        // have to stay out: appending them here is a silent HTTP 400, which the `?` below turns
+        // The COMPRESSED policy ONLY: 1785 chars, 215 under the backend's 2000-character cap. The local
+        // policy is 2480 chars by itself, so it, its examples and the context block all have to stay
+        // out: appending them here is a silent HTTP 400, which the `?` below turns
         // into an abstention. That is exactly how the remote route first measured as 33/40 dropped
         // — the ladder's own number, with the model never heard from.
         let instructions = String::from(POLICY_LUNAROUTE);
