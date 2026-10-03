@@ -261,6 +261,34 @@ impl RouterConfig {
 }
 
 /// Talks to one model endpoint. `None` from every method means "no answer" — never a guess.
+
+/// The System One backend caps `instructions` at **2000 characters** — measured by bisection: 2000
+/// accepted, 2001 rejected, a hard cut. It is characters, not words and not tokens, and `state` is
+/// not capped (8000 accepted). Over-length is answered with the same opaque 400 an empty body gets,
+/// which any `?` in the caller turns into a silent abstention.
+///
+/// That is not a hypothetical: it is precisely how this route first measured as 33/40 dropped — the
+/// ladder's own number — with the model never heard from. So the cap is enforced HERE, in the open,
+/// and an over-long policy is a visible truncation rather than an invisible no-opinion.
+pub const REMOTE_INSTRUCTION_CAP: usize = 2000;
+
+fn fit_remote_instructions(text: &str) -> String {
+    if text.len() <= REMOTE_INSTRUCTION_CAP {
+        return text.to_string();
+    }
+    let cut = text[..REMOTE_INSTRUCTION_CAP]
+        .rfind('\n')
+        .or_else(|| text[..REMOTE_INSTRUCTION_CAP].rfind(' '))
+        .unwrap_or(REMOTE_INSTRUCTION_CAP);
+    eprintln!(
+        "router: instructions are {} chars, over the remote {} cap — truncated at {} (the policy needs compressing)",
+        text.len(),
+        REMOTE_INSTRUCTION_CAP,
+        cut
+    );
+    text[..cut].to_string()
+}
+
 pub struct ModelClient {
     cfg: RouterConfig,
     http: reqwest::blocking::Client,
@@ -369,7 +397,7 @@ impl ModelClient {
         // out: appending them here is a silent HTTP 400, which the `?` below turns
         // into an abstention. That is exactly how the remote route first measured as 33/40 dropped
         // — the ladder's own number, with the model never heard from.
-        let instructions = String::from(POLICY_LUNAROUTE);
+        let instructions = fit_remote_instructions(&String::from(POLICY_LUNAROUTE));
         let _ = context; // the remote route cannot carry the context block; the policy stands alone
         let body = serde_json::json!({
             "model": "djev",
@@ -539,6 +567,26 @@ pub fn router_from_config(root: &Path) -> Router {
 
 #[cfg(test)]
 mod tests {
+    /// The cap is the backend's, and the shipped policy must fit inside it. If someone grows the
+    /// policy past the cap, this fails rather than the route silently abstaining in production.
+    #[test]
+    fn the_shipped_remote_policy_fits_the_backends_cap() {
+        assert!(
+            POLICY_LUNAROUTE.len() <= REMOTE_INSTRUCTION_CAP,
+            "POLICY_LUNAROUTE is {} chars, over the {} char cap — compress it",
+            POLICY_LUNAROUTE.len(),
+            REMOTE_INSTRUCTION_CAP
+        );
+    }
+
+    #[test]
+    fn an_overlong_block_is_truncated_visibly_not_dropped() {
+        let long = "every day. ".repeat(400);
+        let fitted = fit_remote_instructions(&long);
+        assert!(fitted.len() <= REMOTE_INSTRUCTION_CAP);
+        assert!(long.starts_with(&fitted), "truncation, not corruption of the text");
+    }
+
     use super::super::{PatternStrategy, RouterStrategy, RoutingRequest};
     use super::*;
     use std::collections::HashMap;
