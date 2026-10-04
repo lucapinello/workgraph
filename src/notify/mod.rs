@@ -31,6 +31,7 @@ pub mod relay_receipt;
 pub mod reminder;
 pub mod reminder_readback;
 pub mod shopping_language;
+pub mod shopping_overlay;
 pub mod slack;
 pub mod sms;
 pub mod telegram;
