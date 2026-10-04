@@ -559,11 +559,87 @@ fn print_help(dir: &Path, show_all: bool, alphabetical: bool) {
     }
 
     println!("\nOptions:");
-    println!("  -d, --dir <PATH>    WG directory [default: .wg]");
-    println!("  -h, --help          Print help (--help-all for all commands)");
-    println!("      --alphabetical  Sort commands alphabetically");
-    println!("      --json          Output as JSON");
-    println!("  -V, --version       Print version");
+    print!("{}", options_help());
+}
+
+/// The top-level options block, as text.
+///
+/// Returned rather than printed directly so a test can parse it: the help block is hand-written
+/// while the parser is derived from clap, and the two had already drifted. It advertised
+/// `-d, --dir <PATH>` (KNOWN-GAPS #6) when `--dir` defines no short at all — `-d` is bound to
+/// `--desc` on subcommands, so it could not be added globally without colliding. A hand-written
+/// line printed next to a derived parser is a claim that nothing checks, which is how a fresh
+/// deployer met `error: unexpected argument '-d' found` while following this text.
+#[must_use]
+pub fn options_help() -> String {
+    // Alignment: descriptions begin at column 22, matching the block below.
+    [
+        "      --dir <PATH>    WG directory [default: .wg]",
+        "  -h, --help          Print help (--help-all for all commands)",
+        "      --alphabetical  Sort commands alphabetically",
+        "      --json          Output as JSON",
+        "  -V, --version       Print version",
+    ]
+    .join("\n")
+        + "\n"
+}
+
+#[cfg(test)]
+mod options_help_tests {
+    use super::{options_help, Cli};
+    use clap::Parser;
+
+    /// Every flag this block advertises must actually be RECOGNISED by the parser.
+    ///
+    /// The block is hand-written and the parser is derived from clap; nothing tied the two
+    /// together, so they drifted — the block offered `-d, --dir <PATH>` while `--dir` defines no
+    /// short at all (`-d` is `--desc` on subcommands, so it could not be added globally without
+    /// colliding). This test reads the very text the binary prints, splits each flag back out, and
+    /// hands it to the parser, so a line that lies fails here instead of in a deployer's terminal.
+    #[test]
+    fn every_advertised_flag_is_recognised_by_the_parser() {
+        // clap builds a very large `Command` for this enum and parsing walks it recursively; the
+        // default 2 MB test-thread stack overflows (SIGABRT, observed). Run the check on an
+        // explicitly larger stack rather than weakening it into a source-level grep.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(check_advertised_flags)
+            .expect("spawn the help-flag check")
+            .join()
+            .expect("the help-flag check must not panic");
+    }
+
+    fn check_advertised_flags() {
+        for line in options_help().lines() {
+            let line = line.trim();
+            if !line.starts_with('-') {
+                continue;
+            }
+            let needs_value = line.contains('<');
+            let spellings: Vec<String> = line
+                .split_whitespace()
+                .take_while(|t| t.starts_with('-'))
+                .map(|t| t.trim_end_matches(',').to_string())
+                .collect();
+            for flag in spellings {
+                let mut argv: Vec<String> = vec!["wg".into(), flag.clone()];
+                if needs_value {
+                    argv.push("scratch".into());
+                }
+                // `--help`/`--version` legitimately leave through clap's display-error path rather
+                // than setting a field, so only the "is this flag known at all" property is asserted.
+                if let Err(err) = Cli::try_parse_from(&argv) {
+                    let msg = err.to_string();
+                    assert!(
+                        !msg.contains("unexpected argument")
+                            && !msg.contains("unrecognized")
+                            && !msg.contains("found argument"),
+                        "the help block advertises `{flag}` but the parser does not recognise it: {msg}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Print commands using the curated default ordering, with remaining commands shown alphabetically.
