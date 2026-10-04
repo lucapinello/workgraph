@@ -1088,7 +1088,7 @@ async fn get_updates_once(
     let body = serde_json::json!({
         "offset": offset,
         "timeout": timeout_secs,
-        "allowed_updates": ["message", "callback_query"],
+        "allowed_updates": ["message", "callback_query", "message_reaction"],
     });
     let resp = client
         .post(&url)
@@ -1234,6 +1234,76 @@ pub fn decode_update(update: &serde_json::Value, channel_tag: &str) -> Option<In
             photo_file_id: None,
             media_group_id: None,
             // A button press carries no audio recording.
+            voice_file_id: None,
+            voice_mime: None,
+        });
+    }
+
+    // Handle message reactions — THE EAR.
+    //
+    // KNOWN-GAPS #9 (2026-08-15). The house asks the family to rate dinner and names a bare thumb
+    // as the easy answer, but `allowed_updates` never subscribed `message_reaction`, so a thumb
+    // could not reach this process at all. Worse, the listener was demonstrably HEARING — typed
+    // questions hand-sent to the same chat arrived — which is what made the silence misleading:
+    // the ear was deaf to one update type, not to the chat, so "nothing came back" read as "the
+    // family did not answer" when the answer had been sent and dropped at the wire.
+    //
+    // A reaction carries NO TEXT, so the emoji IS the body. It is handed to exactly the routing a
+    // typed reply takes: `meal_feedback` already turns a bare emoji reaction into a Verdict, so no
+    // new decoding logic belongs at this boundary.
+    if let Some(react) = update.get("message_reaction") {
+        // A reaction was REMOVED (or replaced by a non-emoji type) -> `new_reaction` is empty or
+        // carries no emoji. That is not an answer to anything, and must not become one.
+        let emojis: Vec<String> = react
+            .get("new_reaction")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("emoji"))
+                    .filter_map(|r| r.get("emoji").and_then(|e| e.as_str()))
+                    .map(|e| e.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if emojis.is_empty() {
+            return None;
+        }
+        // The reactor is `user`, the same object shape as a message's `from`.
+        let user = react
+            .get("user")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let identity = super::telegram_sender::identity_from_from(&user);
+        return Some(IncomingMessage {
+            channel: channel_tag.to_string(),
+            sender: identity.display(),
+            sender_id: identity.user_id,
+            sender_is_bot: identity.is_bot,
+            sent_at: react.get("date").and_then(|d| d.as_i64()),
+            body: emojis.join(" "),
+            action_id: None,
+            // The reaction's `message_id` is the message reacted TO — the dinner ask. Carrying it
+            // as `reply_to` is what lets the routing match the reaction to the ask it answers.
+            reply_to: react
+                .get("message_id")
+                .and_then(|m| m.as_i64())
+                .map(|mid| MessageId(mid.to_string())),
+            message_id: None,
+            chat_id: react
+                .get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(|id| id.as_i64())
+                .map(|id| id.to_string()),
+            chat_type: react
+                .get("chat")
+                .and_then(|c| c.get("type"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string()),
+            mention_usernames: Vec::new(),
+            reply_to_bot: None,
+            has_bot_command: false,
+            photo_file_id: None,
+            media_group_id: None,
             voice_file_id: None,
             voice_mime: None,
         });
@@ -2574,4 +2644,58 @@ agent_id = "nora"
              leaks ~1 fd/iteration and stays elevated after settling)"
         );
     }
+    /// THE EAR (KNOWN-GAPS #9). A bare thumb must reach the process, and it must arrive as a
+    /// message whose body IS the emoji, so it travels the same routing a typed reply takes. Before
+    /// this, `message_reaction` was not subscribed and this function had no branch for it: the
+    /// family's answer was sent and dropped at the wire, and the house recorded a silence.
+    #[test]
+    fn decode_update_hears_a_bare_emoji_reaction() {
+        let update = serde_json::json!({
+            "update_id": 41,
+            "message_reaction": {
+                "chat": { "id": -1001234, "type": "supergroup" },
+                "message_id": 88,
+                "user": { "id": 55, "username": "nadin", "is_bot": false },
+                "date": 1_700_000_000,
+                "new_reaction": [ { "type": "emoji", "emoji": "\u{1F44D}" } ],
+                "old_reaction": []
+            }
+        });
+        let m = decode_update(&update, "telegram:bruno").expect("a reaction must decode");
+        assert_eq!(m.body, "\u{1F44D}", "the emoji IS the body — meal_feedback decodes it");
+        assert_eq!(m.sender, "nadin");
+        assert_eq!(m.sender_id.as_deref(), Some("55"));
+        assert_eq!(m.chat_id.as_deref(), Some("-1001234"));
+        assert_eq!(m.chat_type.as_deref(), Some("supergroup"));
+        assert_eq!(m.sent_at, Some(1_700_000_000));
+        assert_eq!(
+            m.reply_to.as_ref().map(|r| r.0.as_str()),
+            Some("88"),
+            "the message reacted to is the dinner ask — carry it"
+        );
+        assert!(!m.sender_is_bot);
+        assert!(!m.has_bot_command);
+    }
+
+    /// The control for the branch above: a reaction REMOVED is not an answer. Without this a
+    /// thumb-down-then-removed would read as engagement and flip the ask answered.
+    #[test]
+    fn decode_update_ignores_a_removed_reaction() {
+        let update = serde_json::json!({
+            "update_id": 42,
+            "message_reaction": {
+                "chat": { "id": -1001234, "type": "supergroup" },
+                "message_id": 88,
+                "user": { "id": 55, "username": "nadin", "is_bot": false },
+                "date": 1_700_000_100,
+                "new_reaction": [],
+                "old_reaction": [ { "type": "emoji", "emoji": "\u{1F44D}" } ]
+            }
+        });
+        assert!(
+            decode_update(&update, "telegram:bruno").is_none(),
+            "an un-reaction is not a rating and must not become one"
+        );
+    }
+
 }

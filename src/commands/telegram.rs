@@ -4645,7 +4645,7 @@ async fn poll_once(
     let body = serde_json::json!({
         "offset": offset,
         "timeout": timeout,
-        "allowed_updates": ["message", "callback_query"],
+        "allowed_updates": ["message", "callback_query", "message_reaction"],
     });
 
     let resp = channel.api_call("getUpdates", &body).await?;
