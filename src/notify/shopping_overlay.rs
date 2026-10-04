@@ -256,6 +256,89 @@ pub fn add_item(
     }
 }
 
+/// Take a FAMILY-ADDED item back off the week's overlay. Returns the row that was removed, or
+/// `None` when the overlay does not hold it.
+///
+/// The `None` case is load-bearing: it is how the caller learns the row it is being asked to remove
+/// is not a family delta at all but a GENERATED plan row, which is a different store and a different
+/// writer. Add and remove MUST agree on the store, or the family gets the worst shape of all — a
+/// sentence the house confirms going in and then cannot honour coming out (`fast_lane`'s
+/// `e2e_a_conversational_removal_reaches_the_plan_file` is exactly that round-trip).
+pub fn remove_item(
+    root: &Path,
+    week_candidates: &[&str],
+    text: &str,
+) -> Result<Option<AddedItem>, OverlayError> {
+    let wanted = text.trim();
+    if wanted.is_empty() {
+        return Err(OverlayError::EmptyItem);
+    }
+    let week_key = week_candidates
+        .iter()
+        .find_map(|c| normalize_week_key(c))
+        .ok_or_else(|| OverlayError::Io("no ISO week token in any candidate".into()))?;
+    let path = overlay_path(root, &week_key);
+
+    let body = || -> Result<Option<AddedItem>, OverlayError> {
+        let mut state = read_state(&path)?;
+        // Case-insensitive on the trimmed text: the family types the same item with any case, and
+        // "olive oil" said one way must take off "Olive oil" added another.
+        let idx = {
+            match state.get_mut("added").and_then(Value::as_array_mut) {
+                Some(rows) => rows.iter().position(|r| {
+                    r.get("text")
+                        .and_then(Value::as_str)
+                        .map(|t| t.trim().eq_ignore_ascii_case(wanted))
+                        .unwrap_or(false)
+                }),
+                None => None,
+            }
+        };
+        let Some(idx) = idx else {
+            return Ok(None);
+        };
+        let row = state
+            .get_mut("added")
+            .and_then(Value::as_array_mut)
+            .expect("just located the row")
+            .remove(idx);
+        let key = row.get("key").and_then(Value::as_str).map(str::to_string);
+        // Drop the row's own state with it. Leaving a `checked`/`bumped`/`dismissed` entry behind
+        // for a `key` no longer in `added[]` is an orphan the gateway would have to guess about —
+        // and if the id is ever reused it would silently adopt the dead row's state.
+        if let Some(key) = key.as_deref() {
+            for field in ["checked", "bumps", "dismissed"] {
+                if let Some(map) = state.get_mut(field).and_then(Value::as_object_mut) {
+                    map.remove(key);
+                }
+            }
+        }
+        let removed = AddedItem {
+            id: row.get("id").and_then(Value::as_u64).unwrap_or(0),
+            text: row
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            store: row
+                .get("store")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_STORE)
+                .to_string(),
+            key: key.unwrap_or_default(),
+        };
+        write_state(&path, &state)?;
+        Ok(Some(removed))
+    };
+
+    match project_lock::with_week_mutation_lock(root, body) {
+        Ok(completed) => completed.out,
+        Err(refusal) => Err(OverlayError::LockUnavailable {
+            detail: refusal.detail().to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +517,77 @@ mod tests {
         std::fs::write(&path, "{not json at all").unwrap();
         let added = add_item(&root, &["2026-W40"], "rice", None, None).unwrap();
         assert_eq!(added.id, 1, "a corrupt file does not wedge the list");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The round-trip the family actually performs: say it, then change your mind. Before this,
+    /// the add persisted and the removal did not.
+    #[test]
+    fn add_then_remove_round_trips_out_of_the_overlay() {
+        let root = scratch("roundtrip");
+        add_item(&root, &["2026-W40"], "AA batteries", None, None).unwrap();
+        let removed = remove_item(&root, &["2026-W40"], "AA batteries").unwrap();
+        assert_eq!(removed.expect("it was there").text, "AA batteries");
+
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(overlay_path(&root, "2026-W40")).unwrap())
+                .unwrap();
+        assert_eq!(v["added"].as_array().unwrap().len(), 0, "the row is gone");
+
+        // …and the NEXT add still gets a fresh, uncolliding id (seq is a counter, not a reused slot).
+        let again = add_item(&root, &["2026-W40"], "AA batteries", None, None).unwrap();
+        assert_eq!(again.id, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_a_row_the_overlay_does_not_hold_reports_none() {
+        let root = scratch("rm-none");
+        add_item(&root, &["2026-W40"], "olive oil", None, None).unwrap();
+        // A GENERATED plan row is not in the overlay — the caller must be told that clearly, because
+        // that is what sends it to the plan path instead.
+        assert_eq!(remove_item(&root, &["2026-W40"], "Carrots").unwrap(), None);
+        // A missing overlay is not an error either, just nothing to remove.
+        assert_eq!(remove_item(&root, &["2026-W41"], "anything").unwrap(), None);
+        // Nothing was touched by a failed remove.
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(overlay_path(&root, "2026-W40")).unwrap())
+                .unwrap();
+        assert_eq!(v["added"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_is_case_insensitive_and_takes_the_rows_state_with_it() {
+        let root = scratch("rm-case");
+        let path = overlay_path(&root, "2026-W40");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "version": 1,
+                "checked": { "add:1": true },
+                "added": [{ "id": 1, "text": "Olive Oil", "store": "Also getting", "key": "add:1" }],
+                "bumps": { "add:1": 3 },
+                "dismissed": { "add:1": true },
+                "unrelated": { "plan:Monday:Carrots": true },
+                "seq": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let removed = remove_item(&root, &["2026-W40"], "olive oil").unwrap();
+        assert_eq!(removed.expect("case-insensitive match").key, "add:1");
+
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The row's OWN state goes with it — an orphan keyed to a dead row would be adopted by a
+        // future row that reused the id.
+        assert!(v["checked"].as_object().unwrap().get("add:1").is_none());
+        assert!(v["bumps"].as_object().unwrap().get("add:1").is_none());
+        assert!(v["dismissed"].as_object().unwrap().get("add:1").is_none());
+        // …but state keyed to anything else is left alone.
+        assert_eq!(v["unrelated"]["plan:Monday:Carrots"], true);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
