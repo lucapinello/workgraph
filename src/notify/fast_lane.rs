@@ -2224,6 +2224,26 @@ pub enum FastLaneResult {
 /// note, be round-trip verified there, and be reported to the family as applied
 /// while the plan of record never changed. Same collapse as `load_plans`: one file
 /// per week, the richest parse, the canonical `-family-plan` winning ties.
+/// The week candidates a FAMILY shopping delta addresses, in the gateway's own precedence —
+/// `overlayWeekKey` is `normalizeWeekKey(entry.file) || normalizeWeekKey(entry.plan?.weekKey) ||
+/// fallback`, i.e. the current plan's week code, then the calendar week. Derived once here so the
+/// add and the remove can never disagree about which week's overlay they are talking about: an
+/// add that lands in one week's file and a remove that looks in another is a silent no-op.
+///
+/// Returns `(candidates, week_code)`, where `week_code` is what a report should name.
+fn shopping_delta_weeks(root: &Path, today: NaiveDate) -> (Vec<String>, String) {
+    use chrono::Datelike as _;
+    let iso = today.iso_week();
+    let today_iso = format!("{}-W{:02}", iso.year(), iso.week());
+    let plan_week = current_plan_file(root, today).map(|(_, week_code, _)| week_code);
+    let mut owned: Vec<String> = Vec::new();
+    if let Some(ref week) = plan_week {
+        owned.push(week.clone());
+    }
+    owned.push(today_iso.clone());
+    (owned, plan_week.unwrap_or(today_iso))
+}
+
 fn current_plan_file(root: &Path, today: NaiveDate) -> Option<(PathBuf, String, PlanDoc)> {
     let plans_dir = root.join("plans");
     // (path, week, doc) + the selection keys (content score, canonical?, mtime).
@@ -2406,6 +2426,88 @@ pub fn run_fast_lane_at(
     // touched: exactly one candidate is removed, or nothing is.
     if matches!(op, FastLaneOp::ReminderCancel { .. }) {
         return cancel_one_reminder(root, today, op, calendar_owner);
+    }
+
+    // ── A FAMILY SHOPPING ADD IS A DELTA, NOT A PLAN EDIT (KNOWN-GAPS #7) ───────────
+    //
+    // The shopping list has TWO representations and they are not interchangeable. The plan's
+    // `## 4. Shopping list` is DERIVED — the planner's list, regenerated whenever the week is
+    // rewritten. The per-week OVERLAY (`.casa/shopping/<week>.json`, `added[]`) is the DURABLE
+    // record of what the FAMILY put there, and it exists for exactly one reason: so a manual item
+    // survives that regeneration (`shoppingStore.mjs`'s own header says so).
+    //
+    // This lane used to write the family's item into the derived side. So an item jotted from a
+    // phone was erased by the next plan rewrite, while the same item added on the kiosk — which
+    // goes through the gateway to the overlay — was safe. Two surfaces, two stores, and only one
+    // of them durable.
+    //
+    // Which is right is not a judgement call: `docs/42` §1 already names the overlay as the store
+    // the `week-mutation` lock protects, and names Telegram as one of its writers. The engine was
+    // simply not behaving like the writer the contract already described.
+    //
+    // Intercepting HERE and not in the Telegram listener is deliberate: `run_fast_lane_at` is the
+    // single mutating entry, so the listener, the voice note and the web plan-editor all get the
+    // durable store from this one seam, and no surface has to remember which store to use. That is
+    // the general rule this bug is a case of — a surface emits intent, the operation owns the
+    // store — and putting the store choice at the seam is what makes it hold for surfaces that do
+    // not exist yet.
+    //
+    // It runs BEFORE the plan lookup below, because adding to the shopping list does not need a
+    // plan to exist; requiring one would fail the family's request for a reason unrelated to it.
+    if let FastLaneOp::ShoppingAdd { item } = &op {
+        // The ISO week of TODAY is the honest fallback; the plan's own week code wins when a plan
+        // exists, because that is the identity the gateway's `overlayWeekKey` derives
+        // (`normalizeWeekKey(entry.file) || normalizeWeekKey(entry.plan?.weekKey) || fallback`).
+        let (owned, week_code) = shopping_delta_weeks(root, today);
+        let candidates: Vec<&str> = owned.iter().map(String::as_str).collect();
+
+        return match super::shopping_overlay::add_item(root, &candidates, item, None, None) {
+            Ok(_) => FastLaneResult::Applied {
+                // The SAME line the family has always seen — only the store changed.
+                report: report_line(&op),
+                op,
+                week_code,
+            },
+            // Fail CLOSED, like every other lock refusal here: if the overlay cannot be written
+            // we do not quietly fall back to the derived side and claim success — that would
+            // reproduce the original bug under a lock refusal, which is the hardest case to see.
+            Err(e) => FastLaneResult::Fallback {
+                reason: format!("shopping overlay not written: {e}"),
+            },
+        };
+    }
+
+    // ── THE OTHER HALF OF THE ROUND-TRIP ────────────────────────────────────────────
+    //
+    // An add that goes to the overlay and a remove that edits the plan is not half a fix, it is a
+    // worse bug than the one it replaces: the house confirms "olive oil on the list", and then the
+    // family says "take the olive oil off" and it answers that it was never there. Both directions
+    // must share a store, so the overlay is consulted FIRST.
+    //
+    // `Ok(None)` is the discriminator, and it is deliberately not an error: it means the overlay
+    // does not hold this row — so the request is about a GENERATED plan row, which the plan path
+    // below is still the right writer for. The two stores do not overlap, so this is a decision
+    // about which one owns a row, never a race between them.
+    if let FastLaneOp::ShoppingRemove { item } = &op {
+        let (owned, week_code) = shopping_delta_weeks(root, today);
+        let candidates: Vec<&str> = owned.iter().map(String::as_str).collect();
+        match super::shopping_overlay::remove_item(root, &candidates, item) {
+            Ok(Some(_)) => {
+                return FastLaneResult::Applied {
+                    report: report_line(&op),
+                    op,
+                    week_code,
+                }
+            }
+            // A generated row: fall through to the plan edit below, unchanged.
+            Ok(None) => {}
+            // Fail CLOSED — never silently edit the generated side and claim the delta was undone.
+            Err(e) => {
+                return FastLaneResult::Fallback {
+                    reason: format!("shopping overlay unavailable: {e}"),
+                }
+            }
+        }
     }
 
     // A reminder is filed on its RESOLVED date, which can fall in the next plan
@@ -4123,24 +4225,60 @@ domains = ["meals"]
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The family's round-trip: say it, then change your mind.
+    ///
+    /// This test used to assert the item landed in the PLAN MARKDOWN and that the removal took it back
+    /// out of the markdown — which encoded KNOWN-GAPS #7 as if it were the contract. It WAS the bug:
+    /// the plan's `## 4.` is DERIVED and regenerated, so an item written there is erased by the next
+    /// rewrite, while the same item added on the kiosk (which writes the overlay) survives.
+    ///
+    /// The assertions are inverted to witness the DURABLE store, and a regeneration step is added
+    /// because presence alone cannot tell the two stores apart — both render. A rewrite can.
     #[test]
-    fn e2e_a_conversational_removal_reaches_the_plan_file() {
-        let dir = std::env::temp_dir().join(format!("fastlane-shop-rm-{}", std::process::id()));
+    fn e2e_a_conversational_shopping_round_trip_lives_in_the_overlay() {
+        let dir = std::env::temp_dir().join(format!("fastlane-shop-rt-{}", std::process::id()));
         let plans = dir.join("plans");
         std::fs::create_dir_all(&plans).unwrap();
         let plan_path = plans.join("2026-W29-family-plan.md");
         std::fs::write(&plan_path, W29).unwrap();
+        let before = std::fs::read_to_string(&plan_path).unwrap();
 
-        // First put a jotted item on the list the conversational way…
+        // Put a jotted item on the list the conversational way…
         match run_fast_lane(&dir, "add AA batteries to the shopping list", today()) {
-            FastLaneResult::Applied { .. } => {}
+            FastLaneResult::Applied { report, .. } => {
+                assert!(report.contains("shopping list"), "got {report:?}")
+            }
             other => panic!("expected the add to apply, got {other:?}"),
         }
-        let mid = std::fs::read_to_string(&plan_path).unwrap();
-        assert!(mid.to_lowercase().contains("aa batteries"));
 
-        // …then take it back off with the report's own phrasing. THIS is the
-        // asymmetry the live-cert found: the add persisted, the removal did not.
+        // 1. The item is in the DURABLE store…
+        let overlay = dir.join(".casa/shopping/2026-W29.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&overlay).expect("the overlay was written"))
+                .unwrap();
+        assert_eq!(v["added"][0]["text"], "aa batteries");
+        assert_eq!(v["added"][0]["key"], "add:1");
+        // …and the family's delta did NOT rewrite the generated plan.
+        assert_eq!(
+            std::fs::read_to_string(&plan_path).unwrap(),
+            before,
+            "a family delta must not rewrite the generated plan"
+        );
+
+        // 2. THE DISCRIMINATOR. Regenerate the plan the way a rewrite does — the item must SURVIVE.
+        //    This is the step an "it appears in the file" assertion cannot perform, and the reason
+        //    the original bug shipped green.
+        std::fs::write(&plan_path, W29).unwrap();
+        let still: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&overlay).unwrap()).unwrap();
+        assert_eq!(
+            still["added"][0]["text"], "aa batteries",
+            "the item must survive a plan regeneration"
+        );
+
+        // 3. …then take it back off with the report's own phrasing. THIS was the asymmetry the
+        //    live-cert found. Both directions must reach the same store, or the house confirms an
+        //    add it cannot undo.
         match run_fast_lane(&dir, "Remove AA batteries again.", today()) {
             FastLaneResult::Applied { report, op, .. } => {
                 assert!(matches!(op, FastLaneOp::ShoppingRemove { .. }));
@@ -4148,16 +4286,55 @@ domains = ["meals"]
             }
             other => panic!("expected the removal to apply, got {other:?}"),
         }
-        let after = std::fs::read_to_string(&plan_path).unwrap();
-        assert!(
-            !after.to_lowercase().contains("aa batteries"),
-            "the removal must reach the plan file the /week and kiosk surfaces read"
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&overlay).unwrap()).unwrap();
+        assert_eq!(
+            after["added"].as_array().unwrap().len(),
+            0,
+            "the removal must reach the durable store"
         );
-        // Nothing else was disturbed.
-        let doc = PlanDoc::parse("2026-W29", &after);
-        assert!(doc.meals.len() >= 5, "the meal table survived the edit");
+        // The generated plan is untouched by either direction.
+        assert_eq!(std::fs::read_to_string(&plan_path).unwrap(), before);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A removal that names a GENERATED plan row still edits the plan: the two stores do not
+    /// overlap, and `remove_item` returning `None` is what distinguishes that case. Without this,
+    /// `remove_item` answering `Ok(None)` for a generated row could be read as "the row is gone".
+    #[test]
+    fn a_removal_of_a_generated_row_still_reaches_the_plan() {
+        let dir = std::env::temp_dir().join(format!("fastlane-shop-gen-{}", std::process::id()));
+        let plans = dir.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan_path = plans.join("2026-W29-family-plan.md");
+        std::fs::write(&plan_path, W29).unwrap();
+
+        // "Lemons ×3, oranges ×2 (vit-C for iron absorption)" is a GENERATED plan row that occurs
+        // exactly ONCE in the whole document, so the classifier resolves it unambiguously and this
+        // test can actually exercise the fall-through. ("walnuts" appears 5× across §4 and the §7
+        // recipe methods, so the classifier answers `which-item` before any store is consulted — its
+        // own correct behaviour, but it would prove nothing about this seam.)
+        match run_fast_lane(&dir, "remove lemons from the shopping list", today()) {
+            FastLaneResult::Applied { report, op, .. } => {
+                assert!(matches!(op, FastLaneOp::ShoppingRemove { .. }));
+                assert!(report.contains("off the shopping list"), "got {report:?}");
+            }
+            other => panic!("expected the plan path to take it off, got {other:?}"),
+        }
+        let after = std::fs::read_to_string(&plan_path).unwrap();
+        assert!(
+            !after.to_lowercase().contains("lemons"),
+            "the generated row left the plan"
+        );
+        // The plan WAS rewritten (that is the generated-row path), but no family delta was invented
+        // along the way: the two stores do not overlap, and the overlay must stay absent.
+        assert!(
+            !dir.join(".casa/shopping").exists(),
+            "a generated row is not a family delta"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- side-channel files are never the edit target (task sidecar-is-not) ----

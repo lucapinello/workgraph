@@ -7181,6 +7181,36 @@ domains = ["coordination"]
         let first_key =
             crate::casa::plan_edits::web_physical_turn_key("-100700", words, Some("turn-a"), None);
 
+        // The family's shopping delta now lands in the DURABLE overlay, not the plan markdown
+        // (KNOWN-GAPS #7). The property under test is unchanged — it must be applied exactly once —
+        // so the count simply reads the store that holds it. Scoped to whichever overlay file the
+        // week resolved to, so this does not silently pass by reading the wrong week.
+        let overlay_count = || {
+            let mut n = 0usize;
+            if let Ok(entries) = std::fs::read_dir(root.join(".casa/shopping")) {
+                for entry in entries.flatten() {
+                    let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    if let Some(rows) = value["added"].as_array() {
+                        n += rows
+                            .iter()
+                            .filter(|row| {
+                                row["text"]
+                                    .as_str()
+                                    .map(|t| t.contains("oat milk"))
+                                    .unwrap_or(false)
+                            })
+                            .count();
+                    }
+                }
+            }
+            n
+        };
+
         // First invocation applies once and retains canonical bytes when the
         // transport fails.
         let first = run_web_fast_lane_occurrence(
@@ -7200,11 +7230,9 @@ domains = ["coordination"]
         .await;
         assert!(first.is_err());
         assert_eq!(
-            std::fs::read_to_string(&plan_path)
-                .unwrap()
-                .matches("- oat milk")
-                .count(),
+            overlay_count(),
             1,
+            "the shopping delta is in the durable overlay, exactly once"
         );
 
         // A fresh-process refire may carry drifted mutable inputs. The persisted
@@ -7234,8 +7262,7 @@ domains = ["coordination"]
                 ..
             }
         ));
-        let plan = std::fs::read_to_string(&plan_path).unwrap();
-        assert_eq!(plan.matches("- oat milk").count(), 1);
+        assert_eq!(overlay_count(), 1, "the refire must not add it a second time");
         let delivered = sink.delivered.lock().unwrap().clone();
         assert_eq!(delivered.len(), 1);
         assert_eq!(&delivered[0].0, "helper-9");
@@ -7267,13 +7294,7 @@ domains = ["coordination"]
             }
         ));
         assert_eq!(sink.attempts.lock().unwrap().len(), 2);
-        assert_eq!(
-            std::fs::read_to_string(&plan_path)
-                .unwrap()
-                .matches("- oat milk")
-                .count(),
-            1,
-        );
+        assert_eq!(overlay_count(), 1, "a completed occurrence is a full no-op");
 
         // Identical words with a later occurrence id remain a new household
         // turn and therefore apply + deliver once of their own.
@@ -7297,13 +7318,9 @@ domains = ["coordination"]
         .unwrap();
         assert_eq!(sink.attempts.lock().unwrap().len(), 3);
         assert_eq!(sink.delivered.lock().unwrap().len(), 2);
-        assert_eq!(
-            std::fs::read_to_string(&plan_path)
-                .unwrap()
-                .matches("- oat milk")
-                .count(),
-            2,
-        );
+        // A distinct occurrence id is a NEW household turn, so it applies once of its own — two
+        // rows in the durable store, each with its own id, not one row overwritten.
+        assert_eq!(overlay_count(), 2);
         let graph = worksgood::parser::load_graph(workgraph_dir.join("graph.jsonl")).unwrap();
         assert_eq!(
             graph
