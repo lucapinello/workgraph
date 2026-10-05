@@ -3861,6 +3861,7 @@ fn main() -> Result<()> {
                 today,
                 force,
                 dry_run,
+                send,
             } => commands::feedback::run_ask(
                 &workgraph_dir,
                 dish.as_deref(),
@@ -3868,6 +3869,7 @@ fn main() -> Result<()> {
                 force,
                 dry_run,
                 cli.json,
+                send,
             ),
             FeedbackCommands::Record {
                 rater,

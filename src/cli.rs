@@ -6493,6 +6493,16 @@ pub enum FeedbackCommands {
         /// Compose but do not record the ask (no state written).
         #[arg(long)]
         dry_run: bool,
+
+        /// Deliver the composed line to the family group via the configured
+        /// Telegram bot — and record the ask only once delivery SUCCEEDED. Without
+        /// this flag the command composes and records, and somebody else must send
+        /// it: that split is how 54 days of "backing off" happened, because a
+        /// recorded ask nobody received makes the family look silent and the gate
+        /// goes quiet for good. A failed delivery records NOTHING and exits
+        /// non-zero, leaving the gate free to retry. Never sends under --dry-run.
+        #[arg(long)]
+        send: bool,
     },
 
     /// Route a family reply/reaction into a rating and append it to

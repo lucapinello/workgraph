@@ -63,6 +63,38 @@ pub fn run_ask(
     force: bool,
     dry_run: bool,
     json: bool,
+    send: bool,
+) -> Result<()> {
+    run_ask_with(
+        workgraph_dir,
+        dish,
+        today,
+        force,
+        dry_run,
+        json,
+        send,
+        &deliver_via_telegram,
+    )
+}
+
+/// The real delivery: hand the family-voice line to the configured Telegram bot,
+/// reusing `wg telegram send`'s resolution — same default bot, same chat, same
+/// identity rules — so the ask can never diverge from how a hand-sent message
+/// travels. `run_send` prints its own "Message sent to chat …" line, which is
+/// deliberately kept: an operator running this by hand sees delivery happen.
+fn deliver_via_telegram(line: &str) -> Result<()> {
+    crate::commands::telegram::run_send(None, line, false, None)
+}
+
+fn run_ask_with(
+    workgraph_dir: &Path,
+    dish: Option<&str>,
+    today: Option<&str>,
+    force: bool,
+    dry_run: bool,
+    json: bool,
+    send: bool,
+    deliver: &dyn Fn(&str) -> Result<()>,
 ) -> Result<()> {
     let root = project_root(workgraph_dir);
     let day = resolve_today(today)?;
@@ -97,6 +129,21 @@ pub fn run_ask(
     let line = meal_feedback::compose_ask(&dish_str);
 
     if !dry_run {
+        // DELIVER FIRST, RECORD ON SUCCESS. The ask ledger's contract is "an ask
+        // went out", and the nag gate keys off it: two recorded-and-unanswered
+        // asks put the house into backoff. So a ledger entry for an ask the family
+        // never received is not a harmless bookkeeping slip — it manufactures the
+        // family's silence, and the house goes quiet for good (KNOWN-GAPS #9:
+        // the ask was composed and recorded while nothing was ever sent, which is
+        // how 54 days of "two silent asks — backing off" happened). A failed
+        // delivery therefore records NOTHING and exits non-zero, leaving the gate
+        // free to try again next cycle. `--dry-run` never reaches this block, so
+        // composing is always safe.
+        if send {
+            deliver(&line).context(
+                "the ask could not be delivered — it was NOT recorded, so the gate may retry",
+            )?;
+        }
         let record = meal_feedback::AskRecord {
             ts: now,
             dish: dish_str.clone(),
@@ -447,6 +494,126 @@ mod tests {
         assert!(
             meal_feedback::load_ratings(&meal_feedback::feedback_path_for(root)).is_empty(),
             "no rating was invented for a night nobody asked about"
+        );
+    }
+
+    // ── `--send`: the ask must ARRIVE before the ledger says it did ────────────
+    // The loop's missing delivery step (2026-10-05). `wg feedback ask` composed and
+    // recorded while nothing ever delivered the line to the group, so the family
+    // could never answer, two recorded asks made them look silent, and the gate
+    // backed off for good — 54 days of "two silent asks in a row — backing off".
+    // These pin the fix's contract: DELIVER FIRST, RECORD ON SUCCESS, and the
+    // flag changes nothing about the compose-only behavior it extends.
+
+    #[test]
+    fn a_failed_delivery_records_no_ask_so_the_gate_may_retry() {
+        let dir = scratch_with_plan();
+        let root = dir.path();
+        let res = run_ask_with(
+            root,
+            Some("Baked salmon"),
+            Some("2026-07-14"),
+            true,  // force: prove the send step even when the gate allows
+            false, // not a dry run
+            false,
+            true,  // --send
+            &|_line| anyhow::bail!("telegram unavailable"),
+        );
+        assert!(res.is_err(), "a failed delivery must fail the command");
+        assert!(
+            res.unwrap_err().to_string().contains("NOT recorded"),
+            "the error must say the ask was not recorded, so an operator knows the gate is free to retry"
+        );
+        assert!(
+            meal_feedback::load_asks(&meal_feedback::ask_log_path_for(root)).is_empty(),
+            "a ledger entry for an ask the family never received would manufacture the family's \
+             silence — the exact 54-day death"
+        );
+    }
+
+    #[test]
+    fn a_delivered_ask_is_recorded_exactly_once() {
+        let dir = scratch_with_plan();
+        let root = dir.path();
+        let delivered = std::cell::Cell::new(0);
+        run_ask_with(
+            root,
+            Some("Baked salmon"),
+            Some("2026-07-14"),
+            true,
+            false,
+            false,
+            true,
+            &|line| {
+                assert!(
+                    line.to_lowercase().contains("baked salmon"),
+                    "the delivered line must be the composed ask (dish folded to speech): {line}"
+                );
+                assert!(line.contains('👍'), "the delivered line must be the family-voice ask, not a bare dish name");
+                delivered.set(delivered.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("a successful delivery records the ask");
+        assert_eq!(delivered.get(), 1, "exactly one delivery");
+        let asks = meal_feedback::load_asks(&meal_feedback::ask_log_path_for(root));
+        assert_eq!(asks.len(), 1, "exactly one ask recorded");
+        assert_eq!(asks[0].dish, "Baked salmon");
+        assert!(!asks[0].responded, "a fresh ask starts unanswered");
+    }
+
+    #[test]
+    fn without_send_the_command_still_records_without_delivering() {
+        // The compose-and-record behavior the cron task ran on for months must be
+        // untouched: `--send` extends it, it does not replace it.
+        let dir = scratch_with_plan();
+        let root = dir.path();
+        let delivered = std::cell::Cell::new(0);
+        run_ask_with(
+            root,
+            Some("Baked salmon"),
+            Some("2026-07-14"),
+            true,
+            false,
+            false,
+            false, // no --send
+            &|_line| {
+                delivered.set(delivered.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("compose-and-record is unchanged");
+        assert_eq!(delivered.get(), 0, "nothing is delivered without --send");
+        assert_eq!(
+            meal_feedback::load_asks(&meal_feedback::ask_log_path_for(root)).len(),
+            1,
+            "the ask is still recorded, as before"
+        );
+    }
+
+    #[test]
+    fn dry_run_with_send_neither_delivers_nor_records() {
+        let dir = scratch_with_plan();
+        let root = dir.path();
+        let delivered = std::cell::Cell::new(0);
+        run_ask_with(
+            root,
+            Some("Baked salmon"),
+            Some("2026-07-14"),
+            true,
+            true, // dry run: compose only
+            false,
+            true, // even with --send
+            &|_line| {
+                delivered.set(delivered.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("composing is always safe");
+        assert_eq!(delivered.get(), 0, "a dry run must never deliver");
+        assert!(
+            meal_feedback::load_asks(&meal_feedback::ask_log_path_for(root)).is_empty(),
+            "a dry run must never record"
         );
     }
 }
