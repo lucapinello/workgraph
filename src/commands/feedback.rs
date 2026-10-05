@@ -252,3 +252,201 @@ pub fn run_summary(workgraph_dir: &Path, session: bool, json: bool) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use worksgood::notify::telegram;
+
+    /// A week whose Tuesday dinner is the one the family is answering about.
+    const PLAN: &str = "\
+# Family week · 2026-W29 · Week of Monday July 13 – Sunday July 19
+
+**Week of Monday 2026-07-13 to Sunday 2026-07-19**
+**Status:** PUBLISHED
+
+## 1. Dinners (planner → cook)
+
+| Day | Slot | Dinner | Prep |
+|-----|------|--------|------|
+| Mon 07-13 | Vegetarian | Chickpea curry | ~35 min |
+| Tue 07-14 | Fish | Baked salmon | ~30 min |
+";
+
+    fn scratch_with_plan() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = dir.path().join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("2026-W29-family-plan.md"), PLAN).unwrap();
+        dir
+    }
+
+    /// A raw update in the exact wire shape Telegram sends for a reaction. Written out in full
+    /// rather than built from a helper, because the SHAPE is half of what this test is about: the
+    /// decoder is pinned to the real field names, not to a convenient approximation of them.
+    fn reaction_update(message_id: i64, emoji: &str) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": 900,
+            "message_reaction": {
+                "chat": { "id": -1001234567890_i64, "type": "group" },
+                "message_id": message_id,
+                "user": { "id": 42, "username": "luca" },
+                "date": 1_752_500_000_i64,
+                "new_reaction": [ { "type": "emoji", "emoji": emoji } ]
+            }
+        })
+    }
+
+    /// THE FLIP, end to end and hermetically: a real Telegram reaction — the wire shape the
+    /// listener actually receives — through the REAL decoder, into a real rating, and onto the
+    /// RIGHT evening of the ask ledger.
+    ///
+    /// This is the half of the dinner loop that can be proved without a live family. The other
+    /// half — one real ask and one real thumb in the real group — is Luca's, and cannot be
+    /// simulated here without lying about what was proved.
+    #[test]
+    fn a_thumb_reaction_reaches_a_rating_on_the_right_evening() {
+        let dir = scratch_with_plan();
+        let root = dir.path();
+
+        // The ledger holds an OLD ask (well out of range) and the one the thumb actually answers.
+        // Timestamps are relative to the real clock because `run_record` stamps the rating with
+        // `Utc::now()` — the one input a file-level test cannot pin without changing production
+        // code to suit the test.
+        let now_ms = Utc::now().timestamp_millis();
+        let hour_ms = 60 * 60 * 1000;
+        let day_ms = 24 * hour_ms;
+        let ask_log = meal_feedback::ask_log_path_for(root);
+        meal_feedback::append_ask(
+            &ask_log,
+            &meal_feedback::AskRecord {
+                ts: now_ms - 20 * day_ms,
+                dish: "Roast chicken".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        meal_feedback::append_ask(
+            &ask_log,
+            &meal_feedback::AskRecord {
+                ts: now_ms - hour_ms,
+                dish: "Baked salmon".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+
+        // 1. THE EAR. A reaction carries no text, so the emoji IS the body — and its message_id is
+        //    the message reacted TO, which must ride as `reply_to` or the answer cannot be tied to
+        //    the ask. Before KNOWN-GAPS #9 was closed this returned None: `allowed_updates` never
+        //    subscribed `message_reaction`, and this function had no branch for it.
+        let msg = telegram::decode_update(&reaction_update(555, "👍"), "telegram:nora")
+            .expect("a thumb on the dinner ask must decode — the ear was the bug");
+        assert_eq!(msg.body, "👍", "the emoji is the body");
+        assert_eq!(
+            msg.reply_to.as_ref().map(|m| m.0.as_str()),
+            Some("555"),
+            "the reaction's message_id is the ask it answers"
+        );
+        assert!(!msg.sender_is_bot, "a family member's thumb is not a bot's");
+        assert!(msg.message_id.is_none(), "a reaction is not itself a message");
+
+        // 2. THE FLIP. The decoded body goes through the SAME routing a typed reply takes.
+        run_record(root, &msg.sender, &msg.body, None, Some("2026-07-14"), true)
+            .expect("recording a legible thumb must not fail");
+
+        // 3. What landed is one rating, for TONIGHT'S dish, and a LIKED one.
+        let ratings = meal_feedback::load_ratings(&meal_feedback::feedback_path_for(root));
+        assert_eq!(ratings.len(), 1, "exactly one rating — not zero, not two");
+        assert_eq!(ratings[0].dish, "Baked salmon", "the dish came from the plan");
+        assert_eq!(ratings[0].verdict, meal_feedback::Verdict::Liked, "👍 is a Liked");
+
+        // 4. AND THE RIGHT EVENING WAS FLIPPED. This is the assertion that makes the rest mean
+        //    something: a flip is only correct if it lands on the ask the family actually answered.
+        //    The old newest-ts flip marked whatever ask was most recent, which falsifies the ledger
+        //    the gate reads — the house would believe it had been answered when it had not.
+        let asks = meal_feedback::load_asks(&ask_log);
+        assert_eq!(asks.len(), 2);
+        assert!(asks[1].responded, "last night's ask — the one the thumb answered — must flip");
+        assert!(
+            !asks[0].responded,
+            "an ask from 20 days ago must NOT be flipped by tonight's thumb"
+        );
+    }
+
+    /// A DEGRADED EVENT MUST NOT BECOME ENGAGEMENT — asserted in the only place that matters:
+    /// the ledger must be left exactly as it was.
+    #[test]
+    fn a_reaction_that_is_not_an_answer_never_records_one() {
+        // The wire names the new reactions `new_reaction`. A payload that misspells it must decode
+        // to NOTHING: a decoder that fuzzily "finds something" would turn a malformed update into
+        // family-visible engagement that never happened — which is worse than missing it, because
+        // nothing downstream can tell the difference afterwards.
+        let wrong_field = serde_json::json!({
+            "update_id": 901,
+            "message_reaction": {
+                "chat": { "id": -1001234567890_i64 },
+                "message_id": 555,
+                "user": { "id": 42, "username": "luca" },
+                "new_reactions": [ { "type": "emoji", "emoji": "👍" } ]
+            }
+        });
+        assert!(
+            telegram::decode_update(&wrong_field, "telegram:nora").is_none(),
+            "a misnamed field must not decode into a rating"
+        );
+
+        // A thumb REMOVED carries no emoji, and an un-thumb is not an answer.
+        let removed = serde_json::json!({
+            "update_id": 902,
+            "message_reaction": {
+                "chat": { "id": -1001234567890_i64 },
+                "message_id": 555,
+                "user": { "id": 42, "username": "luca" },
+                "new_reaction": []
+            }
+        });
+        assert!(
+            telegram::decode_update(&removed, "telegram:nora").is_none(),
+            "an un-thumb must not fake engagement"
+        );
+
+        // A non-emoji reaction type is not a sentiment we can read.
+        let custom = serde_json::json!({
+            "update_id": 903,
+            "message_reaction": {
+                "chat": { "id": -1001234567890_i64 },
+                "message_id": 555,
+                "user": { "id": 42, "username": "luca" },
+                "new_reaction": [ { "type": "custom_emoji", "custom_emoji_id": "5368324170671202286" } ]
+            }
+        });
+        assert!(telegram::decode_update(&custom, "telegram:nora").is_none());
+
+        // And the ledger is untouched by a rating for a night the house never asked about: the
+        // flip must leave it ALONE rather than mark the nearest ask answered.
+        let dir = scratch_with_plan();
+        let root = dir.path();
+        let ask_log = meal_feedback::ask_log_path_for(root);
+        meal_feedback::append_ask(
+            &ask_log,
+            &meal_feedback::AskRecord {
+                ts: 1_752_400_000_000,
+                dish: "Roast chicken".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        let flipped = meal_feedback::mark_ask_answered(&ask_log, "Baked salmon", 1_752_900_000_000)
+            .unwrap();
+        assert!(!flipped, "no ask about that evening — nothing to flip");
+        assert!(
+            meal_feedback::load_asks(&ask_log).iter().all(|a| !a.responded),
+            "the ledger must be byte-for-byte as it was"
+        );
+        assert!(
+            meal_feedback::load_ratings(&meal_feedback::feedback_path_for(root)).is_empty(),
+            "no rating was invented for a night nobody asked about"
+        );
+    }
+}
