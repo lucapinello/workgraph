@@ -125,6 +125,17 @@ jobs:
           else
             echo "no existing SHA256SUMS on $TAG — first publish for this tag"
           fi
+          # RELEASE-INFO merges per target EXACTLY like SHA256SUMS (release-wg.sh drops this
+          # target's row and keeps every other), so it carries the same orphaning trap: without
+          # this seed, a Linux publish would upload a Linux-only provenance manifest and
+          # silently drop the macOS row — leaving release-is-current.mjs able to pass while the
+          # macOS target's staleness went unchecked. A green gate over an unexamined target is
+          # precisely the failure mode the gate was built to end.
+          if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern RELEASE-INFO --dir dist; then
+            echo "seeded provenance from $TAG:"; cat dist/RELEASE-INFO
+          else
+            echo "no existing RELEASE-INFO on $TAG — first provenance-stamped publish"
+          fi
 
       # WG_SOURCE_DIR is REQUIRED, not optional: release-wg.sh dies if it is missing and reads
       # the release version from $WG_SOURCE_DIR/Cargo.toml. Its default is a developer's local
@@ -193,6 +204,33 @@ jobs:
           done
           echo "carried digests match what is published"
 
+          # (3) PROVENANCE ORPHANING — the same two guards, for RELEASE-INFO. A row already
+          #     published must survive this upload (a vanishing row makes that target's
+          #     staleness INVISIBLE to release-is-current.mjs), and for targets we did not
+          #     rebuild, the row we carry must still be the one that is published — otherwise a
+          #     concurrent re-publish is being silently reverted to older provenance.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern RELEASE-INFO \
+            --output "${RUNNER_TEMP:-/tmp}/published-RELEASE-INFO" 2>/dev/null \
+            || echo "no published RELEASE-INFO — first provenance-stamped publish, nothing to orphan"
+          while read -r t c _rest; do
+            [ -n "$t" ] || continue
+            case "$t" in *linux-gnu*) continue;; esac   # we just rebuilt these, their rows are ours
+            if ! grep -q "^$t " dist/RELEASE-INFO; then
+              echo "RELEASE-INFO would drop the provenance row for $t" >&2
+              echo "that target's staleness would become invisible to release-is-current.mjs" >&2
+              exit 1
+            fi
+            ours="$(awk -v n="$t" '$1 == n {print $2}' dist/RELEASE-INFO)"
+            if [ -n "$c" ] && [ "$ours" != "$c" ]; then
+              echo "STALE provenance seed for $t" >&2
+              echo "  ours:     $ours" >&2
+              echo "  published: $c" >&2
+              echo "that target was re-published after this run seeded RELEASE-INFO; re-run this workflow." >&2
+              exit 1
+            fi
+          done < "${RUNNER_TEMP:-/tmp}/published-RELEASE-INFO"
+          echo "carried provenance rows match what is published"
+
       - name: publish
         if: ${{ inputs.publish == 'true' }}
         env:
@@ -201,7 +239,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            dist/wg-*-linux-gnu.tar.gz dist/wg-*-linux-gnu.tar.gz.sha256 dist/SHA256SUMS
+            dist/wg-*-linux-gnu.tar.gz dist/wg-*-linux-gnu.tar.gz.sha256 dist/SHA256SUMS dist/RELEASE-INFO
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[] | "\(.name)  \(.size)"'
 
