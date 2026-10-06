@@ -110,7 +110,11 @@ fn run_ask_with(
     let ask_log = meal_feedback::ask_log_path_for(&root);
     let asks = meal_feedback::load_asks(&ask_log);
     let now = Utc::now().timestamp_millis();
-    let decision = meal_feedback::gate(&asks, now);
+    // The household's own UTC offset: the gate buckets by CIVIL day, and the dinner cron fires
+    // at 01:00 UTC = 21:00 local on purpose. Bucketing by UTC there would split one evening
+    // across two days — see meal_feedback::day_bucket.
+    let tz_offset_ms = i64::from(Local::now().offset().local_minus_utc()) * 1000;
+    let decision = meal_feedback::gate(&asks, now, tz_offset_ms);
     if !force && !decision.should_send() {
         if json {
             println!(
@@ -229,7 +233,8 @@ pub fn run_record(
     // Only an ask about THIS evening may be marked answered — see ask_a_rating_may_answer.
     // A rating for a night the house never asked about must leave the ledger alone rather than
     // falsify it, which is what the old newest-ts flip did.
-    let _ = meal_feedback::mark_ask_answered(&ask_log, &rating.dish, rating.ts);
+    let tz_offset_ms = i64::from(Local::now().offset().local_minus_utc()) * 1000;
+    let _ = meal_feedback::mark_ask_answered(&ask_log, &rating.dish, rating.ts, tz_offset_ms);
 
     if json {
         println!(
@@ -484,7 +489,7 @@ mod tests {
             },
         )
         .unwrap();
-        let flipped = meal_feedback::mark_ask_answered(&ask_log, "Baked salmon", 1_752_900_000_000)
+        let flipped = meal_feedback::mark_ask_answered(&ask_log, "Baked salmon", 1_752_900_000_000, 0)
             .unwrap();
         assert!(!flipped, "no ask about that evening — nothing to flip");
         assert!(

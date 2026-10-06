@@ -473,10 +473,10 @@ pub fn load_asks(path: &Path) -> Vec<AskRecord> {
 ///   rating flips the latest ask to answered and reopens the gate).
 ///
 /// Pure: takes the loaded ask history and the current time, returns a decision.
-pub fn gate(asks: &[AskRecord], now_ms: i64) -> AskDecision {
-    // Rule 1: one per day.
-    let today = day_bucket(now_ms);
-    if asks.iter().any(|a| day_bucket(a.ts) == today) {
+pub fn gate(asks: &[AskRecord], now_ms: i64, tz_offset_ms: i64) -> AskDecision {
+    // Rule 1: one per LOCAL civil day (see day_bucket).
+    let today = day_bucket(now_ms, tz_offset_ms);
+    if asks.iter().any(|a| day_bucket(a.ts, tz_offset_ms) == today) {
         return AskDecision::Skip("already asked today".to_string());
     }
 
@@ -512,10 +512,27 @@ pub const BACKOFF_QUIET_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 
 /// UTC day index (days since epoch) for an epoch-ms timestamp. Two timestamps in
 /// the same UTC day share a bucket. Used only for the "one ask per day" rule.
-fn day_bucket(ts_ms: i64) -> i64 {
+/// Which CIVIL day an instant falls on, in the household's own timezone.
+///
+/// THE BUG THIS FIXES (measured live, 2026-10-05). This bucketed by UTC day, while
+/// `resolve_today` picks tonight's dish by the LOCAL civil day. The dinner cron fires at
+/// 01:00 UTC — which is 21:00 in America/New_York, an evening, deliberately. So every ask the
+/// cron sends lands in the NEXT UTC day's bucket from an ask sent earlier the same evening, and
+/// the two rules that call this both break at the same hour:
+///
+///   * Rule 1 ("one per day") stops seeing the earlier ask, so the house asks a SECOND time
+///     about a dinner it already asked about — the nag the rule exists to prevent;
+///   * `ask_a_rating_may_answer` stops matching, so a thumb given after ~20:00 local is refused
+///     as being "about another evening" and the family's answer is dropped.
+///
+/// `tz_offset_ms` is the household's UTC offset at that instant, supplied by the caller. It is a
+/// PARAMETER rather than a `Local::now()` call because this module is pure: the gate's whole
+/// testability rests on being a function of its inputs, and reading the machine clock here would
+/// make every test depend on the timezone of the box it runs on. Pass 0 for UTC bucketing.
+fn day_bucket(ts_ms: i64, tz_offset_ms: i64) -> i64 {
     // 86_400_000 ms per day. Floor-divide so negative (pre-epoch, test-only)
     // values still bucket monotonically.
-    ts_ms.div_euclid(86_400_000)
+    ts_ms.saturating_add(tz_offset_ms).div_euclid(86_400_000)
 }
 
 /// Which ask a recorded rating is allowed to mark answered, if any.
@@ -539,13 +556,14 @@ pub fn ask_a_rating_may_answer(
     asks: &[AskRecord],
     rating_dish: &str,
     rating_ts: i64,
+    tz_offset_ms: i64,
 ) -> Option<usize> {
     let want = rating_dish.trim();
     let newest_in = |day: i64| -> Option<usize> {
         let mut dish_match: Option<usize> = None;
         let mut any: Option<usize> = None;
         for (i, a) in asks.iter().enumerate() {
-            if day_bucket(a.ts) != day {
+            if day_bucket(a.ts, tz_offset_ms) != day {
                 continue;
             }
             if !want.is_empty() && a.dish.trim().eq_ignore_ascii_case(want) {
@@ -559,7 +577,7 @@ pub fn ask_a_rating_may_answer(
         }
         dish_match.or(any)
     };
-    let rating_day = day_bucket(rating_ts);
+    let rating_day = day_bucket(rating_ts, tz_offset_ms);
     newest_in(rating_day).or_else(|| newest_in(rating_day - 1))
 }
 
@@ -572,12 +590,13 @@ pub fn mark_ask_answered(
     path: &Path,
     rating_dish: &str,
     rating_ts: i64,
+    tz_offset_ms: i64,
 ) -> std::io::Result<bool> {
     let mut asks = load_asks(path);
     if asks.is_empty() {
         return Ok(false);
     }
-    let Some(i) = ask_a_rating_may_answer(&asks, rating_dish, rating_ts) else {
+    let Some(i) = ask_a_rating_may_answer(&asks, rating_dish, rating_ts, tz_offset_ms) else {
         return Ok(false);
     };
     if asks[i].responded {
@@ -910,7 +929,7 @@ mod tests {
 
     #[test]
     fn feedback_gate_allows_first_ask() {
-        assert!(gate(&[], 5 * DAY).should_send());
+        assert!(gate(&[], 5 * DAY, 0).should_send());
     }
 
     #[test]
@@ -920,11 +939,11 @@ mod tests {
             dish: "Salmon".into(),
             responded: true,
         }];
-        let d = gate(&asks, 5 * DAY + 9_000_000);
+        let d = gate(&asks, 5 * DAY + 9_000_000, 0);
         assert!(!d.should_send());
         assert!(d.reason().contains("today"));
         // A new day reopens the gate.
-        assert!(gate(&asks, 6 * DAY + 1000).should_send());
+        assert!(gate(&asks, 6 * DAY + 1000, 0).should_send());
     }
 
     #[test]
@@ -942,7 +961,7 @@ mod tests {
                 responded: false,
             },
         ];
-        let d = gate(&asks, 5 * DAY);
+        let d = gate(&asks, 5 * DAY, 0);
         assert!(!d.should_send(), "should back off, not nag");
         assert!(d.reason().contains("silent") || d.reason().contains("backing off"));
     }
@@ -962,7 +981,73 @@ mod tests {
                 responded: true,
             },
         ];
-        assert!(gate(&asks, 5 * DAY).should_send());
+        assert!(gate(&asks, 5 * DAY, 0).should_send());
+    }
+
+    // ── the civil-day seam ──────────────────────────────────────────────────────────────
+    // Measured live on 2026-10-05 by the first unattended cron run. All three instants below
+    // are the SAME local evening in America/New_York (UTC-4), but they straddle midnight UTC
+    // because the dinner cron fires at 01:00 UTC = 21:00 local, on purpose.
+    const EDT: i64 = -4 * 60 * 60 * 1000;
+    const ASK_1900_LOCAL: i64 = 1_791_241_200_000; // 2026-10-05 23:00Z = 19:00 EDT
+    const CRON_2100_LOCAL: i64 = 1_791_248_400_000; // 2026-10-06 01:00Z = 21:00 EDT
+    const RATING_2150_LOCAL: i64 = 1_791_251_400_000; // 2026-10-06 01:50Z = 21:50 EDT
+
+    #[test]
+    fn rule_1_holds_across_midnight_utc_within_one_local_evening() {
+        let asks = vec![AskRecord {
+            ts: ASK_1900_LOCAL,
+            dish: "Cod".into(),
+            responded: false,
+        }];
+        // The house already asked at 19:00. At 21:00 the SAME evening it must not ask again.
+        assert!(
+            !gate(&asks, CRON_2100_LOCAL, EDT).should_send(),
+            "a second ask went out for an evening the house had already asked about"
+        );
+        // CONTROL — the defect, in one line: bucketing by UTC puts 19:00 and 21:00 on different
+        // days, so Rule 1 stops seeing the earlier ask and the family gets nagged twice.
+        assert!(
+            gate(&asks, CRON_2100_LOCAL, 0).should_send(),
+            "UTC bucketing was expected to show the duplicate-ask defect"
+        );
+        // And a genuinely new local evening still gets its ask.
+        assert!(gate(&asks, CRON_2100_LOCAL + 24 * 60 * 60 * 1000, EDT).should_send());
+    }
+
+    /// WHY THE RATING FLIP WAS NEVER BROKEN BY THE UTC BUCKETING, THOUGH IT READS LIKE IT SHOULD
+    /// BE. `ask_a_rating_may_answer` ends in `newest_in(rating_day).or_else(|| newest_in(rating_day
+    /// - 1))` — that day-1 fallback already absorbs a midnight straddle, so a late thumb finds the
+    /// evening's ask under EITHER bucketing. Only Rule 1, which has no such fallback, broke.
+    ///
+    /// This is pinned because the asymmetry is genuinely surprising: an auditor reading
+    /// `day_bucket` alone (this one did) concludes the family's rating is dropped too, and it is
+    /// not. Deleting the fallback would make that conclusion true — hence the third assertion.
+    #[test]
+    fn a_late_evening_rating_answers_that_evening_under_either_bucketing() {
+        let asks = vec![AskRecord {
+            ts: ASK_1900_LOCAL,
+            dish: "Cod".into(),
+            responded: false,
+        }];
+        // A thumb at 21:50 local is about the dinner asked about at 19:00 local.
+        assert_eq!(
+            ask_a_rating_may_answer(&asks, "Cod", RATING_2150_LOCAL, EDT),
+            Some(0),
+            "the evening's own ask was not matched"
+        );
+        // Unchanged by the fix: the day-1 fallback already covered the straddle.
+        assert_eq!(
+            ask_a_rating_may_answer(&asks, "Cod", RATING_2150_LOCAL, 0),
+            Some(0),
+            "UTC bucketing used to match via the day-1 fallback and must still"
+        );
+        // The fallback is load-bearing, not incidental: two days back is NOT an answer.
+        assert_eq!(
+            ask_a_rating_may_answer(&asks, "Cod", RATING_2150_LOCAL + 2 * 24 * 60 * 60 * 1000, EDT),
+            None,
+            "a rating two evenings later must not claim this ask"
+        );
     }
 
     #[test]
@@ -988,15 +1073,15 @@ mod tests {
         )
         .unwrap();
         // Before answering: gate backs off.
-        assert!(!gate(&load_asks(&path), 5 * DAY).should_send());
+        assert!(!gate(&load_asks(&path), 5 * DAY, 0).should_send());
         // A rating for Thursday's "Cod" arrives on Friday -> it may answer Thursday's ask (the
         // ask from the rating's own day, or the previous day; a family often rates this morning
         // what they ate last night).
-        assert!(mark_ask_answered(&path, "Cod", 5 * DAY).unwrap());
+        assert!(mark_ask_answered(&path, "Cod", 5 * DAY, 0).unwrap());
         let asks = load_asks(&path);
         assert!(asks.iter().max_by_key(|a| a.ts).unwrap().responded);
         // Gate now reopens (most recent is answered).
-        assert!(gate(&asks, 5 * DAY).should_send());
+        assert!(gate(&asks, 5 * DAY, 0).should_send());
     }
 
     /// THE BUG (KNOWN-GAPS #9, recorded 2026-08-24). A genuine "loved it" about *tonight's*
@@ -1027,7 +1112,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(mark_ask_answered(&path, "Sardines", 11 * DAY).unwrap());
+        assert!(mark_ask_answered(&path, "Sardines", 11 * DAY, 0).unwrap());
 
         let asks = load_asks(&path);
         let stale = asks
@@ -1062,7 +1147,7 @@ mod tests {
 
         // A rating nine days later, for a dish no ask ever carried.
         assert!(
-            !mark_ask_answered(&path, "Roast chicken", 20 * DAY).unwrap(),
+            !mark_ask_answered(&path, "Roast chicken", 20 * DAY, 0).unwrap(),
             "nothing is eligible, so nothing flips"
         );
         assert!(
@@ -1158,17 +1243,17 @@ mod tests {
 
         // well inside the quiet period, and on its last day -> still backed off
         assert!(
-            !gate(&asks, 3 * DAY).should_send(),
+            !gate(&asks, 3 * DAY, 0).should_send(),
             "one day after the second silence, the house stays quiet"
         );
         assert!(
-            !gate(&asks, 2 * DAY + BACKOFF_QUIET_MS - 1).should_send(),
+            !gate(&asks, 2 * DAY + BACKOFF_QUIET_MS - 1, 0).should_send(),
             "the last millisecond of the quiet period is still quiet"
         );
 
         // the clock passes -> the loop resumes with nobody having replied
         assert!(
-            gate(&asks, 2 * DAY + BACKOFF_QUIET_MS).should_send(),
+            gate(&asks, 2 * DAY + BACKOFF_QUIET_MS, 0).should_send(),
             "when the quiet period expires the gate reopens without a reply"
         );
     }
@@ -1202,7 +1287,7 @@ mod tests {
         let asks = load_asks(&path);
         // Rule 1 is checked first and outranks the clock: never two asks in one day.
         assert!(
-            !gate(&asks, 5 * DAY).should_send(),
+            !gate(&asks, 5 * DAY, 0).should_send(),
             "an ask already sent today still suppresses a second one, clock or no clock"
         );
     }
