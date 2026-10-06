@@ -798,6 +798,44 @@ pub fn run_listen(dir: &Path, chat_id: Option<&str>) -> Result<()> {
                         chrono::Utc::now().format("%H:%M:%S"),
                     );
                 }
+
+                // THE DINNER LOOP CLOSES ITSELF (KNOWN-GAPS Finding C, closed
+                // 2026-10-06). A rating-shaped group reply now records without an
+                // operator or the next evening's agent: the same ear-to-ledger
+                // chain `wg feedback record` performs, run by the listener on the
+                // message itself. It sits POST-DEDUPE, so the five-bot fan-out
+                // records exactly once; the same-evening gate inside makes it
+                // precise (a bare 👍 with no open ask is a reaction to something
+                // else, and records nothing); and a decoded reaction carries the
+                // emoji as its body, so it flows here too once the bots are group
+                // admins. `Ok(None)` is the ordinary outcome and stays quiet —
+                // the loop records dinner data, it does not speak.
+                //
+                // Log line: resolved name + dish + verdict only — no message body,
+                // no ids (the feed mirror above carries the redaction discipline).
+                let tz_offset_ms =
+                    i64::from(chrono::Local::now().offset().local_minus_utc()) * 1000;
+                match worksgood::notify::meal_feedback::maybe_record_rating_reply(
+                    &project_root(&workgraph_dir),
+                    &feed_sender,
+                    &msg.body,
+                    casa_feed::now_ms(),
+                    tz_offset_ms,
+                ) {
+                    Ok(Some(rating)) => println!(
+                        "[{}] dinner rating recorded: {} rated \"{}\" {} {}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                        rating.rater,
+                        rating.dish,
+                        rating.verdict.emoji(),
+                        rating.verdict.as_str(),
+                    ),
+                    Ok(None) => {}
+                    Err(e) => eprintln!(
+                        "[{}] dinner rating: a legible reply could not be recorded: {e}",
+                        chrono::Utc::now().format("%H:%M:%S"),
+                    ),
+                }
             }
 
             // Reply target: the chat the message came from (in a group, the

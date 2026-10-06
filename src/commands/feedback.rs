@@ -621,4 +621,88 @@ mod tests {
             "a dry run must never record"
         );
     }
+
+    /// THE LISTENER'S HALF, END TO END FROM THE WIRE (KNOWN-GAPS Finding C, closed
+    /// 2026-10-06). Both ears — a TYPED 👍 and a TAPPED reaction — decode to a body,
+    /// and that body must flow through the same record gate the listener now calls:
+    /// a real ask about this evening, answered by the message itself, no operator.
+    /// The reaction ear only fires live once the family's bots are group
+    /// administrators (Telegram's rule), but the WIRE SHAPE is provable today.
+    #[test]
+    fn both_ears_feed_the_listener_s_record_gate() {
+        let now_ms = Utc::now().timestamp_millis();
+
+        // 1. THE TYPED EAR — the ear the family has TODAY. A real Telegram message
+        //    whose text IS the thumb, decoded by the real decoder, recorded by the
+        //    listener's gate against tonight's open ask. No operator anywhere.
+        let dir_a = scratch_with_plan();
+        let root_a = dir_a.path();
+        let ask_log_a = meal_feedback::ask_log_path_for(root_a);
+        meal_feedback::append_ask(
+            &ask_log_a,
+            &meal_feedback::AskRecord {
+                ts: now_ms - 3_600_000,
+                dish: "Baked salmon".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        let typed = serde_json::json!({
+            "update_id": 910,
+            "message": {
+                "message_id": 77,
+                "from": { "username": "luca" },
+                "chat": { "id": -1001234567890_i64, "type": "supergroup" },
+                "date": 1_752_500_000_i64,
+                "text": "👍"
+            }
+        });
+        let msg = telegram::decode_update(&typed, "telegram:nora")
+            .expect("a typed 👍 must decode — it is the ear the family has TODAY");
+        assert_eq!(msg.body, "👍");
+        let typed_rating =
+            meal_feedback::maybe_record_rating_reply(root_a, "Luca", &msg.body, now_ms, 0)
+                .expect("clean append")
+                .expect("the typed thumb records itself against tonight's open ask");
+        assert_eq!(typed_rating.dish, "Baked salmon");
+        assert!(
+            meal_feedback::load_asks(&ask_log_a).iter().all(|a| a.responded),
+            "the ask the thumb answered is now answered"
+        );
+
+        // 2. THE REACTION EAR — the KNOWN-GAPS #9 wire shape (fires live once the
+        //    family's bots are group administrators). A FRESH scratch and ask, so
+        //    this proves the gate records a tapped thumb on its own merits rather
+        //    than leaning on the first ear's leftovers — and cannot pass on the
+        //    idempotence gate, which would rightly refuse a second answer to the
+        //    same ask.
+        let dir_b = scratch_with_plan();
+        let root_b = dir_b.path();
+        let ask_log_b = meal_feedback::ask_log_path_for(root_b);
+        meal_feedback::append_ask(
+            &ask_log_b,
+            &meal_feedback::AskRecord {
+                ts: now_ms - 3_600_000,
+                dish: "Chickpea curry".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        let react = telegram::decode_update(&reaction_update(555, "👍"), "telegram:nora")
+            .expect("a tapped thumb must decode — the ear for the day the bots are admins");
+        assert_eq!(
+            react.body, "👍",
+            "the emoji IS the body — both ears speak the same body"
+        );
+        let react_rating =
+            meal_feedback::maybe_record_rating_reply(root_b, "Elliot", &react.body, now_ms, 0)
+                .expect("clean append")
+                .expect("the reaction records itself through the identical gate");
+        assert_eq!(react_rating.dish, "Chickpea curry");
+        assert_eq!(react_rating.rater, "Elliot");
+        assert!(
+            meal_feedback::load_asks(&ask_log_b).iter().all(|a| a.responded),
+            "the ask the reaction answered is now answered"
+        );
+    }
 }

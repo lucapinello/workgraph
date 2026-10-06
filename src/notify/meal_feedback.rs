@@ -613,6 +613,74 @@ pub fn mark_ask_answered(
 }
 
 // ---------------------------------------------------------------------------
+// The listener's half of the loop: a rating-shaped reply records ITSELF
+// ---------------------------------------------------------------------------
+//
+// (KNOWN-GAPS Finding C, closed 2026-10-06.) Until now the loop's record step was
+// agent- or operator-mediated: the listener HEARD a typed 👍 perfectly well, but
+// nothing handed it to the recorder, so the loop could not close without a human.
+// This is the same ear-to-ledger chain `wg feedback record` performs, called by the
+// listener on ordinary group traffic.
+
+/// If `body` is a legible rating AND the ledger holds an UNANSWERED ask about this
+/// evening, record it — against THE ASK'S OWN dish — and mark that ask answered.
+/// `Ok(None)` means "nothing to record" and is the ordinary outcome; `Err` means
+/// the append failed and the caller should say so loudly.
+///
+/// STRICTER THAN THE CLI ON PURPOSE. `wg feedback record` records whatever an
+/// operator explicitly hands it; this fires on EVERY group message, so every gate
+/// fails closed:
+///   · no legible sentiment → None — "what time is dinner?" is a question, not a
+///     verdict, and we never invent a rating;
+///   · no ask about this evening → None — a bare 👍 with no open ask is a reaction
+///     to something else in the chat, not dinner data;
+///   · the newest same-evening ask already answered → None. That is the
+///     idempotence the fan-out needs: four of five bot deliveries are dropped
+///     upstream, a listener restart can re-deliver the same update, and none of
+///     those may double-record.
+///
+/// The rating's dish comes from the ASK, not a plan lookup — between ask and answer
+/// the plan may have rolled or been edited, and the answer must name the dish the
+/// family was actually asked about.
+pub fn maybe_record_rating_reply(
+    root: &Path,
+    rater: &str,
+    body: &str,
+    now_ms: i64,
+    tz_offset_ms: i64,
+) -> std::io::Result<Option<MealRating>> {
+    // Gate 1 — legible sentiment, or this is just conversation.
+    let Some((verdict, note)) = parse_rating_reply(body) else {
+        return Ok(None);
+    };
+    let ask_log = ask_log_path_for(root);
+    let asks = load_asks(&ask_log);
+    // Gate 2 — an ask about THIS evening (an empty `want` deliberately asks for
+    // the newest ask in the same-evening window, without pinning a dish).
+    let Some(i) = ask_a_rating_may_answer(&asks, "", now_ms, tz_offset_ms) else {
+        return Ok(None);
+    };
+    // Gate 3 — that ask must still be UNANSWERED (fan-out / re-delivery idempotence).
+    let ask = &asks[i];
+    if ask.responded {
+        return Ok(None);
+    }
+    let rating = MealRating {
+        ts: now_ms,
+        dish: ask.dish.clone(),
+        rater: rater.trim().to_string(),
+        verdict,
+        note,
+    };
+    append_rating(&feedback_path_for(root), &rating)?;
+    // The family engaged — flip this ask to answered so the nag gate knows.
+    // Failing to flip is reported by the `Err` path only for the append above; a
+    // failed flip leaves the ask open, which errs toward asking again — the safe side.
+    let _ = mark_ask_answered(&ask_log, &rating.dish, rating.ts, tz_offset_ms);
+    Ok(Some(rating))
+}
+
+// ---------------------------------------------------------------------------
 // Summarisation: ratings -> memory + plan briefing
 // ---------------------------------------------------------------------------
 
@@ -1290,6 +1358,122 @@ mod tests {
             !gate(&asks, 5 * DAY, 0).should_send(),
             "an ask already sent today still suppresses a second one, clock or no clock"
         );
+    }
+
+    // ---- the listener's half: a rating-shaped reply records ITSELF ----
+    // (KNOWN-GAPS Finding C. The gates must fail closed on ordinary family traffic;
+    // each test below pins one gate.)
+
+    fn scratch_with_open_ask(now_ms: i64) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        append_ask(
+            &ask_log_path_for(&root),
+            &AskRecord {
+                ts: now_ms - 3_600_000, // one hour ago — this same evening
+                dish: "Baked salmon".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn a_rating_reply_records_itself_against_the_asks_own_dish() {
+        let now = 1_800_000_000_000_i64;
+        let (_dir, root) = scratch_with_open_ask(now);
+        let out = maybe_record_rating_reply(&root, "Luca", "👍", now, 0)
+            .expect("a clean append must not error");
+        let rating = out.expect("an open same-evening ask + a legible thumb must record");
+        assert_eq!(rating.dish, "Baked salmon", "the dish comes from the ASK, not a plan lookup");
+        assert_eq!(rating.rater, "Luca");
+        // And the ask flipped — the nag gate must know the family engaged.
+        let asks = load_asks(&ask_log_path_for(&root));
+        assert!(asks.iter().all(|a| a.responded), "the ask must be answered");
+    }
+
+    #[test]
+    fn a_legible_reply_with_no_open_ask_records_nothing() {
+        // A 👍 with no ask about this evening is a reaction to something else in
+        // the chat — recording it would invent dinner data. (Five days old is
+        // outside the same-evening window.)
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let now = 1_800_000_000_000_i64;
+        append_ask(
+            &ask_log_path_for(&root),
+            &AskRecord {
+                ts: now - 5 * 86_400_000,
+                dish: "Ancient stew".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        let out = maybe_record_rating_reply(&root, "Luca", "👍", now, 0)
+            .expect("a clean scan must not error");
+        assert!(out.is_none(), "no open ask about this evening → nothing records");
+        assert!(
+            load_ratings(&feedback_path_for(&root)).is_empty(),
+            "no rating was invented"
+        );
+    }
+
+    #[test]
+    fn an_answered_ask_never_records_twice() {
+        // The five-bot fan-out drops four deliveries upstream, and a listener
+        // restart can re-deliver the same update. A second 👍 for an already-
+        // answered ask must record NOTHING.
+        let now = 1_800_000_000_000_i64;
+        let (_dir, root) = scratch_with_open_ask(now);
+        let first = maybe_record_rating_reply(&root, "Luca", "👍", now, 0)
+            .expect("clean")
+            .expect("first delivery records");
+        let second = maybe_record_rating_reply(&root, "Luca", "👍", now + 1_000, 0)
+            .expect("clean");
+        assert!(second.is_none(), "the re-delivery must not double-record");
+        let ratings = load_ratings(&feedback_path_for(&root));
+        assert_eq!(ratings.len(), 1, "exactly one rating — not two");
+        assert_eq!(ratings[0].dish, first.dish);
+    }
+
+    #[test]
+    fn a_reply_with_no_legible_sentiment_is_not_a_rating() {
+        // "what time is dinner?" carries a question, not a verdict — and we never
+        // invent a rating, even with an ask wide open.
+        let now = 1_800_000_000_000_i64;
+        let (_dir, root) = scratch_with_open_ask(now);
+        let out = maybe_record_rating_reply(&root, "Luca", "what time is dinner?", now, 0)
+            .expect("clean");
+        assert!(out.is_none(), "a question is not a rating");
+        assert!(load_ratings(&feedback_path_for(&root)).is_empty());
+        assert!(
+            !load_asks(&ask_log_path_for(&root)).iter().any(|a| a.responded),
+            "a question must not consume the ask"
+        );
+    }
+
+    #[test]
+    fn a_late_evening_reply_still_answers_tonights_ask() {
+        // The ask went out at 21:00; the family answers at 23:30. Same civil
+        // evening, and the day-straddle window must keep it answerable.
+        let now = 1_800_000_000_000_i64;
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        append_ask(
+            &ask_log_path_for(&root),
+            &AskRecord {
+                ts: now - 2 * 3_600_000, // 19:00 for a 21:00 reply
+                dish: "Chickpea curry".into(),
+                responded: false,
+            },
+        )
+        .unwrap();
+        let out = maybe_record_rating_reply(&root, "Luca", "loved it", now, 0)
+            .expect("clean")
+            .expect("the evening straddle keeps tonight's ask answerable");
+        assert_eq!(out.dish, "Chickpea curry");
+        assert!(load_asks(&ask_log_path_for(&root)).iter().all(|a| a.responded));
     }
 
 }
