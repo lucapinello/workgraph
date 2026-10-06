@@ -2137,7 +2137,10 @@ pub fn schedule_context_line_scoped(
         format!(
             "CALENDAR ({label}) — there is NOTHING on the calendar today. Do NOT invent a \
              meeting, appointment, birthday, or any event, and do NOT say the day is \
-             busy/packed/back-to-back. If asked, say the calendar is clear.\n"
+             busy/packed/back-to-back. If asked about TODAY, say today is clear. This line \
+             tells you NOTHING about any other day: if asked about tomorrow, or any other date, \
+             say you would need to take a proper look — never call another day clear, empty or \
+             free.\n"
         )
     } else if titles.is_empty() {
         // The plan carries no rows for today AND this house syncs an external calendar whose
@@ -2390,7 +2393,10 @@ pub fn schedule_context_line_with_calendar(
             "CALENDAR ({label}) — there is NOTHING on the calendar today, and this includes \
              the household's linked calendar, which IS visible to you here. Do NOT invent a \
              meeting, appointment, birthday, or any event, and do NOT say the day is \
-             busy/packed/back-to-back. If asked, say the calendar is clear.\n"
+             busy/packed/back-to-back. If asked about TODAY, say today is clear. This line \
+             tells you NOTHING about any other day: if asked about tomorrow, or any other date, \
+             say you would need to take a proper look — never call another day clear, empty or \
+             free.\n"
         )
     } else {
         format!(
@@ -4935,6 +4941,40 @@ mod tests {
     /// /calendar.json and the Week view, never a PlanDoc. This is the same class of bug the
     /// gateway fixed on 2026-07-20 (task safety-critical-fast), whose recorded principle is that
     /// an empty result from a non-authoritative source must HEDGE, never say "you are free".
+    /// THE SECOND OCCURRENCE (live, 2026-10-05 22:09). Luca asked "Plan for tomorrow." and Otto
+    /// answered "Tomorrow's all set — ... Calendar's clear otherwise." Tomorrow held jury service
+    /// 7-7, a 1:40 early school release, a 5pm pickup and soccer at 6:30, all of them in the
+    /// household's own synced calendar.
+    ///
+    /// Nothing hallucinated. `calendar_snapshot_view` is scoped to TODAY-and-not-yet-passed, so
+    /// at 22:09 it was legitimately empty — and the line then said, unconditionally, "If asked,
+    /// say the calendar is clear". The model was INSTRUCTED to say it. The premise named today;
+    /// the directive did not, and a question about another day collected the directive.
+    ///
+    /// The 2026-08-18 fix above guards the STALENESS axis (an empty answer from a source that
+    /// stopped reporting). This guards the DAY axis, which sat in its blind spot.
+    #[test]
+    fn a_clear_today_never_licenses_a_claim_about_another_day() {
+        let now = at(2026, 7, 14, 22, 9); // late evening: today's timed events have all passed
+        for line in [
+            schedule_context_line_scoped(None, now, false),
+            schedule_context_line_with_calendar(None, now, &[]),
+        ] {
+            assert!(
+                line.contains("say today is clear"),
+                "today's own emptiness must still be sayable: {line}"
+            );
+            assert!(
+                line.contains("tomorrow"),
+                "the line must name the other-day case explicitly: {line}"
+            );
+            assert!(
+                line.contains("never call another day clear"),
+                "the model is still licensed to call another day clear: {line}"
+            );
+        }
+    }
+
     #[test]
     fn an_external_feed_forbids_claiming_the_day_is_clear() {
         let now = at(2026, 7, 14, 15, 0);
@@ -4945,12 +4985,12 @@ mod tests {
             authoritative.contains("NOTHING on the calendar"),
             "without a feed the strict truth line must stay: {authoritative}"
         );
-        assert!(authoritative.contains("say the calendar is clear"));
+        assert!(authoritative.contains("say today is clear"));
 
         // A feed exists and the plan is empty: we cannot see the family's day.
         let hedged = schedule_context_line_scoped(None, now, true);
         assert!(
-            !hedged.contains("say the calendar is clear"),
+            !hedged.contains("say today is clear"),
             "the model was still licensed to claim a clear day: {hedged}"
         );
         assert!(
