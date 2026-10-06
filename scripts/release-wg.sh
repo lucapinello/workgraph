@@ -144,15 +144,23 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WG_SOURCE_DIR/Cargo.toml" | hea
 # Soft branch check: warn (don't force-switch — the fork checkout is shared) if the
 # source isn't on the fork branch we advertise as the release source.
 CUR_BRANCH="$(git -C "$WG_SOURCE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-# HARD FAIL, not a warning. This was a `warn` until 2026-10-05, and a warning is invisible in a
-# long build log: the check existed and the release still shipped off the wrong branch twice.
-# `WG_ALLOW_OFF_BRANCH=1` is the deliberate escape (a test build, a hotfix branch) — it has to be
-# typed, which is the whole point.
+# HARD FAIL ON PUBLISH, warn on a dry run. This was a bare `warn` until 2026-10-05, and a warning
+# is invisible in a long build log: the check existed and the release still shipped off the wrong
+# branch twice. But the harm it prevents is PUBLISHING a wrong-branch artifact — packaging one
+# locally hurts nobody, and the hermetic `prebuilt_wg_install` smoke scenario deliberately
+# packages from a SYNTHETIC minimal checkout that is not a git repo at all (branch resolves to
+# '?'), which a blanket die broke on 2026-10-06. Gating on PUBLISH keeps the strictness exactly
+# where the damage is and stops punishing a dry run.
+#
+# `WG_ALLOW_OFF_BRANCH=1` remains the deliberate escape for a publish (a hotfix branch) — it has
+# to be typed, which is the whole point.
 if [ "$CUR_BRANCH" != "$WG_FORK_BRANCH" ]; then
-  if [ "${WG_ALLOW_OFF_BRANCH:-0}" = "1" ]; then
-    warn "source is on '$CUR_BRANCH', not '$WG_FORK_BRANCH' — continuing because WG_ALLOW_OFF_BRANCH=1"
+  if [ "$PUBLISH" -ne 1 ]; then
+    warn "source is on '$CUR_BRANCH', not '$WG_FORK_BRANCH' — packaging anyway (dry run publishes nothing)"
+  elif [ "${WG_ALLOW_OFF_BRANCH:-0}" = "1" ]; then
+    warn "source is on '$CUR_BRANCH', not '$WG_FORK_BRANCH' — PUBLISHING anyway because WG_ALLOW_OFF_BRANCH=1"
   else
-    die "source is on '$CUR_BRANCH', not '$WG_FORK_BRANCH' — checkout the fork branch for the canonical artifact (or set WG_ALLOW_OFF_BRANCH=1 to build anyway)"
+    die "refusing to PUBLISH from '$CUR_BRANCH', not '$WG_FORK_BRANCH' — checkout the fork branch for the canonical artifact (or set WG_ALLOW_OFF_BRANCH=1 to publish anyway)"
   fi
 fi
 
