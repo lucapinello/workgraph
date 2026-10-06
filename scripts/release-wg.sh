@@ -144,7 +144,17 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$WG_SOURCE_DIR/Cargo.toml" | hea
 # Soft branch check: warn (don't force-switch — the fork checkout is shared) if the
 # source isn't on the fork branch we advertise as the release source.
 CUR_BRANCH="$(git -C "$WG_SOURCE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-[ "$CUR_BRANCH" = "$WG_FORK_BRANCH" ] || warn "source is on '$CUR_BRANCH', not '$WG_FORK_BRANCH' — checkout the fork branch for the canonical artifact"
+# HARD FAIL, not a warning. This was a `warn` until 2026-10-05, and a warning is invisible in a
+# long build log: the check existed and the release still shipped off the wrong branch twice.
+# `WG_ALLOW_OFF_BRANCH=1` is the deliberate escape (a test build, a hotfix branch) — it has to be
+# typed, which is the whole point.
+if [ "$CUR_BRANCH" != "$WG_FORK_BRANCH" ]; then
+  if [ "${WG_ALLOW_OFF_BRANCH:-0}" = "1" ]; then
+    warn "source is on '$CUR_BRANCH', not '$WG_FORK_BRANCH' — continuing because WG_ALLOW_OFF_BRANCH=1"
+  else
+    die "source is on '$CUR_BRANCH', not '$WG_FORK_BRANCH' — checkout the fork branch for the canonical artifact (or set WG_ALLOW_OFF_BRANCH=1 to build anyway)"
+  fi
+fi
 
 # ── resolve a wg binary for ONE target ───────────────────────────────────────
 # Prints the binary path on stdout and returns 0; returns non-zero (with a reason
@@ -238,6 +248,18 @@ EOF
   printf '%s  %s\n' "$digest" "$archive_name" >> "$OUT_DIR/SHA256SUMS.tmp"
   sort -k2 "$OUT_DIR/SHA256SUMS.tmp" > "$OUT_DIR/SHA256SUMS"; rm -f "$OUT_DIR/SHA256SUMS.tmp"
 
+  # RELEASE-INFO: which COMMIT this target was built from. Without it a published release is
+  # unfalsifiable — nothing records its provenance, so "is the release current?" cannot be asked
+  # at all, and staleness is only ever found by someone probing a binary for a literal by hand
+  # (which is how the 2026-10-05 `--send` miss was caught). Merged per target exactly like
+  # SHA256SUMS above, because macOS publishes locally and Linux publishes from CI: the two halves
+  # can be built from DIFFERENT commits, and one line per target is what makes that visible.
+  local src_commit; src_commit="$(git -C "$WG_SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  touch "$OUT_DIR/RELEASE-INFO"
+  grep -v "^$target " "$OUT_DIR/RELEASE-INFO" > "$OUT_DIR/RELEASE-INFO.tmp" 2>/dev/null || true
+  printf '%s %s %s %s\n' "$target" "$src_commit" "$CUR_BRANCH" "$VERSION" >> "$OUT_DIR/RELEASE-INFO.tmp"
+  sort -k1 "$OUT_DIR/RELEASE-INFO.tmp" > "$OUT_DIR/RELEASE-INFO"; rm -f "$OUT_DIR/RELEASE-INFO.tmp"
+
   # Self-verify — a release that can't verify itself is worthless.
   ( cd "$OUT_DIR" && ( command -v sha256sum >/dev/null 2>&1 && sha256sum -c "$archive_name.sha256" \
       || shasum -a 256 -c "$archive_name.sha256" ) >/dev/null ) \
@@ -288,7 +310,7 @@ Verify by hand:
 shasum -a 256 -c SHA256SUMS
 \`\`\`"
 
-ASSETS=("${PRODUCED_ASSETS[@]}" "$OUT_DIR/SHA256SUMS")
+ASSETS=("${PRODUCED_ASSETS[@]}" "$OUT_DIR/SHA256SUMS" "$OUT_DIR/RELEASE-INFO")
 if gh release view "$WG_RELEASE_TAG" --repo "$WG_RELEASE_REPO" >/dev/null 2>&1; then
   gh release upload "$WG_RELEASE_TAG" "${ASSETS[@]}" --repo "$WG_RELEASE_REPO" --clobber \
     || die "gh release upload failed"
