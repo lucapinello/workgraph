@@ -2244,6 +2244,21 @@ pub enum CalendarView {
 /// freshness at all — with no external feed the family's own entries ARE the whole calendar,
 /// and they are complete the moment they are written.
 pub fn calendar_snapshot_view(root: &Path, now: NaiveDateTime) -> CalendarView {
+    calendar_view_for(root, now, now.date())
+}
+
+/// The same snapshot, read for ANY `day` rather than only `now`'s.
+///
+/// WHY THIS EXISTS. `calendar_snapshot_view` could only ever answer about today, and the line
+/// built from it ended "say the calendar is clear" — so a question about TOMORROW collected an
+/// answer computed for today. On 2026-10-05 at 22:09, when every one of today's timed events had
+/// passed and the view was legitimately empty, the family was told tomorrow was clear while it
+/// held jury service, an early school release, a pickup and soccer.
+///
+/// The "already passed" filter applies ONLY to today: on any other day nothing has passed yet,
+/// and dropping a 9am event because it is now 10pm the night before is the same class of silent
+/// wrongness this function exists to end.
+pub fn calendar_view_for(root: &Path, now: NaiveDateTime, day: chrono::NaiveDate) -> CalendarView {
     let path = root
         .join(".casa")
         .join("calendar")
@@ -2283,7 +2298,7 @@ pub fn calendar_snapshot_view(root: &Path, now: NaiveDateTime) -> CalendarView {
             age.abs() <= CALENDAR_SNAPSHOT_MAX_AGE_SECS
         });
     }
-    let today = now.date();
+    let today = day;
     let mut titles = Vec::new();
     for e in json
         .get("events")
@@ -2310,7 +2325,7 @@ pub fn calendar_snapshot_view(root: &Path, now: NaiveDateTime) -> CalendarView {
         // An all-day entry has no clock to have passed; a timed one that is over is not
         // "what's on today" any more, matching how the plan's own rows are filtered.
         let all_day = e.get("allDay").and_then(|v| v.as_bool()).unwrap_or(false);
-        if !all_day && local < now {
+        if !all_day && day == now.date() && local < now {
             continue;
         }
         let title = e
@@ -2343,6 +2358,47 @@ pub fn calendar_snapshot_view(root: &Path, now: NaiveDateTime) -> CalendarView {
 /// dropped, because there is no longer anything this process cannot see. When it is missing or
 /// stale the hedge stands, which is the same honest answer as before.
 pub fn fetch_schedule_context_line(root: &Path, now: NaiveDateTime) -> String {
+    let today_line = fetch_schedule_context_line_today(root, now);
+    format!("{today_line}{}", tomorrow_calendar_line(root, now))
+}
+
+/// What the house knows about TOMORROW's calendar, as its own line.
+///
+/// The week context has carried today AND tomorrow markers for a long time; the calendar context
+/// carried today only. That asymmetry is why one reply could name tomorrow's dinner correctly and
+/// call tomorrow's calendar clear in the same breath (2026-10-05) — the model had one and not the
+/// other. Scoping the directive stopped the false claim; this is what lets the house actually
+/// answer, which is what the family asked for.
+///
+/// Silence when the snapshot is unreadable or the feed is unconfirmed: an empty answer from a
+/// source that has stopped reporting is not evidence, and saying nothing leaves the scoped "I
+/// would need to take a proper look" line standing, which is the honest one.
+fn tomorrow_calendar_line(root: &Path, now: NaiveDateTime) -> String {
+    let Some(tomorrow) = now.date().succ_opt() else {
+        return String::new();
+    };
+    let label = format!(
+        "tomorrow, {} {}",
+        family_plan::long_weekday(tomorrow),
+        tomorrow.format("%b %-d")
+    );
+    match calendar_view_for(root, now, tomorrow) {
+        CalendarView::Visible { titles, .. } if !titles.is_empty() => format!(
+            "CALENDAR ({label}) — the real events tomorrow are: {}. This list includes the \
+             household's linked calendar, so it is COMPLETE for that day: mention ONLY these and \
+             do NOT invent any other.\n",
+            titles.join("; ")
+        ),
+        CalendarView::Visible { confirmed: true, .. } => format!(
+            "CALENDAR ({label}) — there is NOTHING on the calendar tomorrow, and this includes \
+             the household's linked calendar. If asked about tomorrow you may say it is clear, \
+             and must not invent an event.\n"
+        ),
+        _ => String::new(),
+    }
+}
+
+fn fetch_schedule_context_line_today(root: &Path, now: NaiveDateTime) -> String {
     let plans = family_plan::load_plans(root);
     let doc = family_plan::current_plan(&plans, now.date());
     match calendar_snapshot_view(root, now) {
@@ -4973,6 +5029,72 @@ mod tests {
                 "the model is still licensed to call another day clear: {line}"
             );
         }
+    }
+
+    /// THE OTHER HALF OF THE 2026-10-05 MISS. Scoping the directive stopped the house calling
+    /// tomorrow clear; it still could not SAY what was on it, because the calendar context
+    /// carried today only while the week context had carried today AND tomorrow for months. The
+    /// family asked "Plan for tomorrow." — naming the day is the answer they wanted.
+    #[test]
+    fn the_context_names_tomorrows_real_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let cal = dir.path().join(".casa").join("calendar");
+        std::fs::create_dir_all(&cal).unwrap();
+        std::fs::write(
+            dir.path().join(".casa").join("calendar.toml"),
+            "[calendar]\nics_url = \"https://example.invalid/private-feed.ics\"\n",
+        )
+        .unwrap();
+        // Late evening, exactly as on the night this was found: today's timed events have passed.
+        let now = at(2026, 7, 14, 22, 9);
+        let abs = |t: NaiveDateTime| {
+            Local
+                .from_local_datetime(&t)
+                .single()
+                .expect("unambiguous local instant")
+                .to_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let fresh = Local
+            .from_local_datetime(&now)
+            .earliest()
+            .unwrap()
+            .timestamp_millis();
+        let today_done = abs(at(2026, 7, 14, 17, 0)); // already passed
+        let tomorrow_pickup = abs(at(2026, 7, 15, 17, 0));
+        std::fs::write(
+            cal.join("synced-events.json"),
+            format!(
+                r#"{{"version":1,"feed":"configured","fetchedAt":{fresh},"events":[
+                   {{"title":"Old thing","start":"{today_done}","allDay":false,"source":"google"}},
+                   {{"title":"Jury service","start":"{tomorrow_pickup}","allDay":true,"source":"google"}},
+                   {{"title":"Pick up Elliot","start":"{tomorrow_pickup}","allDay":false,"source":"google"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let line = fetch_schedule_context_line(dir.path(), now);
+        assert!(line.contains("Jury service"), "tomorrow's events are not named: {line}");
+        assert!(line.contains("Pick up Elliot"), "tomorrow's events are not named: {line}");
+        // And the day is never described as clear while those sit on it.
+        assert!(
+            !line.contains("NOTHING on the calendar tomorrow"),
+            "a day holding two events was reported as empty: {line}"
+        );
+        // Today's passed event is still not resurrected — the today filter is unchanged.
+        assert!(!line.contains("Old thing"), "a finished event came back: {line}");
+
+        // CONTROL: an empty tomorrow, from a confirmed feed, may be called clear.
+        std::fs::write(
+            cal.join("synced-events.json"),
+            format!(r#"{{"version":1,"feed":"configured","fetchedAt":{fresh},"events":[]}}"#),
+        )
+        .unwrap();
+        assert!(
+            fetch_schedule_context_line(dir.path(), now)
+                .contains("NOTHING on the calendar tomorrow"),
+            "a genuinely empty tomorrow should be sayable"
+        );
     }
 
     #[test]
