@@ -73,17 +73,22 @@ pub fn run_ask(
         dry_run,
         json,
         send,
-        &deliver_via_telegram,
+        &|line: &str| deliver_via_telegram(workgraph_dir, line),
     )
 }
 
-/// The real delivery: hand the family-voice line to the configured Telegram bot,
-/// reusing `wg telegram send`'s resolution — same default bot, same chat, same
-/// identity rules — so the ask can never diverge from how a hand-sent message
-/// travels. `run_send` prints its own "Message sent to chat …" line, which is
-/// deliberately kept: an operator running this by hand sees delivery happen.
-fn deliver_via_telegram(line: &str) -> Result<()> {
-    crate::commands::telegram::run_send(None, line, false, None)
+/// The real delivery: hand the family-voice line to the configured Telegram bot
+/// through `send_family_line`, which uses the SAME resolution `wg telegram send`
+/// does — same default bot, same chat, same identity rules — and additionally
+/// leaves the trace every other outbound family reply leaves: the conversation-pane
+/// row and its receipt.
+///
+/// It used to call `run_send` directly, which is bare transport. That is why the
+/// 2026-10-07 ask was delivered with no pane row and no durable evidence of
+/// delivery (audit finding R2). The "Message sent to chat …" line is still printed:
+/// an operator running this by hand sees delivery happen.
+fn deliver_via_telegram(workgraph_dir: &Path, line: &str) -> Result<()> {
+    crate::commands::telegram::send_family_line(workgraph_dir, line)
 }
 
 fn run_ask_with(
@@ -594,6 +599,40 @@ mod tests {
             1,
             "the ask is still recorded, as before"
         );
+    }
+
+    /// THE ASK MUST SURVIVE ITS OWN DELIVERY GATE, BYTE FOR BYTE.
+    ///
+    /// `send_family_line` wraps the send with `GuardPolicy::Enforce`, which applies
+    /// `enforce_family_voice`. That gate exists to strip jargon and off-roster names from
+    /// family-visible copy — but it is a REWRITER, and the one line the whole dinner loop
+    /// depends on now passes through it. A silent rewrite here would change what the family
+    /// is asked without changing anything that is tested.
+    ///
+    /// (This also records a correction: the worry was that `Enforce` might let the
+    /// anti-fabrication CLAIM policy refuse the ask, the way it produced a false refusal on a
+    /// grounded time in flow 42. It cannot — `Enforce` is the family-voice gate, a different
+    /// mechanism. The real risk is this one: quiet copy-editing.)
+    #[test]
+    fn the_composed_ask_survives_the_family_voice_gate_untouched() {
+        use worksgood::notify::grounding::{enforce_family_voice, FamilyVoiceRoster};
+        let roster = FamilyVoiceRoster::from_names(
+            ["Nora", "Bruno", "Coach Mira", "Otto"],
+            ["Household Member"],
+        );
+        for dish in [
+            "Garlicky white beans on toast with chilli and lemon",
+            "Cod baked from frozen in tomato, olives and capers, with rice",
+            "Sicilian sardines",
+            "",
+        ] {
+            let ask = meal_feedback::compose_ask(dish);
+            assert_eq!(
+                enforce_family_voice(&ask, &roster),
+                ask,
+                "the family-voice gate rewrote the dinner ask for dish {dish:?}"
+            );
+        }
     }
 
     #[test]

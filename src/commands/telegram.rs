@@ -2454,6 +2454,79 @@ fn classify_inbound_message(
 /// digest). When set, the message is bound to that persona's bot and a
 /// misconfigured persona is a hard error — see [`resolve_send_bot`]. When
 /// `None`, the plain default-bot resolution applies.
+/// Deliver ONE family-facing line and leave the durable trace every other outbound
+/// family reply leaves — the conversation-pane row and its receipt.
+///
+/// WHY THIS EXISTS (audit finding R2). `run_send` below is bare transport: it posts and
+/// prints "Message sent to chat …" and writes NOTHING. `wg feedback ask --send` rode it, so
+/// the nightly dinner ask left three traces that it was composed and recorded and zero that
+/// it was DELIVERED — the pane could not show the house's own ask, and "it was delivered" was
+/// unfalsifiable from the system's own records. Measured live on 2026-10-07: the ask went out
+/// at 00:50Z and `.casa/group-feed.jsonl` had no row for it at all.
+///
+/// It does NOT hand-roll the feed write. `deliver_lifecycle_fire` is the house's existing
+/// engine-originated family-facing outbound, and it wraps its sink in `FamilyReplyDelivery`
+/// so the mirror and the receipt happen inside the ONE path that already proves them
+/// (`ScopedFamilyReplySink::send_phase` → `mirror` → `append_entry_proving` +
+/// `write_engine_receipt`). Copying that transaction here would have been a second
+/// implementation of the one invariant this house most needs to keep.
+///
+/// `GuardPolicy::Enforce` matches lifecycle. It applies `enforce_family_voice` — the
+/// jargon/roster gate — NOT the claim policy, so it cannot refuse a grounded statement the
+/// way the composer guard can; the test below pins that the composed ask survives it
+/// byte-identical.
+///
+/// With no causal turn (a cron ask has no inbound message) the row mirrors UNPROVEN: the pane
+/// gets the ask, and the receipt arrives whenever a turn exists. That is the same honest
+/// degradation the lifecycle path takes, and it still closes R2's actual gap.
+pub(crate) fn send_family_line(workgraph_dir: &Path, message: &str) -> Result<()> {
+    use crate::casa::reply_delivery::FamilyReplyDelivery;
+    use worksgood::notify::telegram_conversation::BotReplySink;
+
+    let config = load_telegram_config()?;
+    let (bot_id, _bot, effective_chat_id) = resolve_send_bot(&config, None, None)?;
+    let delivery = FamilyReplyDelivery::load(workgraph_dir, &config);
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    rt.block_on(async {
+        send_family_line_with(
+            &delivery,
+            BotReplySink::new(config.clone()),
+            &bot_id,
+            &effective_chat_id,
+            message,
+        )
+        .await?;
+        println!("Message sent to chat {}", effective_chat_id);
+        Ok(())
+    })
+}
+
+/// The testable core of [`send_family_line`]: everything except resolving the live config.
+///
+/// Split out so a test can drive the REAL wrapper with a recording sink and a temp root and
+/// assert the pane row actually lands — the half that had no coverage, and the reason the
+/// 2026-10-07 ask could be "delivered" with nothing to show for it.
+pub(crate) async fn send_family_line_with<S>(
+    delivery: &crate::casa::reply_delivery::FamilyReplyDelivery,
+    inner: S,
+    bot_id: &str,
+    chat_id: &str,
+    message: &str,
+) -> Result<()>
+where
+    S: worksgood::notify::telegram_conversation::ReplySink,
+{
+    use crate::casa::reply_delivery::{GuardPolicy, ReplyScope};
+    use worksgood::notify::telegram_conversation::ReplySink as _;
+
+    let sink = delivery.wrap(inner, ReplyScope::Group, GuardPolicy::Enforce);
+    sink.send(bot_id, chat_id, message)
+        .await
+        .context("Failed to send message")?;
+    Ok(())
+}
+
 pub fn run_send(
     chat_id: Option<&str>,
     message: &str,
@@ -9672,6 +9745,53 @@ domains = ["coordination"]
     }
 
     #[test]
+    /// THE DINNER ASK LEAVES A TRACE — the half that had none (audit finding R2).
+    ///
+    /// Live on 2026-10-07 the ask was delivered at 00:50Z and `.casa/group-feed.jsonl` had no
+    /// row for it: three traces said it was composed and recorded, zero said it was DELIVERED,
+    /// so the pane could not show the house's own ask and the claim was unfalsifiable from the
+    /// system's own records. `run_send` was bare transport.
+    ///
+    /// This drives the REAL wrapper the ask now goes through, with a recording sink and a temp
+    /// root, and asserts both halves: exactly one send, and exactly one `agent` pane row
+    /// carrying the ask's own words.
+    #[test]
+    fn the_dinner_ask_lands_in_the_pane_and_telegram_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = casa_feed::feed_path_for(dir.path());
+        let delivery = opaque_delivery(&feed);
+        let sink = RecordingSink::default();
+        let ask = worksgood::notify::meal_feedback::compose_ask("Garlicky white beans on toast");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(send_family_line_with(
+            &delivery,
+            crate::casa::reply_delivery::BorrowedReplySink(&sink),
+            "otto",
+            "-100777",
+            &ask,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            sink.sends.lock().unwrap().len(),
+            1,
+            "exactly one telegram send"
+        );
+        let lines = feed_lines(&feed);
+        assert_eq!(
+            lines.len(),
+            1,
+            "the ask must leave exactly one pane row, got {lines:?}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(v["kind"], "agent", "{v}");
+        assert!(
+            v["text"].as_str().unwrap().contains("white beans"),
+            "the pane row carries the ask's own words: {v}"
+        );
+    }
+
     fn lifecycle_group_report_back_lands_in_feed_and_telegram_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let feed = casa_feed::feed_path_for(dir.path());
