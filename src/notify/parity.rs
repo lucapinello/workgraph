@@ -481,7 +481,7 @@ fn preference_match(norm: &str) -> Option<String> {
 /// Lowercase, fold the unicode right-single-quote to ASCII `'`, and collapse
 /// runs of whitespace to single spaces so phrase matching is stable across the
 /// apostrophes and line breaks a composed reply may carry.
-fn normalize(s: &str) -> String {
+pub(crate) fn normalize(s: &str) -> String {
     let lowered = s.to_lowercase().replace('\u{2019}', "'");
     lowered.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -490,7 +490,7 @@ fn normalize(s: &str) -> String {
 /// "address" or "adds". Boundaries are any non-ASCII-alphanumeric byte (spaces,
 /// punctuation, emoji, string ends), so multi-word phrases like "set up" work
 /// too. `haystack` is expected already-[`normalize`]d.
-fn contains_phrase(haystack: &str, phrase: &str) -> bool {
+pub(crate) fn contains_phrase(haystack: &str, phrase: &str) -> bool {
     if phrase.is_empty() {
         return false;
     }

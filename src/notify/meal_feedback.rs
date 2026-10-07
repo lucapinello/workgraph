@@ -275,10 +275,40 @@ pub fn parse_rating_reply(text: &str) -> Option<(Verdict, String)> {
         "banned",
     ];
 
-    let word_hit = |set: &[&str]| set.iter().any(|w| lower.contains(w));
+    // WORD BOUNDARIES, NOT BARE SUBSTRINGS (2026-10-07). This was
+    // `set.iter().any(|w| lower.contains(w))`, and the first fully unattended capture of the
+    // record half recorded a FALSE rating from it: the family asked "How to cook it?" and the
+    // meh list's "ok" matched inside "c-ok" — `verdict:"meh"` written to the family's durable
+    // memory, the ask flipped answered, no operator involved. Same trap family: "laundry day"
+    // and "badminton" both record a DISLIKE, which is the verdict that retires a dish.
+    //
+    // Reuses `parity::contains_phrase` rather than a second matcher: it already handles the
+    // multi-word entries these lists carry ("not bad", "so so", "love it"), and the repo has
+    // paid for one vocabulary-matching bug already (the shopping "can" misroute).
+    let hay = crate::notify::parity::normalize(raw);
+    let word_hit = |set: &[&str]| {
+        set.iter()
+            .any(|w| crate::notify::parity::contains_phrase(&hay, w))
+    };
+
+    // A LONGER PHRASE CONSUMES THE SHORTER ONE IT CONTAINS. Boundaries alone do not save
+    // "not bad at all": "not bad" (meh) and "bad" (disliked) BOTH match at proper boundaries,
+    // and the precedence below resolves disliked first — so a compliment is recorded as a
+    // dislike. Blanking the matched meh phrases before the disliked sweep is what makes
+    // "not bad at all" meh while leaving "not bad, but the fish was bad" disliked, because
+    // only the overlapping occurrence is consumed.
+    let mut masked = hay.clone();
+    for w in meh_words.iter() {
+        if crate::notify::parity::contains_phrase(&masked, w) {
+            masked = masked.replace(w, &" ".repeat(w.len()));
+        }
+    }
+    let disliked_hit = disliked_words
+        .iter()
+        .any(|w| crate::notify::parity::contains_phrase(&masked, w));
 
     let loved = has_love || word_hit(&loved_words);
-    let disliked = has_down || has_yuck || word_hit(&disliked_words);
+    let disliked = has_down || has_yuck || disliked_hit;
     let liked = has_up || word_hit(&liked_words);
     let meh = word_hit(&meh_words);
 
@@ -942,6 +972,72 @@ mod tests {
     }
 
     #[test]
+    /// THE PARSER MUST NOT FIND A VERDICT INSIDE AN ORDINARY WORD.
+    ///
+    /// Measured live 2026-10-07, the first fully unattended capture of the record half: the
+    /// family asked "How to cook it?" and the house wrote `verdict:"meh"` into its durable
+    /// memory and flipped the ask answered — because the meh list's "ok" is a substring of
+    /// "c-ok". No operator was involved; every designed stage fired correctly around a parser
+    /// that read a question as a rating.
+    ///
+    /// The dislike cases are the dangerous half: a disliked verdict is the one that retires a
+    /// dish, so "laundry day" and "badminton" could have removed food the family likes.
+    #[test]
+    fn an_ordinary_word_is_not_a_verdict() {
+        for innocent in [
+            "How to cook it?",   // "ok" ⊂ cook — the live false capture
+            "a cookbook",
+            "laundry day",       // "dry" ⊂ laundry
+            "badminton",         // "bad" ⊂ badminton
+            "can you book a table?",
+        ] {
+            assert_eq!(
+                parse_rating_reply(innocent).map(|(v, _)| v),
+                None,
+                "{innocent:?} was read as a verdict"
+            );
+        }
+    }
+
+    /// A LONGER PHRASE CONSUMES THE SHORTER ONE IT CONTAINS — and only that occurrence.
+    ///
+    /// Word boundaries alone do not save this: in "not bad at all" BOTH "not bad" (meh) and
+    /// "bad" (disliked) match at proper boundaries, and precedence resolves disliked first, so
+    /// a compliment records as a dislike. The second case is the control that keeps the fix
+    /// surgical: a genuine "bad" elsewhere in the same sentence must still register.
+    #[test]
+    fn a_compliment_containing_a_dislike_word_is_not_a_dislike() {
+        assert_eq!(
+            parse_rating_reply("not bad at all").map(|(v, _)| v),
+            Some(Verdict::Meh),
+            "a compliment was recorded as a dislike"
+        );
+        assert_eq!(
+            parse_rating_reply("not bad, but the fish was bad").map(|(v, _)| v),
+            Some(Verdict::Disliked),
+            "masking the overlap swallowed a genuine dislike"
+        );
+    }
+
+    /// The vocabulary still WORKS — the boundary fix must not make the parser deaf.
+    #[test]
+    fn the_real_vocabulary_still_registers() {
+        for (reply, want) in [
+            ("ok", Verdict::Meh),
+            ("okay", Verdict::Meh),
+            ("it was fine", Verdict::Meh),
+            ("loved it", Verdict::Loved),
+            ("that was bad", Verdict::Disliked),
+            ("\u{1F44D}", Verdict::Liked),
+        ] {
+            assert_eq!(
+                parse_rating_reply(reply).map(|(v, _)| v),
+                Some(want),
+                "{reply:?} stopped registering"
+            );
+        }
+    }
+
     fn feedback_routing_mixed_signal_is_meh_with_note() {
         // Loves one part, hates another -> neutral, but the note carries nuance.
         let (v, note) = parse_rating_reply("loved the sauce but hated the beets").unwrap();
