@@ -262,10 +262,19 @@ impl RouterConfig {
 
 /// Talks to one model endpoint. `None` from every method means "no answer" — never a guess.
 
-/// The System One backend caps `instructions` at **2000 characters** — measured by bisection: 2000
-/// accepted, 2001 rejected, a hard cut. It is characters, not words and not tokens, and `state` is
-/// not capped (8000 accepted). Over-length is answered with the same opaque 400 an empty body gets,
-/// which any `?` in the caller turns into a silent abstention.
+/// The System One backend caps `instructions` at **2000** — measured by bisection: 2000 accepted,
+/// 2001 rejected, a hard cut. `state` is not capped (8000 accepted). Over-length is answered with
+/// the same opaque 400 an empty body gets, which any `?` in the caller turns into a silent
+/// abstention.
+///
+/// **The cap is enforced in BYTES, deliberately, and the unit is not as settled as it looks.** The
+/// bisection that produced 2000 was necessarily run with ASCII, where bytes and characters are the
+/// same number, so it cannot distinguish them — the earlier note here asserting "characters, not
+/// words and not tokens" was reading more into the measurement than it could carry. Bytes are the
+/// conservative choice under either reading: if the backend counts characters, a byte cap merely
+/// under-fills the budget for non-ASCII text, whereas if it counts bytes, a character cap
+/// overflows into exactly the opaque 400 this cap exists to avoid. Under-filling costs a few
+/// characters of policy; overflowing costs the model's whole opinion, silently.
 ///
 /// That is not a hypothetical: it is precisely how this route first measured as 33/40 dropped — the
 /// ladder's own number — with the model never heard from. So the cap is enforced HERE, in the open,
@@ -276,13 +285,26 @@ fn fit_remote_instructions(text: &str) -> String {
     if text.len() <= REMOTE_INSTRUCTION_CAP {
         return text.to_string();
     }
-    let cut = text[..REMOTE_INSTRUCTION_CAP]
+    // `text[..REMOTE_INSTRUCTION_CAP]` is a BYTE index, and a byte index at the cap need not fall
+    // on a character boundary — when it does not, slicing PANICS instead of truncating. That is
+    // not academic: POLICY_LUNAROUTE already carries em-dashes (3 bytes each) and sits ~200 bytes
+    // under the cap, so the content class that triggers it is live and only the length is missing.
+    // Walk back to the largest boundary at or below the cap first.
+    let mut cap_byte = REMOTE_INSTRUCTION_CAP;
+    while cap_byte > 0 && !text.is_char_boundary(cap_byte) {
+        cap_byte -= 1;
+    }
+    let head = &text[..cap_byte];
+    // `rfind` returns the byte offset of a match, which is itself a character boundary; the
+    // fallback is one by construction. So both slices below are safe for any input.
+    let cut = head
         .rfind('\n')
-        .or_else(|| text[..REMOTE_INSTRUCTION_CAP].rfind(' '))
-        .unwrap_or(REMOTE_INSTRUCTION_CAP);
+        .or_else(|| head.rfind(' '))
+        .unwrap_or(cap_byte);
     eprintln!(
-        "router: instructions are {} chars, over the remote {} cap — truncated at {} (the policy needs compressing)",
+        "router: instructions are {} bytes ({} chars), over the remote {}-byte cap — truncated at {} (the policy needs compressing)",
         text.len(),
+        text.chars().count(),
         REMOTE_INSTRUCTION_CAP,
         cut
     );
@@ -571,10 +593,13 @@ mod tests {
     /// policy past the cap, this fails rather than the route silently abstaining in production.
     #[test]
     fn the_shipped_remote_policy_fits_the_backends_cap() {
+        // Bytes, not characters: that is the unit the cap is enforced in, and the message used
+        // to say "chars" while printing a byte count — the same conflation the panic came from.
         assert!(
             POLICY_LUNAROUTE.len() <= REMOTE_INSTRUCTION_CAP,
-            "POLICY_LUNAROUTE is {} chars, over the {} char cap — compress it",
+            "POLICY_LUNAROUTE is {} bytes ({} chars), over the {}-byte cap — compress it",
             POLICY_LUNAROUTE.len(),
+            POLICY_LUNAROUTE.chars().count(),
             REMOTE_INSTRUCTION_CAP
         );
     }
@@ -584,7 +609,63 @@ mod tests {
         let long = "every day. ".repeat(400);
         let fitted = fit_remote_instructions(&long);
         assert!(fitted.len() <= REMOTE_INSTRUCTION_CAP);
-        assert!(long.starts_with(&fitted), "truncation, not corruption of the text");
+        assert!(
+            long.starts_with(&fitted),
+            "truncation, not corruption of the text"
+        );
+    }
+
+    /// The case the test above cannot reach, and the reason it could not: its input is pure
+    /// ASCII, where every byte index is a character boundary. Slicing at the byte cap only
+    /// panics when the cap lands INSIDE a multi-byte character, so an ASCII-only truncation test
+    /// leaves the whole panic path unexercised. This fixture straddles the cap on purpose.
+    #[test]
+    fn an_overlong_policy_whose_cap_lands_mid_character_truncates_instead_of_panicking() {
+        // 1999 ASCII bytes, then 'é' (2 bytes) from byte 1999 — so byte 2000 is é's SECOND byte
+        // and is not a character boundary.
+        let mut long = "a ".repeat(999); // 1998 bytes, ends on a space
+        long.push('x'); // 1999
+        long.push_str(&"é".repeat(600)); // straddles the cap, and pushes well past it
+        assert!(
+            !long.is_char_boundary(REMOTE_INSTRUCTION_CAP),
+            "fixture is pointless unless the cap really lands mid-character",
+        );
+        assert!(
+            long.len() > REMOTE_INSTRUCTION_CAP,
+            "fixture must be over the cap"
+        );
+
+        // Before the fix this line panicked: "byte index 2000 is not a char boundary".
+        let fitted = fit_remote_instructions(&long);
+
+        assert!(
+            long.starts_with(&fitted),
+            "truncation, not corruption of the text"
+        );
+        assert!(
+            fitted.len() <= REMOTE_INSTRUCTION_CAP,
+            "must respect the byte cap"
+        );
+        // The result is a valid &str by construction if we got here, but pin the boundary too:
+        // a cut mid-character would have been a panic, never a silently bad string.
+        assert!(
+            long.is_char_boundary(fitted.len()),
+            "cut on a character boundary"
+        );
+    }
+
+    /// A non-ASCII policy must still be cut at a WORD break, not merely at a safe boundary — the
+    /// boundary walk-back must not quietly defeat the \n/space preference.
+    #[test]
+    fn a_non_ascii_truncation_still_prefers_a_word_break() {
+        let mut long = "mangiamo insieme ".repeat(150); // 2550 bytes, spaces throughout
+        long.push_str(&"è".repeat(100));
+        let fitted = fit_remote_instructions(&long);
+        assert!(
+            fitted.ends_with("insieme") || fitted.ends_with("mangiamo"),
+            "expected a cut on a word break, got tail {:?}",
+            &fitted[fitted.len().saturating_sub(24)..],
+        );
     }
 
     use super::super::{PatternStrategy, RouterStrategy, RoutingRequest};
