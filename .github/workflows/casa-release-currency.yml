@@ -1,0 +1,88 @@
+# Does the published `casa-prebuilt` release still build the same `wg` as this branch's tip?
+#
+# WHY THIS IS A NEW FILE AND NOT AN EDIT TO ci.yml. Same reasoning as casa-prebuilt.yml:
+# ci.yml is UPSTREAM'S, and an edit to it conflicts on the next `scripts/sync-upstream.sh`.
+# A casa-owned file cannot.
+#
+# WHY IT IS NEEDED (audit finding N1). `casa install-wg` downloads prebuilt binaries from the
+# fixed `casa-prebuilt` release. Twice the release went stale behind the branch, and the second
+# time nothing noticed for seven hours — a family's dinner cron ran a flag the published binary
+# did not have and exited 2. Staleness was only ever caught by a human probing a download by
+# hand. Now a push answers it.
+#
+# NOTE ON THIS BRANCH'S CI, measured 2026-10-08: upstream's ci.yml triggers on `push: [main]`
+# plus pull_request, and `casa-integration-synced` — the branch that actually ships to families,
+# and this repo's default branch — receives direct pushes, not PRs. So ci.yml has never run on
+# it (last CI run on any branch: 2026-07-26), and until this file landed the ONLY workflow that
+# ever ran here was the manual casa-prebuilt dispatch. This job does not close that gap: it
+# checks release currency, not fmt/clippy/build/test. The gap is recorded for a decision.
+#
+# EXPECT THIS JOB TO BE RED between an engine commit and its republish. That is the signal, not
+# a malfunction: it is the interval in which a new family installs the old behaviour. It goes
+# green when the release is republished, or immediately if the commit cannot change the binary
+# (docs, scripts, tests) — see scripts/casa-release-currency.sh for what "cannot" means.
+
+name: casa release currency
+
+on:
+  push:
+    branches: [casa-integration-synced]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  currency:
+    name: published release vs branch tip
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # fetch-depth: 0 is load-bearing, not caution. The check diffs the PUBLISHED commit's tree
+      # against this tip; on checkout's default depth-1 that commit is absent from the clone and
+      # the script correctly refuses with "cannot determine" (exit 3) rather than guessing.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The teeth run where they are used. The classifier decides whether a mismatch is a red,
+      # so a broken classifier is a silently green gate; these cases are pinned historical
+      # states of this repo and need only git — no network, no release.
+      - name: classifier selftest
+        run: scripts/casa-release-currency.sh --selftest
+
+      - name: is the published release current?
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/casa-release-currency.sh
+
+      # Reached only when the check passed, so the summary cannot claim green over a red step.
+      - name: summary
+        if: success()
+        run: |
+          {
+            echo "### casa release currency ✅"
+            echo
+            echo "The published \`casa-prebuilt\` release builds the same \`wg\` as"
+            echo "\`${GITHUB_SHA:0:8}\`, or differs only in files that cannot change the binary."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: summary (stale)
+        if: failure()
+        run: |
+          {
+            echo "### casa release currency ❌"
+            echo
+            echo "The published \`casa-prebuilt\` release is behind \`${GITHUB_SHA:0:8}\` by a"
+            echo "change that alters the binary. A family running \`casa install-wg\` right now"
+            echo "gets the older behaviour. Republish both halves:"
+            echo
+            echo '```'
+            echo "macOS:  scripts/release-wg.sh --target aarch64-apple-darwin --publish"
+            echo "Linux:  gh workflow run casa-prebuilt.yml -R $GITHUB_REPOSITORY \\"
+            echo "          --ref casa-integration-synced -f release_tag=casa-prebuilt -f publish=true"
+            echo '```'
+            echo
+            echo "If the step said CANNOT DETERMINE (exit 3) instead, it refused to guess —"
+            echo "read its output; it names what would make the question answerable."
+          } >> "$GITHUB_STEP_SUMMARY"
