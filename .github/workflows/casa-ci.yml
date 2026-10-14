@@ -1,0 +1,145 @@
+# The shipping branch's own CI.
+#
+# WHY THIS FILE EXISTS. Upstream's ci.yml triggers on `push: branches: [main]` plus
+# pull_request. But `casa-integration-synced` is this repo's DEFAULT branch, it is the branch
+# `casa install-wg` ships binaries from, and work lands on it by DIRECT PUSH, not by PR. So
+# ci.yml never ran here. Measured 2026-10-14: the last `CI` run on any branch of this repo was
+# 2026-07-26, and every one of the 12 workflow runs on this branch was a manual casa-prebuilt
+# dispatch. No fmt, clippy, build or test had run in CI on the branch that ships to families for
+# over two months. Local sweeps carried it, which is why nothing broke — but "green" meant
+# "green on somebody's laptop", and twelve files had quietly drifted out of rustfmt in the gap.
+#
+# WHY IT IS A NEW FILE AND NOT ONE LINE IN ci.yml. Adding this branch to ci.yml's push trigger
+# is a one-line fix to UPSTREAM'S file, and an edit there conflicts on the next
+# scripts/sync-upstream.sh. That is the same reasoning casa-prebuilt.yml and
+# casa-release-currency.yml are built on: a casa-owned file cannot conflict on a sync.
+#
+# WHY IT IS A SUBSET OF UPSTREAM'S MATRIX. Deliberately the cheap, high-signal third: fmt,
+# clippy, build, `--lib`, `--doc` and the `wg` binary's own unit tests. It does NOT run the
+# integration suite (`cargo install` + integration_service, ~15 min) or the worksgood-pi plugin
+# build. Those are covered by the local 126-scenario smoke sweep, which runs the real gateway
+# and the real engine together and tests far more than CI could. Spending ten minutes of
+# Actions time per push to duplicate a third of it would buy little; catching a formatting slip
+# or a broken unit test in 90 seconds buys a lot.
+#
+# CLIPPY IS NOT `-D warnings`, ON PURPOSE. There are 337 inherited clippy warnings and 0 errors.
+# Plain `cargo clippy` is what upstream runs and it exits 0, so the warnings stay visible in the
+# log without the gate being red on arrival — a gate that is red the day it lands is one people
+# learn to route around. Ratcheting those 337 down is its own piece of work; when it is done,
+# `-D warnings` belongs here.
+#
+# ON THE TOOLCHAIN. rust-toolchain.toml pins channel 1.96.0 with rustfmt + clippy, and that pin
+# WINS over whatever @stable installs — every cargo invocation in this directory uses it, which
+# is the whole point of the file (its header records the polish branch shipping nightly-formatted
+# code twice and failing CI's stable `fmt --check`). @stable is kept because it matches upstream
+# and guarantees the components exist, but it is not what decides the version. Since a drift
+# between the pin and the runner would otherwise show up only as an inexplicable `fmt --check`
+# red, each job echoes the versions cargo actually resolved before using them.
+
+name: casa CI
+
+on:
+  push:
+    branches: [casa-integration-synced]
+  pull_request:
+    branches: [casa-integration-synced]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A second push supersedes the first: these are gates, and only the tip's verdict matters.
+concurrency:
+  group: casa-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt & clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-casaci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-casaci-
+
+      # First and cheapest: it needs no build, so a formatting slip fails in seconds rather
+      # than after a ten-minute compile.
+      # Printed, not assumed: rust-toolchain.toml decides this, and a mismatch between it and
+      # the runner is the one thing that makes `fmt --check` red here while clean locally.
+      - name: toolchain actually in use
+        run: |
+          rustc --version
+          cargo fmt --version
+          cargo clippy --version 2>/dev/null || true
+          echo "rust-toolchain.toml pins: $(grep '^channel' rust-toolchain.toml)"
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy
+
+  test:
+    name: build & unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-casaci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-casaci-
+
+      # Printed, not assumed: rust-toolchain.toml decides this, and a mismatch between it and
+      # the runner is the one thing that makes a build red here while green locally.
+      - name: toolchain actually in use
+        run: |
+          rustc --version
+          cargo fmt --version
+          cargo clippy --version 2>/dev/null || true
+          echo "rust-toolchain.toml pins: $(grep '^channel' rust-toolchain.toml)"
+
+      - name: cargo build
+        run: cargo build
+
+      - name: cargo test --lib
+        run: cargo test --lib
+
+      # The `wg` BINARY's unit tests, which upstream's ci.yml does not run at all. Most of
+      # casa's own engine code lives under src/casa/** and src/commands/**, which compile into
+      # the binary and not the library — so `--lib` alone leaves the router, the election, the
+      # feedback loop and the telegram commands untested. This is the half that matters most
+      # here: 4083 tests against ~3981 in the lib.
+      - name: cargo test --bin wg
+        run: cargo test --bin wg
+
+      - name: cargo test --doc
+        run: cargo test --doc
