@@ -586,7 +586,7 @@ pub fn options_help() -> String {
 
 #[cfg(test)]
 mod options_help_tests {
-    use super::{options_help, Cli};
+    use super::{Cli, options_help};
     use clap::Parser;
 
     /// Every flag this block advertises must actually be RECOGNISED by the parser.

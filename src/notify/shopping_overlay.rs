@@ -42,7 +42,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::project_lock;
 
@@ -364,7 +364,10 @@ mod tests {
             normalize_week_key("2026-W40-family-plan.md"),
             Some("2026-W40".into())
         );
-        assert_eq!(normalize_week_key("plans/2026-W41-bruno-recipes.md"), Some("2026-W41".into()));
+        assert_eq!(
+            normalize_week_key("plans/2026-W41-bruno-recipes.md"),
+            Some("2026-W41".into())
+        );
         assert_eq!(normalize_week_key("family-plan.md"), None);
         assert_eq!(normalize_week_key(""), None);
         // A bare year must not be mistaken for a week.
@@ -433,12 +436,25 @@ mod tests {
         assert_eq!(added.id, 2, "seq continues from the stored counter");
 
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["checked"]["plan:Monday:Carrots"], true, "crossed-off state preserved");
+        assert_eq!(
+            v["checked"]["plan:Monday:Carrots"], true,
+            "crossed-off state preserved"
+        );
         assert_eq!(v["bumps"]["plan:Tuesday:Milk"], 6, "bumps preserved");
-        assert_eq!(v["dismissed"]["plan:Sunday:Basil"], true, "dismissals preserved");
+        assert_eq!(
+            v["dismissed"]["plan:Sunday:Basil"], true,
+            "dismissals preserved"
+        );
         assert_eq!(v["carriedWeeks"]["2026-W39"][0], "plan:Monday:Carrots");
-        assert_eq!(v["anUnknownFutureKey"]["keep"], "me", "unknown keys preserved");
-        assert_eq!(v["added"].as_array().unwrap().len(), 2, "the new row is appended, not replacing");
+        assert_eq!(
+            v["anUnknownFutureKey"]["keep"], "me",
+            "unknown keys preserved"
+        );
+        assert_eq!(
+            v["added"].as_array().unwrap().len(),
+            2,
+            "the new row is appended, not replacing"
+        );
         assert_eq!(v["added"][0]["text"], "wine");
         assert_eq!(v["added"][1]["text"], "milk");
         assert_eq!(v["added"][1]["key"], "add:2");
@@ -453,9 +469,10 @@ mod tests {
             assert_eq!(added.id, i as u64 + 1);
             assert_eq!(added.key, format!("add:{}", i + 1));
         }
-        let v: Value =
-            serde_json::from_str(&std::fs::read_to_string(overlay_path(&root, "2026-W40")).unwrap())
-                .unwrap();
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(overlay_path(&root, "2026-W40")).unwrap(),
+        )
+        .unwrap();
         let keys: Vec<String> = v["added"]
             .as_array()
             .unwrap()
@@ -504,7 +521,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(overlay_path(&root, "2026-W40").exists(), "the plan file name wins");
+        assert!(
+            overlay_path(&root, "2026-W40").exists(),
+            "the plan file name wins"
+        );
         assert!(!overlay_path(&root, "2026-W41").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -529,9 +549,10 @@ mod tests {
         let removed = remove_item(&root, &["2026-W40"], "AA batteries").unwrap();
         assert_eq!(removed.expect("it was there").text, "AA batteries");
 
-        let v: Value =
-            serde_json::from_str(&std::fs::read_to_string(overlay_path(&root, "2026-W40")).unwrap())
-                .unwrap();
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(overlay_path(&root, "2026-W40")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["added"].as_array().unwrap().len(), 0, "the row is gone");
 
         // …and the NEXT add still gets a fresh, uncolliding id (seq is a counter, not a reused slot).
@@ -550,9 +571,10 @@ mod tests {
         // A missing overlay is not an error either, just nothing to remove.
         assert_eq!(remove_item(&root, &["2026-W41"], "anything").unwrap(), None);
         // Nothing was touched by a failed remove.
-        let v: Value =
-            serde_json::from_str(&std::fs::read_to_string(overlay_path(&root, "2026-W40")).unwrap())
-                .unwrap();
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(overlay_path(&root, "2026-W40")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["added"].as_array().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }

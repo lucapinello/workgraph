@@ -7373,7 +7373,11 @@ domains = ["coordination"]
                 ..
             }
         ));
-        assert_eq!(overlay_count(), 1, "the refire must not add it a second time");
+        assert_eq!(
+            overlay_count(),
+            1,
+            "the refire must not add it a second time"
+        );
         let delivered = sink.delivered.lock().unwrap().clone();
         assert_eq!(delivered.len(), 1);
         assert_eq!(&delivered[0].0, "helper-9");

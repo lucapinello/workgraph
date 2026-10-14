@@ -406,7 +406,10 @@ mod tests {
             "the reaction's message_id is the ask it answers"
         );
         assert!(!msg.sender_is_bot, "a family member's thumb is not a bot's");
-        assert!(msg.message_id.is_none(), "a reaction is not itself a message");
+        assert!(
+            msg.message_id.is_none(),
+            "a reaction is not itself a message"
+        );
 
         // 2. THE FLIP. The decoded body goes through the SAME routing a typed reply takes.
         run_record(root, &msg.sender, &msg.body, None, Some("2026-07-14"), true)
@@ -415,8 +418,15 @@ mod tests {
         // 3. What landed is one rating, for TONIGHT'S dish, and a LIKED one.
         let ratings = meal_feedback::load_ratings(&meal_feedback::feedback_path_for(root));
         assert_eq!(ratings.len(), 1, "exactly one rating — not zero, not two");
-        assert_eq!(ratings[0].dish, "Baked salmon", "the dish came from the plan");
-        assert_eq!(ratings[0].verdict, meal_feedback::Verdict::Liked, "👍 is a Liked");
+        assert_eq!(
+            ratings[0].dish, "Baked salmon",
+            "the dish came from the plan"
+        );
+        assert_eq!(
+            ratings[0].verdict,
+            meal_feedback::Verdict::Liked,
+            "👍 is a Liked"
+        );
 
         // 4. AND THE RIGHT EVENING WAS FLIPPED. This is the assertion that makes the rest mean
         //    something: a flip is only correct if it lands on the ask the family actually answered.
@@ -424,7 +434,10 @@ mod tests {
         //    the gate reads — the house would believe it had been answered when it had not.
         let asks = meal_feedback::load_asks(&ask_log);
         assert_eq!(asks.len(), 2);
-        assert!(asks[1].responded, "last night's ask — the one the thumb answered — must flip");
+        assert!(
+            asks[1].responded,
+            "last night's ask — the one the thumb answered — must flip"
+        );
         assert!(
             !asks[0].responded,
             "an ask from 20 days ago must NOT be flipped by tonight's thumb"
@@ -494,11 +507,14 @@ mod tests {
             },
         )
         .unwrap();
-        let flipped = meal_feedback::mark_ask_answered(&ask_log, "Baked salmon", 1_752_900_000_000, 0)
-            .unwrap();
+        let flipped =
+            meal_feedback::mark_ask_answered(&ask_log, "Baked salmon", 1_752_900_000_000, 0)
+                .unwrap();
         assert!(!flipped, "no ask about that evening — nothing to flip");
         assert!(
-            meal_feedback::load_asks(&ask_log).iter().all(|a| !a.responded),
+            meal_feedback::load_asks(&ask_log)
+                .iter()
+                .all(|a| !a.responded),
             "the ledger must be byte-for-byte as it was"
         );
         assert!(
@@ -526,7 +542,7 @@ mod tests {
             true,  // force: prove the send step even when the gate allows
             false, // not a dry run
             false,
-            true,  // --send
+            true, // --send
             &|_line| anyhow::bail!("telegram unavailable"),
         );
         assert!(res.is_err(), "a failed delivery must fail the command");
@@ -559,7 +575,10 @@ mod tests {
                     line.to_lowercase().contains("baked salmon"),
                     "the delivered line must be the composed ask (dish folded to speech): {line}"
                 );
-                assert!(line.contains('👍'), "the delivered line must be the family-voice ask, not a bare dish name");
+                assert!(
+                    line.contains('👍'),
+                    "the delivered line must be the family-voice ask, not a bare dish name"
+                );
                 delivered.set(delivered.get() + 1);
                 Ok(())
             },
@@ -615,7 +634,7 @@ mod tests {
     /// mechanism. The real risk is this one: quiet copy-editing.)
     #[test]
     fn the_composed_ask_survives_the_family_voice_gate_untouched() {
-        use worksgood::notify::grounding::{enforce_family_voice, FamilyVoiceRoster};
+        use worksgood::notify::grounding::{FamilyVoiceRoster, enforce_family_voice};
         let roster = FamilyVoiceRoster::from_names(
             ["Nora", "Bruno", "Coach Mira", "Otto"],
             ["Household Member"],
@@ -705,7 +724,9 @@ mod tests {
                 .expect("the typed thumb records itself against tonight's open ask");
         assert_eq!(typed_rating.dish, "Baked salmon");
         assert!(
-            meal_feedback::load_asks(&ask_log_a).iter().all(|a| a.responded),
+            meal_feedback::load_asks(&ask_log_a)
+                .iter()
+                .all(|a| a.responded),
             "the ask the thumb answered is now answered"
         );
 
@@ -740,7 +761,9 @@ mod tests {
         assert_eq!(react_rating.dish, "Chickpea curry");
         assert_eq!(react_rating.rater, "Elliot");
         assert!(
-            meal_feedback::load_asks(&ask_log_b).iter().all(|a| a.responded),
+            meal_feedback::load_asks(&ask_log_b)
+                .iter()
+                .all(|a| a.responded),
             "the ask the reaction answered is now answered"
         );
     }

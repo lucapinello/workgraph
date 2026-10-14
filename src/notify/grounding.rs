@@ -2223,7 +2223,10 @@ pub enum CalendarView {
     /// regardless of age and the Week view keeps showing it, because "a blip never empties".
     /// An engine that went blind after an hour would have the kiosk naming a 5pm pickup while
     /// Otto said he could not see the calendar — one house, two answers.
-    Visible { titles: Vec<String>, confirmed: bool },
+    Visible {
+        titles: Vec<String>,
+        confirmed: bool,
+    },
 }
 
 /// Read the gateway's merged calendar snapshot (`.casa/calendar/synced-events.json`) and
@@ -2389,7 +2392,9 @@ fn tomorrow_calendar_line(root: &Path, now: NaiveDateTime) -> String {
              do NOT invent any other.\n",
             titles.join("; ")
         ),
-        CalendarView::Visible { confirmed: true, .. } => format!(
+        CalendarView::Visible {
+            confirmed: true, ..
+        } => format!(
             "CALENDAR ({label}) — there is NOTHING on the calendar tomorrow, and this includes \
              the household's linked calendar. If asked about tomorrow you may say it is clear, \
              and must not invent an event.\n"
@@ -2407,9 +2412,9 @@ fn fetch_schedule_context_line_today(root: &Path, now: NaiveDateTime) -> String 
             schedule_context_line_with_calendar(doc, now, &titles)
         }
         // Nothing today, from a calendar we just confirmed: the day really is clear.
-        CalendarView::Visible { confirmed: true, .. } => {
-            schedule_context_line_with_calendar(doc, now, &[])
-        }
+        CalendarView::Visible {
+            confirmed: true, ..
+        } => schedule_context_line_with_calendar(doc, now, &[]),
         // Nothing today from a source that has stopped reporting — or no snapshot at all. An
         // empty answer is then not evidence, and the hedge is the honest one.
         _ => schedule_context_line_scoped(doc, now, external_calendar_configured(root)),
@@ -5074,15 +5079,24 @@ mod tests {
         .unwrap();
 
         let line = fetch_schedule_context_line(dir.path(), now);
-        assert!(line.contains("Jury service"), "tomorrow's events are not named: {line}");
-        assert!(line.contains("Pick up Elliot"), "tomorrow's events are not named: {line}");
+        assert!(
+            line.contains("Jury service"),
+            "tomorrow's events are not named: {line}"
+        );
+        assert!(
+            line.contains("Pick up Elliot"),
+            "tomorrow's events are not named: {line}"
+        );
         // And the day is never described as clear while those sit on it.
         assert!(
             !line.contains("NOTHING on the calendar tomorrow"),
             "a day holding two events was reported as empty: {line}"
         );
         // Today's passed event is still not resurrected — the today filter is unchanged.
-        assert!(!line.contains("Old thing"), "a finished event came back: {line}");
+        assert!(
+            !line.contains("Old thing"),
+            "a finished event came back: {line}"
+        );
 
         // CONTROL: an empty tomorrow, from a confirmed feed, may be called clear.
         std::fs::write(
@@ -5197,7 +5211,10 @@ mod tests {
         let CalendarView::Visible { titles, confirmed } = view else {
             panic!("a fresh snapshot was not trusted: {view:?}");
         };
-        assert!(confirmed, "a snapshot stamped just now did not read as confirmed");
+        assert!(
+            confirmed,
+            "a snapshot stamped just now did not read as confirmed"
+        );
         // Today's REMAINING event only: the 9am dentist has passed, sports day is tomorrow.
         assert_eq!(titles, vec!["Pick up the kids (5:00pm)".to_string()]);
 
@@ -5288,7 +5305,10 @@ mod tests {
         write("null".to_string());
         assert!(matches!(
             calendar_snapshot_view(dir.path(), now),
-            CalendarView::Visible { confirmed: false, .. }
+            CalendarView::Visible {
+                confirmed: false,
+                ..
+            }
         ));
         std::fs::write(cal.join("synced-events.json"), "{ not json").unwrap();
         assert_eq!(calendar_snapshot_view(dir.path(), now), CalendarView::Blind);
@@ -5326,10 +5346,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let CalendarView::Visible { titles, confirmed } = calendar_snapshot_view(dir.path(), now) else {
+        let CalendarView::Visible { titles, confirmed } = calendar_snapshot_view(dir.path(), now)
+        else {
             panic!("a feed-less snapshot was treated as blind");
         };
-        assert!(confirmed, "with no feed there is nothing to have gone stale");
+        assert!(
+            confirmed,
+            "with no feed there is nothing to have gone stale"
+        );
         assert_eq!(titles, vec!["Swimming (6:00pm)".to_string()]);
         let line = fetch_schedule_context_line(dir.path(), now);
         assert!(line.contains("Swimming"), "{line}");

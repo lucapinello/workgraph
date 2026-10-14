@@ -1249,7 +1249,11 @@ mod tests {
         // every other queued task was headed for the same fate. The budget is a PROVIDER
         // condition: FatalProvider parks the run instead of consuming the graph.
         assert_eq!(
-            classify_typed_or_legacy_failure(Some(FailureClass::ApiError400UsageLimit), Some(1), ""),
+            classify_typed_or_legacy_failure(
+                Some(FailureClass::ApiError400UsageLimit),
+                Some(1),
+                ""
+            ),
             Some(ProviderErrorKind::FatalProvider),
         );
         // A real document error is still the task's own input problem.

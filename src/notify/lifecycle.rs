@@ -1680,8 +1680,7 @@ mod tests {
         // THE LIVE LEAK (2026-08-19, Telegram). The family said "I have to pick up the
         // kids, can you tell this to the developer"; a task was filed under an
         // engineering title; and the Done ping spoke it to them word for word.
-        let leaked =
-            "Report Casa calendar sync issue — user has standing kids pickup obligation \
+        let leaked = "Report Casa calendar sync issue — user has standing kids pickup obligation \
              not reflected in system";
         assert!(
             reads_like_a_dev_ticket(leaked),

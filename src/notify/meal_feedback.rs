@@ -985,10 +985,10 @@ mod tests {
     #[test]
     fn an_ordinary_word_is_not_a_verdict() {
         for innocent in [
-            "How to cook it?",   // "ok" ⊂ cook — the live false capture
+            "How to cook it?", // "ok" ⊂ cook — the live false capture
             "a cookbook",
-            "laundry day",       // "dry" ⊂ laundry
-            "badminton",         // "bad" ⊂ badminton
+            "laundry day", // "dry" ⊂ laundry
+            "badminton",   // "bad" ⊂ badminton
             "can you book a table?",
         ] {
             assert_eq!(
@@ -1208,7 +1208,12 @@ mod tests {
         );
         // The fallback is load-bearing, not incidental: two days back is NOT an answer.
         assert_eq!(
-            ask_a_rating_may_answer(&asks, "Cod", RATING_2150_LOCAL + 2 * 24 * 60 * 60 * 1000, EDT),
+            ask_a_rating_may_answer(
+                &asks,
+                "Cod",
+                RATING_2150_LOCAL + 2 * 24 * 60 * 60 * 1000,
+                EDT
+            ),
             None,
             "a rating two evenings later must not claim this ask"
         );
@@ -1279,16 +1284,16 @@ mod tests {
         assert!(mark_ask_answered(&path, "Sardines", 11 * DAY, 0).unwrap());
 
         let asks = load_asks(&path);
-        let stale = asks
-            .iter()
-            .find(|a| a.dish.starts_with("Spiced"))
-            .unwrap();
+        let stale = asks.iter().find(|a| a.dish.starts_with("Spiced")).unwrap();
         assert!(
             !stale.responded,
             "the ten-day-stale ask for another dish must NOT be marked answered"
         );
         assert!(
-            asks.iter().find(|a| a.dish == "Sardines").unwrap().responded,
+            asks.iter()
+                .find(|a| a.dish == "Sardines")
+                .unwrap()
+                .responded,
             "tonight's ask is the one the rating answers"
         );
     }
@@ -1482,7 +1487,10 @@ mod tests {
         let out = maybe_record_rating_reply(&root, "Luca", "👍", now, 0)
             .expect("a clean append must not error");
         let rating = out.expect("an open same-evening ask + a legible thumb must record");
-        assert_eq!(rating.dish, "Baked salmon", "the dish comes from the ASK, not a plan lookup");
+        assert_eq!(
+            rating.dish, "Baked salmon",
+            "the dish comes from the ASK, not a plan lookup"
+        );
         assert_eq!(rating.rater, "Luca");
         // And the ask flipped — the nag gate must know the family engaged.
         let asks = load_asks(&ask_log_path_for(&root));
@@ -1508,7 +1516,10 @@ mod tests {
         .unwrap();
         let out = maybe_record_rating_reply(&root, "Luca", "👍", now, 0)
             .expect("a clean scan must not error");
-        assert!(out.is_none(), "no open ask about this evening → nothing records");
+        assert!(
+            out.is_none(),
+            "no open ask about this evening → nothing records"
+        );
         assert!(
             load_ratings(&feedback_path_for(&root)).is_empty(),
             "no rating was invented"
@@ -1525,8 +1536,7 @@ mod tests {
         let first = maybe_record_rating_reply(&root, "Luca", "👍", now, 0)
             .expect("clean")
             .expect("first delivery records");
-        let second = maybe_record_rating_reply(&root, "Luca", "👍", now + 1_000, 0)
-            .expect("clean");
+        let second = maybe_record_rating_reply(&root, "Luca", "👍", now + 1_000, 0).expect("clean");
         assert!(second.is_none(), "the re-delivery must not double-record");
         let ratings = load_ratings(&feedback_path_for(&root));
         assert_eq!(ratings.len(), 1, "exactly one rating — not two");
@@ -1544,7 +1554,9 @@ mod tests {
         assert!(out.is_none(), "a question is not a rating");
         assert!(load_ratings(&feedback_path_for(&root)).is_empty());
         assert!(
-            !load_asks(&ask_log_path_for(&root)).iter().any(|a| a.responded),
+            !load_asks(&ask_log_path_for(&root))
+                .iter()
+                .any(|a| a.responded),
             "a question must not consume the ask"
         );
     }
@@ -1569,7 +1581,10 @@ mod tests {
             .expect("clean")
             .expect("the evening straddle keeps tonight's ask answerable");
         assert_eq!(out.dish, "Chickpea curry");
-        assert!(load_asks(&ask_log_path_for(&root)).iter().all(|a| a.responded));
+        assert!(
+            load_asks(&ask_log_path_for(&root))
+                .iter()
+                .all(|a| a.responded)
+        );
     }
-
 }

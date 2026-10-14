@@ -2662,7 +2662,10 @@ agent_id = "nora"
             }
         });
         let m = decode_update(&update, "telegram:bruno").expect("a reaction must decode");
-        assert_eq!(m.body, "\u{1F44D}", "the emoji IS the body — meal_feedback decodes it");
+        assert_eq!(
+            m.body, "\u{1F44D}",
+            "the emoji IS the body — meal_feedback decodes it"
+        );
         assert_eq!(m.sender, "nadin");
         assert_eq!(m.sender_id.as_deref(), Some("55"));
         assert_eq!(m.chat_id.as_deref(), Some("-1001234"));
@@ -2697,5 +2700,4 @@ agent_id = "nora"
             "an un-reaction is not a rating and must not become one"
         );
     }
-
 }

@@ -2497,7 +2497,7 @@ pub fn run_fast_lane_at(
                     report: report_line(&op),
                     op,
                     week_code,
-                }
+                };
             }
             // A generated row: fall through to the plan edit below, unchanged.
             Ok(None) => {}
@@ -2505,7 +2505,7 @@ pub fn run_fast_lane_at(
             Err(e) => {
                 return FastLaneResult::Fallback {
                     reason: format!("shopping overlay unavailable: {e}"),
-                }
+                };
             }
         }
     }
@@ -4253,9 +4253,10 @@ domains = ["meals"]
 
         // 1. The item is in the DURABLE store…
         let overlay = dir.join(".casa/shopping/2026-W29.json");
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&overlay).expect("the overlay was written"))
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&overlay).expect("the overlay was written"),
+        )
+        .unwrap();
         assert_eq!(v["added"][0]["text"], "aa batteries");
         assert_eq!(v["added"][0]["key"], "add:1");
         // …and the family's delta did NOT rewrite the generated plan.
@@ -5113,7 +5114,9 @@ mod packaging_word_is_not_a_purchase_on_its_own {
     #[test]
     fn modal_can_is_not_grocery_evidence_but_a_can_of_something_is() {
         // The false positive, at the predicate.
-        assert!(!lang::plausible_grocery("can you tell this to the developer"));
+        assert!(!lang::plausible_grocery(
+            "can you tell this to the developer"
+        ));
         assert!(!lang::plausible_grocery("can we talk later"));
         assert!(!lang::plausible_grocery("box him in"));
         // …and the true positives a unit construction must keep.
